@@ -76,7 +76,7 @@ async function reloadChangedDocuments(names: string[]): Promise<void> {
 }
 
 const App: React.FC = () => {
-  const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath && import.meta.env.VITE_MDVIEWER_SESSIONS_PREVIEW === '1');
+  const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath);
   const [sessionsMounted, setSessionsMounted] = useState(sessionsVisible);
   // Subscribe field by field so that high frequency updates (scroll offsets,
   // active heading) do not re-render the whole application.
@@ -686,7 +686,7 @@ const App: React.FC = () => {
           if (dirty.length === 0) return;
           event.preventDefault();
           const names = dirty.map((t) => t.title).join(', ');
-          if (window.confirm(`Unsaved changes in ${names}. Close MDViewer and discard them?`)) {
+          if (window.confirm(`Unsaved changes in ${names}. Close Agent MCR and discard them?`)) {
             await appWindow.destroy();
           }
         });

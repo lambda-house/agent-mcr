@@ -1,368 +1,43 @@
-# MDViewer
+# Agent MCR
 
-A powerful, elegant markdown document viewer built with Tauri, React, and TypeScript.
+**Agent Mission Control Room.** A local harness for a group of coding agents on a Mac.
 
-## Features
+- **Sessions.** The Claude Code and Codex sessions on this machine: active and inactive, who started whom, models, tokens, tool calls, and ticket mentions.
+- **Planned.** The agents' terminals running inside the app and surviving app restarts, a dependency graph, an attention list for everything that waits on you, tools agents use to talk to each other, a supervisor surface for an external agent, and infrastructure tools through a local [agentgateway](https://agentgateway.dev).
 
-- 📁 **Multi-directory browsing** with recursive file discovery
-- 🎨 **Syntax highlighting** for 15+ programming languages (via Shiki)
-- 📊 **Mermaid diagram support** - flowcharts, sequence diagrams, class diagrams, and more
-- 📑 **Tabbed interface** for multi-document workflows
-- 🤖 **Agent workspace** - the instructions, memory, plans and skills of Claude Code, Codex and Gemini CLI in one panel, with what changed since you last read them
-- 📋 **Table of Contents** sidebar with scroll synchronization
-- 🖱️ **Drag & drop** markdown files or folders onto the window to open them
-- 🔍 **File search** with instant filtering
-- 🔎 **Zoom control** with hover-expand UI
-- 🌙 **IntelliJ IDEA-inspired dark theme** with fully customizable colors
-- ⚡ **Fast and lightweight** - built with Tauri for minimal resource usage
-- 🖥️ **Cross-platform** - Windows, macOS, and Linux
+The architecture and its decisions are in [docs/AGENT_HARNESS_DESIGN.md](docs/AGENT_HARNESS_DESIGN.md).
 
-## UI
+Agent MCR is built on [MDViewer](https://github.com/lambda-house/mdviewer-mj) and still contains its Markdown viewer (**Documents**). MDViewer's own README is kept at [docs/MDVIEWER.md](docs/MDVIEWER.md). Viewer fixes are merged from the `upstream` remote.
 
-![MD VIewer MJ](./docs/mdviewer-mj-screenshot.png)
+## Status
 
-## Tech Stack
+Pre-release (0.1.0): macOS only, no published builds and no updates. It runs alongside an installed MDViewer without sharing settings, data or file associations.
 
-| Layer | Technology |
-|-------|------------|
-| Framework | Tauri 2.0 |
-| Frontend | React 18 + TypeScript |
-| State | Zustand |
-| Markdown | markdown-it |
-| Highlighting | Shiki |
-| Diagrams | Mermaid 11 |
-| Styling | CSS Variables + Custom Properties |
+## Build and run
 
-## Install
-
-Download the installer for your platform from the
-[latest release](https://github.com/lambda-house/mdviewer-mj/releases/latest):
-
-| Platform | File |
-|----------|------|
-| macOS (Apple Silicon) | `MDViewer_<version>_aarch64.dmg` |
-| macOS (Intel) | `MDViewer_<version>_x64.dmg` |
-| Windows | `MDViewer_<version>_x64-setup.exe` or `MDViewer_<version>_x64_en-US.msi` |
-| Linux | `.deb`, `.rpm` or `.AppImage` |
-
-Or install with a package manager:
-
-- **Homebrew (macOS):** `brew install --cask lambda-house/tap/mdviewer`
-- **apt (Debian, Ubuntu) and dnf (Fedora):** add the signed repository at [lambda-house.github.io/mdviewer-packages](https://lambda-house.github.io/mdviewer-packages/), then install `md-viewer`
-
-Every release lists `SHA256SUMS` and has a build provenance attestation for each file: `gh attestation verify <file> --repo lambda-house/mdviewer-mj` checks that it was built by this repository's release workflow.
-
-Installed packages register MDViewer as an app for `.md` and `.markdown` files. Double-clicking one opens it in MDViewer when the operating system selects MDViewer as the default. An existing default chosen by the user remains in place; select MDViewer in the system's **Open with** or default-app settings to switch it.
-
-Unless the release was built with signing set up (see [Code signing](#code-signing)), the builds are not code-signed and the first launch needs one extra step:
-
-- **macOS:** open MDViewer once, then click **Open Anyway** in System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/MDViewer.app`
-- **Windows:** on the SmartScreen warning, click "More info" → "Run anyway"
-
-## Getting Started
-
-### Prerequisites
-
-- **Node.js** 18.x or later
-- **Rust** 1.70 or later
-- **npm** or **yarn**
-
-### Installation
-
-1. Clone the repository:
-```bash
-git clone git@github.com:lambda-house/mdviewer-mj.git
-cd mdviewer-mj
-```
-
-2. Install dependencies:
-```bash
-npm install
-```
-
-3. Run in development mode:
-```bash
-npm run tauri dev
-```
-
-4. Build for production:
-```bash
-npm run tauri build
-```
-
-The build also produces signed update packages, so it needs the updater key (see [Updates](#updates)). Without the key, turn them off for a local build:
-```bash
-npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'
-```
-
-On Linux, install the WebKitGTK build dependencies first:
-`sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf`
-
-### Releasing
-
-For the first signed release and account setup, follow [the 1.1.0 release plan](docs/RELEASE_1.1.0.md). The bundle identifier is `cc.lambdahouse.mdviewer`. 1.1.0 is signed for macOS under an individual Apple Developer ID; the Windows installers are not code-signed yet.
-
-CI (`.github/workflows/ci.yml`) typechecks the frontend and checks the Rust backend on every push and pull request.
-
-To publish a release after signed builds and install checks pass, bump the version in `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`, add a `CHANGELOG.md` entry, then push a tag:
+Needs Node.js, Rust and the Xcode command-line tools.
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
+npm ci
+npm run tauri dev        # development
+npm run build:app        # src-tauri/target/release/bundle/macos/Agent MCR.app
+npm test                 # frontend tests
+cd src-tauri && cargo test
 ```
 
-`.github/workflows/release.yml` builds macOS (arm64 and x64), Windows x64 and Linux x64, and attaches the installers to a GitHub Release for that tag. Running the workflow by hand from the Actions tab builds the same installers as workflow artifacts without publishing a release.
+The app opens on **Sessions**. Reading transcripts is switched on in the app, after a native confirmation.
 
-### Updates
+## Where data lives
 
-The app checks `https://github.com/lambda-house/mdviewer-mj/releases/latest/download/latest.json` a few seconds after it starts (Settings → General → Check for updates on start, or **Check now**). When a newer version is there, a bar under the toolbar offers **Install and restart**; nothing is installed without that click.
+`~/Library/Application Support/agent-mcr/` holds:
 
-Every update package is signed with the updater key, and the app refuses packages whose signature doesn't match the public key in `tauri.conf.json` (`plugins.updater.pubkey`). The release workflow signs with two repository secrets, `TAURI_SIGNING_PRIVATE_KEY` (the key file's contents) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, and its `updater-manifest` job writes `latest.json` once all platforms are uploaded. Keep a backup of the key and its password: without them, installed copies can't be updated anymore and users would have to reinstall by hand.
+- `access.json`: what you've allowed
+- `sessions/index.sqlite`: the transcript index, which contains private transcript content
+- `history/` and `read-state/`: inherited from the viewer
+- `analysis/mcp.sock`: the analysis MCP socket, while it's switched on
 
-The updater needs the repository to be public, because the app downloads release files without logging in.
+Browser-side settings are stored per app, separate from MDViewer's.
 
-### Code signing
+## Analysis MCP
 
-The release workflow signs when the secrets below exist (repository Settings → Secrets and variables → Actions). Manual workflow runs can build unsigned installers for testing; tagged builds fail before packaging only if the updater key is missing. Without Apple credentials the macOS app is ad-hoc signed (it opens after **Open Anyway**); without Windows credentials the installers are unsigned. A tagged release remains a draft until all four builds and the updater manifest succeed. Signing is the first step of the [distribution roadmap](docs/DISTRIBUTION.md) (package managers and app stores).
-
-**macOS** needs an Apple Developer Program membership and a "Developer ID Application" certificate:
-
-| Secret | Value |
-|--------|-------|
-| `APPLE_CERTIFICATE` | The certificate exported from Keychain Access as `.p12`, base64-encoded (`base64 -i cert.p12`) |
-| `APPLE_CERTIFICATE_PASSWORD` | The `.p12` export password |
-| `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (TEAMID)` |
-| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | For notarization: the Apple ID, an app-specific password for it, and the team ID |
-
-**Windows** installers are unsigned for now. The workflow can sign them with [Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/) (an Azure account with a Trusted Signing account and certificate profile, and an app registration allowed to sign with it), which Microsoft offers to individual developers only in the US and Canada:
-
-| Secret | Value |
-|--------|-------|
-| `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID` | The app registration |
-| `AZURE_SIGNING_ENDPOINT` | The account's region endpoint, e.g. `https://weu.codesigning.azure.net` |
-| `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE` | The Trusted Signing account and certificate profile names |
-
-Linux release files are not signed; the apt and dnf repository below signs its packages and indexes.
-
-### Package channels
-
-After a tagged release is published, three jobs of the release workflow update the package channels. Each skips with a notice while its secrets are missing. The scripts that generate the files are in `packaging/`.
-
-| Job | Updates | Secrets |
-|-----|---------|---------|
-| `homebrew` | `Casks/mdviewer.rb` in [lambda-house/homebrew-tap](https://github.com/lambda-house/homebrew-tap) | `HOMEBREW_TAP_DEPLOY_KEY`: private half of a write deploy key on that repository |
-| `linux-repo` | The apt and dnf repository in [lambda-house/mdviewer-packages](https://github.com/lambda-house/mdviewer-packages) (GitHub Pages), via `packaging/linux-repo/build.sh` | `PACKAGES_DEPLOY_KEY` (write deploy key on that repository) and `PACKAGES_GPG_PRIVATE_KEY` (armored signing key without passphrase) |
-| `aur` | [`mdviewer-bin`](https://aur.archlinux.org/packages/mdviewer-bin), which repackages the `.deb`. Skips while the AUR doesn't accept the key | `AUR_SSH_PRIVATE_KEY`: the key registered on the AUR maintainer account |
-
-Users trust the packages' GPG key by its fingerprint, so keep a backup of it with its revocation certificate. The deploy keys and the AUR key can be replaced at any time.
-
-## Project Structure
-
-```
-mdviewer/
-├── src/                      # React frontend
-│   ├── components/           # UI components
-│   │   ├── Toolbar.tsx       # Top toolbar with zoom control
-│   │   ├── FilePanel.tsx     # Left sidebar with file tree
-│   │   ├── DocumentPanel.tsx # Main document viewer
-│   │   ├── TocSidebar.tsx    # Right TOC sidebar
-│   │   ├── Resizer.tsx       # Panel resize handles
-│   │   └── StatusBar.tsx     # Auto-hide status bar
-│   ├── store/                # Zustand state management
-│   ├── utils/                # Utilities (markdown, files)
-│   ├── styles/               # CSS styles and themes
-│   ├── App.tsx               # Main app component
-│   └── main.tsx              # Entry point
-├── src-tauri/                # Rust backend
-│   ├── src/
-│   │   ├── main.rs           # Tauri commands, access list
-│   │   └── agent.rs          # Agent workspace: discovery, read state
-│   ├── Cargo.toml            # Rust dependencies
-│   └── tauri.conf.json       # Tauri configuration
-├── package.json
-├── tsconfig.json
-└── vite.config.ts
-```
-
-## Agent Workspace
-
-In the Files panel, select **Agents** to show agent documents inside the folders you opened, including hidden `.claude` and `.cursor` folders. The normal **Files** filter shows only folders containing Markdown documents; the **Show text files** setting can also show other text files inside those folders.
-
-**Global agent files** appears as a separate root below the opened folders in the same left column. Click the root to expand or collapse it. Hide it with the × on that row and show it again with the 🤖 button (Ctrl+Shift+A). It contains files in the agents' own folders:
-
-| Section | What's in it |
-|---|---|
-| Instructions | `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` |
-| Rules | Claude Code rules in `~/.claude/rules`, with what each applies to |
-| Memory | Claude Code's per-project memory (`~/.claude/projects/*/memory`), grouped by project |
-| Plans | `~/.claude/plans` (newest 100) |
-| Skills | `SKILL.md` of user and plugin skills, with their descriptions |
-| Agents, Commands | Subagent definitions and slash commands (`~/.codex/prompts` too) |
-
-The first time you expand the root, select **Show agent files** to confirm access in a native dialog. Everything that is there then counts as read. After that, a dot marks files an agent has changed since you last read them, and **Changed since you read them** collects them at the top. Opening one highlights the changed blocks, with **Next change** and **Mark as read**; leaving the document marks it read too. While the root or an agent file is open, the list and open documents update as soon as an agent writes a file.
-
-## Sessions workspace
-
-To test alongside an installed MDViewer on macOS, run `npm run build:sessions-preview` and open `src-tauri/target/debug/bundle/macos/MDViewer Sessions Preview.app`. This build has a distinct bundle identifier, opens directly to Sessions, uses `mdviewer-sessions-preview` for its backend settings, and disables production updates and file associations. Launching the normal build while MDViewer is already running hands off to the existing instance, so its new UI will not appear until that instance is quit.
-
-Use the **Documents / Sessions** switch in the toolbar to inspect Codex and Claude activity across all recorded project directories. **Enable session access** grants a separate, revocable permission to read `~/.codex/sessions` and `~/.claude/projects`. The existing Global agent files permission does not grant transcript access.
-
-Statistics stay in a compact corner summary; expand it for token totals and session counts. The directory map and activity window are collapsible.
-
-The workspace provides:
-
-- Collapsible session hierarchy distinguishes human sessions, subagents, automation and unknown origins. Human forks retain a separate source link. Filtered-out ancestors remain visible for context and do not inflate totals.
-- Provider, role, status, model, tool and ticket search. Expand **Activity window** for the time filters. **Active since** includes last activity at or after a local date/time; **Inactive since** includes last activity at or before it. **Active in the last** selects recent activity; **No activity for** adds a relative inactivity threshold. These use transcript modification time, not verified process liveness.
-- A directory map includes every recorded working directory, including directory changes within a session. Choose **Current directory** (the selected session’s directory, otherwise the app’s launch directory or `~/work`), an ancestor directory, or **All locations**. Counts include descendant directories without counting a session twice.
-- Message and tool activity with source provenance, model/effort, and per-model token accounting.
-- Input, cached input, cache writes, output and reasoning usage. Cached input is already part of input; reasoning is already part of output. Monetary cost is not inferred from subscription token counts.
-- Jira ticket mentions with browser links and on-demand issue details. A mention does not imply assignment.
-- TEOB `memory_run` lookup by session ID, plus memory tools observed in the transcript.
-- **User memories** and each session’s **Memories** tab show user-wide instructions/memory, shared project files, and explicitly session-linked Codex memories and recorded compaction context. Local memory access has a separate native permission. Files show their source and scope; current shared files are not presented as historical session snapshots. **Open in new window** opens Markdown memories in a separate MDViewer reader, keeping the Sessions view in place. Reopening the same file focuses its existing window.
-- Live Codex inspection, steering and interruption through an **existing** local app-server daemon on macOS/Linux. Commands are confirmed in a native dialog and carry the observed turn ID. No second writer or daemon is started. Externally launched Claude sessions currently provide inspection and a copyable resume command; live Claude steering is not connected.
-
-Recent files are indexed first, in bounded batches; **totals are partial** while history is indexing. The overview refreshes every five seconds while visible; during cold indexing it continues immediately between bounded batches. A persistent SQLite index stores file checkpoints, usage deduplication state and extracted activity. Restarts reuse it: unchanged transcripts require no content reads, appended records resume from the saved offset, incomplete trailing lines wait for the writer, and replaced/truncated files invalidate old events. The activity view pages 300 extracted events from SQLite at a time, with 12,000-character previews. Malformed or oversized records are reported. The footer shows the cache location, restored file count and bytes parsed in the latest scan. **Revoke session access** clears the index and disables local memory access.
-
-The index lives at `dirs::config_dir()/mdviewer/sessions/index.sqlite` (on macOS, `~/Library/Application Support/mdviewer/sessions/index.sqlite`). The isolated preview uses `mdviewer-sessions-preview` instead. Initial history indexing runs once and resumes across restarts; the database contains private extracted transcript content.
-
-Local memory discovery reads fixed Markdown locations under the agent folders and known session directories. Claude project memory is shared, not private to one session. Codex thread memories are read from `~/.codex/memories_1.sqlite`, matched by `stage1_outputs.thread_id`. If the live database cannot be opened read-only, a labelled checkpoint-only view may omit recent WAL records. Recorded memory-tool calls are evidence of an attempt, not proof that a write succeeded.
-
-**Observed working** means a transcript reported an unfinished turn and was written within two minutes; it does not prove process liveness. **Stale** means an unfinished turn has no recent writes. Use **Direct → Inspect live Codex state** to check the daemon. Unknown telemetry stays unknown.
-
-**Connections** accepts an Atlassian site, email and API token, and a TEOB memory MCP HTTPS endpoint and access token. Tokens stay only in the desktop process, never localStorage or a config file, and are cleared on exit or **Revoke session access**. Saving replaces both connections. Reads happen only when you request an issue or memory run; redirects are refused, requests time out, and responses are bounded. The app does not reuse credentials from another agent or from a connected chat plugin. TEOB must grant access to the requested memory run; a session ID alone does not grant access.
-
-For a read-only JSON extraction using the same Rust index:
-
-```bash
-cargo run --manifest-path src-tauri/Cargo.toml --example session_snapshot --no-default-features > /tmp/mdviewer-sessions.json
-```
-
-Optional positional arguments are `max_batches cache_path home_override`; providing a cache path enables persistent reuse for the extractor too. For example, `-- 1000 /tmp/mdviewer-session-cache/index.sqlite` uses a dedicated temporary cache directory.
-
-The JSON contains session metadata, counts, ticket mentions and provenance paths, with activity loaded separately in the desktop workspace. Treat exports as private workspace data. The extractor never changes agent transcripts.
-
-## Keyboard Shortcuts
-
-The menu button (☰, top left) lists every command with its shortcut.
-
-| Action | Windows/Linux | macOS |
-|--------|---------------|-------|
-| Open File | Ctrl+O | Cmd+O |
-| Save File | Ctrl+S | Cmd+S |
-| Save All | Ctrl+Shift+S | Cmd+Shift+S |
-| Settings | Ctrl+, | Cmd+, |
-| Toggle TOC | Ctrl+Shift+O | Cmd+Shift+O |
-| Close Tab | Ctrl+W | Cmd+W |
-| Zoom In | Ctrl+Plus | Cmd+Plus |
-| Zoom Out | Ctrl+Minus | Cmd+Minus |
-| Reset Zoom | Ctrl+0 | Cmd+0 |
-| Next / Previous Tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab |
-| Reopen Closed Tab | Ctrl+Shift+T | Cmd+Shift+T |
-| Toggle File Panel | Ctrl+B | Cmd+B |
-| Toggle History | Ctrl+H | Cmd+H |
-| Toggle Agent Panel | Ctrl+Shift+A | Cmd+Shift+A |
-
-## Settings and Data
-
-There is no config file to edit. Settings (theme, zoom, panel sizes, text colors), open folders, tabs and workspaces are saved by the app itself and restored on the next start. Change them in the app's Settings dialog.
-
-The app keeps two files in its config folder (`~/Library/Application Support/mdviewer` on macOS, `~/.config/mdviewer` on Linux, `%APPDATA%\mdviewer` on Windows):
-
-| File | Contents |
-|------|----------|
-| `access.json` | Folders and files you opened. The app reads only these (see below) |
-| `history/history.md` | Which files you opened and when, newest 1000 entries |
-| `read-state/` | Agent workspace only: a copy of each agent file as you last read it, to show what changed |
-
-The only network requests the app makes on its own are the update check (when enabled) and, if you allow them, remote images in documents.
-
-## Security
-
-Documents come from anywhere, so the app treats them as untrusted:
-
-- **File access is limited to what you opened.** The backend reads, lists and saves only inside folders you picked in the folder dialog, files you picked with Open File, folders and files you dropped on the window, and files the app was launched with ("Open with"). Inside an opened folder it only touches markdown and text files; inside an opened single file's folder it only serves images. The webview can't extend the list by naming a path, so a script that got into a rendered document still couldn't read `~/.ssh`. To revoke access, remove the entry from `access.json` while the app is closed.
-- **Links to files you didn't open ask first.** Clicking a link to a file outside the opened folders and files shows a native "Open linked file?" dialog; only if you confirm is that file added. Symlinks inside an opened folder are followed when they point to a document (or image), never to anything else.
-- **The agent workspace is opt-in.** The Global agent files root reads the agents' own folders (`~/.claude`, `~/.codex`, `~/.gemini`) only after you confirm a native dialog, and then only markdown in fixed places: `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, `projects/*/memory`, `plans`, `skills`, `agents`, `commands` and plugin skills. Settings, credentials and session transcripts are never read. The eye button on the expanded root turns access off; × hides the root.
-- **Remote images are not loaded until you allow it**, since loading them tells their server when you read the document. Use **Load images** above the document, or turn on Settings → General → Load remote images.
-- **Raw HTML in markdown is escaped**, not rendered, and links with `javascript:` and similar schemes are neutralised.
-- **A Content Security Policy** blocks scripts other than the app's own, plugins, frames and network requests, as a second line of defence. The window can't be navigated away from the app: web links open in your browser.
-- **Saving is atomic**: the new content is written to a temporary file next to the original and renamed over it, so a crash or power loss can't leave a truncated file. Saving a symlink updates its target.
-
-## Theme Customization
-
-MDViewer uses CSS variables for complete theme customization:
-
-```css
-:root {
-  --surface-bg: #1e1e1e;
-  --surface-elevated: #252526;
-  --text-primary: #cccccc;
-  --text-accent: #4fc1ff;
-  --border-active: #007acc;
-  /* ... and many more */
-}
-```
-
-## Supported Languages (Syntax Highlighting)
-
-- JavaScript / TypeScript
-- Python
-- Rust
-- Scala
-- Java
-- Go
-- SQL
-- JSON / YAML
-- Bash / Shell
-- HTML / CSS
-- C / C++
-- And more...
-
-## Mermaid Diagrams
-
-MDViewer supports all major Mermaid diagram types:
-
-```mermaid
-flowchart TD
-    A[Start] --> B{Decision}
-    B -->|Yes| C[Action 1]
-    B -->|No| D[Action 2]
-    C --> E[End]
-    D --> E
-```
-
-## Linux / Raspberry Pi Rendering
-
-WebKitGTK's DMA-BUF renderer produces a torn or corrupted window on Raspberry Pi
-and some other ARM GL drivers ([tauri#9289](https://github.com/tauri-apps/tauri/issues/9289)).
-MDViewer therefore sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` for itself on Linux
-before the webview starts.
-
-Both parts are overridable through the environment:
-
-| Variable | Effect |
-|----------|--------|
-| `MDVIEWER_ENABLE_DMABUF=1` | Keep WebKit's default DMA-BUF renderer (try this if rendering looks fine and you want maximum GPU performance) |
-| `MDVIEWER_DISABLE_COMPOSITING=1` | Additionally set `WEBKIT_DISABLE_COMPOSITING_MODE=1` - a heavier fallback for drivers where disabling DMA-BUF is not enough |
-| `WEBKIT_DISABLE_DMABUF_RENDERER=...` | Set it yourself and MDViewer leaves it alone |
-
-## Contributing
-
-Issues and pull requests are welcome.
-
-## License
-
-MIT License, © 2026 Lambda House. See [LICENSE](LICENSE).
-
-## Acknowledgments
-
-- [Tauri](https://tauri.app/) - Desktop framework
-- [markdown-it](https://github.com/markdown-it/markdown-it) - Markdown parser
-- [Shiki](https://shiki.matsu.io/) - Syntax highlighter
-- [Mermaid](https://mermaid.js.org/) - Diagram library
-- [Lucide](https://lucide.dev/) - Icons
-- [Zustand](https://github.com/pmndrs/zustand) - State management
-
-### Agent analysis through MCP
-
-In Sessions, open **Agent access** to share a session/directory scope with local MCP clients. The app owns the SQLite index; clients start its executable with `--mcp` and connect through a private Unix socket. Seven read-only tools expose session metadata, tool/skill observations, cohort comparisons and bounded evidence. Sharing lasts until revoked or the app closes. [Connection, query examples and validation](docs/SESSION_ANALYSIS_MCP.md).
+A local agent can query the session index read-only. See [docs/SESSION_ANALYSIS_MCP.md](docs/SESSION_ANALYSIS_MCP.md).

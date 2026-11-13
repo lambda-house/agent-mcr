@@ -80,7 +80,7 @@ pub async fn run_session_analysis(
 ) -> Result<Value, String> {
     let service = state.0.clone();
     let index = sessions.index.clone();
-    tauri::async_runtime::spawn_blocking(move || service.call(&index, "MDViewer", &name, arguments))
+    tauri::async_runtime::spawn_blocking(move || service.call(&index, "Agent MCR", &name, arguments))
         .await
         .map_err(|e| e.to_string())?
 }

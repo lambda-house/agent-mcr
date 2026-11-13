@@ -6,7 +6,7 @@ import { invoke } from '@tauri-apps/api/core';
 import SessionAgentAccess from './SessionAgentAccess';
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 let root: Root; let host: HTMLDivElement;
-const status = (enabled = false) => ({ grant: { enabled, directory: '/work/demo', session: '', excerpts: false }, socket: '/tmp/private/mcp.sock', executable: '/Applications/MDViewer.app/Contents/MacOS/mdviewer', error: null, clients: [], recentQueries: [] });
+const status = (enabled = false) => ({ grant: { enabled, directory: '/work/demo', session: '', excerpts: false }, socket: '/tmp/private/mcp.sock', executable: '/Applications/Agent MCR.app/Contents/MacOS/agent-mcr', error: null, clients: [], recentQueries: [] });
 const button = (label: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.includes(label))!;
 beforeEach(() => { vi.resetAllMocks();Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(invoke).mockResolvedValue(status()); });
 afterEach(async () => {await act(async () => root.unmount());host.remove();});

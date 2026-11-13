@@ -1,4 +1,4 @@
-// MDViewer - Tauri Backend
+// Agent MCR - Tauri backend (based on MDViewer)
 // Handles file system operations, watching, and configuration
 
 #![cfg_attr(
@@ -678,11 +678,7 @@ static HISTORY_LOCK: Mutex<()> = Mutex::new(());
 fn get_config_dir() -> Result<PathBuf, AppError> {
     dirs::config_dir()
         .map(|p| {
-            p.join(if cfg!(feature = "sessions-preview") {
-                "mdviewer-sessions-preview"
-            } else {
-                "mdviewer"
-            })
+            p.join("agent-mcr")
         })
         .ok_or_else(|| AppError::new("CONFIG_ERROR", "Cannot determine config directory"))
 }
@@ -1326,7 +1322,7 @@ async fn enable_agent_workspace(app: AppHandle, access: State<'_, AccessState>) 
     let found = if locations.is_empty() {
         "No agent folders were found yet. Agent files in the folders you open are still listed.".to_string()
     } else {
-        format!("MDViewer will read the markdown files coding agents keep in:\n\n{}", locations.join("\n"))
+        format!("Agent MCR will read the markdown files coding agents keep in:\n\n{}", locations.join("\n"))
     };
     let mut dialog = app.dialog()
         .message(format!(
@@ -1399,10 +1395,12 @@ pub struct UpdateInfo {
 
 /// Ask the release server (`plugins.updater.endpoints` in tauri.conf.json)
 /// for a newer version. `None` when this one is the latest.
+const RELEASE_CHANNEL: bool = false;
+
 #[tauri::command]
 async fn check_for_update(app: AppHandle, pending: State<'_, PendingUpdate>) -> Result<Option<UpdateInfo>, AppError> {
-    // Preview builds must never offer the production updater channel.
-    if cfg!(feature = "sessions-preview") {
+    // Agent MCR has no release channel yet; never offer MDViewer's.
+    if !RELEASE_CHANNEL {
         return Ok(None);
     }
     let update = app.updater()
@@ -1607,7 +1605,7 @@ fn take_launch_paths(launch: State<'_, LaunchPaths>) -> Vec<String> {
 fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
     let handle = app.handle();
     #[cfg(target_os = "macos")]
-    let app_menu = SubmenuBuilder::new(handle, "MDViewer")
+    let app_menu = SubmenuBuilder::new(handle, "Agent MCR")
         .about(None).separator().services().separator()
         .hide().hide_others().separator().quit().build()?;
 
@@ -1635,10 +1633,10 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
     app.set_menu(menu.items(&[&file, &edit, &window, &help]).build()?)?;
     app.on_menu_event(|app, event| match event.id().0.as_str() {
         "help.docs" => {
-            let _ = app.opener().open_url("https://github.com/lambda-house/mdviewer-mj#readme", None::<&str>);
+            let _ = app.opener().open_url("https://github.com/lambda-house/agent-mcr#readme", None::<&str>);
         }
         "help.issues" => {
-            let _ = app.opener().open_url("https://github.com/lambda-house/mdviewer-mj/issues", None::<&str>);
+            let _ = app.opener().open_url("https://github.com/lambda-house/agent-mcr/issues", None::<&str>);
         }
         id => {
             if let Some(window) = app.webview_windows().values().find(|window| window.is_focused().unwrap_or(false)) {

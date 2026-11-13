@@ -362,7 +362,7 @@ fn cohort_summary(sessions: &[Session]) -> Value {
 }
 pub fn query(index: &mut Index, grant: &Grant, name: &str, args: Value) -> Result<Value, String> {
     if !grant.enabled {
-        return Err("Agent analysis access is disabled in MDViewer".into());
+        return Err("Agent analysis access is disabled in Agent MCR".into());
     }
     let definitions = tools();
     let definition = definitions["tools"]

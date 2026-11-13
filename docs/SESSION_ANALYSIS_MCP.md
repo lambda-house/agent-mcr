@@ -4,7 +4,7 @@ MDViewer exposes seven read-only analysis tools from its running desktop process
 
 ## Connect
 
-1. Open **MDViewer Sessions Preview**, then **Sessions → Agent access**.
+1. Open **Agent MCR**, then **Sessions → Agent access**.
 2. Choose the selected session, directory or all indexed sessions. Detailed transcript sharing is off by default. Enable access and confirm the native dialog.
 3. Copy the executable command shown in the panel into your MCP client’s local stdio configuration. The command is the app executable; the argument is `--mcp`.
 
@@ -13,8 +13,8 @@ For clients using the common JSON server configuration, substitute the exact exe
 ```json
 {
   "mcpServers": {
-    "mdviewer-analysis": {
-      "command": "/absolute/path/MDViewer Sessions Preview.app/Contents/MacOS/mdviewer",
+    "agent-mcr-analysis": {
+      "command": "/absolute/path/Agent MCR.app/Contents/MacOS/agent-mcr",
       "args": ["--mcp"]
     }
   }

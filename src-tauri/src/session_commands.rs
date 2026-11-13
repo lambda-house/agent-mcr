@@ -281,7 +281,7 @@ fn codex_request(method: &str, params: Value) -> Result<Value, String> {
         }
         Err("Codex request timed out".into())
     }
-    writeln!(socket,"{}",json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"mdviewer_sessions","version":"1.1.1"},"capabilities":{"experimentalApi":true}}})).map_err(|e|e.to_string())?;
+    writeln!(socket,"{}",json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"agent_mcr","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}})).map_err(|e|e.to_string())?;
     receive(&mut reader, 1)?;
     writeln!(socket, "{}", json!({"method":"initialized"})).map_err(|e| e.to_string())?;
     writeln!(
@@ -545,7 +545,7 @@ pub async fn open_session_memory_window(
         return window.set_focus().map_err(|e| e.to_string());
     }
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url))
-        .title(format!("{} — MDViewer", document.title))
+        .title(format!("{} — Agent MCR", document.title))
         .inner_size(1000.0, 760.0)
         .min_inner_size(720.0, 480.0)
         .build()

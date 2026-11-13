@@ -235,7 +235,7 @@ const SettingsModal: React.FC = () => {
                   <div className="settings-option-info">
                     <span className="settings-option-label">Check for updates on start</span>
                     <span className="settings-option-description">
-                      {appVersion && `You have MDViewer ${appVersion}. `}
+                      {appVersion && `You have Agent MCR ${appVersion}. `}
                       {updateStatus || 'Look for a new version on GitHub when the app starts. Updates install only when you click Install'}
                     </span>
                   </div>

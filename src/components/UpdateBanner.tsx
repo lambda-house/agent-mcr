@@ -33,8 +33,8 @@ const UpdateBanner: React.FC = () => {
       <Download size={14} aria-hidden="true" />
       <span>
         {installing
-          ? `Downloading MDViewer ${update.version}…`
-          : `MDViewer ${update.version} is available (you have ${update.currentVersion}).`}
+          ? `Downloading Agent MCR ${update.version}…`
+          : `Agent MCR ${update.version} is available (you have ${update.currentVersion}).`}
       </span>
       {!installing && (
         <>

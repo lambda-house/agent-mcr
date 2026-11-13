@@ -1,10 +1,10 @@
 [package]
-name = "mdviewer"
-version = "1.1.1"
-description = "Markdown Document Viewer"
+name = "agent-mcr"
+version = "0.1.0"
+description = "Agent Mission Control Room"
 authors = ["Lambda House"]
 license = "MIT"
-repository = "https://github.com/lambda-house/mdviewer-mj"
+repository = "https://github.com/lambda-house/agent-mcr"
 edition = "2021"
 
 [build-dependencies]
@@ -35,6 +35,5 @@ glib = "0.22.10"
 gobject-sys = "0.22.9"
 
 [features]
-sessions-preview = []
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

@@ -1,6 +1,6 @@
 {
-  "name": "mdviewer",
-  "version": "1.1.1",
+  "name": "agent-mcr",
+  "version": "0.1.0",
   "description": "Markdown Document Viewer",
   "type": "module",
   "scripts": {
@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "build:sessions-preview": "VITE_MDVIEWER_SESSIONS_PREVIEW=1 tauri build --debug --features sessions-preview --bundles app --config src-tauri/tauri.sessions-preview.conf.json"
+    "build:app": "tauri build --bundles app"
   },
   "dependencies": {
     "@codemirror/commands": "^6.11.1",

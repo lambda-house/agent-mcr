@@ -26,7 +26,7 @@ export default function SessionAgentAccess({ close, directory, selected, inspect
   const evidenceRows = ((result?.data as { evidence?: { id: string; session: string; event: SessionEvent }[] } | undefined)?.evidence ?? []).filter(row => row.event);
   return <div className="sc-dialog-backdrop"><section className="sc-dialog sc-analysis-dialog" role="dialog" aria-modal="true" aria-label="Agent access">
     <header><h2><Shield size={18}/> Agent access</h2><button aria-label="Close agent access" onClick={close}><X size={18}/></button></header>
-    <p>Let local agents query this app’s SQLite index through MCP. Access ends when you revoke it or close MDViewer.</p>
+    <p>Let local agents query this app’s SQLite index through MCP. Access ends when you revoke it or close Agent MCR.</p>
     <div className="sc-analysis-state"><strong>{status?.grant.enabled ? 'Sharing enabled' : 'Sharing disabled'}</strong><span>{status?.clients.length ?? 0} connected clients</span></div>
     {status?.grant.enabled ? <><p className="sc-note">Shared: {status.grant.session || status.grant.directory || 'All sessions'} · excerpts {status.grant.excerpts ? 'enabled' : 'disabled'}</p><button disabled={busy} onClick={() => void action(async () => { await analysisApi.revoke(); setResult(null); })}>Revoke agent access</button></> : <>
       <label>Share scope<select aria-label="Share scope" value={scope} onChange={e => setScope(e.target.value)}>
