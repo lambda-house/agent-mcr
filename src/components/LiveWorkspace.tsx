@@ -109,7 +109,7 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
             </button>
             <span className="hs-actions">
               {!h.exit && <button title="Interrupt (Ctrl-C to the foreground process)" aria-label="Interrupt" onClick={() => act(() => harnessApi.signal(h.id, 'INT'))}><Zap size={13}/></button>}
-              {!h.exit && <button title="Stop the session (SIGTERM)" aria-label="Stop" onClick={() => act(() => harnessApi.signal(h.id, 'TERM'))}><Square size={13}/></button>}
+              {!h.exit && <button title="Stop the session (hangup, as when a terminal window closes)" aria-label="Stop" onClick={() => act(() => harnessApi.signal(h.id, 'HUP'))}><Square size={13}/></button>}
               {h.exit && <button title="Forget this session and its output" aria-label="Forget" onClick={() => act(async () => { await harnessApi.forget(h.id); setOpened(o => o.filter(x => x !== h.id)); if (selected === h.id) setSelected(''); })}><Trash2 size={13}/></button>}
             </span>
           </li>;

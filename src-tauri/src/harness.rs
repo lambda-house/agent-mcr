@@ -254,6 +254,14 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
     files.iter().find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix))).and_then(|p| codex_resumable(p))
 }
 
+/// Whether the program in the terminal asked for bracketed paste (DECSET 2004).
+pub fn wants_bracketed_paste(bytes: &[u8]) -> bool {
+    let one = core::num::NonZeroU16::MIN;
+    let mut parser = vt100::Parser::new(one, one, 0);
+    parser.process(bytes);
+    parser.screen().bracketed_paste()
+}
+
 /// The terminal as text: the last `lines` rows of what a view would show.
 pub fn screen_text(bytes: &[u8], rows: u16, cols: u16, lines: usize) -> String {
     let size = |n: u16| core::num::NonZeroU16::new(n.max(1)).unwrap_or(core::num::NonZeroU16::MIN);
@@ -684,11 +692,16 @@ impl Harness {
         Ok(created)
     }
 
-    /// Type a prompt into the session: bracketed paste, so a multi-line text
-    /// arrives whole, then Enter.
+    /// Type a prompt into the session, then Enter. As a bracketed paste when
+    /// the program asked for it, so a multi-line text arrives whole; a program
+    /// that didn't (a plain shell) would see the markers as text.
     fn deliver(&self, session: &str, text: &str) -> Result<(), String> {
         let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
-        self.runner(json!({"op": "write", "id": session, "data": format!("\x1b[200~{clean}\x1b[201~")}))?;
+        // Agents always turn it on, and their old output may have left the scrollback
+        let agent = lock(&self.store).sessions.get(session).is_some_and(|t| t.profile == "claude" || t.profile == "codex");
+        let bracketed = agent || runner::snapshot(&runner_socket(&self.dir), session).is_ok_and(|bytes| wants_bracketed_paste(&bytes));
+        let data = if bracketed { format!("\x1b[200~{clean}\x1b[201~") } else { clean };
+        self.runner(json!({"op": "write", "id": session, "data": data}))?;
         std::thread::sleep(Duration::from_millis(250));
         self.runner(json!({"op": "write", "id": session, "data": "\r"}))?;
         Ok(())
@@ -1011,7 +1024,8 @@ impl Harness {
                 Ok(json!({ "interrupted": true }))
             }
             "session_end" => {
-                self.runner(json!({"op": "signal", "id": text("session")?, "signal": "TERM"}))?;
+                // Hangup, as when a terminal window closes: interactive shells ignore SIGTERM
+                self.runner(json!({"op": "signal", "id": text("session")?, "signal": "HUP"}))?;
                 Ok(json!({ "ended": true }))
             }
             "session_forget" => {
@@ -1100,7 +1114,7 @@ fn supervisor_tools() -> Value {
         tool("terminal_read", "The session's terminal as text (last lines).", json!({"session": session, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"]),
         tool("terminal_write", "Type raw input into a session's terminal (use \\r for Enter). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}}), &["session", "input"]),
         tool("session_interrupt", "Stop the current turn (Esc for Claude, Ctrl-C otherwise).", json!({"session": session}), &["session"]),
-        tool("session_end", "End a session (SIGTERM). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
+        tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
         tool("session_forget", "Drop an ended session and its terminal output.", json!({"session": session}), &["session"]),
         tool("attention_list", "Sessions waiting for the human operator, with what they ask.", json!({}), &[]),
         tool("attention_wait", "Wait until some session needs the operator or the time is up.", json!({"timeout_seconds": wait}), &[]),
@@ -1316,6 +1330,9 @@ mod tests {
         assert_eq!((lines[0], lines[24], lines[25]), ("line 1", "line 25", "red prompt>"));
         assert_eq!(screen_text(&bytes, 10, 40, 2), "line 25\nred prompt>");
         assert_eq!(screen_text(b"one\r\ntwo", 10, 40, 60), "one\ntwo");
+        assert!(!wants_bracketed_paste(b"bash-3.2$ "));
+        assert!(wants_bracketed_paste(b"\x1b[?2004h> "));
+        assert!(!wants_bracketed_paste(b"\x1b[?2004h> \x1b[?2004l"));
     }
 
     #[test]
