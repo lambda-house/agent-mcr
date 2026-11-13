@@ -1,0 +1,40 @@
+/* Live view: hosted agent terminals (inside .session-cockpit, uses its --sc-* palette) */
+.hs-view-switch { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--sc-border); border-radius: 6px; }
+.session-cockpit .hs-view-switch button { height: 23px; padding: 0 9px; border: 0; border-radius: 4px; background: transparent; color: var(--sc-muted); font-size: 11px; font-weight: 500; gap: 5px; }
+.session-cockpit .hs-view-switch button[aria-current='page'] { color: var(--sc-text); background: var(--sc-card); }
+
+.hs-live-wrap { flex: 1; min-height: 0; display: flex; }
+.hs-live-wrap[hidden] { display: none; }
+.hs-live { flex: 1; min-height: 0; display: grid; grid-template-columns: clamp(240px, 26%, 340px) minmax(0, 1fr); }
+
+.hs-list { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--sc-border); background: var(--sc-panel); }
+.hs-new { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-bottom: 1px solid var(--sc-border); }
+.hs-new-row { display: flex; gap: 6px; }
+.hs-new select, .hs-new input { flex: 1; min-width: 0; padding: 5px 7px; border: 1px solid var(--sc-border); border-radius: 6px; background: var(--sc-bg); }
+.session-cockpit .hs-new button { padding: 5px 9px; }
+.session-cockpit .hs-start { background: var(--sc-accent); color: var(--sc-bg); border-color: var(--sc-accent); font-weight: 600; }
+.hs-error { margin: 8px; padding: 6px 8px; border: 1px solid #c15b5b; border-radius: 6px; color: #e8a0a0; font-size: 12px; overflow-wrap: anywhere; }
+.hs-list ul { list-style: none; margin: 0; padding: 4px; overflow: auto; flex: 1; }
+.hs-list li { display: flex; align-items: flex-start; gap: 2px; border-radius: 6px; }
+.hs-list li.selected { background: var(--sc-card); }
+.session-cockpit .hs-item { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 8px; padding: 6px; border: 0; background: transparent; text-align: left; }
+.hs-item-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.hs-item-text strong { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-item-text small { color: var(--sc-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-dot { flex: 0 0 auto; width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: var(--sc-muted); }
+.hs-dot.running { background: var(--sc-accent); }
+.hs-dot.failed { background: #d0743c; }
+.hs-actions { display: flex; gap: 2px; padding: 4px 4px 0 0; }
+.session-cockpit .hs-actions button { padding: 4px; border-color: transparent; background: transparent; color: var(--sc-muted); }
+.session-cockpit .hs-actions button:hover { color: var(--sc-text); }
+.hs-empty { padding: 12px; color: var(--sc-muted); font-size: 12px; }
+.hs-footer { padding: 6px 10px; border-top: 1px solid var(--sc-border); color: var(--sc-muted); font-size: 11px; }
+
+.hs-terminals { position: relative; min-width: 0; min-height: 0; display: flex; background: var(--sc-bg); }
+.hs-pane { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.hs-pane[hidden] { display: none; }
+.hs-terminal-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.hs-terminal { flex: 1; min-height: 0; padding: 6px 0 0 8px; }
+.hs-terminal .xterm { height: 100%; }
+.hs-terminal-notice { padding: 6px 10px; border-top: 1px solid var(--sc-border); color: var(--sc-muted); font-size: 12px; }
+.hs-placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--sc-muted); }

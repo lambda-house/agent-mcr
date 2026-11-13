@@ -9,6 +9,12 @@ import WorkspaceSwitch from './WorkspaceSwitch';
 import SessionDirectoryMap from './SessionDirectoryMap';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import SessionAgentAccess from './SessionAgentAccess';
+import LiveWorkspace from './LiveWorkspace';
+
+const VIEW_KEY = 'agent-mcr.sessions.view';
+function savedView(): 'live' | 'history' {
+  try { return localStorage.getItem(VIEW_KEY) === 'history' ? 'history' : 'live'; } catch { return 'live'; }
+}
 
 const empty: Snapshot = { sessions: [], errors: [], scannedFiles: 0, pendingFiles: 0, indexedAt: 0 };
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -37,6 +43,8 @@ function ContextResult({ value }: { value: unknown }) {
 }
 export default function SessionWorkspace({ onClose, active = true }: { onClose: () => void; active?: boolean }) {
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [view, setViewState] = useState<'live' | 'history'>(savedView);
+  const setView = (v: 'live' | 'history') => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
   const [data, setData] = useState<Snapshot>(empty);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [focusedEvidence, setFocusedEvidence] = useState<{ session: string; event: SessionEvent } | null>(null);
@@ -86,6 +94,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const usage = sumUsage(filtered); const working = filtered.filter(s => s.status === 'working').length;
   const events = focusedEvidence?.session === selected ? [focusedEvidence.event] : olderEvents ?? chosen?.events ?? [];
   const descendants = chosen ? family(data.sessions,chosen) : [];
+  const recentDirectories = useMemo(() => [...new Set([...data.sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [data.sessions]);
   const loadContext = async (provider: string, key: string) => {
     const version = ++contextVersion.current; setContextBusy(true); setContext(null); setContextError(''); setContextTitle(`${provider === 'jira' ? 'Jira issue' : 'TEOB memory run'} · ${key}`);
     try { const v = await sessionApi.context(provider,key); if(contextVersion.current === version) setContext(v); } catch(e) { if(contextVersion.current === version) setContextError(err(e)); } finally { if(contextVersion.current === version) setContextBusy(false); }
@@ -106,6 +115,10 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   return <section className="session-cockpit">
     <header className="sc-topbar">
       <WorkspaceSwitch active="sessions" onChange={workspace => { if (workspace === 'documents') onClose(); }}/>
+      <nav className="hs-view-switch" aria-label="Sessions view">
+        <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
+        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')}><Clock size={13}/> History</button>
+      </nav>
       <div className="sc-top-actions">
         {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button><button onClick={() => setConnections(true)}><Settings2 size={14}/> Connections</button><button onClick={() => setUserMemories(true)}>User memories</button><button onClick={() => setAgentAccess(true)}>Agent access</button></>}
       </div>
@@ -120,6 +133,8 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div>
       </details>}
     </header>
+    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories}/></div>
+    {view === 'history' && <>
     {error && <div className="sc-banner" role="alert">{error}</div>}
     {!enabled ? <div className="sc-welcome"><div className="sc-logo"><Bot size={36}/></div><p className="sc-eyebrow">YOUR AGENTIC LANDSCAPE</p><h1>See the work.<br/>Follow every agent.</h1><p>Codex and Claude sessions, their agents, models, tokens, tools and linked work. One view across all recorded workspaces on this machine.</p>
       <button className="sc-primary" disabled={!isTauri() || enabled === null} onClick={async () => { try { setEnabled(await sessionApi.enable()); } catch(e) {setError(err(e));} }}><Shield size={16}/>{isTauri() ? 'Enable session access' : 'Open the desktop app to connect local sessions'}</button><small>Local transcripts · no transcript edits · remote connections on demand</small></div> : <>
@@ -161,5 +176,5 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div></> : <div className="sc-empty"><Bot size={32}/><h2>Select a session</h2><p>Inspect its activity, agents and linked work.</p></div>}</main></div>
       <footer className="sc-footer"><span title={data.cachePath || 'No persistent cache'}><i className="sc-local-dot"/> {data.cachePath ? 'SQLite index' : 'In-memory index'} · {data.restoredFiles || 0} restored · {data.pendingFiles ? `${data.pendingFiles} files still indexing · totals partial` : 'history indexed'} · {compact(data.bytesRead || 0)} bytes read this scan · {data.errors.length} warnings</span><button onClick={async () => { try { await sessionApi.disable(); setEnabled(false); setData(empty); } catch(e) {setError(err(e));} }}>Revoke session access</button></footer>
       {data.errors.length > 0 && <details className="sc-errors"><summary>Index warnings</summary>{data.errors.map((e,i) => <p key={i}>{e}</p>)}</details>}
-    </>}{agentAccess && <SessionAgentAccess close={() => setAgentAccess(false)} directory={directory} selected={chosen} inspect={(key,event)=>{setSelected(key);setTab('activity');setEventFilter('all');setAgentAccess(false);setFocusedEvidence({session:key,event});}}/>}{connections && <ConnectionsPanel close={() => setConnections(false)}/>}{userMemories && <div className="sc-dialog-backdrop"><section className="sc-dialog sc-memory-dialog" role="dialog" aria-modal="true" aria-label="User memories"><header><h2>User memories</h2><button onClick={()=>setUserMemories(false)} aria-label="Close user memories"><X size={18}/></button></header><SessionMemoryBrowser/></section></div>}</section>;
+    </>}</>}{agentAccess && <SessionAgentAccess close={() => setAgentAccess(false)} directory={directory} selected={chosen} inspect={(key,event)=>{setSelected(key);setTab('activity');setEventFilter('all');setAgentAccess(false);setFocusedEvidence({session:key,event});}}/>}{connections && <ConnectionsPanel close={() => setConnections(false)}/>}{userMemories && <div className="sc-dialog-backdrop"><section className="sc-dialog sc-memory-dialog" role="dialog" aria-modal="true" aria-label="User memories"><header><h2>User memories</h2><button onClick={()=>setUserMemories(false)} aria-label="Close user memories"><X size={18}/></button></header><SessionMemoryBrowser/></section></div>}</section>;
 }

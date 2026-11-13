@@ -920,6 +920,12 @@ impl Index {
         item.dirty = false;
         Ok(())
     }
+    /// Whether any indexed session worked in `dir` (hosted terminals may start there).
+    pub fn knows_directory(&self, dir: &Path) -> bool {
+        self.files.values().any(|i| {
+            Path::new(&i.session.cwd) == dir || i.session.directories.iter().any(|d| Path::new(d) == dir)
+        })
+    }
     pub fn summaries(&self) -> Vec<Session> {
         self.files.values().map(|i| i.session.summary()).collect()
     }

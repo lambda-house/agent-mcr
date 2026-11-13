@@ -22,6 +22,10 @@ use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
 mod agent;
+#[cfg(unix)]
+mod runner;
+#[cfg(unix)]
+mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
 mod session_mcp;
@@ -259,6 +263,11 @@ impl AccessState {
                 &target.named.to_string_lossy(),
             ))
         }
+    }
+
+    /// A canonical folder inside one the user opened (hosted terminals start there).
+    pub(crate) fn may_list(&self, dir: &Path) -> bool {
+        self.access.lock().map(|access| access.can_list(dir)).unwrap_or(false)
     }
 
     /// Grant user-chosen paths (dialog, drop, command line) and save the list.
@@ -1671,6 +1680,19 @@ fn apply_linux_rendering_workarounds() {
 }
 
 fn main() {
+    // The runner owns agent terminals and outlives the app (started by launchd).
+    // Like the MCP bridge, it must branch before any AppKit/Tauri initialization.
+    #[cfg(unix)]
+    if std::env::args().nth(1).as_deref() == Some("--runner") {
+        let result = get_config_dir()
+            .map_err(|e| e.message)
+            .and_then(|dir| runner::serve(&dir.join("runner.sock")));
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
         let path = std::env::args().nth(2).map(PathBuf::from).or_else(||get_config_dir().ok().map(|p|p.join("analysis/mcp.sock")));
         let result = path.ok_or_else(||"Configuration directory unavailable".to_string()).and_then(|p|session_mcp::bridge(&p));
@@ -1706,6 +1728,7 @@ fn main() {
         .manage(access)
         .manage(LaunchPaths(Mutex::new(LaunchPathQueue { pending: launch_paths, frontend_ready: false })))
         .manage(PendingUpdate::default())
+        .manage(harness_commands::HarnessState::default())
         .plugin(tauri_plugin_dialog::init())
         // Used from Rust only (`check_for_update`, `install_update`)
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1729,6 +1752,16 @@ fn main() {
             serve_local_image(&ctx.app_handle().state::<AccessState>(), request.uri().path())
         })
         .invoke_handler(tauri::generate_handler![
+            harness_commands::harness_status,
+            harness_commands::harness_list,
+            harness_commands::harness_spawn,
+            harness_commands::harness_signal,
+            harness_commands::harness_forget,
+            harness_commands::terminal_attach,
+            harness_commands::terminal_input,
+            harness_commands::terminal_resize,
+            harness_commands::terminal_detach,
+            harness_commands::terminal_save_image,
             session_analysis_commands::analysis_access,
             session_analysis_commands::enable_analysis,
             session_analysis_commands::revoke_analysis,

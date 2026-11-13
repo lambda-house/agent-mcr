@@ -1,6 +1,6 @@
 # Local agent harness: architecture
 
-**Status:** design, revision 4 (2026-11-13). Decisions D1–D11 are signed (below). Home: `lambda-house/agent-mcr` (Agent Mission Control Room), a private repository carrying mdviewer-mj's history; viewer fixes merge from `upstream` (`lambda-house/mdviewer-mj`). Derived with the Outside-In method: every mechanism cites the requirement it serves (traceability map at the end).
+**Status:** design, revision 4 (2026-11-13). Decisions D1–D12 are signed (below). Home: `lambda-house/agent-mcr` (Agent Mission Control Room), a private repository carrying mdviewer-mj's history; viewer fixes merge from `upstream` (`lambda-house/mdviewer-mj`). Derived with the Outside-In method: every mechanism cites the requirement it serves (traceability map at the end).
 
 **Goal.** MDViewer becomes the local harness for a group of coding agents. It runs their terminals and connects them to each other, to infrastructure tools (Atlassian now, TEOB memory later) and to two kinds of supervisor: the human operator in the app, and an external agent that creates sessions and assigns them tasks. It must not depend on any one agent.
 
@@ -19,6 +19,7 @@
 | D9 | Sessions belong to named groups (for example a supervisor's task force). `list_peers` and messaging cover the group by default, and the whole machine only with a flag. The graph collapses by group | 2026-11-13 |
 | D10 | The harness is built in a separate repository: `lambda-house/agent-mcr` (private), with mdviewer-mj's history and mdviewer-mj as `upstream`. MDViewer itself stays a Markdown viewer | 2026-11-13 |
 | D11 | agentgateway is a prerequisite installed with Homebrew, found on `PATH` or configured, with a version check | 2026-11-13 |
+| D12 | Local builds are the gate: `npm run build`, `npm test`, `cargo clippy --all-targets` and `cargo test` on the Mac. GitHub CI stays Linux-only and checks what compiles there; macOS-only modules are behind `cfg(target_os = "macos")` | 2026-11-13 |
 
 ### What revision 3 changed
 
