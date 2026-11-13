@@ -1,6 +1,6 @@
 # Local agent harness: architecture
 
-**Status:** design, revision 4 (2026-11-13). Decisions D1–D12 are signed (below). Home: `lambda-house/agent-mcr` (Agent Mission Control Room), a private repository carrying mdviewer-mj's history; viewer fixes merge from `upstream` (`lambda-house/mdviewer-mj`). Derived with the Outside-In method: every mechanism cites the requirement it serves (traceability map at the end).
+**Status:** design, revision 5 (2026-11-13); built so far: see "What is built" below. Decisions D1–D12 are signed (below). Home: `lambda-house/agent-mcr` (Agent Mission Control Room), a private repository carrying mdviewer-mj's history; viewer fixes merge from `upstream` (`lambda-house/mdviewer-mj`). Derived with the Outside-In method: every mechanism cites the requirement it serves (traceability map at the end).
 
 **Goal.** MDViewer becomes the local harness for a group of coding agents. It runs their terminals and connects them to each other, to infrastructure tools (Atlassian now, TEOB memory later) and to two kinds of supervisor: the human operator in the app, and an external agent that creates sessions and assigns them tasks. It must not depend on any one agent.
 
@@ -20,6 +20,36 @@
 | D10 | The harness is built in a separate repository: `lambda-house/agent-mcr` (private), with mdviewer-mj's history and mdviewer-mj as `upstream`. MDViewer itself stays a Markdown viewer | 2026-11-13 |
 | D11 | agentgateway is a prerequisite installed with Homebrew, found on `PATH` or configured, with a version check | 2026-11-13 |
 | D12 | Local builds are the gate: `npm run build`, `npm test`, `cargo clippy --all-targets` and `cargo test` on the Mac. GitHub CI stays Linux-only and checks what compiles there; macOS-only modules are behind `cfg(target_os = "macos")` | 2026-11-13 |
+
+### What is built (revision 5)
+
+Milestone: every current agent session can run in the harness, with one supervisor outside.
+
+| Part | State |
+|---|---|
+| Runner, Live view, terminals, launch profiles, image paste | Built |
+| Harness service (`--harness`, LaunchAgent): session registry, state, tasks, attention | Built |
+| Session state from Claude hooks and Codex `notify`, passed per launch | Built, checked live with Claude Code 2.1.323 and Codex 0.167.1 / 0.169.0 |
+| Attention list in the Live view, macOS notification when a session starts waiting | Built. The notification is posted with `osascript`, so it appears under Script Editor's name, not the app's |
+| Resume an earlier Claude or Codex session in the harness (Live view and `session_create(resume)`) | Built, checked live |
+| Supervisor MCP (`--supervise`): sessions, tasks, terminals, attention | Built, checked live with an outside Claude Code |
+| D6: the supervisor is refused input while a session waits on the human | Built, checked live |
+
+What differs from the design for now, and why:
+
+| Design | Now | Trigger to close the gap |
+|---|---|---|
+| D2: MCP 2026-07-28 with the Tasks extension | The supervisor MCP speaks the older revisions (up to 2025-11-25). `task_assign` returns at once; `task_wait` and `attention_wait` are tool calls that wait up to 10 minutes | Step 4, where `listen` needs Tasks to wake an idle agent |
+| `harness.sqlite` | `harness-state.json` (session states and at most 500 tasks, rewritten atomically) | Step 4: messages need queries and receipts |
+| Notifications under the app's identity | `osascript` | Icon and cosmetics pass |
+| D8 worktrees, D9 groups | Not built | Step 4 |
+| Finder file paste, drag and drop onto a terminal | Not built | Next step-1 leftovers |
+
+Three findings from the live runs changed the design. None of them is reported by a hook:
+
+- **Start-up questions.** Claude Code asks whether to trust a new folder before any hook fires. The service raises an attention item when a Claude session has printed something, gone quiet for 4 s and reported no hook 10 s after starting.
+- **Other threads in a Codex terminal.** Codex calls `notify` for the turn that writes the session title and for subagents. Only the session's own thread ends its turn. The first thread seen is taken as its own unless its prompt is the title writer's.
+- **Typing into the wrong prompt.** A Codex session reports nothing until its first turn ends. A task typed before that can land in a start-up question: in the test it accepted Codex's update offer. A task for such a session now waits until the terminal shows Codex's input box, and the operator is told after 15 s if it doesn't.
 
 ### What revision 3 changed
 
@@ -308,4 +338,7 @@ Supervision comes before agent-to-agent coordination because it reuses the same 
 | `rmcp` supports 2026-07-28 and Tasks | MCP implementation choice | Check the crate |
 | Bursts ≤ 1 MB/s; scrollback ≤ 5 MB | Raw replay without an emulator in the runner | Measure in phase 1 |
 | The service, run by launchd from inside `MDViewer.app`, can post macOS notifications under the app's identity | R16 with the app closed | Phase 1 spike; otherwise the service opens a minimal notifier from the bundle |
-| Claude Code's Notification hook fires for every permission prompt; Codex emits an approval event or OSC 9 | R16 | Fixture per agent |
+| Claude Code's Notification hook fires for every permission prompt; Codex emits an approval event or OSC 9 | R16 | Claude: seen live for a Bash approval. Codex: an OSC 9 text containing "approv" raises the item; **not yet seen live** |
+| Codex's title writer is recognised by its prompt ("Generate a concise, single-line task title") | Codex turn ends, task results | Re-check on every Codex update; a wrong guess shows as a task completing with a `{"title": …}` result |
+| Codex's input box is recognised on screen by "›" and "for shortcuts" | Typing tasks into a Codex session before its first turn end | Re-check on every Codex update; when the marker is missing the task stays queued and the operator is told |
+| A Claude session that is quiet with no hook 10 s after start is asking a start-up question | R16 for trust and login questions | A slow start raises a false item that clears at the first hook |

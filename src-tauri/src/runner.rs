@@ -40,7 +40,7 @@ const IDLE_EXIT: Duration = Duration::from_secs(600);
 const MAX_REQUEST: u64 = 1024 * 1024;
 const MAX_OSC: usize = 4096;
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
@@ -196,7 +196,7 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn random_id() -> String {
+pub fn random_id() -> String {
     let mut bytes = [0u8; 16];
     if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
         bytes[..8].copy_from_slice(&now_ms().to_le_bytes());
@@ -205,7 +205,7 @@ fn random_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A panicking reader thread must not take every other session down with it
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -471,6 +471,18 @@ impl Runner {
         stream.shutdown(std::net::Shutdown::Both)
     }
 
+    /// The scrollback as it is now: a length line, then that many raw bytes.
+    fn snapshot(&self, id: &str, mut stream: UnixStream) -> std::io::Result<()> {
+        let session = match self.get(id) {
+            Ok(s) => s,
+            Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
+        };
+        let bytes: Vec<u8> = lock(&session.output).ring.iter().copied().collect();
+        writeln!(stream, "{}", json!({"ok": true, "len": bytes.len()}))?;
+        stream.write_all(&bytes)?;
+        stream.shutdown(std::net::Shutdown::Both)
+    }
+
     fn watch(&self, mut stream: UnixStream) -> std::io::Result<()> {
         let (tx, rx) = sync_channel::<Value>(1024);
         lock(&self.watchers).push(tx);
@@ -500,6 +512,7 @@ impl Runner {
                 // Both turn the connection into a stream; nothing was read past the line
                 Some("attach") => return self.attach(req["id"].as_str().unwrap_or(""), writer),
                 Some("watch") => return self.watch(writer),
+                Some("snapshot") => return self.snapshot(req["id"].as_str().unwrap_or(""), writer),
                 _ => {
                     let reply = self.control(&req).unwrap_or_else(|e| json!({ "error": e }));
                     writeln!(writer, "{reply}")?;
@@ -601,28 +614,51 @@ pub fn open_stream(socket: &Path, req: Value) -> Result<(BufReader<UnixStream>, 
     Ok((reader, stream))
 }
 
+/// A session's scrollback bytes (what a new view would be replayed).
+pub fn snapshot(socket: &Path, id: &str) -> Result<Vec<u8>, String> {
+    let (mut reader, _stream) = open_stream(socket, json!({"op": "snapshot", "id": id}))?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
 /// Connect to the runner, starting it if needed. Returns its `hello`.
 pub fn ensure(socket: &Path) -> Result<Value, String> {
+    ensure_unit(socket, &RUNNER, PROTOCOL)
+}
+
+/// A background unit of this binary, started by launchd outside the app's
+/// process tree: the runner (`--runner`) or the harness service (`--harness`).
+pub struct Unit {
+    pub label: &'static str,
+    pub flag: &'static str,
+    pub name: &'static str,
+}
+
+pub const RUNNER: Unit = Unit { label: LAUNCH_LABEL, flag: "--runner", name: "runner" };
+
+/// Connect to a unit's socket, starting the unit if needed. Returns its `hello`.
+pub fn ensure_unit(socket: &Path, unit: &Unit, protocol: u32) -> Result<Value, String> {
     let hello = |socket: &Path| Client::connect(socket).and_then(|mut c| c.call(json!({"op": "hello"})));
     if let Ok(h) = hello(socket) {
-        return check_protocol(h);
+        return check_protocol(h, unit, protocol);
     }
-    start(socket)?;
+    start(socket, unit)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match hello(socket) {
-            Ok(h) => return check_protocol(h),
-            Err(e) if Instant::now() >= deadline => return Err(format!("The runner did not start: {e}")),
+            Ok(h) => return check_protocol(h, unit, protocol),
+            Err(e) if Instant::now() >= deadline => return Err(format!("The {} did not start: {e}", unit.name)),
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 }
 
-fn check_protocol(hello: Value) -> Result<Value, String> {
+fn check_protocol(hello: Value, unit: &Unit, protocol: u32) -> Result<Value, String> {
     match hello["protocol"].as_u64() {
-        Some(p) if p == PROTOCOL as u64 || p + 1 == PROTOCOL as u64 => Ok(hello),
-        Some(p) => Err(format!("The running runner speaks protocol {p}, this app {PROTOCOL}. End its sessions, then restart it.")),
-        None => Err("The runner did not identify itself".into()),
+        Some(p) if p == protocol as u64 || p + 1 == protocol as u64 => Ok(hello),
+        Some(p) => Err(format!("The running {} speaks protocol {p}, this app {protocol}. Stop it, then start again.", unit.name)),
+        None => Err(format!("The {} did not identify itself", unit.name)),
     }
 }
 
@@ -634,7 +670,7 @@ fn xml_escape(s: &str) -> String {
 
 /// The LaunchAgent that runs the runner outside the app's process tree, so
 /// quitting or updating the app leaves agents running.
-pub fn launch_agent_plist(exe: &Path, log: &Path) -> String {
+pub fn launch_agent_plist(unit: &Unit, exe: &Path, log: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -642,7 +678,7 @@ pub fn launch_agent_plist(exe: &Path, log: &Path) -> String {
 <dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
-  <array><string>{exe}</string><string>--runner</string></array>
+  <array><string>{exe}</string><string>{flag}</string></array>
   <key>RunAtLoad</key><false/>
   <key>KeepAlive</key><false/>
   <key>ProcessType</key><string>Interactive</string>
@@ -652,25 +688,26 @@ pub fn launch_agent_plist(exe: &Path, log: &Path) -> String {
 </dict>
 </plist>
 "#,
-        label = LAUNCH_LABEL,
+        label = unit.label,
+        flag = unit.flag,
         exe = xml_escape(&exe.display().to_string()),
         log = xml_escape(&log.display().to_string()),
     )
 }
 
 #[cfg(target_os = "macos")]
-fn start(socket: &Path) -> Result<(), String> {
+fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
     use std::process::Command;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let log = socket.with_file_name("runner.log");
+    let log = socket.with_extension("log");
     let home = dirs::home_dir().ok_or("Home directory unavailable")?;
     let agents = home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&agents).map_err(|e| e.to_string())?;
-    let plist = agents.join(format!("{LAUNCH_LABEL}.plist"));
-    let content = launch_agent_plist(&exe, &log);
+    let plist = agents.join(format!("{}.plist", unit.label));
+    let content = launch_agent_plist(unit, &exe, &log);
     // SAFETY: getuid has no preconditions
     let domain = format!("gui/{}", unsafe { libc::getuid() });
-    let service = format!("{domain}/{LAUNCH_LABEL}");
+    let service = format!("{domain}/{}", unit.label);
     if std::fs::read_to_string(&plist).ok().as_deref() != Some(content.as_str()) {
         // Another build (dev or release) registered itself; it isn't running, or
         // `ensure` would have connected. Re-register this executable.
@@ -687,7 +724,7 @@ fn start(socket: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn start(socket: &Path) -> Result<(), String> {
+fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     if let Some(dir) = socket.parent() {
@@ -696,17 +733,17 @@ fn start(socket: &Path) -> Result<(), String> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(socket.with_file_name("runner.log"))
+        .open(socket.with_extension("log"))
         .map_err(|e| e.to_string())?;
     std::process::Command::new(exe)
-        .arg("--runner")
+        .arg(unit.flag)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(log)
         .process_group(0)
         .spawn()
         .map(drop)
-        .map_err(|e| format!("Cannot start the runner: {e}"))
+        .map_err(|e| format!("Cannot start the {}: {e}", unit.name))
 }
 
 #[cfg(test)]
@@ -841,7 +878,7 @@ mod tests {
         let socket = temp_socket("twice");
         serve_in_background(&socket);
         assert!(serve(&socket).unwrap_err().contains("already listening"));
-        let plist = launch_agent_plist(Path::new("/A & B/Agent MCR.app/Contents/MacOS/agent-mcr"), Path::new("/tmp/r.log"));
+        let plist = launch_agent_plist(&RUNNER, Path::new("/A & B/Agent MCR.app/Contents/MacOS/agent-mcr"), Path::new("/tmp/r.log"));
         assert!(plist.contains("<string>/A &amp; B/Agent MCR.app/Contents/MacOS/agent-mcr</string>"));
         assert!(plist.contains("<string>--runner</string>"));
     }

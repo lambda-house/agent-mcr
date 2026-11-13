@@ -25,6 +25,8 @@ mod agent;
 #[cfg(unix)]
 mod runner;
 #[cfg(unix)]
+mod harness;
+#[cfg(unix)]
 mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
@@ -1693,6 +1695,25 @@ fn main() {
         }
         return;
     }
+    // The harness service, the supervisor's MCP bridge and the agents' hook reporter
+    #[cfg(unix)]
+    match std::env::args().nth(1).as_deref() {
+        Some(flag @ ("--harness" | "--supervise")) => {
+            let result = get_config_dir().map_err(|e| e.message).and_then(|dir| {
+                if flag == "--harness" { harness::serve(&dir) } else { harness::supervise_bridge(&dir) }
+            });
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("--harness-hook") => {
+            harness::hook_bridge(&std::env::args().nth(2).unwrap_or_default(), std::env::args().nth(3));
+            return;
+        }
+        _ => {}
+    }
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
         let path = std::env::args().nth(2).map(PathBuf::from).or_else(||get_config_dir().ok().map(|p|p.join("analysis/mcp.sock")));
         let result = path.ok_or_else(||"Configuration directory unavailable".to_string()).and_then(|p|session_mcp::bridge(&p));
@@ -1755,6 +1776,8 @@ fn main() {
             harness_commands::harness_status,
             harness_commands::harness_list,
             harness_commands::harness_spawn,
+            harness_commands::harness_resumable,
+            harness_commands::harness_ack,
             harness_commands::harness_signal,
             harness_commands::harness_forget,
             harness_commands::terminal_attach,

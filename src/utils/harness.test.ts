@@ -25,5 +25,10 @@ describe('harness helpers', () => {
     expect(hostedState(hosted())).toBe('running');
     expect(hostedState(hosted({ exit: { code: 0, signal: null, at: 1 } }))).toBe('exited');
     expect(hostedState(hosted({ exit: { code: 1, signal: null, at: 1 } }))).toBe('failed');
+    const tracked = { name: 'reviewer', profile: 'claude', since: 0, precise: true, agentSession: null, attention: null, lastMessage: null };
+    expect(hostedState(hosted({ harness: { ...tracked, state: 'waiting' } }))).toBe('waiting');
+    expect(hostedState(hosted({ harness: { ...tracked, state: 'unknown' } }))).toBe('running');
+    expect(hostedState(hosted({ harness: { ...tracked, state: 'working' }, exit: { code: 0, signal: null, at: 1 } }))).toBe('exited');
+    expect(hostedLabel(hosted({ meta: { label: 'Claude Code' }, harness: { ...tracked, state: 'idle' } }))).toBe('reviewer');
   });
 });

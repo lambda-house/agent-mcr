@@ -1,18 +1,18 @@
-//! Hosted terminals, app side (delivery step 1, before the harness service
-//! exists): the app talks to the runner directly. The webview starts sessions
-//! only from launch profiles held here — never raw argv — in a directory the
+//! Hosted terminals, app side. Terminal bytes go straight to the runner;
+//! sessions, their state and resuming go through the harness service. The
+//! webview starts sessions only from launch profiles — never raw argv — in a directory the
 //! user opened, a directory from session history, or the home folder
 //! (docs/AGENT_HARNESS_DESIGN.md, 05 · Trust).
 
+use crate::harness;
 use crate::runner::{self, Client};
 use crate::session_commands::SessionState;
 use crate::AccessState;
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
@@ -26,56 +26,12 @@ pub struct HarnessState {
     next_view: AtomicU64,
 }
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Profile {
-    id: &'static str,
-    label: &'static str,
-    /// What runs inside the user's login shell
-    command: &'static str,
-}
-
-/// D7: agents start in their own permission modes that keep prompts to shell
-/// commands and network access.
-const PROFILES: &[Profile] = &[
-    Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits" },
-    Profile { id: "codex", label: "Codex", command: "codex --sandbox workspace-write --ask-for-approval on-request" },
-    Profile { id: "shell", label: "Shell", command: "" },
-];
-
 fn socket() -> Result<PathBuf, String> {
     crate::get_config_dir().map(|d| d.join("runner.sock")).map_err(|e| e.message)
 }
 
-/// The user's login shell from the account database: GUI apps and launchd
-/// jobs don't reliably have `$SHELL`.
-fn login_shell() -> String {
-    // SAFETY: getpwuid returns a pointer into static storage or null; we copy
-    // the string out immediately and don't call it concurrently from here.
-    let from_passwd = unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() || (*pw).pw_shell.is_null() {
-            None
-        } else {
-            std::ffi::CStr::from_ptr((*pw).pw_shell).to_str().ok().map(str::to_owned)
-        }
-    };
-    from_passwd
-        .filter(|s| Path::new(s).is_file())
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/zsh".into())
-}
-
-/// Every profile runs in a login shell, so agents see the PATH, keys and
-/// version managers the user has in Terminal.
-pub fn argv_for(profile: &str) -> Result<Vec<String>, String> {
-    let p = PROFILES.iter().find(|p| p.id == profile).ok_or_else(|| format!("Unknown profile {profile}"))?;
-    let shell = login_shell();
-    Ok(if p.command.is_empty() {
-        vec![shell, "-l".into()]
-    } else {
-        vec![shell, "-l".into(), "-i".into(), "-c".into(), format!("exec {}", p.command)]
-    })
+fn config_dir() -> Result<PathBuf, String> {
+    crate::get_config_dir().map_err(|e| e.message)
 }
 
 /// Socket I/O off the async runtime (and never on the main thread).
@@ -83,25 +39,50 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Sen
     tauri::async_runtime::spawn_blocking(f).await.map_err(|e| e.to_string())?
 }
 
+/// Terminal plumbing goes straight to the runner.
 fn call(req: Value) -> Result<Value, String> {
     let socket = socket()?;
     runner::ensure(&socket)?;
     Client::connect(&socket)?.call(req)
 }
 
+/// Sessions, their state and resuming go through the harness service.
+fn service(req: Value) -> Result<Value, String> {
+    harness::call(&config_dir()?, req)
+}
+
 #[tauri::command]
 pub async fn harness_status() -> Result<Value, String> {
     blocking(|| {
         let hello = runner::ensure(&socket()?)?;
+        let service = harness::ensure(&config_dir()?)?;
         let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-        Ok(json!({ "runner": hello, "profiles": PROFILES, "home": home }))
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
+        // What the user runs once to give an outside agent the supervisor tools
+        let supervisor = format!("claude mcp add --scope user agent-mcr-supervisor -- '{}' --supervise", exe.replace('\'', "'\\''"));
+        Ok(json!({ "runner": hello, "service": service, "profiles": harness::PROFILES, "home": home, "supervisorCommand": supervisor }))
     })
     .await
 }
 
 #[tauri::command]
 pub async fn harness_list() -> Result<Value, String> {
-    blocking(|| call(json!({"op": "list"}))).await
+    blocking(|| service(json!({"op": "sessions"}))).await
+}
+
+/// Earlier Claude and Codex sessions that can continue here (ids, folders, times).
+#[tauri::command]
+pub async fn harness_resumable(access: State<'_, AccessState>) -> Result<Value, String> {
+    if !access.access.lock().map(|a| a.session_workspace).unwrap_or(false) {
+        return Err("Turn on the Sessions workspace to resume earlier sessions".into());
+    }
+    blocking(|| service(json!({"op": "resumable", "days": 7}))).await
+}
+
+#[tauri::command]
+pub async fn harness_ack(id: String) -> Result<(), String> {
+    valid_id(&id)?;
+    blocking(move || service(json!({"op": "ack", "id": id})).map(drop)).await
 }
 
 #[tauri::command]
@@ -110,9 +91,17 @@ pub async fn harness_spawn(
     cwd: String,
     cols: u16,
     rows: u16,
+    resume: Option<String>,
     access: State<'_, AccessState>,
     sessions: State<'_, SessionState>,
 ) -> Result<Value, String> {
+    // Resuming: the service takes the agent and the folder from the transcript itself
+    if let Some(id) = resume.filter(|r| !r.is_empty()) {
+        if !access.access.lock().map(|a| a.session_workspace).unwrap_or(false) {
+            return Err("Turn on the Sessions workspace to resume earlier sessions".into());
+        }
+        return blocking(move || service(json!({"op": "create", "resume": id, "cols": cols, "rows": rows}))).await;
+    }
     let dir = dunce::canonicalize(&cwd).map_err(|e| format!("{cwd}: {e}"))?;
     if !dir.is_dir() {
         return Err(format!("Not a folder: {cwd}"));
@@ -124,20 +113,7 @@ pub async fn harness_spawn(
     if !known {
         return Err("Start sessions in a folder you opened, your home folder, or a folder an agent worked in".into());
     }
-    let argv = argv_for(&profile)?;
-    let label = PROFILES.iter().find(|p| p.id == profile).map(|p| p.label).unwrap_or_default();
-    blocking(move || {
-        call(json!({
-            "op": "spawn",
-            "argv": argv,
-            "cwd": dir.display().to_string(),
-            "env": { "AGENT_MCR_PROFILE": profile },
-            "meta": { "profile": profile, "label": label },
-            "cols": cols,
-            "rows": rows,
-        }))
-    })
-    .await
+    blocking(move || service(json!({"op": "create", "profile": profile, "cwd": dir.display().to_string(), "cols": cols, "rows": rows}))).await
 }
 
 fn valid_id(id: &str) -> Result<(), String> {
@@ -257,16 +233,6 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn profiles_run_in_a_login_shell_with_their_permission_modes() {
-        let claude = argv_for("claude").unwrap();
-        assert_eq!(&claude[1..4], &["-l", "-i", "-c"]);
-        assert_eq!(claude[4], "exec claude --permission-mode acceptEdits");
-        assert!(argv_for("codex").unwrap()[4].contains("--sandbox workspace-write"));
-        assert_eq!(argv_for("shell").unwrap()[1..], ["-l"]);
-        assert!(argv_for("rm -rf /").is_err());
-    }
 
     #[test]
     fn pasted_images_are_recognised_by_content() {

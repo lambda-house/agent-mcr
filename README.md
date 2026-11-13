@@ -3,7 +3,9 @@
 **Agent Mission Control Room.** A local harness for a group of coding agents on a Mac.
 
 - **Sessions.** The Claude Code and Codex sessions on this machine: active and inactive, who started whom, models, tokens, tool calls, and ticket mentions.
-- **Planned.** The agents' terminals running inside the app and surviving app restarts, a dependency graph, an attention list for everything that waits on you, tools agents use to talk to each other, a supervisor surface for an external agent, and infrastructure tools through a local [agentgateway](https://agentgateway.dev).
+- **Live.** Claude Code, Codex and shell terminals running inside the app. They keep running when the app quits. Each shows what it is doing (working, idle, waiting for you), and the ones waiting for you are listed on top and raise a macOS notification. An earlier Claude or Codex session can be resumed here.
+- **Supervisor.** An outside agent creates and resumes sessions, gives them tasks and follows the results through an MCP server (below). It cannot answer permission prompts: those are yours.
+- **Planned.** A dependency graph, tools agents use to talk to each other, a git worktree per session, and infrastructure tools through a local [agentgateway](https://agentgateway.dev).
 
 The architecture and its decisions are in [docs/AGENT_HARNESS_DESIGN.md](docs/AGENT_HARNESS_DESIGN.md).
 
@@ -27,6 +29,18 @@ cd src-tauri && cargo test
 
 The app opens on **Sessions**. Reading transcripts is switched on in the app, after a native confirmation.
 
+## Supervising from an outside agent
+
+Give one Claude Code session outside the app the supervisor tools (the **Supervisor** button in the Live view copies this command with the right path):
+
+```bash
+claude mcp add --scope user agent-mcr-supervisor -- '/path/to/Agent MCR.app/Contents/MacOS/agent-mcr' --supervise
+```
+
+It then has `session_create` (with `resume` for an earlier session), `session_resumable`, `session_list`, `task_assign`, `task_wait`, `terminal_read`, `attention_list` and the rest. The app doesn't have to be open: the tools start the harness service themselves.
+
+To move a session you run in another terminal into the harness, close it there, then resume it from the Live view or with `session_create(resume: <id>)`.
+
 ## Where data lives
 
 `~/Library/Application Support/agent-mcr/` holds:
@@ -35,6 +49,8 @@ The app opens on **Sessions**. Reading transcripts is switched on in the app, af
 - `sessions/index.sqlite`: the transcript index, which contains private transcript content
 - `history/` and `read-state/`: inherited from the viewer
 - `analysis/mcp.sock`: the analysis MCP socket, while it's switched on
+- `runner.sock`, `harness.sock` and their logs: the two background units that host terminals and track sessions
+- `harness-state.json`: session states and tasks; `claude-hooks.json`: the hooks passed to hosted Claude sessions
 
 Browser-side settings are stored per app, separate from MDViewer's.
 

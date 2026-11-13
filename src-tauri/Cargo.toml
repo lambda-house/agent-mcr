@@ -30,6 +30,7 @@ sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio
 tokio = { version = "1", features = ["rt-multi-thread"] }
 portable-pty = "0.9"
 libc = "0.2"
+vt100 = "0.18.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 glib-sys = "0.22.9"
