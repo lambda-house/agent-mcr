@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
+Agent MCR (Agent Mission Control Room) is a local harness for coding-agent sessions, built on MDViewer. The harness architecture, its signed decisions and the delivery sequence are in `docs/AGENT_HARNESS_DESIGN.md`. Read it before changing harness code. `upstream` is `lambda-house/mdviewer-mj`; viewer fixes are merged from there.
+
 MDViewer is a cross-platform markdown document viewer built with Tauri 2.0, React 18, and TypeScript. It renders markdown with Shiki syntax highlighting, Mermaid diagram support, and features a tabbed multi-document interface.
 
 ## Build Commands
