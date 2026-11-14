@@ -451,7 +451,8 @@ impl Store {
 
     fn post(&mut self, mut message: Message) -> Message {
         message.id = format!("m{}", &runner::random_id()[..10]);
-        message.created = now_ms();
+        // Strictly increasing, so two messages in one millisecond keep their order
+        message.created = now_ms().max(self.messages.values().map(|m| m.created + 1).max().unwrap_or(0));
         message.from_name = self.sessions.get(&message.from).map(label).unwrap_or_else(|| "Agent MCR".into());
         message.to_name = self.sessions.get(&message.to).map(label).unwrap_or_default();
         self.messages.insert(message.id.clone(), message.clone());
