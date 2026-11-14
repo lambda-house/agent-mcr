@@ -491,19 +491,43 @@ pub fn call(dir: &Path, req: Value) -> Result<Value, String> {
     Client::connect(&socket(dir))?.call(req)
 }
 
+/// Banners under the app's own name: a click opens Agent MCR, not another program.
+#[cfg(target_os = "macos")]
+mod banner {
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_user_notifications::{UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest, UNNotificationSound, UNUserNotificationCenter};
+
+    /// The notification centre raises an exception in a process outside an app bundle
+    fn bundled() -> bool {
+        std::env::current_exe().ok().is_some_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+    }
+
+    #[allow(unused_unsafe)]
+    pub fn post(title: &str, text: &str) {
+        if !bundled() { return; }
+        unsafe {
+            let center = UNUserNotificationCenter::currentNotificationCenter();
+            let content = UNMutableNotificationContent::new();
+            content.setTitle(&NSString::from_str(title));
+            content.setBody(&NSString::from_str(text));
+            content.setSound(Some(&UNNotificationSound::defaultSound()));
+            let request = UNNotificationRequest::requestWithIdentifier_content_trigger(&NSString::from_str(&crate::runner::random_id()), &content, None);
+            let adder = center.clone();
+            // macOS asks the person once; later calls return the stored answer
+            let decided = RcBlock::new(move |granted: Bool, _error: *mut NSError| {
+                if granted.as_bool() { adder.addNotificationRequest_withCompletionHandler(&request, None); }
+                else { eprintln!("harness: notifications are not allowed for Agent MCR"); }
+            });
+            center.requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &decided);
+        }
+    }
+}
+
 fn notify_user(title: &str, text: &str) {
     #[cfg(target_os = "macos")]
-    {
-        // Arguments, not script text: nothing an agent prints is run as AppleScript
-        let _ = std::process::Command::new("/usr/bin/osascript")
-            .args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run"])
-            .arg(title)
-            .arg(text.chars().take(200).collect::<String>())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    banner::post(title, &text.chars().take(200).collect::<String>());
     #[cfg(not(target_os = "macos"))]
     let _ = (title, text);
 }

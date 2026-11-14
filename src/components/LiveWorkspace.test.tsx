@@ -61,10 +61,14 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(host.textContent).toContain('working · 2 tasks · pid 42');
     expect(host.querySelector('.hs-dot.waiting')?.getAttribute('aria-label')).toBe('waiting for you');
-    const strip = host.querySelector('[aria-label="Waiting for you"]') as HTMLElement;
-    expect(strip.textContent).toContain('reviewer · api');
-    expect(strip.textContent).toContain('Claude needs your permission to use Bash');
-    await act(async () => (strip.querySelector('button') as HTMLButtonElement).click()); await flush();
+    // One row per session: the waiting one is first and says why, with no second card for it
+    expect(host.querySelector('.hs-attention')?.textContent).toContain('1 session is waiting for you');
+    const rows = [...host.querySelectorAll('.hs-list li')];
+    expect(rows).toHaveLength(2);
+    expect(rows[0].className).toContain('needs-you');
+    expect(rows[0].textContent).toContain('reviewer · api');
+    expect(rows[0].textContent).toContain('Claude needs your permission to use Bash');
+    await act(async () => (rows[0].querySelector('.hs-item') as HTMLButtonElement).click()); await flush();
     expect(host.querySelector('[data-terminal="b1"]')).not.toBeNull();
     expect(harnessApi.ack).not.toHaveBeenCalled();
   });

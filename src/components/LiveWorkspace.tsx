@@ -57,7 +57,9 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
   };
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...openedFolders, ...recentDirectories].filter(Boolean))].slice(0, 40), [status, openedFolders, recentDirectories]);
-  const sorted = useMemo(() => [...hosted].sort((a, b) => Number(!!a.exit) - Number(!!b.exit) || b.started - a.started), [hosted]);
+  // Sessions that need the person come first, ended ones last
+  const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
+  const sorted = useMemo(() => [...hosted].sort((a, b) => Number(needsYou(b)) - Number(needsYou(a)) || Number(!!a.exit) - Number(!!b.exit) || b.started - a.started), [hosted]);
   const running = hosted.filter(h => !h.exit).length;
 
   const start = async () => {
@@ -90,20 +92,18 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
           {resumable.map(r => <option key={r.id} value={r.id}>{`${r.agent === 'claude' ? 'Claude' : 'Codex'} · ${base(r.cwd)} · ${formatAge(r.modified)}${maybeOpenElsewhere(r, Date.now()) ? ' · open elsewhere?' : ''}`}</option>)}
         </select>}
       </form>
-      {waiting.length > 0 && <section className="hs-attention" aria-label="Waiting for you">
-        <h3><BellRing size={12}/> Waiting for you</h3>
-        {waiting.map(h => <button key={h.id} onClick={() => select(h.id)}><strong>{hostedLabel(h)} · {base(h.cwd)}</strong><small>{h.harness?.attention?.text}</small></button>)}
-      </section>}
+      {waiting.length > 0 && <p className="hs-attention" role="status"><BellRing size={12}/> {waiting.length === 1 ? '1 session is waiting for you' : `${waiting.length} sessions are waiting for you`}</p>}
       {error && <div className="hs-error" role="alert">{error}</div>}
       <ul>
         {sorted.map(h => {
           const state = hostedState(h);
-          return <li key={h.id} className={h.id === selected ? 'selected' : ''}>
+          return <li key={h.id} className={`${h.id === selected ? 'selected' : ''}${needsYou(h) ? ' needs-you' : ''}`}>
             <button className="hs-item" onClick={() => select(h.id)} title={`${h.argv.join(' ')}\n${h.cwd}`}>
               <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
               <span className="hs-item-text">
                 <strong>{hostedLabel(h)} · {base(h.cwd)}</strong>
                 <small>{h.exit ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}` : `${STATE_LABEL[state]}${h.openTasks ? ` · ${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : ''} · pid ${h.pid ?? '?'}${h.lastOutput ? ` · output ${formatAge(h.lastOutput)}` : ''}`}</small>
+                {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
                 {h.title && <small className="hs-title">{h.title}</small>}
               </span>
             </button>
