@@ -40,6 +40,7 @@
 .hs-subs li.active .hs-dot { opacity: 1; }
 .hs-subs .hs-item-text strong { font-weight: 500; font-size: 11px; }
 .hs-subs li:not(.active) .hs-item-text strong { color: var(--sc-muted); }
+.hs-list ul.hs-subs li.hs-subs-done { color: var(--sc-muted); font-size: 11px; }
 .hs-actions { display: flex; gap: 2px; padding: 4px 4px 0 0; }
 .session-cockpit .hs-actions button { padding: 4px; border-color: transparent; background: transparent; color: var(--sc-muted); }
 .session-cockpit .hs-actions button:hover { color: var(--sc-text); }

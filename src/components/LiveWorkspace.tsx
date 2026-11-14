@@ -114,16 +114,17 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
               {h.exit && <button title="Forget this session and its output" aria-label="Forget" onClick={() => act(async () => { await harnessApi.forget(h.id); setOpened(o => o.filter(x => x !== h.id)); if (selected === h.id) setSelected(''); })}><Trash2 size={13}/></button>}
             </span>
             {!!h.subagents?.length && <ul className="hs-subs" aria-label={`Subagents of ${hostedLabel(h)}`}>
-              {h.subagents.map(a => {
+              {h.subagents.filter(a => !a.finished).map(a => {
                 const live = subagentActive(a, Date.now());
                 return <li key={a.id} className={live ? 'active' : ''} title={`${a.description || a.id}\nStarted ${formatAge(a.started)}`}>
                   <span className={`hs-dot ${live ? 'working' : ''}`} aria-label={live ? 'active' : 'quiet'}/>
                   <span className="hs-item-text">
                     <strong>{a.description || `Subagent ${a.id.slice(0, 8)}`}</strong>
-                    <small>{[a.agentType, a.model, live ? 'active' : `last activity ${formatAge(a.lastActivity)}`].filter(Boolean).join(' · ')}</small>
+                    <small>{[a.agentType, a.model, live ? 'active' : `quiet, last activity ${formatAge(a.lastActivity)}`].filter(Boolean).join(' · ')}</small>
                   </span>
                 </li>;
               })}
+              {h.subagents.some(a => a.finished) && <li className="hs-subs-done" title={h.subagents.filter(a => a.finished).map(a => a.description || a.id).join('\n')}>{`${h.subagents.filter(a => a.finished).length} finished in the last hour`}</li>}
             </ul>}
           </li>;
         })}

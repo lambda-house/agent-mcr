@@ -81,6 +81,7 @@ describe('Live workspace', () => {
       subagents: [
         { id: 'a1', description: 'MEM-653 false-premise template', agentType: 'general-purpose', model: 'sonnet', started: now - 60_000, lastActivity: now - 5_000 },
         { id: 'b2b2b2b2b2', description: '', agentType: 'Explore', model: '', started: now - 3_000_000, lastActivity: now - 1_800_000 },
+        { id: 'c3', description: 'MEM-650 guard', agentType: 'general-purpose', model: 'opus', started: now - 3_000_000, lastActivity: now - 2_000_000, finished: true },
       ],
     };
     vi.mocked(harnessApi.list).mockResolvedValue([parent]);
@@ -88,9 +89,11 @@ describe('Live workspace', () => {
     expect(host.textContent).toContain('2 unread');
     expect(host.querySelector('.hs-status')?.textContent).toBe('running the regrade');
     const subs = [...host.querySelectorAll('.hs-subs li')];
-    expect(subs.map(li => li.className)).toEqual(['active', '']);
+    // Finished ones are only counted
+    expect(subs.map(li => li.className)).toEqual(['active', '', 'hs-subs-done']);
+    expect(subs[2].textContent).toBe('1 finished in the last hour');
     expect(subs[0].textContent).toBe('MEM-653 false-premise templategeneral-purpose · sonnet · active');
-    expect(subs[1].textContent).toBe('Subagent b2b2b2b2Explore · last activity just now');
+    expect(subs[1].textContent).toBe('Subagent b2b2b2b2Explore · quiet, last activity just now');
     // A subagent has no terminal: its row is not a button
     expect(subs[0].querySelector('button')).toBeNull();
   });

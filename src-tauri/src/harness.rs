@@ -327,6 +327,28 @@ pub struct Subagent {
     pub started: u64,
     /// Last write to its transcript: activity seen in files, not a live process
     pub last_activity: u64,
+    /// Its transcript ends with a final answer or a delivered report
+    pub finished: bool,
+}
+
+/// Whether a subagent's transcript ends the way a finished one does: a final
+/// assistant message, or the acknowledgement of its report to the caller (the
+/// wording depends on the Claude Code version; when it isn't recognised the
+/// subagent shows as quiet, not finished). Only the last record is looked at.
+fn subagent_finished(path: &Path) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)));
+    let mut tail = Vec::new();
+    let _ = file.take(256 * 1024).read_to_end(&mut tail);
+    let text = String::from_utf8_lossy(&tail);
+    let Some(last) = text.lines().rev().find(|l| !l.trim().is_empty()) else { return false };
+    match serde_json::from_str::<Value>(last) {
+        Ok(v) if v["type"] == "assistant" => v["message"]["stop_reason"] == "end_turn",
+        Ok(v) if v["type"] == "user" => last.contains("Report delivered to your caller"),
+        _ => false,
+    }
 }
 
 const MAX_SUBAGENTS: usize = 20;
@@ -362,7 +384,8 @@ pub fn subagents(home: &Path, transcript: &str, since: u64) -> Vec<Subagent> {
                 0 => last_activity,
                 at => at.min(last_activity),
             };
-            Some(Subagent { id, description: field("description"), agent_type: field("agentType"), model: field("model"), started, last_activity })
+            let finished = subagent_finished(&path);
+            Some(Subagent { id, description: field("description"), agent_type: field("agentType"), model: field("model"), started, last_activity, finished })
         })
         .collect();
     out.sort_by_key(|a| std::cmp::Reverse(a.last_activity));
@@ -1875,11 +1898,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent-a1.jsonl"), "{}\n").unwrap();
         std::fs::write(dir.join("agent-a1.meta.json"), r#"{"agentType":"general-purpose","description":"MEM-1 fix","model":"sonnet"}"#).unwrap();
-        std::fs::write(dir.join("agent-b2.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.join("agent-b2.jsonl"), "{\"type\":\"user\"}\n{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\"}}\n\n").unwrap();
+        std::fs::write(dir.join("agent-c3.jsonl"), "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"Report delivered to your caller.\"}]}}\n").unwrap();
+        std::fs::write(dir.join("agent-d4.jsonl"), "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"tool_use\"}}\n").unwrap();
         std::fs::write(dir.join("notes.txt"), "x").unwrap();
         let transcript = project.join("S1.jsonl").display().to_string();
         let found = subagents(&home, &transcript, 0);
-        assert_eq!(found.len(), 2);
+        assert_eq!(found.len(), 4);
+        let finished: Vec<&str> = found.iter().filter(|a| a.finished).map(|a| a.id.as_str()).collect();
+        assert!(finished.len() == 2 && finished.contains(&"b2") && finished.contains(&"c3"), "{finished:?}");
         let a1 = found.iter().find(|a| a.id == "a1").unwrap();
         assert_eq!((a1.description.as_str(), a1.agent_type.as_str(), a1.model.as_str()), ("MEM-1 fix", "general-purpose", "sonnet"));
         assert!(a1.last_activity > 0 && a1.started <= a1.last_activity);

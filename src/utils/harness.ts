@@ -13,7 +13,7 @@ export interface Tracked {
   status?: string;
 }
 /** A subagent a Claude session started, as its files show it (activity, not verified liveness). */
-export interface Subagent { id: string; description: string; agentType: string; model: string; started: number; lastActivity: number }
+export interface Subagent { id: string; description: string; agentType: string; model: string; started: number; lastActivity: number; finished?: boolean }
 /** A terminal the runner hosts (`runner::Info`), with the service's view of it. */
 export interface Hosted {
   id: string; pid: number | null; argv: string[]; cwd: string; started: number;
