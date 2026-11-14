@@ -9,6 +9,8 @@ export interface Attention { kind: 'permission' | 'notification'; text: string; 
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';
   since: number; precise: boolean; agentSession: string | null; attention: Attention | null; lastMessage: string | null;
+  /** What the agent says it is doing (its `set_status` tool) */
+  status?: string;
 }
 /** A terminal the runner hosts (`runner::Info`), with the service's view of it. */
 export interface Hosted {
@@ -16,6 +18,8 @@ export interface Hosted {
   cols: number; rows: number; title: string; lastOutput: number;
   exit: HostedExit | null; meta: Record<string, string>;
   harness?: Tracked; openTasks?: number;
+  /** Messages from other sessions it hasn't read yet */
+  unread?: number;
 }
 /** An earlier Claude or Codex session that can continue in the harness. */
 export interface Resumable { agent: 'claude' | 'codex'; id: string; cwd: string; modified: number }

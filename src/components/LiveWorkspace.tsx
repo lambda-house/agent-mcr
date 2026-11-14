@@ -102,8 +102,9 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
               <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
               <span className="hs-item-text">
                 <strong>{hostedLabel(h)} · {base(h.cwd)}</strong>
-                <small>{h.exit ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}` : `${STATE_LABEL[state]}${h.openTasks ? ` · ${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : ''} · pid ${h.pid ?? '?'}${h.lastOutput ? ` · output ${formatAge(h.lastOutput)}` : ''}`}</small>
+                <small>{h.exit ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}` : `${STATE_LABEL[state]}${h.openTasks ? ` · ${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : ''}${h.unread ? ` · ${h.unread} unread` : ''} · pid ${h.pid ?? '?'}${h.lastOutput ? ` · output ${formatAge(h.lastOutput)}` : ''}`}</small>
                 {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
+                {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
                 {h.title && <small className="hs-title">{h.title}</small>}
               </span>
             </button>
