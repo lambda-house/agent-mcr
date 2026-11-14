@@ -12,6 +12,8 @@ export interface Tracked {
   /** What the agent says it is doing (its `set_status` tool) */
   status?: string;
 }
+/** A subagent a Claude session started, as its files show it (activity, not verified liveness). */
+export interface Subagent { id: string; description: string; agentType: string; model: string; started: number; lastActivity: number }
 /** A terminal the runner hosts (`runner::Info`), with the service's view of it. */
 export interface Hosted {
   id: string; pid: number | null; argv: string[]; cwd: string; started: number;
@@ -20,6 +22,8 @@ export interface Hosted {
   harness?: Tracked; openTasks?: number;
   /** Messages from other sessions it hasn't read yet */
   unread?: number;
+  /** Subagents active in the last hour, newest first */
+  subagents?: Subagent[];
 }
 /** An earlier Claude or Codex session that can continue in the harness. */
 export interface Resumable { agent: 'claude' | 'codex'; id: string; cwd: string; modified: number }
@@ -83,3 +87,6 @@ export function pastedImage(data: DataTransfer | null): File | null {
   const image = items.find(i => i.kind === 'file' && i.type.startsWith('image/'));
   return image?.getAsFile() ?? null;
 }
+
+/** A subagent that wrote to its transcript this recently counts as active. */
+export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;

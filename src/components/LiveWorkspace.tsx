@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BellRing, Copy, FolderOpen, Play, Square, Trash2, Zap } from 'lucide-react';
 import TerminalPane from './TerminalPane';
-import { harnessApi, hostedLabel, hostedState, maybeOpenElsewhere, STATE_LABEL, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { harnessApi, hostedLabel, hostedState, maybeOpenElsewhere, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { useStore } from '../store';
@@ -113,6 +113,18 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
               {!h.exit && <button title="Stop the session (hangup, as when a terminal window closes)" aria-label="Stop" onClick={() => act(() => harnessApi.signal(h.id, 'HUP'))}><Square size={13}/></button>}
               {h.exit && <button title="Forget this session and its output" aria-label="Forget" onClick={() => act(async () => { await harnessApi.forget(h.id); setOpened(o => o.filter(x => x !== h.id)); if (selected === h.id) setSelected(''); })}><Trash2 size={13}/></button>}
             </span>
+            {!!h.subagents?.length && <ul className="hs-subs" aria-label={`Subagents of ${hostedLabel(h)}`}>
+              {h.subagents.map(a => {
+                const live = subagentActive(a, Date.now());
+                return <li key={a.id} className={live ? 'active' : ''} title={`${a.description || a.id}\nStarted ${formatAge(a.started)}`}>
+                  <span className={`hs-dot ${live ? 'working' : ''}`} aria-label={live ? 'active' : 'quiet'}/>
+                  <span className="hs-item-text">
+                    <strong>{a.description || `Subagent ${a.id.slice(0, 8)}`}</strong>
+                    <small>{[a.agentType, a.model, live ? 'active' : `last activity ${formatAge(a.lastActivity)}`].filter(Boolean).join(' · ')}</small>
+                  </span>
+                </li>;
+              })}
+            </ul>}
           </li>;
         })}
       </ul>

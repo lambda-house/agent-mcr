@@ -316,6 +316,60 @@ pub fn screen_text(bytes: &[u8], rows: u16, cols: u16, lines: usize) -> String {
     text[from..].iter().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n")
 }
 
+/// A subagent a Claude session started, as its files on disk show it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Subagent {
+    pub id: String,
+    pub description: String,
+    pub agent_type: String,
+    pub model: String,
+    pub started: u64,
+    /// Last write to its transcript: activity seen in files, not a live process
+    pub last_activity: u64,
+}
+
+const MAX_SUBAGENTS: usize = 20;
+
+/// Subagents of the Claude session with this transcript that wrote something
+/// since `since`, newest first. Claude Code keeps them next to the transcript,
+/// in `<session id>/subagents/agent-<id>.jsonl` with a `.meta.json`. Only the
+/// meta file is read (what it is for, its kind and model), never what it said.
+pub fn subagents(home: &Path, transcript: &str, since: u64) -> Vec<Subagent> {
+    let transcript = Path::new(transcript);
+    if !transcript.starts_with(home.join(".claude/projects")) || transcript.extension().is_none_or(|e| e != "jsonl") {
+        return Vec::new();
+    }
+    let dir = transcript.with_extension("").join("subagents");
+    let mut out: Vec<Subagent> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path.file_name()?.to_str()?.strip_prefix("agent-")?.strip_suffix(".jsonl")?.to_string();
+            let last_activity = modified_ms(&path);
+            if last_activity < since {
+                return None;
+            }
+            let meta_path = dir.join(format!("agent-{id}.meta.json"));
+            let meta: Value = std::fs::File::open(&meta_path)
+                .ok()
+                .and_then(|f| serde_json::from_reader(f.take(64 * 1024)).ok())
+                .unwrap_or(Value::Null);
+            let field = |key: &str| meta[key].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(120).collect::<String>();
+            let started = match modified_ms(&meta_path) {
+                0 => last_activity,
+                at => at.min(last_activity),
+            };
+            Some(Subagent { id, description: field("description"), agent_type: field("agentType"), model: field("model"), started, last_activity })
+        })
+        .collect();
+    out.sort_by_key(|a| std::cmp::Reverse(a.last_activity));
+    out.truncate(MAX_SUBAGENTS);
+    out
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Attention {
@@ -695,6 +749,8 @@ impl Harness {
             self.update(|s| s.sessions.retain(|k, _| ids.contains(k.as_str())));
         }
         let store = lock(&self.store);
+        let home = dirs::home_dir();
+        let recent = now_ms().saturating_sub(3_600_000);
         Ok(infos
             .iter()
             .map(|info| {
@@ -714,6 +770,9 @@ impl Harness {
                 out["harness"] = json!(tracked);
                 out["openTasks"] = json!(open);
                 out["unread"] = json!(store.unread(id));
+                if let (true, Some(home), Some(transcript)) = (info["exit"].is_null(), &home, &tracked.transcript) {
+                    out["subagents"] = json!(subagents(home, transcript, recent));
+                }
                 out
             })
             .collect())
@@ -1298,7 +1357,7 @@ impl Harness {
             "state": h["state"], "stateSince": h["since"], "stateFromHooks": h["precise"],
             "attention": h["attention"], "openTasks": session["openTasks"], "agentSession": h["agentSession"],
             "pid": session["pid"], "exit": session["exit"], "title": session["title"], "lastOutput": session["lastOutput"],
-            "status": h["status"], "unread": session["unread"],
+            "status": h["status"], "unread": session["unread"], "subagents": session["subagents"],
         })
     }
 
@@ -1806,6 +1865,28 @@ mod tests {
         assert!(s.awaiting("a").is_empty());
         let notice = s.take_unread("a").pop().unwrap();
         assert_eq!((notice.from.as_str(), notice.from_name.as_str(), notice.in_reply_to), ("", "Agent MCR", Some(lost.id)));
+    }
+
+    #[test]
+    fn subagents_come_from_the_files_next_to_the_transcript() {
+        let home = std::env::temp_dir().join(format!("agent-mcr-sub-{}", runner::random_id()));
+        let project = home.join(".claude/projects/-work-x");
+        let dir = project.join("S1/subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.join("agent-a1.meta.json"), r#"{"agentType":"general-purpose","description":"MEM-1 fix","model":"sonnet"}"#).unwrap();
+        std::fs::write(dir.join("agent-b2.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        let transcript = project.join("S1.jsonl").display().to_string();
+        let found = subagents(&home, &transcript, 0);
+        assert_eq!(found.len(), 2);
+        let a1 = found.iter().find(|a| a.id == "a1").unwrap();
+        assert_eq!((a1.description.as_str(), a1.agent_type.as_str(), a1.model.as_str()), ("MEM-1 fix", "general-purpose", "sonnet"));
+        assert!(a1.last_activity > 0 && a1.started <= a1.last_activity);
+        assert_eq!(found.iter().find(|a| a.id == "b2").unwrap().description, "");
+        assert!(subagents(&home, &transcript, now_ms() + 60_000).is_empty(), "older than the window");
+        assert!(subagents(&home, "/etc/S1.jsonl", 0).is_empty(), "only under ~/.claude/projects");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

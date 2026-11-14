@@ -73,6 +73,28 @@ describe('Live workspace', () => {
     expect(harnessApi.ack).not.toHaveBeenCalled();
   });
 
+  it('lists a session\'s subagents under it, with unread messages and its status', async () => {
+    const now = Date.now();
+    const parent: Hosted = {
+      ...running, id: 'p1', unread: 2,
+      harness: { name: 'Memory', profile: 'claude', state: 'working', since: 1, precise: true, agentSession: null, lastMessage: null, attention: null, status: 'running the regrade' },
+      subagents: [
+        { id: 'a1', description: 'MEM-653 false-premise template', agentType: 'general-purpose', model: 'sonnet', started: now - 60_000, lastActivity: now - 5_000 },
+        { id: 'b2b2b2b2b2', description: '', agentType: 'Explore', model: '', started: now - 3_000_000, lastActivity: now - 1_800_000 },
+      ],
+    };
+    vi.mocked(harnessApi.list).mockResolvedValue([parent]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(host.textContent).toContain('2 unread');
+    expect(host.querySelector('.hs-status')?.textContent).toBe('running the regrade');
+    const subs = [...host.querySelectorAll('.hs-subs li')];
+    expect(subs.map(li => li.className)).toEqual(['active', '']);
+    expect(subs[0].textContent).toBe('MEM-653 false-premise templategeneral-purpose · sonnet · active');
+    expect(subs[1].textContent).toBe('Subagent b2b2b2b2Explore · last activity just now');
+    // A subagent has no terminal: its row is not a button
+    expect(subs[0].querySelector('button')).toBeNull();
+  });
+
   it('resumes an earlier session from its transcript, not from the form', async () => {
     vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'aaaaaaaa-1111-4111-8111-111111111111', cwd: '/work/api', modified: 1 }]);
     vi.mocked(harnessApi.spawn).mockResolvedValue(running);

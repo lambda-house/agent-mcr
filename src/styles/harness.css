@@ -15,7 +15,7 @@
 .session-cockpit .hs-start { background: var(--sc-accent); color: var(--sc-bg); border-color: var(--sc-accent); font-weight: 600; }
 .hs-error { margin: 8px; padding: 6px 8px; border: 1px solid #c15b5b; border-radius: 6px; color: #e8a0a0; font-size: 12px; overflow-wrap: anywhere; }
 .hs-list ul { list-style: none; margin: 0; padding: 4px; overflow: auto; flex: 1; }
-.hs-list li { display: flex; align-items: flex-start; gap: 2px; border-radius: 6px; }
+.hs-list li { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 2px; border-radius: 6px; }
 .hs-list li.selected { background: var(--sc-card); }
 .session-cockpit .hs-item { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 8px; padding: 6px; border: 0; background: transparent; text-align: left; }
 .hs-item-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -33,6 +33,13 @@
 .hs-list li.needs-you { box-shadow: inset 2px 0 0 #e0a23c; }
 .hs-item-text small.hs-needs { color: #e0a23c; white-space: normal; overflow-wrap: anywhere; }
 .hs-dot.failed { background: #d0743c; }
+/* Subagents of a session: rows under it, not selectable (they have no terminal) */
+.hs-list ul.hs-subs { flex: 0 0 100%; overflow: visible; margin: 0 0 4px 20px; padding: 0 6px 0 8px; border-left: 1px solid var(--sc-border); }
+.hs-list ul.hs-subs li { gap: 7px; padding: 2px 0; flex-wrap: nowrap; }
+.hs-subs .hs-dot { width: 6px; height: 6px; margin-top: 5px; opacity: .6; }
+.hs-subs li.active .hs-dot { opacity: 1; }
+.hs-subs .hs-item-text strong { font-weight: 500; font-size: 11px; }
+.hs-subs li:not(.active) .hs-item-text strong { color: var(--sc-muted); }
 .hs-actions { display: flex; gap: 2px; padding: 4px 4px 0 0; }
 .session-cockpit .hs-actions button { padding: 4px; border-color: transparent; background: transparent; color: var(--sc-muted); }
 .session-cockpit .hs-actions button:hover { color: var(--sc-text); }
