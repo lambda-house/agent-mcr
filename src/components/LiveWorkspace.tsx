@@ -192,8 +192,8 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
       {error && <div className="hs-error" role="alert">{error}</div>}
       <ul>
         {groups.map(group => group.length === 1 ? row(group[0])
-          : <li key={`group-${group[0].id}`} className="hs-group" title="These sessions exchanged messages in the last day">
-            <ul aria-label="Sessions in contact">{group.map(row)}</ul>
+          : <li key={`group-${group[0].id}`} className="hs-group" title="These sessions run in the same folder or exchanged messages in the last day">
+            <ul aria-label="Sessions working together">{group.map(row)}</ul>
           </li>)}
       </ul>
       {!hosted.length && status && <p className="hs-empty">No hosted sessions. Start one above; it keeps running when you close the app.</p>}
@@ -203,7 +203,15 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
       </footer>
     </aside>
     <main className="hs-terminals">
-      {opened.filter(id => hosted.some(h => h.id === id)).map(id => <div key={id} className="hs-pane" hidden={id !== selected}><TerminalPane id={id} active={active && id === selected}/></div>)}
+      {opened.map(id => hosted.find(h => h.id === id)).filter((h): h is Hosted => !!h).map(h => <div key={h.id} className="hs-pane" hidden={h.id !== selected}>
+        <header className="hs-pane-title">
+          <span className={`hs-dot ${hostedState(h)}`} aria-label={STATE_LABEL[hostedState(h)]}/>
+          <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/>
+          <strong>{isSupervisor(h) ? 'Supervisor' : hostedLabel(h)}</strong>
+          <span title={h.cwd}>{h.cwd}</span>
+        </header>
+        <TerminalPane id={h.id} active={active && h.id === selected}/>
+      </div>)}
       {!selected && <div className="hs-placeholder"><p>Select a session, or start one.</p></div>}
     </main>
   </div>;

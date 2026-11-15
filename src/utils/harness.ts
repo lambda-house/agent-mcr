@@ -107,8 +107,9 @@ export function pastedImage(data: DataTransfer | null): File | null {
 export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;
 
 /**
- * The list in groups: sessions that exchanged messages stand together, in the
- * place of the first of them. A session that talked to nobody is a group of one.
+ * The list in groups: sessions that exchanged messages or run in the same
+ * folder stand together, in the place of the first of them. A session with
+ * neither is a group of one.
  */
 export function groupSessions(list: Hosted[]): Hosted[][] {
   const live = new Map(list.filter(h => !h.exit).map(h => [h.id, h]));
@@ -119,7 +120,8 @@ export function groupSessions(list: Hosted[]): Hosted[][] {
     const members = new Set<string>([h.id]);
     const queue = h.exit ? [] : [h];
     for (let next = queue.shift(); next; next = queue.shift()) {
-      for (const id of next.peers ?? []) {
+      const linked = [...(next.peers ?? []), ...[...live.values()].filter(x => x.cwd === next.cwd).map(x => x.id)];
+      for (const id of linked) {
         const peer = live.get(id);
         if (peer && !members.has(id)) { members.add(id); queue.push(peer); }
       }

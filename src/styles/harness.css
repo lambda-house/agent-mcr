@@ -67,7 +67,12 @@
 .session-cockpit .hs-footer button { padding: 2px 6px; font-size: 11px; gap: 4px; color: var(--sc-muted); }
 
 .hs-terminals { position: relative; min-width: 0; min-height: 0; display: flex; background: var(--sc-bg); }
-.hs-pane { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.hs-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+/* The terminal carries the name its session has in the list */
+.hs-pane-title { flex: 0 0 auto; display: flex; align-items: center; gap: 7px; padding: 5px 10px; border-bottom: 1px solid var(--sc-border); background: var(--sc-panel); font-size: 12px; }
+.hs-pane-title .hs-dot { margin-top: 0; }
+.hs-pane-title strong { font-weight: 600; white-space: nowrap; }
+.hs-pane-title > span:last-child { min-width: 0; color: var(--sc-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hs-pane[hidden] { display: none; }
 .hs-terminal-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .hs-terminal { flex: 1; min-height: 0; padding: 6px 0 0 8px; }

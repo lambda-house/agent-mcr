@@ -72,12 +72,18 @@ describe('Live workspace', () => {
   });
 
   it('keeps sessions that talk to each other together', async () => {
-    const s = (id: string, started: number, peers: string[]): Hosted => ({ ...running, id, started, title: id, peers });
-    vi.mocked(harnessApi.list).mockResolvedValue([s('lone', 4, []), s('exec', 3, ['review']), s('other', 2, []), s('review', 1, ['exec'])]);
+    const s = (id: string, started: number, peers: string[], cwd = `/work/${id}`): Hosted => ({ ...running, id, started, title: `${id} job`, peers, cwd });
+    vi.mocked(harnessApi.list).mockResolvedValue([s('lone', 6, []), s('exec', 5, ['review']), s('other', 4, []), s('review', 3, ['exec']), s('api1', 2, [], '/work/api'), s('api2', 1, [], '/work/api')]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     const top = [...host.querySelectorAll('.hs-list > ul > li')];
-    expect(top.map(li => li.className)).toEqual(['', 'hs-group', '']);
-    expect([...top[1].querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim())).toEqual(['exec · repo', 'review · repo']);
+    // By messages, and by running in the same folder
+    expect(top.map(li => li.className)).toEqual(['', 'hs-group', '', 'hs-group']);
+    expect([...top[1].querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim())).toEqual(['exec job · exec', 'review job · review']);
+    expect([...top[3].querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim())).toEqual(['api1 job · api', 'api2 job · api']);
+    // The terminal is headed by the name its session has in the list
+    await act(async () => (top[0].querySelector('.hs-item') as HTMLButtonElement).click()); await flush();
+    expect(host.querySelector('.hs-pane:not([hidden]) .hs-pane-title strong')?.textContent).toBe('lone job');
+    expect(host.querySelector('.hs-pane:not([hidden]) .hs-pane-title')?.textContent).toContain('/work/lone');
   });
 
   it('starts a profile in the chosen folder and opens its terminal', async () => {
