@@ -8,11 +8,14 @@
 .hs-live { flex: 1; min-height: 0; display: grid; grid-template-columns: clamp(240px, 26%, 340px) minmax(0, 1fr); }
 
 .hs-list { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--sc-border); background: var(--sc-panel); }
-.session-cockpit .hs-supervisor { display: flex; align-items: center; gap: 7px; margin: 8px 8px 0; padding: 7px 10px; border: 1px solid var(--sc-accent); border-radius: 6px; background: transparent; color: var(--sc-accent); font-weight: 600; font-size: 12px; text-align: left; }
-.session-cockpit .hs-supervisor.running { background: color-mix(in srgb, var(--sc-accent) 12%, transparent); }
-.session-cockpit .hs-supervisor.selected { background: color-mix(in srgb, var(--sc-accent) 24%, transparent); }
-.hs-supervisor small { margin-left: auto; font-weight: 400; color: var(--sc-muted); }
-.hs-list li.supervisor { box-shadow: inset 2px 0 0 var(--sc-accent); }
+/* The supervisor: its own tile above everything else in the list */
+.hs-supervisor { display: flex; align-items: flex-start; margin: 8px 8px 0; border: 1px solid var(--sc-accent); border-radius: 8px; background: color-mix(in srgb, var(--sc-accent) 7%, transparent); }
+.hs-supervisor.running { background: color-mix(in srgb, var(--sc-accent) 14%, transparent); }
+.hs-supervisor.selected { background: color-mix(in srgb, var(--sc-accent) 26%, transparent); box-shadow: 0 0 0 1px var(--sc-accent); }
+.hs-supervisor.needs-you { border-color: #e0a23c; }
+.session-cockpit .hs-supervisor-open { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 0; background: transparent; color: var(--sc-accent); text-align: left; }
+.hs-supervisor-open .hs-item-text strong { font-size: 13px; color: var(--sc-accent); }
+.hs-item-text strong .hs-mark { vertical-align: -2px; margin-right: 2px; }
 .hs-new { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-bottom: 1px solid var(--sc-border); }
 .hs-new-row { display: flex; gap: 6px; }
 .hs-new select, .hs-new input { flex: 1; min-width: 0; padding: 5px 7px; border: 1px solid var(--sc-border); border-radius: 6px; background: var(--sc-bg); }

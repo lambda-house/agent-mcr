@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BellRing, Copy, FolderOpen, Play, Radar, Square, Trash2, Zap } from 'lucide-react';
 import TerminalPane from './TerminalPane';
+import AgentMark from './AgentMark';
 import { harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -57,9 +58,9 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
   };
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...openedFolders, ...recentDirectories].filter(Boolean))].slice(0, 40), [status, openedFolders, recentDirectories]);
-  // The supervisor is always first; then sessions that need the person; ended ones last
+  // Sessions that need the person come first, ended ones last. The supervisor has its own tile above the list
   const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
-  const sorted = useMemo(() => [...hosted].sort((a, b) => Number(!b.exit && isSupervisor(b)) - Number(!a.exit && isSupervisor(a)) || Number(needsYou(b)) - Number(needsYou(a)) || Number(!!a.exit) - Number(!!b.exit) || b.started - a.started), [hosted]);
+  const sorted = useMemo(() => hosted.filter(h => h.exit || !isSupervisor(h)).sort((a, b) => Number(needsYou(b)) - Number(needsYou(a)) || Number(!!a.exit) - Number(!!b.exit) || b.started - a.started), [hosted]);
   const running = hosted.filter(h => !h.exit).length;
 
   const start = async () => {
@@ -83,11 +84,22 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
 
   return <div className="hs-live">
     <aside className="hs-list" aria-label="Hosted sessions">
-      <button type="button" className={`hs-supervisor${supervisor ? ' running' : ''}${supervisor && supervisor.id === selected ? ' selected' : ''}`} disabled={!status || starting} onClick={() => void openSupervisor()}
-        title="A Claude session wired to this harness: it sees and directs all the other sessions. It cannot answer their permission prompts; only you can.">
-        <Radar size={14}/> <span>{supervisor ? 'Supervisor' : 'Open supervisor'}</span>
-        {supervisor && <small>{STATE_LABEL[hostedState(supervisor)]}</small>}
-      </button>
+      <div className={`hs-supervisor${supervisor ? ' running' : ''}${supervisor && supervisor.id === selected ? ' selected' : ''}${supervisor && needsYou(supervisor) ? ' needs-you' : ''}`}>
+        <button type="button" className="hs-supervisor-open" disabled={!status || starting} onClick={() => void openSupervisor()}
+          title="A Claude session wired to this harness: it sees and directs all the other sessions. It cannot answer their permission prompts; only you can.">
+          <Radar size={18}/>
+          <span className="hs-item-text">
+            <strong>{supervisor ? 'Supervisor' : 'Open supervisor'}</strong>
+            <small>{supervisor ? `${STATE_LABEL[hostedState(supervisor)]} · pid ${supervisor.pid ?? '?'}${supervisor.lastOutput ? ` · output ${formatAge(supervisor.lastOutput)}` : ''}` : 'Sees and directs all sessions'}</small>
+            {supervisor && needsYou(supervisor) && <small className="hs-needs">{supervisor.harness?.attention?.text}</small>}
+            {supervisor?.harness?.status && <small className="hs-status">{supervisor.harness.status}</small>}
+          </span>
+        </button>
+        {supervisor && <span className="hs-actions">
+          <button title="Interrupt (Ctrl-C to the foreground process)" aria-label="Interrupt the supervisor" onClick={() => act(() => harnessApi.signal(supervisor.id, 'INT'))}><Zap size={13}/></button>
+          <button title="Stop the supervisor session" aria-label="Stop the supervisor" onClick={() => act(() => harnessApi.signal(supervisor.id, 'HUP'))}><Square size={13}/></button>
+        </span>}
+      </div>
       <form className="hs-new" onSubmit={e => { e.preventDefault(); void start(); }}>
         <div className="hs-new-row">
           <select aria-label="Launch profile" value={profile} disabled={!!resume} onChange={e => setProfile(e.target.value)}>
@@ -110,15 +122,16 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
       <ul>
         {sorted.map(h => {
           const state = hostedState(h);
-          return <li key={h.id} className={`${h.id === selected ? 'selected' : ''}${needsYou(h) ? ' needs-you' : ''}${!h.exit && isSupervisor(h) ? ' supervisor' : ''}`}>
+          const label = hostedLabel(h);
+          return <li key={h.id} className={`${h.id === selected ? 'selected' : ''}${needsYou(h) ? ' needs-you' : ''}`}>
             <button className="hs-item" onClick={() => select(h.id)} title={`${h.argv.join(' ')}\n${h.cwd}`}>
               <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
               <span className="hs-item-text">
-                <strong>{hostedLabel(h)} · {base(h.cwd)}</strong>
+                <strong><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label} · {base(h.cwd)}</strong>
                 <small>{h.exit ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}` : `${STATE_LABEL[state]}${h.openTasks ? ` · ${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : ''}${h.unread ? ` · ${h.unread} unread` : ''} · pid ${h.pid ?? '?'}${h.lastOutput ? ` · output ${formatAge(h.lastOutput)}` : ''}`}</small>
                 {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
                 {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
-                {h.title && <small className="hs-title">{h.title}</small>}
+                {h.title && !h.title.includes(label) && <small className="hs-title">{h.title}</small>}
               </span>
             </button>
             <span className="hs-actions">

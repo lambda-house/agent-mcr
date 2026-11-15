@@ -500,6 +500,24 @@ pub struct Tracked {
     pub status: String,
     /// Its agent connected to the harness tools (the `mcr` MCP server)
     pub tools: bool,
+    /// What the agent calls the session in its terminal title, when that says
+    /// more than the agent's or the folder's name. Stands in for a missing name.
+    pub title: String,
+    /// The operator or the supervisor named it (output only)
+    #[serde(skip_deserializing)]
+    pub named: bool,
+}
+
+/// The session's own name from its terminal title: without the agent's status
+/// glyph and the folder Codex appends, and nothing when the title is only the
+/// agent's or the folder's name.
+pub fn title_name(title: &str, cwd: &str) -> String {
+    let text = title.trim_start_matches(|c: char| !c.is_alphanumeric()).split(" | ").next().unwrap_or("").trim();
+    let folder = cwd.rsplit('/').find(|p| !p.is_empty()).unwrap_or("");
+    if text.is_empty() || text == folder || PROFILES.iter().any(|p| p.label.eq_ignore_ascii_case(text)) || text.eq_ignore_ascii_case("claude") {
+        return String::new();
+    }
+    text.chars().filter(|c| !c.is_control() && *c != '"').take(80).collect()
 }
 
 /// A message between hosted sessions. Kept until trimmed, so the operator and
@@ -556,7 +574,7 @@ struct Store {
 }
 
 fn label(t: &Tracked) -> String {
-    let name = if t.name.is_empty() { &t.profile } else { &t.name };
+    let name = [&t.name, &t.title, &t.profile].into_iter().find(|n| !n.is_empty()).unwrap_or(&t.profile);
     name.chars().filter(|c| !c.is_control() && *c != '"').take(60).collect()
 }
 
@@ -849,6 +867,27 @@ impl Harness {
         if lock(&self.store).sessions.keys().any(|k| !ids.contains(k.as_str())) {
             self.update(|s| s.sessions.retain(|k, _| ids.contains(k.as_str())));
         }
+        // Titles the agents gave their sessions, kept so messages and peers can use them
+        let titles: Vec<(String, String)> = {
+            let store = lock(&self.store);
+            infos
+                .iter()
+                .filter_map(|i| {
+                    let id = i["id"].as_str()?;
+                    let title = title_name(i["title"].as_str().unwrap_or(""), i["cwd"].as_str().unwrap_or(""));
+                    (store.sessions.get(id)?.title != title).then(|| (id.to_string(), title))
+                })
+                .collect()
+        };
+        if !titles.is_empty() {
+            self.update(|s| {
+                for (id, title) in titles {
+                    if let Some(t) = s.sessions.get_mut(&id) {
+                        t.title = title;
+                    }
+                }
+            });
+        }
         let store = lock(&self.store);
         let home = dirs::home_dir();
         let recent = now_ms().saturating_sub(3_600_000);
@@ -865,6 +904,11 @@ impl Harness {
                 if !info["exit"].is_null() {
                     tracked.state = "exited".into();
                     tracked.attention = None;
+                }
+                // An unnamed session goes by the title its agent gave it
+                tracked.named = !tracked.name.is_empty();
+                if tracked.name.is_empty() {
+                    tracked.name = if tracked.title.is_empty() { title_name(info["title"].as_str().unwrap_or(""), info["cwd"].as_str().unwrap_or("")) } else { tracked.title.clone() };
                 }
                 let open = store.tasks.values().filter(|t| t.session == id && t.open()).count();
                 let mut out = info.clone();
@@ -1067,7 +1111,7 @@ impl Harness {
                     let tracked = s.sessions.get_mut(session).filter(|t| t.attention.is_none())?;
                     let text = "A task is queued, but the terminal is not at Codex's prompt: it may be asking something";
                     tracked.attention = Some(Attention { kind: "permission".into(), text: text.into(), since: now_ms() });
-                    Some(if tracked.name.is_empty() { tracked.profile.clone() } else { tracked.name.clone() })
+                    Some(label(tracked))
                 });
                 if let Some(who) = raise {
                     notify_user(&format!("Agent MCR: {who} is waiting for you"), "Its terminal is not at the prompt");
@@ -1354,7 +1398,7 @@ impl Harness {
             (ready, now_waiting)
         });
         if let Some(t) = waiting {
-            let who = if t.name.is_empty() { t.profile.clone() } else { t.name.clone() };
+            let who = label(&t);
             notify_user(&format!("Agent MCR: {who} is waiting for you"), t.attention.as_ref().map(|a| a.text.as_str()).unwrap_or(""));
         }
         if ready {
@@ -1391,7 +1435,7 @@ impl Harness {
                     }
                     let approval = body.to_lowercase().contains("approv");
                     tracked.attention = Some(Attention { kind: if approval { "permission" } else { "notification" }.into(), text: body.clone(), since: now_ms() });
-                    let who = if tracked.name.is_empty() { tracked.profile.clone() } else { tracked.name.clone() };
+                    let who = label(tracked);
                     if approval {
                         s.set_state(id, "waiting");
                     }
@@ -1426,7 +1470,7 @@ impl Harness {
                 let text = "It has not started: its terminal is asking something first (for example whether to trust this folder)";
                 let tracked = s.sessions.get_mut(id)?;
                 tracked.attention = Some(Attention { kind: "permission".into(), text: text.into(), since: now });
-                let who = if tracked.name.is_empty() { tracked.profile.clone() } else { tracked.name.clone() };
+                let who = label(tracked);
                 s.set_state(id, "waiting");
                 Some(who)
             });
@@ -2107,6 +2151,19 @@ mod tests {
         assert!(subagents(&home, &transcript, now_ms() + 60_000).is_empty(), "older than the window");
         assert!(subagents(&home, "/etc/S1.jsonl", 0).is_empty(), "only under ~/.claude/projects");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_unnamed_session_goes_by_its_terminal_title() {
+        assert_eq!(title_name("\u{2733} TEOB Rust reviewer", "/work/teob-rust"), "TEOB Rust reviewer");
+        assert_eq!(title_name("\u{25d0} teob-ai pull request 88", "/work/teob-ai"), "teob-ai pull request 88");
+        assert_eq!(title_name("Connect Atlassian tools | timur", "/Users/timur"), "Connect Atlassian tools");
+        for (title, cwd) in [("\u{2733} Claude Code", "/x"), ("teob-ai", "/work/teob-ai"), ("", "/x"), ("Codex", "/x")] {
+            assert_eq!(title_name(title, cwd), "", "{title}");
+        }
+        let titled = Tracked { profile: "claude".into(), title: "TEOB Rust".into(), ..Tracked::default() };
+        assert_eq!(label(&titled), "TEOB Rust");
+        assert_eq!(label(&Tracked { name: "Executor".into(), ..titled }), "Executor");
     }
 
     #[test]

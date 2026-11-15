@@ -32,8 +32,11 @@ afterEach(async () => { await act(async () => root.unmount()); host.remove(); })
 describe('Live workspace', () => {
   it('lists running sessions first with their state and offers the right actions', async () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={['/work/repo']}/>)); await flush();
-    const items = [...host.querySelectorAll('.hs-item strong')].map(e => e.textContent);
-    expect(items).toEqual(['Claude Code · repo', 'Shell · repo']);
+    const items = [...host.querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim());
+    // An unnamed session goes by the title its agent gave it; the agent kind is a mark
+    expect(items).toEqual(['Fixing tests · repo', 'Shell · repo']);
+    expect([...host.querySelectorAll('.hs-item .hs-mark')].map(e => e.getAttribute('aria-label'))).toEqual(['Claude Code', 'Shell']);
+    expect(host.querySelector('.hs-title')).toBeNull();
     expect(host.textContent).toContain('running · pid 42');
     expect(host.textContent).toContain('exited with 0');
     expect(host.textContent).toContain('Runner pid 7 · 1 running');
@@ -102,15 +105,19 @@ describe('Live workspace', () => {
     const boss: Hosted = { ...running, id: 'sup1', started: 1, meta: { profile: 'claude', name: 'Supervisor', role: 'supervisor' } };
     vi.mocked(harnessApi.supervisor).mockResolvedValue(boss);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    const button = host.querySelector('.hs-supervisor') as HTMLButtonElement;
-    expect(button.textContent).toContain('Open supervisor');
+    const open = host.querySelector('.hs-supervisor-open') as HTMLButtonElement;
+    expect(open.textContent).toContain('Open supervisor');
     vi.mocked(harnessApi.list).mockResolvedValue([ended, running, boss]);
-    await act(async () => button.click()); await flush();
+    await act(async () => open.click()); await flush();
     expect(harnessApi.supervisor).toHaveBeenCalledWith(120, 32);
     expect(host.querySelector('[data-terminal="sup1"]')).not.toBeNull();
-    expect(host.querySelector('.hs-list li')?.className).toContain('supervisor');
+    // Its own tile above the list, not a row in it
+    expect(host.querySelector('.hs-supervisor')?.className).toContain('running selected');
+    expect(host.querySelector('.hs-supervisor strong')?.textContent).toBe('Supervisor');
+    expect(host.querySelectorAll('.hs-list ul > li')).toHaveLength(2);
+    expect(button('Stop the supervisor')).not.toBeNull();
     // A second click selects the running one instead of starting another
-    await act(async () => (host.querySelector('.hs-supervisor') as HTMLButtonElement).click()); await flush();
+    await act(async () => (host.querySelector('.hs-supervisor-open') as HTMLButtonElement).click()); await flush();
     expect(harnessApi.supervisor).toHaveBeenCalledTimes(1);
   });
 

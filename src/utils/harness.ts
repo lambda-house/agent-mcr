@@ -9,6 +9,8 @@ export interface Attention { kind: 'permission' | 'notification'; text: string; 
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';
   since: number; precise: boolean; agentSession: string | null; attention: Attention | null; lastMessage: string | null;
+  /** False when `name` is the title the agent gave the session, not a name someone chose */
+  named?: boolean;
   /** What the agent says it is doing (its `set_status` tool) */
   status?: string;
 }
@@ -61,10 +63,17 @@ export function shellQuote(path: string): string {
   return path.replace(/([^A-Za-z0-9_\-.,:/@+=%^~])/g, '\\$1');
 }
 
+/** The name in a terminal title: without the agent's status glyph and Codex's folder suffix. */
+function titleName(h: Hosted): string {
+  const text = h.title.replace(/^[^\p{L}\p{N}]+/u, '').split(' | ')[0].trim();
+  const folder = h.cwd.split('/').filter(Boolean).pop() ?? '';
+  return !text || text === folder || /^(claude code|claude|codex|shell)$/i.test(text) ? '' : text;
+}
+
 export const isSupervisor = (h: Hosted) => h.meta.role === 'supervisor';
 
 export function hostedLabel(h: Hosted): string {
-  return h.harness?.name || h.meta.name || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;
+  return h.harness?.name || h.meta.name || titleName(h) || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;
 }
 
 export type HostedState = 'running' | 'starting' | 'working' | 'idle' | 'waiting' | 'exited' | 'failed';
