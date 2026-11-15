@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BellRing, Copy, FolderOpen, MoreHorizontal, Play, Radar, X } from 'lucide-react';
+import { BellRing, Copy, FolderOpen, MoreHorizontal, Play, Radar, RotateCw, X } from 'lucide-react';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
-import { groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, sessionReference, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, sessionReference, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { useStore } from '../store';
@@ -120,8 +120,19 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
   const copyReference = (h: Hosted) => {
     navigator.clipboard.writeText(sessionReference(h)).then(() => { setReferenced(h.id); setTimeout(() => setReferenced(r => r === h.id ? '' : r), 1500); }).catch(e => setError(err(e)));
   };
+  /** The agent is ended and continues its conversation in a new process, with today's settings and tools. */
+  const restart = (h: Hosted) => {
+    setError('');
+    harnessApi.restart(h.id).then(async fresh => {
+      await refresh();
+      setOpened(o => o.filter(x => x !== h.id));
+      if (selected === h.id) select(fresh.id);
+      if (!fresh.resumed) setError(`${hostedLabel(h)} had no saved conversation to continue: it started fresh in the same folder.`);
+    }).catch(e => { setError(err(e)); void refresh(); });
+  };
   const actions = (h: Hosted): Action[] => [
     { label: 'Copy reference', icon: <Copy size={13}/>, run: () => copyReference(h) },
+    ...(canRestart(h) ? [{ label: 'Restart (reload settings)', icon: <RotateCw size={13}/>, run: () => restart(h) }] : []),
     { label: h.exit ? 'Remove from the list' : 'Close session', icon: <X size={13}/>, run: () => close(h) },
   ];
   const groups = useMemo(() => groupSessions(sorted), [sorted]);

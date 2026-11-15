@@ -25,6 +25,7 @@ mod agent;
 #[cfg(unix)]
 mod runner;
 #[cfg(unix)]
+mod agents;
 mod harness;
 #[cfg(unix)]
 mod harness_commands;
@@ -1796,6 +1797,7 @@ fn main() {
             harness_commands::harness_ack,
             harness_commands::harness_signal,
             harness_commands::harness_forget,
+            harness_commands::harness_restart,
             harness_commands::terminal_attach,
             harness_commands::terminal_input,
             harness_commands::terminal_resize,

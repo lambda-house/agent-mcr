@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LiveWorkspace from './LiveWorkspace';
 import { harnessApi, type Hosted } from '../utils/harness';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), resumable: vi.fn(), ack: vi.fn(), supervisor: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), ack: vi.fn(), supervisor: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // Terminals need a real canvas; the pane itself is exercised in the app
@@ -54,16 +54,30 @@ describe('Live workspace', () => {
     expect(host.querySelector('[role="menu"]')).toBeNull();
     const item = (text: string) => [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes(text)) as HTMLButtonElement;
     await act(async () => button('Actions for Fixing tests').click());
-    expect([...host.querySelectorAll('[role="menuitem"]')].map(b => b.textContent?.trim())).toEqual(['Copy reference', 'Close session']);
+    expect([...host.querySelectorAll('[role="menuitem"]')].map(b => b.textContent?.trim())).toEqual(['Copy reference', 'Restart (reload settings)', 'Close session']);
     await act(async () => item('Copy reference').click()); await flush();
     expect(copy.mock.calls[0][0]).toBe('Agent MCR session "Fixing tests" (Claude Code, id r1, pid 42, folder /work/repo). Reach it with the mcr tools: ask or send_message with to "r1".');
     expect(host.querySelector('[role="menu"]')).toBeNull();
+    // Restart: the conversation continues under a new id, which takes the old one's place
+    const fresh: Hosted = { ...running, id: 'r2' };
+    vi.mocked(harnessApi.restart).mockResolvedValue({ ...fresh, replaced: 'r1', resumed: true });
+    await act(async () => (host.querySelector('.hs-item') as HTMLButtonElement).click()); await flush();
+    await act(async () => button('Actions for Fixing tests').click());
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, fresh]);
+    await act(async () => item('Restart').click()); await flush();
+    expect(harnessApi.restart).toHaveBeenCalledWith('r1');
+    expect(host.querySelector('[data-terminal="r1"]')).toBeNull();
+    expect(host.querySelector('.hs-pane:not([hidden]) [data-terminal="r2"]')).not.toBeNull();
+    // A shell has nothing to continue
+    await act(async () => button('Actions for Shell').click());
+    expect(item('Restart')).toBeUndefined();
+    await act(async () => button('Actions for Shell').click());
     // Close ends the session; once it has ended it is dropped without a second step
     await act(async () => button('Actions for Fixing tests').click());
-    vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...running, exit: { code: 0, signal: 'HUP', at: 4 } }]);
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...fresh, exit: { code: 0, signal: 'HUP', at: 4 } }]);
     await act(async () => item('Close session').click()); await flush();
-    expect(harnessApi.signal).toHaveBeenCalledWith('r1', 'HUP');
-    expect(harnessApi.forget).toHaveBeenCalledWith('r1');
+    expect(harnessApi.signal).toHaveBeenCalledWith('r2', 'HUP');
+    expect(harnessApi.forget).toHaveBeenCalledWith('r2');
     expect(harnessApi.forget).not.toHaveBeenCalledWith('e1');
     // A session that ended by itself stays until removed
     await act(async () => button('Actions for Shell').click());

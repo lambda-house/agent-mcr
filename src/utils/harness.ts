@@ -43,6 +43,8 @@ export const harnessApi = {
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume }),
   /** The hosted supervisor session: the running one, or a new one */
   supervisor: (cols: number, rows: number) => invoke<Hosted>('harness_supervisor', { cols, rows }),
+  /** End the agent and continue its conversation in a new process; the session id changes */
+  restart: (id: string) => invoke<Hosted & { replaced: string; resumed: boolean }>('harness_restart', { id }),
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
   /** The person looked at a session's notification */
   ack: (id: string) => invoke<void>('harness_ack', { id }),
@@ -139,3 +141,6 @@ export function sessionReference(h: Hosted): string {
   const kind = KIND[h.harness?.profile || h.meta.profile || ''] ?? 'agent';
   return `Agent MCR session "${hostedLabel(h)}" (${kind}, id ${h.id}, pid ${h.pid ?? 'unknown'}, folder ${h.cwd}). Reach it with the mcr tools: ask or send_message with to "${h.id}".`;
 }
+
+/** A session whose agent can be ended and started again on the same conversation. */
+export const canRestart = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');

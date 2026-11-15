@@ -6,6 +6,8 @@
 //! State comes from the agents' own hooks (`--harness-hook`), passed per
 //! launch; nothing is written into the user's agent config files.
 
+pub use crate::agents::{command_line, Launch};
+use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, ADAPTERS};
 use crate::runner::{self, lock, now_ms, Client, Unit};
 use crate::session_mcp::{read_frame, Protocol, Server};
 use serde::{Deserialize, Serialize};
@@ -123,102 +125,10 @@ pub fn login_shell() -> String {
         .unwrap_or_else(|| "/bin/zsh".into())
 }
 
-fn sh(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-fn is_uuid(s: &str) -> bool {
-    s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() })
-}
-
 fn new_uuid() -> String {
     let hex = runner::random_id();
     // Version 4, variant 1
     format!("{}-{}-4{}-a{}-{}", &hex[..8], &hex[8..12], &hex[13..16], &hex[17..20], &hex[20..32])
-}
-
-/// What a launch needs besides the profile.
-#[derive(Default)]
-pub struct Launch<'a> {
-    pub profile: &'a str,
-    pub exe: &'a str,
-    /// Claude settings file carrying the hooks
-    pub settings: &'a str,
-    /// Claude MCP config file carrying the harness tools
-    pub mcp: &'a str,
-    /// Claude plugin folder carrying the peers skill
-    pub plugin: &'a str,
-    /// Tell the agent about its peers (`PEER_NOTE`)
-    pub note: bool,
-    /// A new Claude session id, so the transcript link is exact
-    pub agent_session: Option<&'a str>,
-    pub resume: Option<&'a str>,
-    pub task: Option<&'a str>,
-}
-
-/// The command line run in the login shell (empty for a plain shell).
-pub fn command_line(l: &Launch) -> Result<String, String> {
-    let p = PROFILES.iter().find(|p| p.id == l.profile).ok_or_else(|| format!("Unknown profile {}", l.profile))?;
-    if let Some(id) = l.resume {
-        if !is_uuid(id) {
-            return Err("Invalid session id to resume".into());
-        }
-    }
-    let task = l.task.map(str::trim).filter(|t| !t.is_empty());
-    let mut cmd = String::new();
-    match p.id {
-        "claude" => {
-            cmd = format!("exec {}", p.command);
-            if !l.mcp.is_empty() {
-                cmd += &format!(" --mcp-config {}", sh(l.mcp));
-            }
-            cmd += &format!(" --settings {}", sh(l.settings));
-            if !l.plugin.is_empty() {
-                cmd += &format!(" --plugin-dir {}", sh(l.plugin));
-            }
-            if l.note {
-                cmd += &format!(" --append-system-prompt {}", sh(PEER_NOTE));
-            }
-            match (l.resume, l.agent_session) {
-                (Some(id), _) => cmd += &format!(" --resume {id}"),
-                (None, Some(id)) if is_uuid(id) => cmd += &format!(" --session-id {id}"),
-                _ => {}
-            }
-            if let Some(t) = task {
-                cmd += &format!(" -- {}", sh(t));
-            }
-        }
-        "codex" => {
-            let (head, flags) = p.command.split_once(' ').unwrap_or((p.command, ""));
-            let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
-            // The harness tools, for this launch only (values are TOML; a JSON string is one)
-            let tools = format!(
-                "-c {} -c {}",
-                sh(&format!("mcp_servers.{AGENT_SERVER}.command={}", json!(l.exe))),
-                sh(&format!("mcp_servers.{AGENT_SERVER}.args=[\"--harness-mcp\"]"))
-            );
-            cmd = format!("exec {head}");
-            if l.resume.is_some() {
-                cmd += " resume";
-            }
-            cmd += &format!(" {flags} -c {} -c tui.notifications=true {tools}", sh(&notify));
-            if l.note {
-                cmd += &format!(" -c {}", sh(&format!("developer_instructions={}", json!(PEER_NOTE))));
-            }
-            if let Some(id) = l.resume {
-                cmd += &format!(" {id}");
-            }
-            if let Some(t) = task {
-                cmd += &format!(" -- {}", sh(t));
-            }
-        }
-        _ => {
-            if l.resume.is_some() || task.is_some() {
-                return Err("A shell has no session to resume and takes no task".into());
-            }
-        }
-    }
-    Ok(cmd)
 }
 
 /// Every profile runs in a login shell, so agents see the PATH, keys and
@@ -265,25 +175,6 @@ pub struct Resumable {
     pub modified: u64,
 }
 
-fn modified_ms(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// The first JSON string value of `key` in the head of a transcript. Lines
-/// can be megabytes long, so this never parses whole lines.
-fn head_value(path: &Path, key: &str, limit: u64) -> Option<String> {
-    let mut head = Vec::new();
-    std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
-    let needle = format!("\"{key}\":\"");
-    let at = head.windows(needle.len()).position(|w| w == needle.as_bytes())? + needle.len() - 1;
-    serde_json::Deserializer::from_slice(&head[at..]).into_iter::<String>().next()?.ok()
-}
-
 fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -297,43 +188,16 @@ fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn claude_resumable(path: &Path) -> Option<Resumable> {
-    let id = path.file_stem()?.to_str()?.to_string();
-    if !is_uuid(&id) {
-        return None;
-    }
-    let cwd = head_value(path, "cwd", 1024 * 1024)?;
-    Some(Resumable { agent: "claude", id, cwd, modified: modified_ms(path) })
-}
-
-fn codex_resumable(path: &Path) -> Option<Resumable> {
-    let stem = path.file_stem()?.to_str()?;
-    let id = stem.get(stem.len().checked_sub(36)?..)?.to_string();
-    if !is_uuid(&id) || !stem.starts_with("rollout-") {
-        return None;
-    }
-    // Sessions started by other agents (subagents) aren't the user's to resume
-    if head_value(path, "thread_source", 8192).is_some_and(|s| s != "user") {
-        return None;
-    }
-    let cwd = head_value(path, "cwd", 8192)?;
-    Some(Resumable { agent: "codex", id, cwd, modified: modified_ms(path) })
-}
-
 /// Top-level sessions changed since `since` (ms), newest first. Ids, folders
 /// and times only; no transcript content.
 pub fn resumable(home: &Path, since: u64, limit: usize) -> Vec<Resumable> {
-    let mut claude = Vec::new();
-    jsonl_files(&home.join(".claude/projects"), 1, &mut claude);
-    let mut codex = Vec::new();
-    jsonl_files(&home.join(".codex/sessions"), 3, &mut codex);
-    let recent = |p: &PathBuf| modified_ms(p) >= since;
-    let mut out: Vec<Resumable> = claude
-        .iter()
-        .filter(|p| recent(p))
-        .filter_map(|p| claude_resumable(p))
-        .chain(codex.iter().filter(|p| recent(p)).filter_map(|p| codex_resumable(p)))
-        .collect();
+    let mut out = Vec::new();
+    for agent in ADAPTERS {
+        let Some((folder, depth)) = agent.transcripts() else { continue };
+        let mut files = Vec::new();
+        jsonl_files(&home.join(folder), depth, &mut files);
+        out.extend(files.iter().filter(|p| modified_ms(p) >= since).filter_map(|p| agent.resumable(p)));
+    }
     out.sort_by_key(|r| std::cmp::Reverse(r.modified));
     out.truncate(limit);
     out
@@ -344,15 +208,13 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
     if !is_uuid(id) {
         return None;
     }
-    let mut files = Vec::new();
-    jsonl_files(&home.join(".claude/projects"), 1, &mut files);
-    if let Some(found) = files.iter().find(|p| p.file_stem().is_some_and(|s| s == id)) {
-        return claude_resumable(found);
-    }
-    files.clear();
-    jsonl_files(&home.join(".codex/sessions"), 3, &mut files);
     let suffix = format!("{id}.jsonl");
-    files.iter().find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix))).and_then(|p| codex_resumable(p))
+    ADAPTERS.iter().find_map(|agent| {
+        let (folder, depth) = agent.transcripts()?;
+        let mut files = Vec::new();
+        jsonl_files(&home.join(folder), depth, &mut files);
+        files.iter().filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix))).find_map(|p| agent.resumable(p)).filter(|r| r.id == id)
+    })
 }
 
 /// Whether the program in the terminal asked for bracketed paste (DECSET 2004).
@@ -572,6 +434,9 @@ struct Store {
     /// Connected `mcr` bridges per session; `Tracked.tools` follows it
     #[serde(skip)]
     bridges: BTreeMap<String, usize>,
+    /// Sessions being ended to start again: their exit is not an abandonment
+    #[serde(skip)]
+    restarting: BTreeSet<String>,
     #[serde(skip)]
     version: u64,
 }
@@ -605,7 +470,7 @@ impl Store {
     /// reports nothing, so it takes one only when its terminal shows the
     /// prompt (`at_prompt`): text typed into a start-up question would answer it.
     fn next(&mut self, session: &str, at_prompt: bool) -> Option<Task> {
-        let ready = self.sessions.get(session).is_some_and(|t| t.state == "idle" || (t.state == "unknown" && (t.profile != "codex" || at_prompt)));
+        let ready = self.sessions.get(session).is_some_and(|t| t.state == "idle" || (t.state == "unknown" && (!adapter(&t.profile).silent_until_first_turn() || at_prompt)));
         if !ready || self.tasks.values().any(|t| t.session == session && t.state == "working") {
             return None;
         }
@@ -961,6 +826,93 @@ impl Harness {
         self.create_as(req, false)
     }
 
+    /// End a session's agent and continue its conversation in a new process,
+    /// which loads the agent's settings, MCP servers and the harness wiring as
+    /// they are now. The new session takes over the name, the queued tasks and
+    /// the messages; the old terminal output is dropped (the agent prints the
+    /// conversation again). Without a transcript to continue it starts fresh
+    /// in the same folder.
+    fn restart(&self, id: &str, force: bool) -> Result<Value, String> {
+        let old = self.session(id)?;
+        let profile = old["harness"]["profile"].as_str().unwrap_or("").to_string();
+        if !adapter(&profile).is_agent() {
+            return Err("Only an agent session can be restarted; a shell has no conversation to continue".into());
+        }
+        if !force && old["exit"].is_null() && old["harness"]["state"] == "working" {
+            return Err("The session is in the middle of a turn; restarting would cut it off. Wait for it, or restart with force".into());
+        }
+        let home = dirs::home_dir().ok_or("Home directory unavailable")?;
+        let resume = old["harness"]["agentSession"].as_str().filter(|c| find_resumable(&home, c).is_some()).map(str::to_owned);
+        self.update(|s| s.restarting.insert(id.to_string()));
+        let started = (|| {
+            if old["exit"].is_null() {
+                // Hangup, as when its terminal window closes; both agents save their conversation as they go
+                self.runner(json!({"op": "signal", "id": id, "signal": "HUP"}))?;
+                let ended = |wait: Duration| {
+                    let until = Instant::now() + wait;
+                    loop {
+                        if self.session(id).is_ok_and(|s| !s["exit"].is_null()) {
+                            return true;
+                        }
+                        if Instant::now() >= until {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                };
+                // Within the ten seconds a caller waits for an answer
+                if !ended(Duration::from_secs(5)) {
+                    self.runner(json!({"op": "signal", "id": id, "signal": "KILL"}))?;
+                    if !ended(Duration::from_secs(2)) {
+                        return Err("The session did not end".to_string());
+                    }
+                }
+            }
+            let mut req = json!({"cwd": old["cwd"], "cols": old["cols"], "rows": old["rows"]});
+            if old["harness"]["named"] == true {
+                req["name"] = old["harness"]["name"].clone();
+            }
+            match &resume {
+                Some(conversation) => req["resume"] = json!(conversation),
+                None => req["profile"] = json!(profile),
+            }
+            self.create_as(&req, old["meta"]["role"] == "supervisor")
+        })();
+        let new = match started {
+            Ok(new) => new,
+            Err(e) => {
+                self.update(|s| s.restarting.remove(id));
+                return Err(e);
+            }
+        };
+        let new_id = new["id"].as_str().unwrap_or("").to_string();
+        self.update(|s| {
+            s.restarting.remove(id);
+            for task in s.tasks.values_mut().filter(|t| t.session == id && t.state == "queued") {
+                task.session = new_id.clone();
+            }
+            for m in s.messages.values_mut() {
+                if m.to == id {
+                    m.to = new_id.clone();
+                    // The new process hasn't been told about what is still unread
+                    m.notified = m.read != 0;
+                }
+                if m.from == id {
+                    m.from = new_id.clone();
+                }
+            }
+            let status = s.sessions.get(id).map(|t| t.status.clone()).unwrap_or_default();
+            if let Some(t) = s.sessions.get_mut(&new_id) {
+                t.status = status;
+            }
+        });
+        let _ = self.runner(json!({"op": "forget", "id": id}));
+        let mut out = self.session(&new_id)?;
+        out["replaced"] = json!(id);
+        out["resumed"] = json!(resume.is_some());
+        Ok(out)
+    }
+
     fn create_as(&self, req: &Value, supervisor: bool) -> Result<Value, String> {
         let home = dirs::home_dir().ok_or("Home directory unavailable")?;
         let resume = req["resume"].as_str().filter(|s| !s.is_empty());
@@ -996,37 +948,21 @@ impl Harness {
             return Err("The task is too long".into());
         }
         let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
+        let agent = adapter(&profile);
+        for (name, content) in agent.files(&exe, supervisor) {
+            let path = self.dir.join(name);
+            if std::fs::read(&path).ok().as_deref() != Some(content.as_bytes()) {
+                std::fs::create_dir_all(path.parent().unwrap_or(&self.dir)).map_err(|e| e.to_string())?;
+                std::fs::write(&path, content).map_err(|e| e.to_string())?;
+            }
+        }
         let settings = self.dir.join(if supervisor { "claude-supervisor-hooks.json" } else { "claude-hooks.json" });
-        if profile == "claude" {
-            let content = serde_json::to_vec_pretty(&claude_settings(&exe, supervisor)).map_err(|e| e.to_string())?;
-            if std::fs::read(&settings).ok().as_deref() != Some(content.as_slice()) {
-                std::fs::write(&settings, content).map_err(|e| e.to_string())?;
-            }
-        }
         let mcp = self.dir.join(if supervisor { "claude-supervisor-mcp.json" } else { "claude-mcp.json" });
-        if profile == "claude" {
-            let content = serde_json::to_vec_pretty(&claude_mcp(&exe, supervisor)).map_err(|e| e.to_string())?;
-            if std::fs::read(&mcp).ok().as_deref() != Some(content.as_slice()) {
-                std::fs::write(&mcp, content).map_err(|e| e.to_string())?;
-            }
-        }
         let plugin = self.dir.join("claude-plugin");
-        if profile == "claude" {
-            for (name, content) in claude_plugin() {
-                let path = plugin.join(name);
-                if std::fs::read(&path).ok().as_deref() != Some(content.as_bytes()) {
-                    std::fs::create_dir_all(path.parent().unwrap_or(&plugin)).map_err(|e| e.to_string())?;
-                    std::fs::write(&path, content).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        // Codex takes one developer_instructions value: the operator's own, if set, stays
-        let own_instructions = profile == "codex"
-            && std::fs::read_to_string(home.join(".codex/config.toml")).is_ok_and(|c| c.lines().any(|l| l.trim_start().starts_with("developer_instructions")));
-        let agent_session = (profile == "claude" && resume.is_none()).then(new_uuid);
+        let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
         let argv = argv_for(&Launch {
             plugin: &plugin.display().to_string(),
-            note: !own_instructions,
+            note: agent.takes_note(&home),
             profile: &profile,
             exe: &exe,
             settings: &settings.display().to_string(),
@@ -1064,10 +1000,9 @@ impl Harness {
         let now = now_ms();
         let first_task = task.map(|_| format!("t{}", &runner::random_id()[..10]));
         self.update(|s| {
-            let state = match (profile.as_str(), task.is_some()) {
-                ("shell", _) => "unknown",
-                (_, true) => "working",
-                ("claude", false) => "starting",
+            let state = match (agent.is_agent(), task.is_some()) {
+                (true, true) => "working",
+                (true, false) if agent.reports_from_start() => "starting",
                 _ => "unknown",
             };
             s.sessions.insert(
@@ -1077,7 +1012,7 @@ impl Harness {
                     profile: profile.clone(),
                     state: state.into(),
                     since: now,
-                    precise: profile == "claude",
+                    precise: agent.reports_from_start(),
                     agent_session: agent_session.or(resume.map(str::to_owned)),
                     ..Tracked::default()
                 },
@@ -1100,7 +1035,7 @@ impl Harness {
     fn deliver(&self, session: &str, text: &str) -> Result<(), String> {
         let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
         // Agents always turn it on, and their old output may have left the scrollback
-        let agent = lock(&self.store).sessions.get(session).is_some_and(|t| t.profile == "claude" || t.profile == "codex");
+        let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
         let bracketed = agent || runner::snapshot(&runner_socket(&self.dir), session).is_ok_and(|bytes| wants_bracketed_paste(&bytes));
         let data = if bracketed { format!("\x1b[200~{clean}\x1b[201~") } else { clean };
         self.runner(json!({"op": "write", "id": session, "data": data}))?;
@@ -1109,10 +1044,11 @@ impl Harness {
         Ok(())
     }
 
-    /// Codex's input box is on screen (the marker depends on the Codex version;
-    /// when it isn't found the task stays queued and the operator is told).
-    fn codex_at_prompt(&self, session: &str) -> bool {
-        self.read_terminal(session, 14).is_ok_and(|text| text.contains("for shortcuts") && text.lines().any(|l| l.starts_with('\u{203a}')))
+    /// The agent's input box is on screen (when it isn't found the task stays
+    /// queued and the operator is told).
+    fn at_prompt(&self, session: &str) -> bool {
+        let profile = lock(&self.store).sessions.get(session).map(|t| t.profile.clone()).unwrap_or_default();
+        self.read_terminal(session, 14).is_ok_and(|text| adapter(&profile).at_prompt(&text))
     }
 
     /// Deliver the next queued task if the session is ready for one.
@@ -1120,15 +1056,15 @@ impl Harness {
         let (queued, unsure) = {
             let store = lock(&self.store);
             let queued = store.tasks.values().filter(|t| t.session == session && t.state == "queued").map(|t| t.created).min();
-            (queued, store.sessions.get(session).is_some_and(|t| t.profile == "codex" && t.state == "unknown"))
+            (queued, store.sessions.get(session).is_some_and(|t| adapter(&t.profile).silent_until_first_turn() && t.state == "unknown"))
         };
         let Some(queued) = queued else { return };
-        let at_prompt = unsure && self.codex_at_prompt(session);
+        let at_prompt = unsure && self.at_prompt(session);
         let Some(task) = self.update(|s| s.next(session, at_prompt)) else {
             if unsure && !at_prompt && now_ms().saturating_sub(queued) > 15_000 {
                 let raise = self.update(|s| {
                     let tracked = s.sessions.get_mut(session).filter(|t| t.attention.is_none())?;
-                    let text = "A task is queued, but the terminal is not at Codex's prompt: it may be asking something";
+                    let text = "A task is queued, but the terminal is not at the agent's prompt: it may be asking something";
                     tracked.attention = Some(Attention { kind: "permission".into(), text: text.into(), since: now_ms() });
                     Some(label(tracked))
                 });
@@ -1140,7 +1076,7 @@ impl Harness {
         };
         let turn_end = self.update(|s| {
             let tracked = s.sessions.get(session);
-            let known = tracked.is_some_and(|t| t.profile == "claude" || t.profile == "codex");
+            let known = tracked.is_some_and(|t| adapter(&t.profile).is_agent());
             if known {
                 s.set_state(session, "working");
                 if let Some(t) = s.sessions.get_mut(session) {
@@ -1169,12 +1105,12 @@ impl Harness {
                 return;
             }
             let Some(t) = store.sessions.get(session) else { return };
-            if t.profile != "claude" && t.profile != "codex" {
+            if !adapter(&t.profile).is_agent() {
                 return;
             }
-            t.profile == "codex" && t.state == "unknown"
+            adapter(&t.profile).silent_until_first_turn() && t.state == "unknown"
         };
-        let at_prompt = unsure && self.codex_at_prompt(session);
+        let at_prompt = unsure && self.at_prompt(session);
         let from = self.update(|s| {
             let t = s.sessions.get(session)?;
             if !(t.state == "idle" || (unsure && at_prompt && t.state == "unknown")) {
@@ -1441,15 +1377,17 @@ impl Harness {
         let Some(id) = event["id"].as_str() else { return };
         match event["event"].as_str() {
             Some("exited") => self.update(|s| {
-                for task in s.tasks.values_mut().filter(|t| t.session == id && t.open()) {
+                // A restart keeps the queue and the open questions for the new process
+                let restarting = s.restarting.contains(id);
+                for task in s.tasks.values_mut().filter(|t| t.session == id && t.open() && (!restarting || t.state == "working")) {
                     task.state = "failed".into();
                     task.finished = now_ms();
-                    task.result = Some("The session ended".into());
+                    task.result = Some(if restarting { "The session was restarted" } else { "The session ended" }.into());
                 }
                 if let Some(t) = s.sessions.get_mut(id) {
                     t.attention = None;
                 }
-                s.abandon(id)
+                if restarting { Vec::new() } else { s.abandon(id) }
             })
             .iter()
             .for_each(|asker| self.nudge(asker)),
@@ -1457,8 +1395,8 @@ impl Harness {
                 let body = event["body"].as_str().or(event["title"].as_str()).unwrap_or("").to_string();
                 let raised = self.update(|s| {
                     let tracked = s.sessions.get_mut(id)?;
-                    // Claude reports through hooks; its terminal notifications would only repeat them
-                    if tracked.profile == "claude" || tracked.state == "waiting" {
+                    // An agent that reports through hooks: its terminal notifications would only repeat them
+                    if adapter(&tracked.profile).reports_from_start() || tracked.state == "waiting" {
                         return None;
                     }
                     let approval = body.to_lowercase().contains("approv");
@@ -1490,7 +1428,7 @@ impl Harness {
             if !quiet || now.saturating_sub(info["started"].as_u64().unwrap_or(now)) < 10_000 {
                 continue;
             }
-            let candidate = |s: &Store| s.sessions.get(id).is_some_and(|t| t.profile == "claude" && !t.hooked && t.attention.is_none());
+            let candidate = |s: &Store| s.sessions.get(id).is_some_and(|t| adapter(&t.profile).reports_from_start() && !t.hooked && t.attention.is_none());
             if !candidate(&lock(&self.store)) {
                 continue;
             }
@@ -1551,6 +1489,7 @@ impl Harness {
             "sessions" => Ok(json!({ "sessions": self.sessions()? })),
             "create" => self.create(req),
             "supervisor" => self.supervisor(req),
+            "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true),
             "hook" => {
                 self.hook(req["session"].as_str().unwrap_or(""), req["event"].as_str().unwrap_or(""), &req["payload"]);
                 Ok(json!({}))
@@ -1665,14 +1604,18 @@ impl Harness {
             "session_interrupt" => {
                 let id = text("session")?;
                 refuse_if_waiting(id)?;
-                // Esc stops a Claude turn; Ctrl-C the foreground process elsewhere
-                if self.session(id)?["harness"]["profile"] == "claude" {
-                    self.runner(json!({"op": "write", "id": id, "data": "\x1b"}))?;
-                } else {
-                    self.runner(json!({"op": "signal", "id": id, "signal": "INT"}))?;
-                }
+                match adapter(self.session(id)?["harness"]["profile"].as_str().unwrap_or("")).interrupt() {
+                    Interrupt::Key(key) => self.runner(json!({"op": "write", "id": id, "data": key}))?,
+                    Interrupt::Signal(signal) => self.runner(json!({"op": "signal", "id": id, "signal": signal}))?,
+                };
                 Ok(json!({ "interrupted": true }))
             }
+            "session_restart" => self.restart(text("session")?, args["force"] == true).map(|s| {
+                let mut brief = Self::brief(&s);
+                brief["replaced"] = s["replaced"].clone();
+                brief["resumed"] = s["resumed"].clone();
+                brief
+            }),
             "session_end" => {
                 // Hangup, as when a terminal window closes: interactive shells ignore SIGTERM
                 self.runner(json!({"op": "signal", "id": text("session")?, "signal": "HUP"}))?;
@@ -1784,6 +1727,7 @@ fn supervisor_tools() -> Value {
         tool("terminal_read", "The session's terminal as text (last lines).", json!({"session": session, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"]),
         tool("terminal_write", "Type raw input into a session's terminal (use \\r for Enter). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}}), &["session", "input"]),
         tool("session_interrupt", "Stop the current turn (Esc for Claude, Ctrl-C otherwise).", json!({"session": session}), &["session"]),
+        tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}}), &["session"]),
         tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
         tool("session_forget", "Drop an ended session and its terminal output.", json!({"session": session}), &["session"]),
         tool("messages_list", "What hosted sessions told each other through the harness tools (newest last): sender, receiver, text, whether it was read and answered.", json!({"session": {"type": "string", "description": "Only messages to or from this session id"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),

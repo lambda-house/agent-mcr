@@ -122,6 +122,14 @@ pub async fn harness_supervisor(cols: u16, rows: u16) -> Result<Value, String> {
     blocking(move || service(json!({"op": "supervisor", "cols": cols, "rows": rows}))).await
 }
 
+/// End a session's agent and continue its conversation in a new process.
+#[tauri::command]
+pub async fn harness_restart(id: String) -> Result<Value, String> {
+    valid_id(&id)?;
+    // The person chose it in the session's menu, so a running turn may be cut off
+    blocking(move || service(json!({"op": "restart", "id": id, "force": true}))).await
+}
+
 fn valid_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err("Invalid session id".into());
