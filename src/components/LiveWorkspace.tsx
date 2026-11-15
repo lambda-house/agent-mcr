@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BellRing, Copy, FolderOpen, Play, Radar, Square, Trash2, Zap } from 'lucide-react';
+import { BellRing, Copy, FolderOpen, MoreHorizontal, Play, Radar, X } from 'lucide-react';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
-import { harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, sessionReference, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { useStore } from '../store';
@@ -10,6 +10,31 @@ import '../styles/harness.css';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const base = (path: string) => path.split('/').filter(Boolean).pop() || path;
+
+interface Action { label: string; icon: React.ReactNode; run: () => void }
+
+/** The one button of a session row: its actions open as a menu. */
+function RowMenu({ label, actions }: { label: string; actions: Action[] }) {
+  const [at, setAt] = useState<{ top: number; right: number } | null>(null);
+  const wrap = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!at) return;
+    const outside = (e: MouseEvent) => { if (!wrap.current?.contains(e.target as Node)) setAt(null); };
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setAt(null); };
+    document.addEventListener('mousedown', outside); document.addEventListener('keydown', key);
+    return () => { document.removeEventListener('mousedown', outside); document.removeEventListener('keydown', key); };
+  }, [at]);
+  return <span className="hs-actions" ref={wrap}>
+    <button type="button" aria-haspopup="menu" aria-expanded={!!at} aria-label={`Actions for ${label}`} title="Actions" onClick={e => {
+      // Fixed position: the list scrolls and would clip a menu placed inside it
+      const box = e.currentTarget.getBoundingClientRect();
+      setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
+    }}><MoreHorizontal size={14}/></button>
+    {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }}>
+      {actions.map(a => <button key={a.label} type="button" role="menuitem" onClick={() => { setAt(null); a.run(); }}>{a.icon} {a.label}</button>)}
+    </div>}
+  </span>;
+}
 
 /**
  * Agent terminals hosted by the runner. They keep running when this view, the
@@ -27,6 +52,9 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
   const [resumable, setResumable] = useState<Resumable[]>([]);
   const [resume, setResume] = useState('');
   const [copied, setCopied] = useState(false);
+  const [referenced, setReferenced] = useState('');
+  // Sessions the person closed: once they have ended they leave the list too
+  const closing = useRef(new Set<string>());
   const openedFolders = useStore(s => s.directories);
   const mounted = useRef(true);
 
@@ -81,6 +109,51 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
     finally { setStarting(false); }
   };
   const act = (fn: () => Promise<void>) => { fn().then(refresh).catch(e => setError(err(e))); };
+  const forget = (id: string) => act(async () => { await harnessApi.forget(id); closing.current.delete(id); setOpened(o => o.filter(x => x !== id)); setSelected(s => s === id ? '' : s); });
+  /** One step to be rid of a session: it is ended, then dropped from the list with its output. */
+  const close = (h: Hosted) => {
+    if (h.exit) { forget(h.id); return; }
+    closing.current.add(h.id);
+    act(() => harnessApi.signal(h.id, 'HUP'));
+  };
+  useEffect(() => { hosted.filter(h => h.exit && closing.current.has(h.id)).forEach(h => forget(h.id)); }, [hosted]); // eslint-disable-line react-hooks/exhaustive-deps
+  const copyReference = (h: Hosted) => {
+    navigator.clipboard.writeText(sessionReference(h)).then(() => { setReferenced(h.id); setTimeout(() => setReferenced(r => r === h.id ? '' : r), 1500); }).catch(e => setError(err(e)));
+  };
+  const actions = (h: Hosted): Action[] => [
+    { label: 'Copy reference', icon: <Copy size={13}/>, run: () => copyReference(h) },
+    { label: h.exit ? 'Remove from the list' : 'Close session', icon: <X size={13}/>, run: () => close(h) },
+  ];
+  const groups = useMemo(() => groupSessions(sorted), [sorted]);
+  const row = (h: Hosted) => {
+    const state = hostedState(h);
+    const label = hostedLabel(h);
+    const detail = h.exit
+      ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
+      : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', referenced === h.id ? 'reference copied' : ''].filter(Boolean).join(' · ');
+    const subs = (h.subagents ?? []).filter(a => !a.finished);
+    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) ? 'idle' : ''].filter(Boolean).join(' ')}>
+      <button className="hs-item" onClick={() => select(h.id)} title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}`}>
+        <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
+        <span className="hs-item-text">
+          <strong><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label} · {base(h.cwd)}</strong>
+          {detail && <small>{detail}</small>}
+          {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
+          {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
+        </span>
+      </button>
+      <RowMenu label={label} actions={actions(h)}/>
+      {subs.length > 0 && <ul className="hs-subs" aria-label={`Subagents of ${label}`}>
+        {subs.map(a => {
+          const live = subagentActive(a, Date.now());
+          return <li key={a.id} className={live ? 'active' : ''} title={[a.agentType, a.model, live ? 'active' : `quiet, last activity ${formatAge(a.lastActivity)}`, `started ${formatAge(a.started)}`].filter(Boolean).join(' · ')}>
+            <span className={`hs-dot ${live ? 'working' : ''}`} aria-label={live ? 'active' : 'quiet'}/>
+            <span className="hs-item-text"><strong>{a.description || `Subagent ${a.id.slice(0, 8)}`}</strong></span>
+          </li>;
+        })}
+      </ul>}
+    </li>;
+  };
 
   return <div className="hs-live">
     <aside className="hs-list" aria-label="Hosted sessions">
@@ -89,16 +162,14 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
           title="A Claude session wired to this harness: it sees and directs all the other sessions. It cannot answer their permission prompts; only you can.">
           <Radar size={18}/>
           <span className="hs-item-text">
-            <strong>{supervisor ? 'Supervisor' : 'Open supervisor'}</strong>
-            <small>{supervisor ? `${STATE_LABEL[hostedState(supervisor)]} · pid ${supervisor.pid ?? '?'}${supervisor.lastOutput ? ` · output ${formatAge(supervisor.lastOutput)}` : ''}` : 'Sees and directs all sessions'}</small>
+            <strong>{supervisor ? 'Supervisor' : 'Open supervisor'}{supervisor && <span className={`hs-dot ${hostedState(supervisor)}`} aria-label={STATE_LABEL[hostedState(supervisor)]}/>}</strong>
+            {!supervisor && <small>Sees and directs all sessions</small>}
+            {supervisor && referenced === supervisor.id && <small>reference copied</small>}
             {supervisor && needsYou(supervisor) && <small className="hs-needs">{supervisor.harness?.attention?.text}</small>}
             {supervisor?.harness?.status && <small className="hs-status">{supervisor.harness.status}</small>}
           </span>
         </button>
-        {supervisor && <span className="hs-actions">
-          <button title="Interrupt (Ctrl-C to the foreground process)" aria-label="Interrupt the supervisor" onClick={() => act(() => harnessApi.signal(supervisor.id, 'INT'))}><Zap size={13}/></button>
-          <button title="Stop the supervisor session" aria-label="Stop the supervisor" onClick={() => act(() => harnessApi.signal(supervisor.id, 'HUP'))}><Square size={13}/></button>
-        </span>}
+        {supervisor && <RowMenu label="the supervisor" actions={actions(supervisor)}/>}
       </div>
       <form className="hs-new" onSubmit={e => { e.preventDefault(); void start(); }}>
         <div className="hs-new-row">
@@ -120,40 +191,10 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
       {waiting.length > 0 && <p className="hs-attention" role="status"><BellRing size={12}/> {waiting.length === 1 ? '1 session is waiting for you' : `${waiting.length} sessions are waiting for you`}</p>}
       {error && <div className="hs-error" role="alert">{error}</div>}
       <ul>
-        {sorted.map(h => {
-          const state = hostedState(h);
-          const label = hostedLabel(h);
-          return <li key={h.id} className={`${h.id === selected ? 'selected' : ''}${needsYou(h) ? ' needs-you' : ''}`}>
-            <button className="hs-item" onClick={() => select(h.id)} title={`${h.argv.join(' ')}\n${h.cwd}`}>
-              <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
-              <span className="hs-item-text">
-                <strong><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label} · {base(h.cwd)}</strong>
-                <small>{h.exit ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}` : `${STATE_LABEL[state]}${h.openTasks ? ` · ${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : ''}${h.unread ? ` · ${h.unread} unread` : ''} · pid ${h.pid ?? '?'}${h.lastOutput ? ` · output ${formatAge(h.lastOutput)}` : ''}`}</small>
-                {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
-                {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
-                {h.title && !h.title.includes(label) && <small className="hs-title">{h.title}</small>}
-              </span>
-            </button>
-            <span className="hs-actions">
-              {!h.exit && <button title="Interrupt (Ctrl-C to the foreground process)" aria-label="Interrupt" onClick={() => act(() => harnessApi.signal(h.id, 'INT'))}><Zap size={13}/></button>}
-              {!h.exit && <button title="Stop the session (hangup, as when a terminal window closes)" aria-label="Stop" onClick={() => act(() => harnessApi.signal(h.id, 'HUP'))}><Square size={13}/></button>}
-              {h.exit && <button title="Forget this session and its output" aria-label="Forget" onClick={() => act(async () => { await harnessApi.forget(h.id); setOpened(o => o.filter(x => x !== h.id)); if (selected === h.id) setSelected(''); })}><Trash2 size={13}/></button>}
-            </span>
-            {!!h.subagents?.length && <ul className="hs-subs" aria-label={`Subagents of ${hostedLabel(h)}`}>
-              {h.subagents.filter(a => !a.finished).map(a => {
-                const live = subagentActive(a, Date.now());
-                return <li key={a.id} className={live ? 'active' : ''} title={`${a.description || a.id}\nStarted ${formatAge(a.started)}`}>
-                  <span className={`hs-dot ${live ? 'working' : ''}`} aria-label={live ? 'active' : 'quiet'}/>
-                  <span className="hs-item-text">
-                    <strong>{a.description || `Subagent ${a.id.slice(0, 8)}`}</strong>
-                    <small>{[a.agentType, a.model, live ? 'active' : `quiet, last activity ${formatAge(a.lastActivity)}`].filter(Boolean).join(' · ')}</small>
-                  </span>
-                </li>;
-              })}
-              {h.subagents.some(a => a.finished) && <li className="hs-subs-done" title={h.subagents.filter(a => a.finished).map(a => a.description || a.id).join('\n')}>{`${h.subagents.filter(a => a.finished).length} finished in the last hour`}</li>}
-            </ul>}
-          </li>;
-        })}
+        {groups.map(group => group.length === 1 ? row(group[0])
+          : <li key={`group-${group[0].id}`} className="hs-group" title="These sessions exchanged messages in the last day">
+            <ul aria-label="Sessions in contact">{group.map(row)}</ul>
+          </li>)}
       </ul>
       {!hosted.length && status && <p className="hs-empty">No hosted sessions. Start one above; it keeps running when you close the app.</p>}
       <footer className="hs-footer">

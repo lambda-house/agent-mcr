@@ -24,6 +24,8 @@ export interface Hosted {
   harness?: Tracked; openTasks?: number;
   /** Messages from other sessions it hasn't read yet */
   unread?: number;
+  /** Live sessions it exchanged messages with in the last day (ids) */
+  peers?: string[];
   /** Subagents active in the last hour, newest first */
   subagents?: Subagent[];
 }
@@ -103,3 +105,35 @@ export function pastedImage(data: DataTransfer | null): File | null {
 
 /** A subagent that wrote to its transcript this recently counts as active. */
 export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;
+
+/**
+ * The list in groups: sessions that exchanged messages stand together, in the
+ * place of the first of them. A session that talked to nobody is a group of one.
+ */
+export function groupSessions(list: Hosted[]): Hosted[][] {
+  const live = new Map(list.filter(h => !h.exit).map(h => [h.id, h]));
+  const seen = new Set<string>();
+  const groups: Hosted[][] = [];
+  for (const h of list) {
+    if (seen.has(h.id)) continue;
+    const members = new Set<string>([h.id]);
+    const queue = h.exit ? [] : [h];
+    for (let next = queue.shift(); next; next = queue.shift()) {
+      for (const id of next.peers ?? []) {
+        const peer = live.get(id);
+        if (peer && !members.has(id)) { members.add(id); queue.push(peer); }
+      }
+    }
+    members.forEach(id => seen.add(id));
+    groups.push(list.filter(x => members.has(x.id)));
+  }
+  return groups;
+}
+
+const KIND: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', shell: 'shell' };
+
+/** What to paste into another session so its agent can reach this one. */
+export function sessionReference(h: Hosted): string {
+  const kind = KIND[h.harness?.profile || h.meta.profile || ''] ?? 'agent';
+  return `Agent MCR session "${hostedLabel(h)}" (${kind}, id ${h.id}, pid ${h.pid ?? 'unknown'}, folder ${h.cwd}). Reach it with the mcr tools: ask or send_message with to "${h.id}".`;
+}

@@ -37,14 +37,47 @@ describe('Live workspace', () => {
     expect(items).toEqual(['Fixing tests · repo', 'Shell · repo']);
     expect([...host.querySelectorAll('.hs-item .hs-mark')].map(e => e.getAttribute('aria-label'))).toEqual(['Claude Code', 'Shell']);
     expect(host.querySelector('.hs-title')).toBeNull();
-    expect(host.textContent).toContain('running · pid 42');
+    // The dot carries the state; pid and output age are not in the row
+    expect(host.querySelector('.hs-list ul')?.textContent).not.toMatch(/pid|output|running/);
+    expect(host.querySelector('.hs-dot.running')?.getAttribute('aria-label')).toBe('running');
     expect(host.textContent).toContain('exited with 0');
     expect(host.textContent).toContain('Runner pid 7 · 1 running');
-    expect(host.querySelectorAll('button[aria-label="Interrupt"]')).toHaveLength(1);
-    expect(host.querySelectorAll('button[aria-label="Forget"]')).toHaveLength(1);
-    vi.mocked(harnessApi.signal).mockResolvedValue();
-    await act(async () => button('Interrupt').click()); await flush();
-    expect(harnessApi.signal).toHaveBeenCalledWith('r1', 'INT');
+    expect(host.querySelectorAll('.hs-list ul > li')[1].className).toContain('idle');
+  });
+
+  it('has one action menu per row: copy a reference, or close the session for good', async () => {
+    const copy = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: copy }, configurable: true });
+    vi.mocked(harnessApi.signal).mockResolvedValue(); vi.mocked(harnessApi.forget).mockResolvedValue();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(host.querySelectorAll('.hs-list ul .hs-actions button')).toHaveLength(2);
+    expect(host.querySelector('[role="menu"]')).toBeNull();
+    const item = (text: string) => [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes(text)) as HTMLButtonElement;
+    await act(async () => button('Actions for Fixing tests').click());
+    expect([...host.querySelectorAll('[role="menuitem"]')].map(b => b.textContent?.trim())).toEqual(['Copy reference', 'Close session']);
+    await act(async () => item('Copy reference').click()); await flush();
+    expect(copy.mock.calls[0][0]).toBe('Agent MCR session "Fixing tests" (Claude Code, id r1, pid 42, folder /work/repo). Reach it with the mcr tools: ask or send_message with to "r1".');
+    expect(host.querySelector('[role="menu"]')).toBeNull();
+    // Close ends the session; once it has ended it is dropped without a second step
+    await act(async () => button('Actions for Fixing tests').click());
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...running, exit: { code: 0, signal: 'HUP', at: 4 } }]);
+    await act(async () => item('Close session').click()); await flush();
+    expect(harnessApi.signal).toHaveBeenCalledWith('r1', 'HUP');
+    expect(harnessApi.forget).toHaveBeenCalledWith('r1');
+    expect(harnessApi.forget).not.toHaveBeenCalledWith('e1');
+    // A session that ended by itself stays until removed
+    await act(async () => button('Actions for Shell').click());
+    await act(async () => item('Remove from the list').click()); await flush();
+    expect(harnessApi.forget).toHaveBeenCalledWith('e1');
+  });
+
+  it('keeps sessions that talk to each other together', async () => {
+    const s = (id: string, started: number, peers: string[]): Hosted => ({ ...running, id, started, title: id, peers });
+    vi.mocked(harnessApi.list).mockResolvedValue([s('lone', 4, []), s('exec', 3, ['review']), s('other', 2, []), s('review', 1, ['exec'])]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const top = [...host.querySelectorAll('.hs-list > ul > li')];
+    expect(top.map(li => li.className)).toEqual(['', 'hs-group', '']);
+    expect([...top[1].querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim())).toEqual(['exec · repo', 'review · repo']);
   });
 
   it('starts a profile in the chosen folder and opens its terminal', async () => {
@@ -62,7 +95,7 @@ describe('Live workspace', () => {
     const blocked: Hosted = { ...running, id: 'b1', cwd: '/work/api', harness: { ...tracked, name: 'reviewer', state: 'waiting', attention: { kind: 'permission', text: 'Claude needs your permission to use Bash', since: 5 } } };
     vi.mocked(harnessApi.list).mockResolvedValue([working, blocked]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    expect(host.textContent).toContain('working · 2 tasks · pid 42');
+    expect(host.textContent).toContain('2 tasks');
     expect(host.querySelector('.hs-dot.waiting')?.getAttribute('aria-label')).toBe('waiting for you');
     // One row per session: the waiting one is first and says why, with no second card for it
     expect(host.querySelector('.hs-attention')?.textContent).toContain('1 session is waiting for you');
@@ -92,11 +125,11 @@ describe('Live workspace', () => {
     expect(host.textContent).toContain('2 unread');
     expect(host.querySelector('.hs-status')?.textContent).toBe('running the regrade');
     const subs = [...host.querySelectorAll('.hs-subs li')];
-    // Finished ones are only counted
-    expect(subs.map(li => li.className)).toEqual(['active', '', 'hs-subs-done']);
-    expect(subs[2].textContent).toBe('1 finished in the last hour');
-    expect(subs[0].textContent).toBe('MEM-653 false-premise templategeneral-purpose · sonnet · active');
-    expect(subs[1].textContent).toBe('Subagent b2b2b2b2Explore · quiet, last activity just now');
+    // Finished ones are not shown; the rest are one line each, details in the tooltip
+    expect(subs.map(li => li.className)).toEqual(['active', '']);
+    expect(subs[0].textContent).toBe('MEM-653 false-premise template');
+    expect(subs[0].getAttribute('title')).toContain('general-purpose · sonnet · active');
+    expect(subs[1].textContent).toBe('Subagent b2b2b2b2');
     // A subagent has no terminal: its row is not a button
     expect(subs[0].querySelector('button')).toBeNull();
   });
@@ -115,7 +148,7 @@ describe('Live workspace', () => {
     expect(host.querySelector('.hs-supervisor')?.className).toContain('running selected');
     expect(host.querySelector('.hs-supervisor strong')?.textContent).toBe('Supervisor');
     expect(host.querySelectorAll('.hs-list ul > li')).toHaveLength(2);
-    expect(button('Stop the supervisor')).not.toBeNull();
+    expect(button('Actions for the supervisor')).not.toBeNull();
     // A second click selects the running one instead of starting another
     await act(async () => (host.querySelector('.hs-supervisor-open') as HTMLButtonElement).click()); await flush();
     expect(harnessApi.supervisor).toHaveBeenCalledTimes(1);

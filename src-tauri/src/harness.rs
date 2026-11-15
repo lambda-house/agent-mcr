@@ -569,6 +569,9 @@ struct Store {
     sessions: BTreeMap<String, Tracked>,
     tasks: BTreeMap<String, Task>,
     messages: BTreeMap<String, Message>,
+    /// Connected `mcr` bridges per session; `Tracked.tools` follows it
+    #[serde(skip)]
+    bridges: BTreeMap<String, usize>,
     #[serde(skip)]
     version: u64,
 }
@@ -615,6 +618,19 @@ impl Store {
 
     fn unread(&self, session: &str) -> usize {
         self.messages.values().filter(|m| m.to == session && m.read == 0).count()
+    }
+
+    /// The live sessions this one exchanged messages with in the last day.
+    fn talked_with(&self, session: &str, live: &BTreeSet<&str>) -> Vec<String> {
+        let since = now_ms().saturating_sub(24 * 3_600_000);
+        let peers: BTreeSet<&str> = self
+            .messages
+            .values()
+            .filter(|m| m.created >= since)
+            .filter_map(|m| if m.from == session { Some(m.to.as_str()) } else if m.to == session { Some(m.from.as_str()) } else { None })
+            .filter(|p| *p != session && live.contains(p))
+            .collect();
+        peers.into_iter().map(String::from).collect()
     }
 
     /// The peers this session asked and has no reply from yet.
@@ -820,7 +836,9 @@ fn notify_user(title: &str, text: &str) {
 
 impl Harness {
     fn open(dir: &Path) -> Self {
-        let store = std::fs::read(dir.join("harness-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut store: Store = std::fs::read(dir.join("harness-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // No bridge is connected to a service that just started; they come back on their own
+        store.sessions.values_mut().for_each(|t| t.tools = false);
         Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0) }
     }
 
@@ -915,6 +933,7 @@ impl Harness {
                 out["harness"] = json!(tracked);
                 out["openTasks"] = json!(open);
                 out["unread"] = json!(store.unread(id));
+                out["peers"] = json!(store.talked_with(id, &ids));
                 if let (true, Some(home), Some(transcript)) = (info["exit"].is_null(), &home, &tracked.transcript) {
                     out["subagents"] = json!(subagents(home, transcript, recent));
                 }
@@ -1344,29 +1363,38 @@ impl Harness {
     fn agent(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream, mcp_client: bool) -> std::io::Result<()> {
         // Refused callers still get a working MCP server whose tools say why
         let me = self.caller(&writer);
-        if let (true, Ok(id)) = (mcp_client, &me) {
-            if lock(&self.store).sessions.get(id).is_some_and(|t| !t.tools) {
+        // The session has the tools for as long as a bridge of its is connected
+        let bridged = |by: isize| {
+            if let (true, Ok(id)) = (mcp_client, &me) {
                 self.update(|s| {
+                    let count = s.bridges.entry(id.clone()).or_default();
+                    *count = count.saturating_add_signed(by);
+                    let tools = *count > 0;
                     if let Some(t) = s.sessions.get_mut(id) {
-                        t.tools = true;
+                        t.tools = tools;
                     }
                 });
             }
-        }
+        };
+        bridged(1);
         let mut protocol = Protocol::default();
-        loop {
+        let result = loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
-                Ok(None) | Err(_) => return Ok(()),
+                Ok(None) | Err(_) => break Ok(()),
             };
             let call = |name: &str, args: Value| match &me {
                 Ok(me) => self.agent_tool(me, name, &args),
                 Err(e) => Err(e.clone()),
             };
             if let Some(reply) = protocol.dispatch_for(&AGENT, frame, call) {
-                writeln!(writer, "{reply}")?;
+                if let Err(e) = writeln!(writer, "{reply}") {
+                    break Err(e);
+                }
             }
-        }
+        };
+        bridged(-1);
+        result
     }
 
     fn assign(&self, session: &str, text: &str) -> Result<Task, String> {
@@ -2388,5 +2416,19 @@ mod tests {
         let reply = line(&mut from_bridge);
         assert_eq!(reply["id"], 3, "the replayed handshake's answer must not reach the agent: {reply}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peers_are_the_live_sessions_a_session_exchanged_messages_with() {
+        let mut s = Store::default();
+        let say = |s: &mut Store, from: &str, to: &str| { s.post(Message { from: from.into(), to: to.into(), text: "hi".into(), ..Message::default() }); };
+        say(&mut s, "a", "b");
+        say(&mut s, "c", "a");
+        say(&mut s, "a", "gone");
+        let live: BTreeSet<&str> = ["a", "b", "c"].into();
+        assert_eq!(s.talked_with("a", &live), ["b", "c"]);
+        assert_eq!(s.talked_with("b", &live), ["a"]);
+        s.messages.values_mut().for_each(|m| m.created = 1);
+        assert!(s.talked_with("a", &live).is_empty(), "old conversations no longer group sessions");
     }
 }
