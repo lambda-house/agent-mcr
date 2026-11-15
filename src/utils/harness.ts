@@ -37,6 +37,8 @@ export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume }),
+  /** The hosted supervisor session: the running one, or a new one */
+  supervisor: (cols: number, rows: number) => invoke<Hosted>('harness_supervisor', { cols, rows }),
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
   /** The person looked at a session's notification */
   ack: (id: string) => invoke<void>('harness_ack', { id }),
@@ -58,6 +60,8 @@ export const harnessApi = {
 export function shellQuote(path: string): string {
   return path.replace(/([^A-Za-z0-9_\-.,:/@+=%^~])/g, '\\$1');
 }
+
+export const isSupervisor = (h: Hosted) => h.meta.role === 'supervisor';
 
 export function hostedLabel(h: Hosted): string {
   return h.harness?.name || h.meta.name || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;

@@ -116,6 +116,12 @@ pub async fn harness_spawn(
     blocking(move || service(json!({"op": "create", "profile": profile, "cwd": dir.display().to_string(), "cols": cols, "rows": rows}))).await
 }
 
+/// Open the hosted supervisor session (the running one, or a new one).
+#[tauri::command]
+pub async fn harness_supervisor(cols: u16, rows: u16) -> Result<Value, String> {
+    blocking(move || service(json!({"op": "supervisor", "cols": cols, "rows": rows}))).await
+}
+
 fn valid_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err("Invalid session id".into());

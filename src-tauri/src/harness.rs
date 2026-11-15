@@ -32,6 +32,8 @@ const MAX_MESSAGE_TEXT: usize = 20_000;
 const MAX_SENT: usize = 40;
 /// The name agents see the harness tools under (`mcp__mcr__…` in Claude Code)
 pub const AGENT_SERVER: &str = "mcr";
+/// The name the hosted supervisor session sees the supervisor tools under
+pub const SUPERVISOR_SERVER: &str = "supervisor";
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -164,19 +166,28 @@ pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
 
 /// Claude Code hooks for one launch (`--settings`): each reports to this
 /// service and prints nothing, so it never changes what the agent does.
-pub fn claude_settings(exe: &str) -> Value {
+pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
     let hook = |event: &str| json!([{ "hooks": [{ "type": "command", "command": format!("{} --harness-hook {event}", sh(exe)), "timeout": 5 }] }]);
     let mut hooks = serde_json::Map::new();
     for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop"] {
         hooks.insert(event.into(), hook(event));
     }
     // The harness tools need no approval: they only reach other sessions' inboxes
-    json!({ "hooks": hooks, "permissions": { "allow": [format!("mcp__{AGENT_SERVER}")] } })
+    let mut allow = vec![format!("mcp__{AGENT_SERVER}")];
+    if supervisor {
+        // D5: the supervisor has the whole harness, without a question per tool
+        allow.push(format!("mcp__{SUPERVISOR_SERVER}"));
+    }
+    json!({ "hooks": hooks, "permissions": { "allow": allow } })
 }
 
 /// Claude Code MCP config for one launch (`--mcp-config`): the harness tools.
-pub fn claude_mcp(exe: &str) -> Value {
-    json!({ "mcpServers": { AGENT_SERVER: { "command": exe, "args": ["--harness-mcp"] } } })
+pub fn claude_mcp(exe: &str, supervisor: bool) -> Value {
+    let mut servers = json!({ AGENT_SERVER: { "command": exe, "args": ["--harness-mcp"] } });
+    if supervisor {
+        servers[SUPERVISOR_SERVER] = json!({ "command": exe, "args": ["--supervise"] });
+    }
+    json!({ "mcpServers": servers })
 }
 
 /// A transcript that `claude --resume` / `codex resume` can continue.
@@ -805,7 +816,22 @@ impl Harness {
         self.sessions()?.into_iter().find(|s| s["id"] == id).ok_or_else(|| format!("No session {id}"))
     }
 
+    /// The hosted supervisor session: the one already running, or a new one.
+    /// A Claude session in its own folder with the supervisor tools wired in.
+    fn supervisor(&self, req: &Value) -> Result<Value, String> {
+        if let Some(live) = self.sessions()?.into_iter().find(|s| s["exit"].is_null() && s["meta"]["role"] == "supervisor") {
+            return Ok(live);
+        }
+        let folder = self.dir.join("supervisor");
+        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+        self.create_as(&json!({"profile": "claude", "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true)
+    }
+
     fn create(&self, req: &Value) -> Result<Value, String> {
+        self.create_as(req, false)
+    }
+
+    fn create_as(&self, req: &Value, supervisor: bool) -> Result<Value, String> {
         let home = dirs::home_dir().ok_or("Home directory unavailable")?;
         let resume = req["resume"].as_str().filter(|s| !s.is_empty());
         let found = match resume {
@@ -840,16 +866,16 @@ impl Harness {
             return Err("The task is too long".into());
         }
         let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
-        let settings = self.dir.join("claude-hooks.json");
+        let settings = self.dir.join(if supervisor { "claude-supervisor-hooks.json" } else { "claude-hooks.json" });
         if profile == "claude" {
-            let content = serde_json::to_vec_pretty(&claude_settings(&exe)).map_err(|e| e.to_string())?;
+            let content = serde_json::to_vec_pretty(&claude_settings(&exe, supervisor)).map_err(|e| e.to_string())?;
             if std::fs::read(&settings).ok().as_deref() != Some(content.as_slice()) {
                 std::fs::write(&settings, content).map_err(|e| e.to_string())?;
             }
         }
-        let mcp = self.dir.join("claude-mcp.json");
+        let mcp = self.dir.join(if supervisor { "claude-supervisor-mcp.json" } else { "claude-mcp.json" });
         if profile == "claude" {
-            let content = serde_json::to_vec_pretty(&claude_mcp(&exe)).map_err(|e| e.to_string())?;
+            let content = serde_json::to_vec_pretty(&claude_mcp(&exe, supervisor)).map_err(|e| e.to_string())?;
             if std::fs::read(&mcp).ok().as_deref() != Some(content.as_slice()) {
                 std::fs::write(&mcp, content).map_err(|e| e.to_string())?;
             }
@@ -872,6 +898,9 @@ impl Harness {
         }
         if resume.is_some() {
             meta["resumed"] = json!("true");
+        }
+        if supervisor {
+            meta["role"] = json!("supervisor");
         }
         self.runner(json!({
             "op": "spawn",
@@ -1346,6 +1375,7 @@ impl Harness {
             })),
             "sessions" => Ok(json!({ "sessions": self.sessions()? })),
             "create" => self.create(req),
+            "supervisor" => self.supervisor(req),
             "hook" => {
                 self.hook(req["session"].as_str().unwrap_or(""), req["event"].as_str().unwrap_or(""), &req["payload"]);
                 Ok(json!({}))
@@ -1504,13 +1534,22 @@ impl Harness {
     }
 
     fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
+        // An ordinary hosted session can't take over the harness by accident:
+        // of the hosted ones, only the supervisor session gets these tools
+        let refused = self.caller(&writer).ok().and_then(|id| self.session(&id).ok()).is_some_and(|s| s["meta"]["role"] != "supervisor");
         let mut protocol = Protocol::default();
         loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
                 Ok(None) | Err(_) => return Ok(()),
             };
-            if let Some(reply) = protocol.dispatch_for(&SUPERVISOR, frame, |name, args| self.tool(name, &args)) {
+            let call = |name: &str, args: Value| {
+                if refused {
+                    return Err("Refused: this is a worker session. Only the Supervisor session and agents outside the harness have the supervisor tools; use the mcr tools to reach other sessions.".into());
+                }
+                self.tool(name, &args)
+            };
+            if let Some(reply) = protocol.dispatch_for(&SUPERVISOR, frame, call) {
                 writeln!(writer, "{reply}")?;
             }
         }
@@ -1778,7 +1817,7 @@ mod tests {
         assert!(command_line(&launch("rm -rf /")).is_err());
         let argv = argv_for(&launch("claude")).unwrap();
         assert_eq!(&argv[1..4], &["-l", "-i", "-c"]);
-        let hooks = claude_settings("/Apps/Agent MCR.app/agent-mcr");
+        let hooks = claude_settings("/Apps/Agent MCR.app/agent-mcr", false);
         assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "'/Apps/Agent MCR.app/agent-mcr' --harness-hook Stop");
     }
 
@@ -1856,8 +1895,12 @@ mod tests {
         assert_eq!(claude, "exec claude --permission-mode acceptEdits --mcp-config '/cfg dir/claude-mcp.json' --settings '/cfg dir/claude-hooks.json'");
         let codex = command_line(&launch("codex")).unwrap();
         assert!(codex.contains(" -c 'mcp_servers.mcr.command=\"/Apps/Agent MCR.app/agent-mcr\"' -c 'mcp_servers.mcr.args=[\"--harness-mcp\"]'"), "{codex}");
-        assert_eq!(claude_settings("/x")["permissions"]["allow"][0], "mcp__mcr");
-        assert_eq!(claude_mcp("/x")["mcpServers"]["mcr"]["args"][0], "--harness-mcp");
+        assert_eq!(claude_settings("/x", false)["permissions"]["allow"], json!(["mcp__mcr"]));
+        assert_eq!(claude_mcp("/x", false)["mcpServers"]["mcr"]["args"][0], "--harness-mcp");
+        // Only the supervisor session is given the supervisor tools
+        assert!(claude_mcp("/x", false)["mcpServers"]["supervisor"].is_null());
+        assert_eq!(claude_mcp("/x", true)["mcpServers"]["supervisor"]["args"][0], "--supervise");
+        assert_eq!(claude_settings("/x", true)["permissions"]["allow"], json!(["mcp__mcr", "mcp__supervisor"]));
     }
 
     #[test]

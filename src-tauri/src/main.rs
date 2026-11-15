@@ -1778,6 +1778,7 @@ fn main() {
             harness_commands::harness_status,
             harness_commands::harness_list,
             harness_commands::harness_spawn,
+            harness_commands::harness_supervisor,
             harness_commands::harness_resumable,
             harness_commands::harness_ack,
             harness_commands::harness_signal,

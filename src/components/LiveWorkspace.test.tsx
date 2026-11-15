@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LiveWorkspace from './LiveWorkspace';
 import { harnessApi, type Hosted } from '../utils/harness';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), resumable: vi.fn(), ack: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), resumable: vi.fn(), ack: vi.fn(), supervisor: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // Terminals need a real canvas; the pane itself is exercised in the app
@@ -96,6 +96,22 @@ describe('Live workspace', () => {
     expect(subs[1].textContent).toBe('Subagent b2b2b2b2Explore · quiet, last activity just now');
     // A subagent has no terminal: its row is not a button
     expect(subs[0].querySelector('button')).toBeNull();
+  });
+
+  it('opens the supervisor with one click and keeps it on top', async () => {
+    const boss: Hosted = { ...running, id: 'sup1', started: 1, meta: { profile: 'claude', name: 'Supervisor', role: 'supervisor' } };
+    vi.mocked(harnessApi.supervisor).mockResolvedValue(boss);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const button = host.querySelector('.hs-supervisor') as HTMLButtonElement;
+    expect(button.textContent).toContain('Open supervisor');
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, running, boss]);
+    await act(async () => button.click()); await flush();
+    expect(harnessApi.supervisor).toHaveBeenCalledWith(120, 32);
+    expect(host.querySelector('[data-terminal="sup1"]')).not.toBeNull();
+    expect(host.querySelector('.hs-list li')?.className).toContain('supervisor');
+    // A second click selects the running one instead of starting another
+    await act(async () => (host.querySelector('.hs-supervisor') as HTMLButtonElement).click()); await flush();
+    expect(harnessApi.supervisor).toHaveBeenCalledTimes(1);
   });
 
   it('resumes an earlier session from its transcript, not from the form', async () => {

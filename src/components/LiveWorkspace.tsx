@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BellRing, Copy, FolderOpen, Play, Square, Trash2, Zap } from 'lucide-react';
+import { BellRing, Copy, FolderOpen, Play, Radar, Square, Trash2, Zap } from 'lucide-react';
 import TerminalPane from './TerminalPane';
-import { harnessApi, hostedLabel, hostedState, maybeOpenElsewhere, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { useStore } from '../store';
@@ -57,9 +57,9 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
   };
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...openedFolders, ...recentDirectories].filter(Boolean))].slice(0, 40), [status, openedFolders, recentDirectories]);
-  // Sessions that need the person come first, ended ones last
+  // The supervisor is always first; then sessions that need the person; ended ones last
   const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
-  const sorted = useMemo(() => [...hosted].sort((a, b) => Number(needsYou(b)) - Number(needsYou(a)) || Number(!!a.exit) - Number(!!b.exit) || b.started - a.started), [hosted]);
+  const sorted = useMemo(() => [...hosted].sort((a, b) => Number(!b.exit && isSupervisor(b)) - Number(!a.exit && isSupervisor(a)) || Number(needsYou(b)) - Number(needsYou(a)) || Number(!!a.exit) - Number(!!b.exit) || b.started - a.started), [hosted]);
   const running = hosted.filter(h => !h.exit).length;
 
   const start = async () => {
@@ -71,10 +71,23 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
     catch (e) { setError(err(e)); }
     finally { setStarting(false); }
   };
+  const supervisor = hosted.find(h => !h.exit && isSupervisor(h));
+  const openSupervisor = async () => {
+    if (supervisor) { select(supervisor.id); return; }
+    setStarting(true); setError('');
+    try { const h = await harnessApi.supervisor(120, 32); await refresh(); select(h.id); }
+    catch (e) { setError(err(e)); }
+    finally { setStarting(false); }
+  };
   const act = (fn: () => Promise<void>) => { fn().then(refresh).catch(e => setError(err(e))); };
 
   return <div className="hs-live">
     <aside className="hs-list" aria-label="Hosted sessions">
+      <button type="button" className={`hs-supervisor${supervisor ? ' running' : ''}${supervisor && supervisor.id === selected ? ' selected' : ''}`} disabled={!status || starting} onClick={() => void openSupervisor()}
+        title="A Claude session wired to this harness: it sees and directs all the other sessions. It cannot answer their permission prompts; only you can.">
+        <Radar size={14}/> <span>{supervisor ? 'Supervisor' : 'Open supervisor'}</span>
+        {supervisor && <small>{STATE_LABEL[hostedState(supervisor)]}</small>}
+      </button>
       <form className="hs-new" onSubmit={e => { e.preventDefault(); void start(); }}>
         <div className="hs-new-row">
           <select aria-label="Launch profile" value={profile} disabled={!!resume} onChange={e => setProfile(e.target.value)}>
@@ -97,7 +110,7 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
       <ul>
         {sorted.map(h => {
           const state = hostedState(h);
-          return <li key={h.id} className={`${h.id === selected ? 'selected' : ''}${needsYou(h) ? ' needs-you' : ''}`}>
+          return <li key={h.id} className={`${h.id === selected ? 'selected' : ''}${needsYou(h) ? ' needs-you' : ''}${!h.exit && isSupervisor(h) ? ' supervisor' : ''}`}>
             <button className="hs-item" onClick={() => select(h.id)} title={`${h.argv.join(' ')}\n${h.cwd}`}>
               <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
               <span className="hs-item-text">
