@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 export interface Usage { input: number; cached: number; cacheWrite: number; output: number; reasoning: number }
+/** What a session's context holds; `toolBytes` is the size of tool output, not tokens. */
+export interface ContextStats { now: number; first: number; peak: number; window: number; compactions: number; toolBytes: Record<string, number>; skills: Record<string, number> }
 export interface SessionEvent { seq: number; at: string; kind: string; text: string; tool: string | null }
 export interface Session {
   id: string; provider: 'codex' | 'claude'; parentId: string | null; forkedFrom?: string | null; origin?: 'human' | 'subagent' | 'automation' | 'unknown'; directories?: string[]; name: string; cwd: string;
@@ -7,6 +9,7 @@ export interface Session {
   status: string; usage: Usage; usageKnown: boolean; models: Record<string, Usage>;
   tools: Record<string, number>; tickets: string[]; memoryRefs: string[]; events: SessionEvent[];
   eventCount: number; malformedLines: number; source: string; turnId: string;
+  context?: ContextStats;
 }
 export interface Snapshot { sessions: Session[]; errors: string[]; scannedFiles: number; pendingFiles: number; indexedAt: number; cachePath?: string | null; restoredFiles?: number; bytesRead?: number; currentDirectory?: string }
 export interface Connections { jiraSite: string; jiraEmail: string; jiraToken: string; memoryUrl: string; memoryToken: string }
@@ -24,6 +27,7 @@ export const sessionApi = {
   enable: () => invoke<boolean>('enable_sessions'),
   disable: () => invoke<void>('disable_sessions'),
   events: (provider: string, id: string, before: number) => invoke<SessionEvent[]>('session_events', { provider, id, before }),
+  stats: (provider: string, id: string) => invoke<Session>('session_stats', { provider, id }),
   detail: (provider: string, id: string) => invoke<Session>('session_details', { provider, id }),
   snapshot: () => invoke<Snapshot>('sessions_snapshot'),
   connections: () => invoke<ConnectionStatus>('session_connections'),

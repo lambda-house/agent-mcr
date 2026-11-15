@@ -352,6 +352,30 @@ pub async fn session_control(
     }).await.map_err(|e|e.to_string())?
 }
 
+/// Usage, tools and context figures of one session, for the Live view's
+/// stats pane. Same grant as the Sessions workspace; no transcript text.
+#[tauri::command]
+pub async fn session_stats(
+    provider: String,
+    id: String,
+    access: State<'_, AccessState>,
+    state: State<'_, SessionState>,
+) -> Result<sessions::Session, String> {
+    allowed(&access)?;
+    let index = state.index.clone();
+    let home = dirs::home_dir().ok_or("Home directory unavailable")?;
+    let cache = crate::get_config_dir().map_err(|e| e.message)?.join("sessions/index.sqlite");
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut i = index.lock().map_err(|_| "Index lock poisoned".to_string())?;
+        i.open_cache(&cache)?;
+        // Newest transcripts are read first, so a live session is current after one pass
+        i.scan(&home, None);
+        i.summary_of(&provider, &id).ok_or_else(|| "Not indexed yet".into())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn session_details(
     provider: String,

@@ -1812,6 +1812,7 @@ fn main() {
             session_commands::disable_sessions,
             session_commands::sessions_snapshot,
             session_commands::session_details,
+            session_commands::session_stats,
             session_commands::session_events,
             session_commands::session_memory_access,
             session_commands::enable_session_memories,

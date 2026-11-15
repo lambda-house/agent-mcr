@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BellRing, Copy, FolderOpen, MoreHorizontal, Play, Radar, RotateCw, X } from 'lucide-react';
+import { BarChart3, BellRing, Copy, FolderOpen, MoreHorizontal, Play, Radar, RotateCw, X } from 'lucide-react';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
+import SessionStats from './SessionStats';
 import { canRestart, groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, sessionReference, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -53,6 +54,9 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
   const [resume, setResume] = useState('');
   const [copied, setCopied] = useState(false);
   const [referenced, setReferenced] = useState('');
+  // The usage pane beside the terminal: open or closed is this viewer's preference
+  const [stats, setStats] = useState(() => { try { return localStorage.getItem('hs-stats') === '1'; } catch { return false; } });
+  const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
   // Sessions the person closed: once they have ended they leave the list too
   const closing = useRef(new Set<string>());
   const openedFolders = useStore(s => s.directories);
@@ -220,8 +224,12 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
           <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/>
           <strong>{isSupervisor(h) ? 'Supervisor' : hostedLabel(h)}</strong>
           <span title={h.cwd}>{h.cwd}</span>
+          <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>
         </header>
-        <TerminalPane id={h.id} active={active && h.id === selected}/>
+        <div className="hs-pane-body">
+          <TerminalPane id={h.id} active={active && h.id === selected}/>
+          {stats && h.id === selected && <SessionStats session={h} active={active}/>}
+        </div>
       </div>)}
       {!selected && <div className="hs-placeholder"><p>Select a session, or start one.</p></div>}
     </main>

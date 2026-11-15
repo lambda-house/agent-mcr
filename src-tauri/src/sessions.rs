@@ -3,7 +3,7 @@ use crate::session_db::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-pub const PARSER_VERSION: u32 = 3;
+pub const PARSER_VERSION: u32 = 4;
 pub fn digest(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -95,6 +95,37 @@ pub struct ToolFact {
     pub skill_observation: Option<String>,
     pub wrapper_references: Vec<String>,
 }
+/// What a session's context holds, as far as the transcript records it.
+/// Token counts are the model's own; `tool_bytes` is the size of what tools
+/// returned, which is not a token count.
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Context {
+    /// Input side of the latest model response: the context as it stands
+    pub now: u64,
+    /// Input side of the first response: prompt, tool definitions and skills before any work
+    pub first: u64,
+    pub peak: u64,
+    /// The model's context window, when the agent records it (Codex)
+    pub window: u64,
+    pub compactions: u64,
+    /// Bytes returned per tool
+    pub tool_bytes: BTreeMap<String, u64>,
+    /// Explicit skill invocations
+    pub skills: BTreeMap<String, u64>,
+}
+impl Context {
+    fn response(&mut self, input: u64) {
+        if input == 0 {
+            return;
+        }
+        self.now = input;
+        self.peak = self.peak.max(input);
+        if self.first == 0 {
+            self.first = input;
+        }
+    }
+}
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -121,6 +152,8 @@ pub struct Session {
     pub memory_refs: BTreeSet<String>,
     #[serde(default)]
     pub skill_observations: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    pub context: Context,
     pub events: VecDeque<Event>,
     #[serde(skip)]
     pending_events: Vec<Event>,
@@ -154,6 +187,7 @@ impl Session {
             tickets: self.tickets.clone(),
             memory_refs: self.memory_refs.clone(),
             skill_observations: self.skill_observations.clone(),
+            context: self.context.clone(),
             events: VecDeque::new(),
             pending_events: Vec::new(),
             event_count: self.event_count,
@@ -274,6 +308,9 @@ struct Indexed {
     modified: u64,
     session: Session,
     records: HashMap<String, Usage>,
+    /// Tool calls whose result hasn't been seen yet: call id → tool name
+    #[serde(default)]
+    calls: HashMap<String, String>,
     cumulative: Usage,
     has_records: bool,
     identity: String,
@@ -327,6 +364,7 @@ impl Indexed {
                 ..Session::default()
             },
             records: HashMap::new(),
+            calls: HashMap::new(),
             cumulative: Usage::default(),
             has_records: false,
             identity: String::new(),
@@ -346,6 +384,19 @@ impl Indexed {
         self.session.models.entry(model).or_default().add(&delta);
         self.session.usage_known = true;
     }
+    fn called(&mut self, call: &str, name: &str, fact: &ToolFact) {
+        if !call.is_empty() && self.calls.len() < 4096 {
+            self.calls.insert(call.into(), name.into());
+        }
+        if let (Some(skill), Some("explicit_invocation")) = (&fact.skill, fact.skill_observation.as_deref()) {
+            *self.session.context.skills.entry(skill.clone()).or_default() += 1;
+        }
+    }
+    fn returned(&mut self, call: &str, bytes: usize) {
+        if let Some(name) = self.calls.remove(call) {
+            *self.session.context.tool_bytes.entry(name).or_default() += bytes as u64;
+        }
+    }
     fn row(&mut self, r: Value) {
         let at = r["timestamp"].as_str().unwrap_or("");
         let kind = r["type"].as_str().unwrap_or("");
@@ -357,6 +408,13 @@ impl Indexed {
             }
         }
         if self.session.provider == "codex" {
+            if kind == "event_msg" && p["type"] == "token_count" {
+                let info = &p["info"];
+                if let Some(window) = info["model_context_window"].as_u64() {
+                    self.session.context.window = window;
+                }
+                self.session.context.response(info["last_token_usage"]["input_tokens"].as_u64().unwrap_or(0));
+            }
             match kind {
                 "session_meta" => {
                     // Forks embed their parent's metadata later: the FIRST metadata is authoritative.
@@ -390,7 +448,10 @@ impl Indexed {
                         }
                     }
                 }
-                "compacted" => self.session.event(at, "memory", strv(p, "message"), None),
+                "compacted" => {
+                    self.session.context.compactions += 1;
+                    self.session.event(at, "memory", strv(p, "message"), None)
+                }
                 "turn_context" => {
                     if let Some(cwd) = p["cwd"].as_str() {
                         self.session.cwd = cwd.into();
@@ -479,10 +540,12 @@ impl Indexed {
                             .unwrap_or("")
                             .to_string();
                         let fact = tool_fact(p, &args, &name, self.offset);
+                        self.called(p["call_id"].as_str().unwrap_or(""), &name, &fact);
                         self.session.tool_event(at, "tool", args, Some(name), fact);
                     }
                     "function_call_output" | "custom_tool_call_output" => {
                         let text = value_text(&p["output"]);
+                        self.returned(p["call_id"].as_str().unwrap_or(""), text.len());
                         let mut fact = tool_fact(p, &text, "", self.offset);
                         fact.exit_code = p["output"]["exit_code"]
                             .as_i64()
@@ -518,7 +581,11 @@ impl Indexed {
                 if model != "<synthetic>" && !model.is_empty() {
                     self.session.model = model.clone();
                     if m["usage"].is_object() {
-                        self.usage(strv(m, "id"), Usage::from(&m["usage"], true), model);
+                        let usage = Usage::from(&m["usage"], true);
+                        if r["isSidechain"] != true {
+                            self.session.context.response(usage.input);
+                        }
+                        self.usage(strv(m, "id"), usage, model);
                     }
                 }
                 self.session.status = if m["stop_reason"].as_str() == Some("end_turn") {
@@ -527,6 +594,9 @@ impl Indexed {
                     "working"
                 }
                 .into();
+            }
+            if r["isCompactSummary"] == true {
+                self.session.context.compactions += 1;
             }
             if kind == "user" || kind == "assistant" {
                 if let Some(text) = m["content"].as_str() {
@@ -559,11 +629,13 @@ impl Indexed {
                                 *self.session.tools.entry(name.clone()).or_default() += 1;
                                 let text = part["input"].to_string();
                                 let mut fact = tool_fact(part, &text, &name, self.offset);
+                                self.called(part["id"].as_str().unwrap_or(""), &name, &fact);
                                 fact.turn_id = strv(m, "id");
                                 self.session.tool_event(at, "tool", text, Some(name), fact);
                             }
                             "tool_result" => {
                                 let text = value_text(&part["content"]);
+                                self.returned(part["tool_use_id"].as_str().unwrap_or(""), text.len());
                                 let mut fact = tool_fact(part, &text, "", self.offset);
                                 fact.explicit_error = part["is_error"].as_bool();
                                 self.session.tool_event(at, "result", text, None, fact);
@@ -1005,6 +1077,11 @@ impl Index {
             .map(|i| i.session.clone())
     }
 
+    /// One session without its events: usage, tools and context figures.
+    pub fn summary_of(&self, provider: &str, id: &str) -> Option<Session> {
+        self.files.values().find(|i| i.session.provider == provider && i.session.id == id).map(|i| i.session.summary())
+    }
+
     pub fn source(&self, provider: &str, id: &str) -> Result<PathBuf, String> {
         self.files
             .iter()
@@ -1343,6 +1420,33 @@ mod tests {
         }
         assert_eq!(i.session.usage.input, 27);
         assert_eq!(i.session.usage.output, 9);
+    }
+    #[test]
+    fn context_size_tool_output_and_skills_come_from_the_records() {
+        let mut c = Indexed::new(Path::new("a.jsonl"), "claude");
+        let turn = |id: &str, read: u64, side: bool| json!({"type":"assistant","isSidechain":side,"message":{"id":id,"model":"opus","usage":{"input_tokens":10,"cache_read_input_tokens":read,"output_tokens":1},
+            "content":[{"type":"tool_use","id":format!("call-{id}"),"name":if id == "m2" { "Skill" } else { "Read" },"input":{"skill":"deploy","file_path":"/x"}}]}});
+        c.row(turn("m1", 1_000, false));
+        c.row(turn("m1", 1_000, false));
+        c.row(json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-m1","content":"0123456789"}]}}));
+        c.row(turn("m2", 9_000, false));
+        c.row(json!({"type":"user","isCompactSummary":true,"message":{"content":"summary of the work so far"}}));
+        c.row(turn("m3", 50_000, true));
+        c.row(turn("m4", 3_000, false));
+        let ctx = &c.session.context;
+        // A subagent's turn inside the file is not this session's context
+        assert_eq!((ctx.first, ctx.peak, ctx.now, ctx.compactions), (1_010, 9_010, 3_010, 1));
+        assert_eq!(ctx.tool_bytes.get("Read"), Some(&10));
+        assert_eq!(ctx.skills.get("deploy"), Some(&1), "a skill is counted when invoked, not when a file mentions it");
+
+        let mut x = Indexed::new(Path::new("b.jsonl"), "codex");
+        x.row(json!({"type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{}"}}));
+        x.row(json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"abcd"}}));
+        x.row(json!({"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":272000,"last_token_usage":{"input_tokens":40000},"total_token_usage":{"input_tokens":90000,"output_tokens":5}}}}));
+        x.row(json!({"type":"compacted","payload":{"message":"compacted"}}));
+        let ctx = &x.session.context;
+        assert_eq!((ctx.now, ctx.window, ctx.compactions), (40_000, 272_000, 1));
+        assert_eq!(ctx.tool_bytes.get("shell"), Some(&4));
     }
     #[test]
     fn codex_cumulative_and_records_not_added_together() {
