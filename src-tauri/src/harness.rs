@@ -217,6 +217,22 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
     })
 }
 
+/// Whether a conversation is one a person runs (`true`) or one started by
+/// another agent (`false`); `None` when no transcript of it is found.
+pub fn top_level_thread(home: &Path, id: &str) -> Option<bool> {
+    if !is_uuid(id) {
+        return None;
+    }
+    let suffix = format!("{id}.jsonl");
+    ADAPTERS.iter().find_map(|agent| {
+        let (folder, depth) = agent.transcripts()?;
+        let mut files = Vec::new();
+        jsonl_files(&home.join(folder), depth, &mut files);
+        let path = files.into_iter().find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix)))?;
+        Some(agent.resumable(&path).is_some())
+    })
+}
+
 /// Whether the program in the terminal asked for bracketed paste (DECSET 2004).
 pub fn wants_bracketed_paste(bytes: &[u8]) -> bool {
     let one = core::num::NonZeroU16::MIN;
@@ -564,15 +580,22 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
     if event == "codex-notify" {
         // Codex also reports turns of other threads in the same terminal: the
         // one that writes the session title, and subagents. Only the session's
-        // own thread ends its turn. The first thread seen is taken as its own,
-        // unless it is the title writer (recognised by its prompt; depends on
-        // the Codex version, see the risk register).
+        // own thread ends its turn. Which thread that is comes from the
+        // transcripts (`top-level`, added by `hook`): a subagent's turn end
+        // must never be taken for the session's, or the session stays
+        // `working` for good. Without a transcript to ask, the first thread
+        // seen is taken, unless it is the title writer (recognised by its
+        // prompt; depends on the Codex version, see the risk register).
         let thread = payload["thread-id"].as_str().unwrap_or("");
         let title_writer = payload["input-messages"][0].as_str().is_some_and(|m| m.starts_with("Generate a concise, single-line task title"));
-        match tracked.agent_session.as_deref() {
-            Some(own) if own != thread => return false,
-            None if title_writer || thread.is_empty() => return false,
-            None => tracked.agent_session = Some(thread.to_string()),
+        if title_writer || thread.is_empty() {
+            return false;
+        }
+        match (tracked.agent_session.as_deref(), payload["top-level"].as_bool()) {
+            (_, Some(false)) => return false,
+            // Also corrects a thread taken by mistake, and follows a new conversation in the same terminal
+            (_, Some(true)) | (None, None) => tracked.agent_session = Some(thread.to_string()),
+            (Some(own), None) if own != thread => return false,
             _ => {}
         }
     } else if let Some(id) = payload["session_id"].as_str() {
@@ -1354,6 +1377,12 @@ impl Harness {
     }
 
     fn hook(&self, session: &str, event: &str, payload: &Value) {
+        // Whether a Codex turn end is the session's own thread or a subagent's
+        let mut payload = payload.clone();
+        if let (true, Some(thread), Some(home)) = (event == "codex-notify", payload["thread-id"].as_str(), dirs::home_dir()) {
+            payload["top-level"] = json!(top_level_thread(&home, thread));
+        }
+        let payload = &payload;
         let (ready, waiting) = self.update(|s| {
             let before = s.sessions.get(session).map(|t| t.state.clone());
             let ready = apply_hook(s, session, event, payload);
@@ -2157,6 +2186,14 @@ mod tests {
         assert!(apply_hook(&mut s, "a", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": "T", "last-assistant-message": "ok"})));
         assert_eq!(s.tasks["t2"].result.as_deref(), Some("ok"));
         assert!(!apply_hook(&mut s, "a", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": "X", "last-assistant-message": "other thread"})));
+        // A subagent's turn end seen first is not the session's, and one taken by mistake is corrected
+        let mut c = store_with("a", "working");
+        c.sessions.get_mut("a").unwrap().profile = "codex".into();
+        assert!(!apply_hook(&mut c, "a", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": "SUB", "top-level": false, "last-assistant-message": "subagent report"})));
+        assert_eq!((c.sessions["a"].agent_session.as_deref(), c.sessions["a"].state.as_str()), (None, "working"));
+        c.sessions.get_mut("a").unwrap().agent_session = Some("SUB".into());
+        assert!(apply_hook(&mut c, "a", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": "OWN", "top-level": true, "last-assistant-message": "done"})));
+        assert_eq!((c.sessions["a"].agent_session.as_deref(), c.sessions["a"].state.as_str()), (Some("OWN"), "idle"));
         assert_eq!(s.sessions["a"].last_message.as_deref(), Some("ok"));
         assert!(!apply_hook(&mut s, "missing", "Stop", &json!({})));
 
