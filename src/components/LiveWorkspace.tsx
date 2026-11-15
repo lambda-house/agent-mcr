@@ -266,6 +266,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       <footer className="hs-footer">
         <span>{status ? `Runner pid ${status.runner.pid} · ${running} running` : 'Connecting to the runner…'}</span>
         {status?.supervisorCommand && <button title={`Copy the command that gives an outside Claude Code the supervisor tools:\n${status.supervisorCommand}`} aria-label="Copy supervisor setup command" onClick={() => { void navigator.clipboard.writeText(status.supervisorCommand ?? '').then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }).catch(e => setError(err(e))); }}><Copy size={12}/> {copied ? 'Copied' : 'Supervisor'}</button>}
+        {status && <label className="hs-outside" title="Off: only the Supervisor session here has the supervisor tools. On: an agent you run outside Agent MCR and connected with the supervisor command has them too."><input type="checkbox" checked={!!status.outsideSupervisors} onChange={e => { void harnessApi.outsideSupervisors(e.target.checked).then(on => setStatus(s => s && { ...s, outsideSupervisors: on })).catch(x => setError(err(x))); }}/> outside agents</label>}
       </footer>
     </aside>
     <main className="hs-terminals">

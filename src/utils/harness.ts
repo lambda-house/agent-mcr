@@ -47,6 +47,8 @@ export interface HarnessStatus {
   runner: { protocol: number; pid: number; version: string; exe: string }; profiles: Profile[]; home: string;
   /** Run once in a terminal to give an outside agent the supervisor tools */
   supervisorCommand?: string;
+  /** The operator lets agents outside the harness use the supervisor tools */
+  outsideSupervisors?: boolean;
 }
 
 export const harnessApi = {
@@ -54,6 +56,8 @@ export const harnessApi = {
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume }),
   /** The hosted supervisor session: the running one, or a new one */
+  /** Asks in a native dialog before turning it on; resolves to the setting as it is now */
+  outsideSupervisors: (on: boolean) => invoke<boolean>('harness_outside_supervisors', { on }),
   supervisor: (cols: number, rows: number) => invoke<Hosted>('harness_supervisor', { cols, rows }),
   /** End the agent and continue its conversation in a new process; the session id changes */
   restart: (id: string) => invoke<Hosted & { replaced: string; resumed: boolean }>('harness_restart', { id }),

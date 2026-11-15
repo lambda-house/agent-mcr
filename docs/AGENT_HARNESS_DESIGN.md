@@ -13,6 +13,7 @@
 | D3 | Atlassian, TEOB memory and other infrastructure tools are MCP servers behind a local gateway (agentgateway). Every hosted agent gets all of them | 2026-11-13 |
 | D4 | macOS only for now | 2026-11-13 |
 | D5 | A local supervisor gets root access: every internal of the harness, with no separate grant or limits. It's all local | 2026-11-13 |
+| D5a | Amends D5 after the security review of 2026-11-15. Root stays, with three limits: an outside agent has the supervisor tools only while the operator's "outside agents" setting is on (default off, native confirmation); `terminal_write` is not pre-approved for the hosted Supervisor, so the operator is asked each time; tasks are refused for shell sessions. The runner takes requests only from this program outside any hosted session, the service's control requests likewise, and a hook is attributed by its process, not by the id it sends | 2026-11-15 |
 | D6 | Only the human answers permission prompts. A session waiting on the human must be clearly visible, never quietly stalled | 2026-11-13 |
 | D7 | Launch profiles carry the agent's own permission mode (Claude `acceptEdits`, Codex `workspace-write` with `on-request` approvals), so prompts are limited to shell commands and network | 2026-11-13 |
 | D8 | `session_create` takes `worktree: true`. That's the default when another live session already uses the same repository. It creates `../<repo>-<session>` on a new branch, and the graph shows the branch. Removing a worktree is a human or supervisor action, never automatic | 2026-11-13 |

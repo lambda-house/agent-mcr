@@ -950,6 +950,12 @@ impl Index {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))
                 .map_err(|e| e.to_string())?;
+            // SQLite gave its sidecars the mode the database had when they were made
+            for suffix in ["-wal", "-shm"] {
+                let mut side = path.as_os_str().to_owned();
+                side.push(suffix);
+                let _ = fs::set_permissions(Path::new(&side), fs::Permissions::from_mode(0o600));
+            }
         }
         let mut restored = HashMap::new();
         for row in db.rows("SELECT path,checkpoint FROM files", &[])? {

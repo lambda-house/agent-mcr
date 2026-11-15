@@ -18,6 +18,8 @@ use std::sync::Mutex;
 use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
 use tauri::State;
 
+/// Pasted images are removed after two weeks, at the next paste
+const PASTED_IMAGE_KEPT: std::time::Duration = std::time::Duration::from_secs(14 * 86_400);
 const MAX_PASTED_IMAGE: usize = 30 * 1024 * 1024;
 
 #[derive(Default)]
@@ -60,7 +62,34 @@ pub async fn harness_status() -> Result<Value, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
         // What the user runs once to give an outside agent the supervisor tools
         let supervisor = format!("claude mcp add --scope user agent-mcr-supervisor -- '{}' --supervise", exe.replace('\'', "'\\''"));
-        Ok(json!({ "runner": hello, "service": service, "profiles": harness::PROFILES, "home": home, "supervisorCommand": supervisor }))
+        let outside = harness::call(&config_dir()?, json!({"op": "settings"})).map(|s| s["outsideSupervisors"] == true).unwrap_or(false);
+        Ok(json!({ "runner": hello, "service": service, "profiles": harness::PROFILES, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": outside }))
+    })
+    .await
+}
+
+/// Let agents outside the harness use the supervisor tools, or stop that.
+/// Turning it on is confirmed in a native dialog, never by the page alone.
+#[tauri::command]
+pub async fn harness_outside_supervisors(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    blocking(move || {
+        if on {
+            let mut dialog = app
+                .dialog()
+                .message("Any agent you run outside Agent MCR and connect with the supervisor command will be able to start, read, direct and end every hosted session.\n\nA program started by a hosted agent that detaches from its session counts as outside too. Leave this off while agents work in folders you don't trust.")
+                .title("Give outside agents the supervisor tools?")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom("Allow".to_string(), "Cancel".to_string()));
+            if let Some(window) = app.get_webview_window("main") {
+                dialog = dialog.parent(&window);
+            }
+            if !dialog.blocking_show() {
+                return Ok(false);
+            }
+        }
+        service(json!({"op": "settings", "outsideSupervisors": on})).map(|s| s["outsideSupervisors"] == true)
     })
     .await
 }
@@ -238,6 +267,20 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
     // the typed path needs no quoting in most agents' prompts.
     let dir = dirs::cache_dir().ok_or("Cache directory unavailable")?.join("agent-mcr/attachments").join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Screenshots can show anything: the user's alone, and not kept for good
+    if let Some(root) = dir.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+        let old = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PASTED_IMAGE_KEPT));
+        for session in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            for file in std::fs::read_dir(session.path()).into_iter().flatten().flatten().filter(|f| old(&f.path())) {
+                let _ = std::fs::remove_file(file.path());
+            }
+            // Fails, as it should, while the folder still holds images
+            let _ = std::fs::remove_dir(session.path());
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
     let path = dir.join(format!("pasted-{stamp}.{ext}"));
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;

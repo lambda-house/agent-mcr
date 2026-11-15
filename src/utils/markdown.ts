@@ -500,6 +500,12 @@ export async function initMermaid(theme: ColorTheme = 'dark'): Promise<void> {
       startOnLoad: false,
       theme: theme === 'dark' ? 'dark' : 'default',
       securityLevel: 'strict', // SECURITY: Enable strict mode
+      // What a diagram may not set for itself (init directive or frontmatter):
+      // Mermaid's own list, plus the settings that go into its stylesheet as
+      // written, where a url() would fetch from the network without the
+      // "Load images" consent. themeVariables stay: Mermaid drops any value
+      // that could hold an address.
+      secure: ['secure', 'securityLevel', 'startOnLoad', 'maxTextSize', 'suppressErrorRendering', 'maxEdges', 'themeCSS', 'fontFamily', 'altFontFamily'],
       themeVariables: MERMAID_THEME_VARIABLES[theme],
       flowchart: {
         curve: 'basis',

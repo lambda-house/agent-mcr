@@ -7,6 +7,7 @@
 //! launch; nothing is written into the user's agent config files.
 
 pub use crate::agents::{command_line, Launch};
+use crate::peer;
 use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, ADAPTERS};
 use crate::runner::{self, lock, now_ms, Client, Unit};
 use crate::session_mcp::{read_frame, Protocol, Server};
@@ -135,7 +136,12 @@ fn new_uuid() -> String {
 /// version managers the user has in Terminal.
 pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
     let cmd = command_line(l)?;
-    let shell = login_shell();
+    let mut shell = login_shell();
+    // The command line is quoted for a POSIX shell; fish and others read quotes differently
+    let posix = ["sh", "bash", "zsh", "dash", "ksh"].contains(&Path::new(&shell).file_name().and_then(|n| n.to_str()).unwrap_or(""));
+    if !cmd.is_empty() && !posix {
+        shell = if Path::new("/bin/zsh").is_file() { "/bin/zsh" } else { "/bin/sh" }.into();
+    }
     Ok(if cmd.is_empty() { vec![shell, "-l".into()] } else { vec![shell, "-l".into(), "-i".into(), "-c".into(), cmd] })
 }
 
@@ -150,8 +156,11 @@ pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
     // The harness tools need no approval: they only reach other sessions' inboxes
     let mut allow = vec![format!("mcp__{AGENT_SERVER}")];
     if supervisor {
-        // D5: the supervisor has the whole harness, without a question per tool
-        allow.push(format!("mcp__{SUPERVISOR_SERVER}"));
+        // D5: the supervisor has the harness without a question per tool, except
+        // typing into a terminal: that can run any command, so the operator is asked
+        let tools = supervisor_tools();
+        let names = tools["tools"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str());
+        allow.extend(names.filter(|n| *n != "terminal_write").map(|n| format!("mcp__{SUPERVISOR_SERVER}__{n}")));
     }
     json!({ "hooks": hooks, "permissions": { "allow": allow } })
 }
@@ -593,6 +602,9 @@ struct Store {
     sessions: BTreeMap<String, Tracked>,
     tasks: BTreeMap<String, Task>,
     messages: BTreeMap<String, Message>,
+    /// The operator lets agents outside the harness use the supervisor tools
+    #[serde(default)]
+    outside_supervisors: bool,
     /// Connected `mcr` bridges per session; `Tracked.tools` follows it
     #[serde(skip)]
     bridges: BTreeMap<String, usize>,
@@ -889,7 +901,9 @@ impl Harness {
         store.version += 1;
         if let Ok(bytes) = serde_json::to_vec(&*store) {
             let tmp = self.dir.join("harness-state.json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(&bytes));
+            if written.is_ok() {
                 let _ = std::fs::rename(&tmp, self.dir.join("harness-state.json"));
             }
         }
@@ -1490,18 +1504,26 @@ impl Harness {
     /// The hosted session a connection comes from: its process descends from
     /// one of the runner's children. Nothing the caller says is trusted.
     fn caller(&self, stream: &UnixStream) -> Result<String, String> {
-        let mut pid = peer_pid(stream).ok_or("Cannot tell which process is calling")?;
-        let sessions = self.sessions()?;
-        for _ in 0..24 {
-            if let Some(s) = sessions.iter().find(|s| s["exit"].is_null() && s["pid"].as_i64() == Some(pid as i64)) {
-                return Ok(s["id"].as_str().unwrap_or("").into());
-            }
-            match parent_pid(pid) {
-                Some(parent) if parent > 1 => pid = parent,
-                _ => break,
-            }
+        match self.who(stream) {
+            Caller::Session { id, .. } => Ok(id),
+            Caller::Outside => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
+            Caller::Unknown => Err("Cannot tell which process is calling".into()),
         }
-        Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into())
+    }
+
+    /// Where a connection comes from, by the caller's process alone.
+    fn who(&self, stream: &UnixStream) -> Caller {
+        let Some(pid) = peer::pid(stream) else { return Caller::Unknown };
+        let Ok(list) = self.runner(json!({"op": "list"})) else { return Caller::Unknown };
+        let live: Vec<(i32, &Value)> = list["sessions"]
+            .as_array()
+            .map(|all| all.iter().filter(|s| s["exit"].is_null()).filter_map(|s| Some((s["pid"].as_i64()? as i32, s))).collect())
+            .unwrap_or_default();
+        let roots: Vec<i32> = live.iter().map(|(pid, _)| *pid).collect();
+        match peer::ancestor_among(pid, &roots).and_then(|root| live.iter().find(|(pid, _)| *pid == root)) {
+            Some((_, s)) => Caller::Session { id: s["id"].as_str().unwrap_or("").into(), supervisor: s["meta"]["role"] == "supervisor" },
+            None => Caller::Outside,
+        }
     }
 
     fn agent(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream, mcp_client: bool) -> std::io::Result<()> {
@@ -1704,9 +1726,11 @@ impl Harness {
             "create" => self.create(req),
             "supervisor" => self.supervisor(req),
             "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true),
-            "hook" => {
-                self.hook(req["session"].as_str().unwrap_or(""), req["event"].as_str().unwrap_or(""), &req["payload"]);
-                Ok(json!({}))
+            "settings" => {
+                if let Some(on) = req["outsideSupervisors"].as_bool() {
+                    self.update(|s| s.outside_supervisors = on);
+                }
+                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors }))
             }
             // The human looked at it
             "ack" => {
@@ -1768,6 +1792,9 @@ impl Harness {
                 out["tasks"] = json!(tasks);
                 Ok(out)
             }
+            "session_create" if args["profile"] == "shell" && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+                Err("Refused: a task for a shell is a command, and commands need the operator. Start the shell without one; terminal_write asks the operator.".into())
+            }
             "session_create" => self.create(args).map(|s| {
                 let mut out = Self::brief(&s);
                 // The first prompt is a task like any other: follow it with task_wait
@@ -1782,6 +1809,10 @@ impl Harness {
             "task_assign" => {
                 let session = text("session")?;
                 refuse_if_waiting(session)?;
+                // In a shell the text would run as a command, with nobody asked
+                if !adapter(self.session(session)?["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
+                    return Err("Refused: tasks are for agent sessions. In a shell the text would run as a command; use terminal_write, which asks the operator.".into());
+                }
                 self.assign(session, text("text")?).map(|t| json!(t))
             }
             "task_status" | "task_wait" => {
@@ -1866,9 +1897,17 @@ impl Harness {
     }
 
     fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
-        // An ordinary hosted session can't take over the harness by accident:
-        // of the hosted ones, only the supervisor session gets these tools
-        let refused = self.caller(&writer).ok().and_then(|id| self.session(&id).ok()).is_some_and(|s| s["meta"]["role"] != "supervisor");
+        // Only the Supervisor session has these tools. An agent outside the
+        // harness gets them when the operator allowed that, and not otherwise:
+        // a worker's process that left its session looks like an outside one.
+        let who = self.who(&writer);
+        let refusal = || match &who {
+            Caller::Session { supervisor: true, .. } => None,
+            Caller::Session { .. } => Some("Refused: this is a worker session. Only the Supervisor session has the supervisor tools; use the mcr tools to reach other sessions."),
+            Caller::Outside if lock(&self.store).outside_supervisors => None,
+            Caller::Outside => Some("Refused: agents outside Agent MCR have the supervisor tools only when the operator allows it. Ask the operator to turn on \"Supervisor tools for outside agents\" in Agent MCR (Live view)."),
+            Caller::Unknown => Some("Refused: cannot tell which process is calling"),
+        };
         let mut protocol = Protocol::default();
         loop {
             let frame = match read_frame(&mut reader) {
@@ -1876,8 +1915,8 @@ impl Harness {
                 Ok(None) | Err(_) => return Ok(()),
             };
             let call = |name: &str, args: Value| {
-                if refused {
-                    return Err("Refused: this is a worker session. Only the Supervisor session and agents outside the harness have the supervisor tools; use the mcr tools to reach other sessions.".into());
+                if let Some(why) = refusal() {
+                    return Err(why.into());
                 }
                 self.tool(name, &args)
             };
@@ -1888,8 +1927,12 @@ impl Harness {
     }
 
     fn handle(&self, stream: UnixStream) -> std::io::Result<()> {
+        if !peer::same_user(&stream) {
+            return Ok(());
+        }
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
+        let mut who: Option<Caller> = None;
         loop {
             let mut line = Vec::new();
             if (&mut reader).take(4 * 1024 * 1024).read_until(b'\n', &mut line)? == 0 {
@@ -1904,10 +1947,34 @@ impl Harness {
             if req["op"] == "agent" {
                 return self.agent(reader, writer, req["cli"] != true);
             }
-            let reply = self.control(&req).unwrap_or_else(|e| json!({ "error": e }));
-            writeln!(writer, "{reply}")?;
+            let op = req["op"].as_str().unwrap_or("");
+            let reply = if op == "hello" {
+                self.control(&req)
+            } else {
+                match (op, &*who.get_or_insert_with(|| self.who(&writer))) {
+                    // A hook speaks for the session its process runs in, whatever it says
+                    ("hook", Caller::Session { id, .. }) => {
+                        self.hook(id, req["event"].as_str().unwrap_or(""), &req["payload"]);
+                        Ok(json!({}))
+                    }
+                    ("hook", _) => Ok(json!({})),
+                    // Everything else is the app's: a hosted session has the tools instead
+                    (_, Caller::Outside) if peer::is_this_program(&writer) => self.control(&req),
+                    _ => Err("Refused: only the Agent MCR app manages sessions".into()),
+                }
+            };
+            writeln!(writer, "{}", reply.unwrap_or_else(|e| json!({ "error": e })))?;
         }
     }
+}
+
+/// Who opened a connection to the service.
+enum Caller {
+    /// A process inside a hosted session
+    Session { id: String, supervisor: bool },
+    /// A process outside every hosted session
+    Outside,
+    Unknown,
 }
 
 fn supervisor_info() -> Value {
@@ -1980,43 +2047,6 @@ fn agent_tools() -> Value {
 
 const AGENT: Server = Server { info: agent_info, tools: agent_tools };
 
-/// The process on the other end of a local socket, from the kernel.
-#[cfg(target_os = "macos")]
-fn peer_pid(stream: &UnixStream) -> Option<i32> {
-    use std::os::fd::AsRawFd;
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: `pid` and `len` are valid for writes of the sizes passed.
-    let ok = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&mut pid as *mut libc::pid_t).cast(), &mut len) } == 0;
-    (ok && pid > 0).then_some(pid)
-}
-
-#[cfg(target_os = "macos")]
-fn parent_pid(pid: i32) -> Option<i32> {
-    // SAFETY: zeroed is a valid proc_bsdinfo, and the size passed is its size.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
-    (got == size).then_some(info.pbi_ppid as i32)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn peer_pid(stream: &UnixStream) -> Option<i32> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: zeroed is a valid ucred, and `len` is its size.
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let ok = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } == 0;
-    (ok && cred.pid > 0).then_some(cred.pid)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn parent_pid(pid: i32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // "pid (comm) state ppid …": the command may hold spaces and brackets
-    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
-}
-
 /// Serve until idle. Refuses to start if another service answers on the socket.
 pub fn serve(dir: &Path) -> Result<(), String> {
     let path = socket(dir);
@@ -2033,6 +2063,13 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     }
     let listener = UnixListener::bind(&path).map_err(|e| format!("Cannot listen on {}: {e}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    // State and logs hold session names, messages and folders: the user's alone,
+    // also when the folder's own mode is changed later
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 != 0) {
+            let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
+        }
+    }
     let harness = Arc::new(Harness::open(dir));
 
     let watching = harness.clone();
@@ -2422,7 +2459,11 @@ mod tests {
         // Only the supervisor session is given the supervisor tools
         assert!(claude_mcp("/x", false)["mcpServers"]["supervisor"].is_null());
         assert_eq!(claude_mcp("/x", true)["mcpServers"]["supervisor"]["args"][0], "--supervise");
-        assert_eq!(claude_settings("/x", true)["permissions"]["allow"], json!(["mcp__mcr", "mcp__supervisor"]));
+        let allow = claude_settings("/x", true)["permissions"]["allow"].clone();
+        let allow: Vec<&str> = allow.as_array().unwrap().iter().filter_map(|a| a.as_str()).collect();
+        assert!(allow.contains(&"mcp__mcr") && allow.contains(&"mcp__supervisor__task_assign"));
+        // Typing into a terminal can run any command: the operator is asked each time
+        assert!(!allow.contains(&"mcp__supervisor") && !allow.contains(&"mcp__supervisor__terminal_write"));
     }
 
     #[test]

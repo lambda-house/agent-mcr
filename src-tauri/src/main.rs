@@ -23,6 +23,8 @@ use tauri_plugin_updater::UpdaterExt;
 
 mod agent;
 #[cfg(unix)]
+mod peer;
+#[cfg(unix)]
 mod runner;
 #[cfg(unix)]
 mod agents;
@@ -207,7 +209,9 @@ impl Use {
     fn fits_target(self, real: &Path) -> bool {
         match self {
             Use::List => real.is_dir(),
-            Use::Open => real.is_file() && is_viewable_file(real, true),
+            // Markdown only: config files with tokens are text too (a cloned
+            // repo's notes.md may point at ~/.config/gh/hosts.yml)
+            Use::Open => real.is_file() && is_markdown_file(real),
             Use::Stat => true,
             Use::Image => real.is_file() && is_image_file(real),
         }
@@ -642,7 +646,7 @@ fn scan_directory_recursive(
             }
         } else if is_viewable_file(&entry_path, include_text)
             && (!entry.file_type().is_ok_and(|t| t.is_symlink())
-                || canonicalize(&entry_path).is_ok_and(|real| is_viewable_file(&real, include_text)))
+                || canonicalize(&entry_path).is_ok_and(|real| is_markdown_file(&real)))
         {
             *file_count += 1;
             has_md_files |= is_markdown_file(&entry_path);
@@ -1798,6 +1802,7 @@ fn main() {
             harness_commands::harness_signal,
             harness_commands::harness_forget,
             harness_commands::harness_restart,
+            harness_commands::harness_outside_supervisors,
             harness_commands::terminal_attach,
             harness_commands::terminal_input,
             harness_commands::terminal_resize,
@@ -1939,12 +1944,14 @@ mod tests {
         let outside = root.join("outside");
         fs::create_dir_all(&docs).unwrap();
         fs::create_dir_all(outside.join("guide")).unwrap();
-        for file in ["outside/notes.md", "outside/id_rsa", "outside/pic.png", "outside/guide/a.md"] {
+        for file in ["outside/notes.md", "outside/id_rsa", "outside/pic.png", "outside/guide/a.md", "outside/hosts.yml"] {
             fs::write(root.join(file), "x").unwrap();
         }
         symlink(outside.join("notes.md"), docs.join("notes.md")).unwrap();
         symlink(outside.join("id_rsa"), docs.join("key.md")).unwrap();
         symlink(outside.join("pic.png"), docs.join("pic.png")).unwrap();
+        symlink(outside.join("hosts.yml"), docs.join("hosts.yml")).unwrap();
+        symlink(outside.join("hosts.yml"), docs.join("hosts.md")).unwrap();
         symlink(outside.join("guide"), docs.join("guide")).unwrap();
         symlink(&docs, docs.join("loop")).unwrap();
 
@@ -1961,6 +1968,8 @@ mod tests {
         assert!(check(docs.join("guide"), Use::List));
         assert!(check(docs.join("pic.png"), Use::Image));
         assert!(!check(docs.join("key.md"), Use::Open), "a .md name doesn't make a key a document");
+        assert!(!check(docs.join("hosts.yml"), Use::Open), "a link out of the folder reaches Markdown only");
+        assert!(!check(docs.join("hosts.md"), Use::Open));
         assert!(!check(outside.join("notes.md"), Use::Open), "the target itself isn't opened");
         assert!(!check(docs.join("guide/../notes.md"), Use::Open), "no `..` through a link");
 

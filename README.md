@@ -4,7 +4,7 @@
 
 - **Sessions.** The Claude Code and Codex sessions on this machine: active and inactive, who started whom, models, tokens, tool calls, and ticket mentions.
 - **Live.** Claude Code, Codex and shell terminals running inside the app. They keep running when the app quits. Each shows what it is doing (working, idle, waiting for you), and the ones waiting for you are listed on top and raise a macOS notification. An earlier Claude or Codex session can be resumed here.
-- **Supervisor.** An outside agent creates and resumes sessions, gives them tasks and follows the results through an MCP server (below). It cannot answer permission prompts: those are yours.
+- **Supervisor.** A Supervisor session in the app, or an outside agent you allowed, creates and resumes sessions, gives them tasks and follows the results through an MCP server (below). It cannot answer permission prompts: those are yours.
 - **Planned.** A dependency graph, tools agents use to talk to each other, a git worktree per session, and infrastructure tools through a local [agentgateway](https://agentgateway.dev).
 
 The architecture and its decisions are in [docs/AGENT_HARNESS_DESIGN.md](docs/AGENT_HARNESS_DESIGN.md).
@@ -37,9 +37,23 @@ Give one Claude Code session outside the app the supervisor tools (the **Supervi
 claude mcp add --scope user agent-mcr-supervisor -- '/path/to/Agent MCR.app/Contents/MacOS/agent-mcr' --supervise
 ```
 
+Then tick **outside agents** at the bottom of the Live view and confirm the dialog. Without it, only the Supervisor session inside the app has these tools.
+
 It then has `session_create` (with `resume` for an earlier session), `session_resumable`, `session_list`, `task_assign`, `task_wait`, `terminal_read`, `attention_list` and the rest. The app doesn't have to be open: the tools start the harness service themselves.
 
 To move a session you run in another terminal into the harness, close it there, then resume it from the Live view or with `session_create(resume: <id>)`.
+
+## What is protected, and what is not
+
+Every agent runs as your macOS user. The harness limits what an agent can do through the harness; it can't wall one of your programs off from another.
+
+- Terminals (`runner.sock`) take requests only from Agent MCR itself: the app and its harness service. Any other program, and anything started inside a hosted session, is refused. So is every other user.
+- Starting, restarting and listing sessions (`harness.sock`) is the app's. A hosted session has the `mcr` tools and nothing else. A hook report counts for the session its process runs in, whatever it claims.
+- The supervisor tools belong to the Supervisor session. Agents outside the app get them only while **outside agents** is ticked. A program that a hosted agent starts and detaches from its session looks like an outside one, so leave the box off while agents work in folders you don't trust.
+- The Supervisor asks you before it types into a terminal (`terminal_write`), and it can't give a shell a task: both would run a command nobody approved.
+- These checks stop a plain command from reaching the sockets. They don't stop a program written to get around them, because it runs as you. A shell command you approve in one agent can still do whatever you can, including to other sessions.
+- The two LaunchAgents (`~/Library/LaunchAgents/cc.lambdahouse.agent-mcr.runner.plist` and `.harness.plist`) don't start at login, but they stay when you delete the app. Remove them by hand.
+- A link inside an opened folder that points out of it is followed only to Markdown files and images.
 
 ## Where data lives
 

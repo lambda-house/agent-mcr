@@ -264,6 +264,9 @@ impl Service {
                 let Ok(stream) = incoming else {
                     break;
                 };
+                if !crate::peer::same_user(&stream) {
+                    continue;
+                }
                 if !service.grant.lock().unwrap().enabled
                     || service.clients.lock().unwrap().len() >= 16
                 {

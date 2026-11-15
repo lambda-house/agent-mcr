@@ -137,3 +137,5 @@
 .hs-resume > small { flex: 0 0 auto; color: var(--sc-muted); font-size: 10.5px; }
 .hs-list li.hs-earlier-more { display: block; padding: 2px 6px; color: var(--sc-muted); font-size: 11px; }
 .session-cockpit .hs-more-folders { margin: 2px 8px 8px; padding: 3px 8px; border: 0; background: transparent; color: var(--sc-muted); font-size: 11px; justify-content: flex-start; }
+.hs-outside { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; }
+.hs-outside input { margin: 0; }

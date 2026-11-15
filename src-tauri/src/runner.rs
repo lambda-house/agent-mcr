@@ -358,7 +358,14 @@ impl Runner {
 
     fn signal(&self, id: &str, name: &str) -> Result<(), String> {
         let session = self.get(id)?;
-        let pid = lock(&session.info).pid.ok_or("Process id unknown")? as libc::pid_t;
+        let pid = {
+            let info = lock(&session.info);
+            // Its process id may belong to an unrelated process by now
+            if info.exit.is_some() {
+                return Err("The session has ended".into());
+            }
+            info.pid.ok_or("Process id unknown")? as libc::pid_t
+        };
         let sig = match name {
             "INT" => libc::SIGINT,
             "TERM" => libc::SIGTERM,
@@ -493,7 +500,23 @@ impl Runner {
         Ok(())
     }
 
+    /// Terminals are driven only by Agent MCR itself: the app and the harness
+    /// service. A hosted session, or any other program, gets nothing but
+    /// `hello`: typing into a terminal answers its prompts, and `spawn` runs
+    /// a command outside every agent's sandbox.
+    fn trusts(&self, stream: &UnixStream) -> bool {
+        if !crate::peer::is_this_program(stream) {
+            return false;
+        }
+        let children: Vec<i32> = lock(&self.sessions).values().filter_map(|s| { let info = lock(&s.info); info.pid.filter(|_| info.exit.is_none()).map(|p| p as i32) }).collect();
+        crate::peer::pid(stream).is_some_and(|pid| crate::peer::ancestor_among(pid, &children).is_none())
+    }
+
     fn handle(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
+        if !crate::peer::same_user(&stream) {
+            return Ok(());
+        }
+        let trusted = self.trusts(&stream);
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
         loop {
@@ -508,6 +531,9 @@ impl Runner {
                     return Ok(());
                 }
             };
+            if !trusted && req["op"] != "hello" {
+                return writeln!(writer, "{}", json!({"error": "Refused: terminals take requests only from Agent MCR itself"}));
+            }
             match req["op"].as_str() {
                 // Both turn the connection into a stream; nothing was read past the line
                 Some("attach") => return self.attach(req["id"].as_str().unwrap_or(""), writer),
@@ -881,5 +907,35 @@ mod tests {
         let plist = launch_agent_plist(&RUNNER, Path::new("/A & B/Agent MCR.app/Contents/MacOS/agent-mcr"), Path::new("/tmp/r.log"));
         assert!(plist.contains("<string>/A &amp; B/Agent MCR.app/Contents/MacOS/agent-mcr</string>"));
         assert!(plist.contains("<string>--runner</string>"));
+    }
+    /// Any other program of the same user is told the version and nothing else.
+    #[test]
+    fn another_program_gets_hello_only() {
+        if !Path::new("/usr/bin/nc").is_file() {
+            return;
+        }
+        let socket = temp_socket("foreign");
+        let serving = socket.clone();
+        std::thread::spawn(move || serve(&serving));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Client::connect(&socket).is_err() {
+            assert!(Instant::now() < deadline, "runner did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ask = |line: &str| {
+            use std::process::{Command, Stdio};
+            let mut nc = Command::new("/usr/bin/nc").arg("-U").arg(&socket).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            writeln!(nc.stdin.as_mut().unwrap(), "{line}").unwrap();
+            let mut first = String::new();
+            BufReader::new(nc.stdout.take().unwrap()).read_line(&mut first).unwrap();
+            let _ = nc.kill();
+            let _ = nc.wait();
+            first
+        };
+        assert!(ask(r#"{"op":"hello"}"#).contains("protocol"));
+        for op in [r#"{"op":"list"}"#, r#"{"op":"spawn","argv":["/bin/true"],"cwd":"/tmp","cols":80,"rows":24}"#, r#"{"op":"write","id":"x","data":"y"}"#, r#"{"op":"attach","id":"x"}"#, r#"{"op":"snapshot","id":"x"}"#, r#"{"op":"watch"}"#] {
+            assert!(ask(op).contains("Refused"), "{op}");
+        }
+        assert_eq!(Client::connect(&socket).unwrap().call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0, "nothing was started");
     }
 }
