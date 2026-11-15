@@ -120,32 +120,6 @@ export function pastedImage(data: DataTransfer | null): File | null {
 /** A subagent that wrote to its transcript this recently counts as active. */
 export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;
 
-/**
- * The list in groups: sessions that exchanged messages or run in the same
- * folder stand together, in the place of the first of them. A session with
- * neither is a group of one.
- */
-export function groupSessions(list: Hosted[]): Hosted[][] {
-  const live = new Map(list.filter(h => !h.exit).map(h => [h.id, h]));
-  const seen = new Set<string>();
-  const groups: Hosted[][] = [];
-  for (const h of list) {
-    if (seen.has(h.id)) continue;
-    const members = new Set<string>([h.id]);
-    const queue = h.exit ? [] : [h];
-    for (let next = queue.shift(); next; next = queue.shift()) {
-      const linked = [...(next.peers ?? []), ...[...live.values()].filter(x => x.cwd === next.cwd).map(x => x.id)];
-      for (const id of linked) {
-        const peer = live.get(id);
-        if (peer && !members.has(id)) { members.add(id); queue.push(peer); }
-      }
-    }
-    members.forEach(id => seen.add(id));
-    groups.push(list.filter(x => members.has(x.id)));
-  }
-  return groups;
-}
-
 const KIND: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', shell: 'shell' };
 
 /** What to paste into another session so its agent can reach this one. */
@@ -176,3 +150,35 @@ export function shellHealth(sh: RunningShell, now: number): 'active' | 'quiet' |
   if (sh.stopped) return 'stopped';
   return sh.quietSince !== undefined && now - sh.quietSince >= SHELL_QUIET_MS ? 'quiet' : 'active';
 }
+
+/** A folder as a section of the Live list: what runs in it, and what ran in it before. */
+export interface DirSection { path: string; sessions: Hosted[]; earlier: Resumable[]; pinned: boolean; latest: number }
+
+/**
+ * The Live list by folder. `sessions` come in list order (the ones that need
+ * the person first). Folders with someone waiting come first, then folders
+ * with live sessions, then pinned ones, then folders that only have history,
+ * most recent first.
+ */
+export function directorySections(sessions: Hosted[], resumable: Resumable[], pinned: string[]): DirSection[] {
+  const by = new Map<string, DirSection>();
+  const at = (path: string) => {
+    let section = by.get(path);
+    if (!section) { section = { path, sessions: [], earlier: [], pinned: pinned.includes(path), latest: 0 }; by.set(path, section); }
+    return section;
+  };
+  pinned.forEach(at);
+  for (const h of sessions) { const d = at(h.cwd); d.sessions.push(h); d.latest = Math.max(d.latest, h.started); }
+  for (const r of resumable) { const d = at(r.cwd); d.earlier.push(r); d.latest = Math.max(d.latest, r.modified); }
+  const rank = (d: DirSection) => d.sessions.some(h => !h.exit && h.harness?.attention) ? 0 : d.sessions.some(h => !h.exit) ? 1 : d.sessions.length || d.pinned ? 2 : 3;
+  return [...by.values()].map(d => ({ ...d, earlier: [...d.earlier].sort((a, b) => b.modified - a.modified) })).sort((a, b) => rank(a) - rank(b) || b.latest - a.latest);
+}
+
+/** A path for a section heading: the last two folders, since the start is the same everywhere. */
+export function shortPath(path: string): string {
+  const parts = path.split('/');
+  return parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : path;
+}
+
+/** A path with the home folder written as ~. */
+export const tildePath = (path: string, home: string) => home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;

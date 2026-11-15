@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowUpRight, Bot, ChevronRight, Clock, Copy, Link2, RefreshCw, Search, Settings2, Shield, Square, Terminal, X, Zap } from 'lucide-react';
+import { Activity, ArrowUpRight, Bot, ChevronRight, Copy, Link2, Play, RefreshCw, Search, Settings2, Shield, Square, Terminal, X, Zap } from 'lucide-react';
 import { compact, family, origin, within, sessionDirectories, matchesActivity, matchesSession, resumeCommand, sessionApi, sessionKey, sumUsage, totalTokens, type Connections, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri, openExternal } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/sessions.css';
 import SessionTree from './SessionTree';
 import WorkspaceSwitch from './WorkspaceSwitch';
-import SessionDirectoryMap from './SessionDirectoryMap';
+import SessionResults from './SessionResults';
+import { harnessApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import SessionAgentAccess from './SessionAgentAccess';
 import LiveWorkspace from './LiveWorkspace';
@@ -94,6 +95,15 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const usage = sumUsage(filtered); const working = filtered.filter(s => s.status === 'working').length;
   const events = focusedEvidence?.session === selected ? [focusedEvidence.event] : olderEvents ?? chosen?.events ?? [];
   const descendants = chosen ? family(data.sessions,chosen) : [];
+  // Titles for the Live view's earlier sessions, which only know ids
+  const titles = useMemo(() => Object.fromEntries(data.sessions.filter(s => !s.parentId && s.title).map(s => [s.id, s.title])), [data.sessions]);
+  const searchFolder = (path: string) => { setDirectory(path); setView('history'); };
+  const filtersOn = [provider !== 'all', role !== 'all', filter !== 'all', !!(activeSince || inactiveSince || activeMinutes || inactiveMinutes)].filter(Boolean).length;
+  const clearFilters = () => { setActiveSince(''); setInactiveSince(''); setInactiveMinutes(''); setActiveMinutes(''); setDirectory(''); setRole('all'); setProvider('all'); setFilter('all'); setQuery(''); };
+  /** Continue an earlier session in a hosted terminal, in its own folder. */
+  const resumeLive = async (s: Session) => {
+    try { await harnessApi.spawn('', '', 120, 32, s.id); setView('live'); } catch (e) { setError(err(e)); }
+  };
   const recentDirectories = useMemo(() => [...new Set([...data.sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [data.sessions]);
   const loadContext = async (provider: string, key: string) => {
     const version = ++contextVersion.current; setContextBusy(true); setContext(null); setContextError(''); setContextTitle(`${provider === 'jira' ? 'Jira issue' : 'TEOB memory run'} · ${key}`);
@@ -117,7 +127,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       <WorkspaceSwitch active="sessions" onChange={workspace => { if (workspace === 'documents') onClose(); }}/>
       <nav className="hs-view-switch" aria-label="Sessions view">
         <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
-        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')}><Clock size={13}/> History</button>
+        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><Search size={13}/> Search</button>
       </nav>
       <div className="sc-top-actions">
         {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button><button onClick={() => setConnections(true)}><Settings2 size={14}/> Connections</button><button onClick={() => setUserMemories(true)}>User memories</button><button onClick={() => setAgentAccess(true)}>Agent access</button></>}
@@ -133,36 +143,34 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div>
       </details>}
     </header>
-    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories}/></div>
+    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined}/></div>
     {view === 'history' && <>
     {error && <div className="sc-banner" role="alert">{error}</div>}
     {!enabled ? <div className="sc-welcome"><div className="sc-logo"><Bot size={36}/></div><p className="sc-eyebrow">YOUR AGENTIC LANDSCAPE</p><h1>See the work.<br/>Follow every agent.</h1><p>Codex and Claude sessions, their agents, models, tokens, tools and linked work. One view across all recorded workspaces on this machine.</p>
       <button className="sc-primary" disabled={!isTauri() || enabled === null} onClick={async () => { try { setEnabled(await sessionApi.enable()); } catch(e) {setError(err(e));} }}><Shield size={16}/>{isTauri() ? 'Enable session access' : 'Open the desktop app to connect local sessions'}</button><small>Local transcripts · no transcript edits · remote connections on demand</small></div> : <>
-      <div className="sc-filters"><div className="sc-search"><Search size={16}/><input aria-label="Search sessions" placeholder="Find a task, ticket, model or tool…" value={query} onChange={e => setQuery(e.target.value)}/></div>
-        <select aria-label="Provider" value={provider} onChange={e => setProvider(e.target.value)}><option value="all">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select>
-        <select aria-label="Session origin" value={role} onChange={e => setRole(e.target.value)}><option value="all">Humans & agents</option><option value="human">Human sessions</option><option value="subagent">Subagents</option><option value="automation">Automation / exec</option><option value="unknown">Unknown origin</option></select>
-        <select aria-label="Activity filter" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">All activity</option><option value="working">Observed working</option><option value="recent">Last 24 hours</option><option value="roots">Root sessions</option><option value="stale">Stale / unconfirmed</option><option value="idle">Idle</option><option value="interrupted">Interrupted</option></select>
-      </div>
-      <div className="sc-activity-toolbar">
-        <details className="sc-time-window">
-          <summary><Clock size={14}/><span>Activity window</span><span className="sc-time-summary">{activeSince || inactiveSince || activeMinutes || inactiveMinutes ? 'Filtered' : 'Any time'}</span><ChevronRight size={13} className="sc-time-chevron"/></summary>
-          <div className="sc-time-filters">
-            <label>Active since<input aria-label="Active since" type="datetime-local" value={activeSince} onChange={e=>setActiveSince(e.target.value)}/></label>
-            <label>Inactive since<input aria-label="Inactive since" type="datetime-local" value={inactiveSince} onChange={e=>setInactiveSince(e.target.value)}/></label>
+      <div className="sc-body ss-body"><aside className="sc-session-list ss-list" aria-label="Session search">
+        <div className="sc-search ss-search"><Search size={14}/><input aria-label="Search sessions" placeholder="Find a task, ticket, model or tool…" value={query} onChange={e => setQuery(e.target.value)}/></div>
+        <details className="ss-filters">
+          <summary><span>Filters{filtersOn ? ` · ${filtersOn} on` : ''}</span><span className="ss-count">{filtered.length.toLocaleString()} sessions</span><ChevronRight size={12}/></summary>
+          <div className="ss-filter-fields">
+            <select aria-label="Provider" value={provider} onChange={e => setProvider(e.target.value)}><option value="all">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select>
+            <select aria-label="Session origin" value={role} onChange={e => setRole(e.target.value)}><option value="all">Humans & agents</option><option value="human">Human sessions</option><option value="subagent">Subagents</option><option value="automation">Automation / exec</option><option value="unknown">Unknown origin</option></select>
+            <select aria-label="Activity filter" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">All activity</option><option value="working">Observed working</option><option value="recent">Last 24 hours</option><option value="roots">Root sessions</option><option value="stale">Stale / unconfirmed</option><option value="idle">Idle</option><option value="interrupted">Interrupted</option></select>
             <label>Active in the last<select aria-label="Active in the last" value={activeMinutes} onChange={e=>setActiveMinutes(e.target.value)}><option value="">Any time</option><option value="5">5 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="1440">1 day</option><option value="10080">7 days</option></select></label>
             <label>No activity for<select aria-label="No activity for" value={inactiveMinutes} onChange={e=>setInactiveMinutes(e.target.value)}><option value="">Any duration</option><option value="5">5 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="1440">1 day</option><option value="10080">7 days</option></select></label>
+            <label>Active since<input aria-label="Active since" type="datetime-local" value={activeSince} onChange={e=>setActiveSince(e.target.value)}/></label>
+            <label>Inactive since<input aria-label="Inactive since" type="datetime-local" value={inactiveSince} onChange={e=>setInactiveSince(e.target.value)}/></label>
             <p className="sc-time-help">Filters combine using last recorded activity. Dates use local time.</p>
-            {(activeSince || inactiveSince || activeMinutes || inactiveMinutes) && <button className="sc-time-reset" onClick={()=>{setActiveSince('');setInactiveSince('');setInactiveMinutes('');setActiveMinutes('');}}>Reset time window</button>}
           </div>
         </details>
-        <button className="sc-clear-filters" onClick={()=>{setActiveSince('');setInactiveSince('');setInactiveMinutes('');setActiveMinutes('');setDirectory('');setRole('all');setProvider('all');setFilter('all');setQuery('');}}><X size={12}/> Clear filters</button>
-      </div>
-      <div className="sc-body"><aside className="sc-session-list" aria-label="Session hierarchy">
-        <SessionDirectoryMap sessions={data.sessions} directory={directory} current={chosen?.cwd || data.currentDirectory || ''} select={setDirectory}/>
-        <SessionTree all={data.sessions} matches={filtered} selected={selected} select={setSelected}/>
+        {(directory || filtersOn > 0 || query) && <div className="ss-active">
+          {directory && <span className="ss-chip" title={directory}>in {directory.replace(/^\/(Users|home)\/[^/]+/, '~')}<button aria-label="Search all folders" title="Search all folders" onClick={() => setDirectory('')}><X size={10}/></button></span>}
+          <button className="sc-clear-filters" onClick={clearFilters}><X size={12}/> Clear</button>
+        </div>}
+        <SessionResults all={data.sessions} matches={filtered} selected={selected} select={setSelected} directory={directory} narrow={setDirectory}/>
         {!filtered.length && <div className="sc-empty">{busy ? 'Indexing transcripts…' : 'No sessions match these filters.'}</div>}
       </aside>
-      <main className="sc-detail">{chosen ? <><div className="sc-detail-heading"><div className="sc-session-meta"><span className={`sc-provider ${chosen.provider}`}>{chosen.provider}</span><span className={`sc-status ${chosen.status}`}>{chosen.status}</span><span>{origin(chosen)==='human' ? 'Human session' : origin(chosen)} · {chosen.name}</span></div><h2 title={label(chosen)}>{label(chosen)}</h2><p title={chosen.cwd}>{chosen.cwd}</p><div className="sc-detail-info"><span><Zap size={14}/>{chosen.model || 'Unknown model'} {chosen.effort && `· ${chosen.effort}`}</span><span>{compact(totalTokens(chosen.usage))} recorded tokens</span><span>{chosen.eventCount.toLocaleString()} events</span></div></div>
+      <main className="sc-detail">{chosen ? <><div className="sc-detail-heading"><div className="sc-session-meta"><span className={`sc-provider ${chosen.provider}`}>{chosen.provider}</span><span className={`sc-status ${chosen.status}`}>{chosen.status}</span><span>{origin(chosen)==='human' ? 'Human session' : origin(chosen)} · {chosen.name}</span></div><h2 title={label(chosen)}>{label(chosen)}</h2>{!chosen.parentId && isTauri() && <button className="ss-resume" title="Continue this session in a hosted terminal, in its folder" onClick={() => void resumeLive(chosen)}><Play size={13}/> Resume in Live</button>}<p title={chosen.cwd}>{chosen.cwd}</p><div className="sc-detail-info"><span><Zap size={14}/>{chosen.model || 'Unknown model'} {chosen.effort && `· ${chosen.effort}`}</span><span>{compact(totalTokens(chosen.usage))} recorded tokens</span><span>{chosen.eventCount.toLocaleString()} events</span></div></div>
         <nav className="sc-tabs" aria-label="Session details">{['activity','agents','usage','memories','linked work','direct'].map(t => <button key={t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>{t}{t === 'agents' && <span>{descendants.length - 1}</span>}</button>)}</nav>
         <div className="sc-detail-content">
         {tab === 'activity' && <>{focusedEvidence?.session === selected && <button onClick={()=>setFocusedEvidence(null)}>Back to activity</button>}<div className="sc-section-row"><h3>Activity <span className="sc-activity-count">{events.length} / {chosen.eventCount} · {olderEvents ? 'earlier' : 'latest'} · newest first</span></h3><select title="Message previews are capped at 12,000 characters" aria-label="Event type" value={eventFilter} onChange={e => setEventFilter(e.target.value)}>{['all','user','assistant','tool','result','error'].map(t => <option key={t}>{t}</option>)}</select></div>

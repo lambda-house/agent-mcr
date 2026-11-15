@@ -76,7 +76,7 @@ pub async fn harness_resumable(access: State<'_, AccessState>) -> Result<Value, 
     if !access.access.lock().map(|a| a.session_workspace).unwrap_or(false) {
         return Err("Turn on the Sessions workspace to resume earlier sessions".into());
     }
-    blocking(|| service(json!({"op": "resumable", "days": 7}))).await
+    blocking(|| service(json!({"op": "resumable", "days": 14}))).await
 }
 
 #[tauri::command]
