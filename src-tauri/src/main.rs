@@ -1710,6 +1710,19 @@ fn main() {
             }
             return;
         }
+        Some("--harness-tool") => {
+            let result = get_config_dir()
+                .map_err(|e| e.message)
+                .and_then(|dir| harness::tool_cli(&dir, &std::env::args().nth(2).unwrap_or_default(), std::env::args().nth(3)));
+            match result {
+                Ok(out) => println!("{out}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Some("--harness-hook") => {
             harness::hook_bridge(&std::env::args().nth(2).unwrap_or_default(), std::env::args().nth(3));
             return;
