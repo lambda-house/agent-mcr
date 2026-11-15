@@ -73,11 +73,11 @@
 .session-cockpit .sc-memory-open { display:flex; align-items:center; gap:4px; color:var(--sc-accent); }
 
 /* Search view: the same shape as the Live list (folders as sections, compact rows) */
-.session-cockpit .ss-body { display: grid; grid-template-columns: clamp(240px, 26%, 340px) minmax(0, 1fr); gap: 0; padding: 0; }
+.session-cockpit .ss-body { display: grid; grid-template-columns: clamp(240px, 26%, 340px) minmax(0, 1fr); gap: 0; margin: 0; padding: 0; border: 0; border-radius: 0; }
 .session-cockpit .ss-list { display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding: 0; border: 0; border-right: 1px solid var(--sc-border); border-radius: 0; background: var(--sc-panel); }
-.session-cockpit .ss-search { display: flex; align-items: center; gap: 6px; margin: 8px 8px 4px; padding: 0 8px; height: 28px; border: 1px solid var(--sc-border); border-radius: 6px; background: var(--sc-bg); color: var(--sc-muted); }
+.session-cockpit .ss-search { display: flex; flex: 0 0 28px; align-items: center; gap: 6px; margin: 8px 8px 4px; padding: 0 8px; height: 28px; border: 1px solid var(--sc-border); border-radius: 6px; background: var(--sc-bg); color: var(--sc-muted); }
 .session-cockpit .ss-search input { flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: transparent; font-size: 12px; color: var(--sc-text); }
-.ss-filters { margin: 0 8px; font-size: 11px; color: var(--sc-muted); }
+.ss-filters { flex: 0 0 auto; margin: 0 8px; font-size: 11px; color: var(--sc-muted); }
 .ss-filters > summary { display: flex; align-items: center; gap: 6px; padding: 3px 2px; list-style: none; cursor: pointer; }
 .ss-filters > summary::-webkit-details-marker { display: none; }
 .ss-filters > summary:hover { color: var(--sc-text); }
@@ -87,7 +87,7 @@
 .ss-filter-fields label { display: flex; flex-direction: column; gap: 2px; }
 .session-cockpit .ss-filter-fields select, .session-cockpit .ss-filter-fields input { width: 100%; min-width: 0; max-width: none; height: 26px; padding: 0 6px; border: 1px solid var(--sc-border); border-radius: 5px; background: var(--sc-bg); font-size: 11.5px; }
 .ss-filter-fields .sc-time-help { margin: 0; }
-.ss-active { display: flex; align-items: center; gap: 6px; margin: 0 8px 2px; min-width: 0; }
+.ss-active { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; margin: 0 8px 2px; min-width: 0; }
 .ss-chip { display: inline-flex; align-items: center; gap: 4px; min-width: 0; padding: 1px 3px 1px 7px; border: 1px solid var(--sc-accent); border-radius: 10px; color: var(--sc-accent); font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .session-cockpit .ss-chip button { padding: 2px; border: 0; background: transparent; color: inherit; }
 .session-cockpit .ss-active .sc-clear-filters { margin-left: auto; min-height: 0; padding: 2px 4px; }
@@ -102,4 +102,4 @@
 .ss-results .sc-session strong .hs-mark { vertical-align: -2px; margin-right: 2px; }
 .ss-results .sc-session small { display: block; color: var(--sc-muted); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ss-meta .sc-origin, .ss-meta .sc-status { display: inline; padding: 0; border: 0; background: none; font-size: inherit; }
-.session-cockpit .ss-resume { margin: 4px 0 2px; padding: 4px 9px; font-size: 12px; border-color: var(--sc-accent); color: var(--sc-accent); background: transparent; }
+.session-cockpit .ss-resume { margin-left: auto; padding: 2px 8px; gap: 5px; font-size: 11px; border-color: var(--sc-accent); color: var(--sc-accent); background: transparent; }

@@ -35,6 +35,7 @@ export default function TerminalPane({ id, active }: { id: string; active: boole
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
+  const resend = useRef<() => void>(() => {});
   const [ended, setEnded] = useState(false);
   const [notice, setNotice] = useState('');
 
@@ -60,17 +61,35 @@ export default function TerminalPane({ id, active }: { id: string; active: boole
 
     let view: number | null = null;
     let disposed = false;
+    // The agent must end up with the size the screen has. Sizes are sent one
+    // at a time, newest last: two requests in flight can arrive in the wrong
+    // order, and an agent that draws for another width than the screen's
+    // garbles every repaint until the next resize.
+    let wanted: { cols: number; rows: number } | null = null;
+    let sending = false;
+    const sendSize = async (cols: number, rows: number) => {
+      wanted = { cols, rows };
+      if (sending) return;
+      sending = true;
+      try {
+        const take = () => { const next = wanted; wanted = null; return next; };
+        for (let next = take(); next && !disposed; next = take()) {
+          await harnessApi.resize(id, next.cols, next.rows).catch(() => {});
+        }
+      } finally { sending = false; }
+    };
+    resend.current = () => { void sendSize(t.cols, t.rows); };
     harnessApi.attach(id, bytes => {
       if (bytes.length === 0) { setEnded(true); return; }
       t.write(bytes);
     }).then(handle => {
       if (disposed) { void harnessApi.detach(handle); return; }
       view = handle;
-      void harnessApi.resize(id, t.cols, t.rows).catch(() => {});
+      void sendSize(t.cols, t.rows);
     }).catch(e => setNotice(err(e)));
 
     const typed = t.onData(data => { if (view !== null) harnessApi.input(view, data).catch(e => setNotice(err(e))); });
-    const resized = t.onResize(({ cols, rows }) => { void harnessApi.resize(id, cols, rows).catch(() => {}); });
+    const resized = t.onResize(({ cols, rows }) => { void sendSize(cols, rows); });
 
     const onPaste = (e: ClipboardEvent) => {
       const image = pastedImage(e.clipboardData);
@@ -102,17 +121,19 @@ export default function TerminalPane({ id, active }: { id: string; active: boole
       typed.dispose(); resized.dispose();
       if (view !== null) void harnessApi.detach(view);
       t.dispose();
-      term.current = null; fit.current = null;
+      term.current = null; fit.current = null; resend.current = () => {};
     };
   }, [id]);
 
   useEffect(() => {
     if (!active) return;
-    requestAnimationFrame(() => { try { fit.current?.fit(); } catch { /* hidden */ } term.current?.focus(); });
+    // Shown again: fit, and tell the agent the size even when it did not change here
+    // (the session may have been resized from elsewhere while this pane was hidden)
+    requestAnimationFrame(() => { try { fit.current?.fit(); } catch { /* hidden */ } resend.current(); term.current?.focus(); });
   }, [active]);
 
   return <div className="hs-terminal-wrap">
-    <div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} />
+    <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
     {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended. Its output is kept until you forget it.'}</div>}
   </div>;
 }

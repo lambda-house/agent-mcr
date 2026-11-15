@@ -3,7 +3,7 @@ use crate::session_db::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-pub const PARSER_VERSION: u32 = 4;
+pub const PARSER_VERSION: u32 = 5;
 pub fn digest(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -203,6 +203,8 @@ impl Session {
             && text.len() >= 12
             && !text.starts_with('<')
             && !text.starts_with("[SYSTEM")
+            // A notice the harness typed is not what the session is about
+            && !text.starts_with("[Agent MCR]")
             && !text.starts_with("Another Claude session")
             && !text.starts_with("The coordinator sent")
         {
