@@ -9,11 +9,9 @@
 
 The architecture and its decisions are in [docs/AGENT_HARNESS_DESIGN.md](docs/AGENT_HARNESS_DESIGN.md).
 
-Agent MCR is built on [MDViewer](https://github.com/lambda-house/mdviewer-mj) and still contains its Markdown viewer (**Documents**). MDViewer's own README is kept at [docs/MDVIEWER.md](docs/MDVIEWER.md). Viewer fixes are merged from the `upstream` remote.
-
 ## Status
 
-Pre-release (0.1.0): macOS only, no published builds and no updates. It runs alongside an installed MDViewer without sharing settings, data or file associations.
+Pre-release (0.1.0): macOS only, no published builds and no updates.
 
 ## Build and run
 
@@ -61,12 +59,12 @@ Every agent runs as your macOS user. The harness limits what an agent can do thr
 
 - `access.json`: what you've allowed
 - `sessions/index.sqlite`: the transcript index, which contains private transcript content
-- `history/` and `read-state/`: inherited from the viewer
+- `history/` and `read-state/`: the Markdown reader's history and its "changed since you read it" copies
 - `analysis/mcp.sock`: the analysis MCP socket, while it's switched on
 - `runner.sock`, `harness.sock` and their logs: the two background units that host terminals and track sessions
 - `harness-state.json`: session states and tasks; `claude-hooks.json`: the hooks passed to hosted Claude sessions
 
-Browser-side settings are stored per app, separate from MDViewer's.
+Browser-side settings are stored per app.
 
 ## Analysis MCP
 
