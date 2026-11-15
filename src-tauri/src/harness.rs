@@ -225,25 +225,49 @@ pub struct Shell {
     pub pid: i32,
     pub command: String,
     pub started: u64,
+    /// Processor seconds used by the shell and everything under it
+    pub cpu: f64,
+    /// Suspended (as by Ctrl-Z or a debugger)
+    pub stopped: bool,
+    /// Since when its processor time has not moved (filled in by the service).
+    /// A process that only waits (a sleep, a lock, the network) looks the same
+    /// as one that is stuck: this says quiet, not broken.
+    pub quiet_since: u64,
 }
 
-/// One row of `ps`: pid, parent, seconds running, command line.
-pub type Process = (i32, i32, u64, String);
+/// One row of `ps`.
+#[derive(Clone, Debug, Default)]
+pub struct Process {
+    pub pid: i32,
+    pub parent: i32,
+    /// Seconds since it started
+    pub elapsed: u64,
+    /// Processor seconds used
+    pub cpu: f64,
+    pub state: String,
+    pub command: String,
+}
 
-/// `[[dd-]hh:]mm:ss` as `ps` prints elapsed time.
-fn elapsed_seconds(text: &str) -> u64 {
-    let (days, rest) = text.split_once('-').map_or((0, text), |(d, r)| (d.parse().unwrap_or(0), r));
-    rest.split(':').fold(0, |total, part| total * 60 + part.parse::<u64>().unwrap_or(0)) + days * 86_400
+/// `[[dd-]hh:]mm:ss[.cc]` as `ps` prints elapsed and processor time.
+fn clock_seconds(text: &str) -> f64 {
+    let (days, rest) = text.split_once('-').map_or((0.0, text), |(d, r)| (d.parse().unwrap_or(0.0), r));
+    rest.split(':').fold(0.0, |total, part| total * 60.0 + part.parse::<f64>().unwrap_or(0.0)) + days * 86_400.0
 }
 
 pub fn process_table() -> Vec<Process> {
-    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,etime=,command="]).output() else { return Vec::new() };
+    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,etime=,time=,state=,command="]).output() else { return Vec::new() };
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
-            let (pid, parent, elapsed) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, elapsed_seconds(parts.next()?));
-            Some((pid, parent, elapsed, parts.collect::<Vec<_>>().join(" ")))
+            Some(Process {
+                pid: parts.next()?.parse().ok()?,
+                parent: parts.next()?.parse().ok()?,
+                elapsed: clock_seconds(parts.next()?) as u64,
+                cpu: clock_seconds(parts.next()?),
+                state: parts.next()?.to_string(),
+                command: parts.collect::<Vec<_>>().join(" "),
+            })
         })
         .collect()
 }
@@ -258,23 +282,32 @@ fn is_command_shell(command: &str) -> bool {
 /// descendants, named by the command it runs. Its helpers that are not shells
 /// (MCP servers, the harness bridge) are not listed.
 pub fn shells(table: &[Process], root: i32, now: u64) -> Vec<Shell> {
-    let children = |pid: i32| table.iter().filter(move |p| p.1 == pid);
+    let children = |pid: i32| table.iter().filter(move |p| p.parent == pid);
     let mut out = Vec::new();
-    let mut queue: Vec<i32> = children(root).map(|p| p.0).collect();
+    let mut queue: Vec<i32> = children(root).map(|p| p.pid).collect();
     while let Some(pid) = queue.pop() {
-        let Some(process) = table.iter().find(|p| p.0 == pid) else { continue };
-        if !is_command_shell(&process.3) {
-            queue.extend(children(pid).map(|p| p.0));
+        let Some(process) = table.iter().find(|p| p.pid == pid) else { continue };
+        if !is_command_shell(&process.command) {
+            queue.extend(children(pid).map(|p| p.pid));
             continue;
         }
         // What it runs: its first child, or else the text it was given
-        let inner = children(pid).min_by_key(|p| p.0).map(|p| {
-            let (program, rest) = p.3.split_once(' ').unwrap_or((&p.3, ""));
+        let inner = children(pid).min_by_key(|p| p.pid).map(|p| {
+            let (program, rest) = p.command.split_once(' ').unwrap_or((&p.command, ""));
             format!("{} {rest}", program.rsplit('/').next().unwrap_or(program))
         });
-        let given = || process.3.rsplit_once("eval ").map(|(_, c)| c).or(process.3.split_once("c ").map(|(_, c)| c)).unwrap_or(&process.3).to_string();
+        let given = || process.command.rsplit_once("eval ").map(|(_, c)| c).or(process.command.split_once("c ").map(|(_, c)| c)).unwrap_or(&process.command).to_string();
         let command: String = inner.unwrap_or_else(given).trim().chars().filter(|c| !c.is_control()).take(160).collect();
-        out.push(Shell { pid, command, started: now.saturating_sub(process.2 * 1000) });
+        // The whole tree under the shell: the work is usually in a grandchild
+        let (mut cpu, mut stopped, mut tree) = (0.0, false, vec![pid]);
+        while let Some(member) = tree.pop() {
+            if let Some(p) = table.iter().find(|p| p.pid == member) {
+                cpu += p.cpu;
+                stopped |= p.state.starts_with('T');
+            }
+            tree.extend(children(member).map(|p| p.pid));
+        }
+        out.push(Shell { pid, command, started: now.saturating_sub(process.elapsed * 1000), cpu, stopped, quiet_since: now });
         if out.len() == 12 {
             break;
         }
@@ -728,6 +761,8 @@ pub struct Harness {
     connections: AtomicUsize,
     /// The process table, read at most every two seconds
     processes: Mutex<(Option<Instant>, Arc<Vec<Process>>)>,
+    /// Per running shell: its processor time and when that last moved
+    activity: Mutex<BTreeMap<i32, (f64, u64)>>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -795,7 +830,7 @@ impl Harness {
         let mut store: Store = std::fs::read(dir.join("harness-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))) }
+        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()) }
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
@@ -842,6 +877,20 @@ impl Harness {
         cached.1.clone()
     }
 
+    /// Stamp each shell with the time its processor use last moved, as seen
+    /// by this service (a shell first seen now counts as active now).
+    fn with_activity(&self, mut found: Vec<Shell>, now: u64) -> Vec<Shell> {
+        let mut activity = lock(&self.activity);
+        for shell in &mut found {
+            let seen = activity.entry(shell.pid).or_insert((shell.cpu, now));
+            if shell.cpu > seen.0 + 0.015 {
+                *seen = (shell.cpu, now);
+            }
+            shell.quiet_since = seen.1;
+        }
+        found
+    }
+
     fn sessions(&self) -> Result<Vec<Value>, String> {
         let list = self.runner(json!({"op": "list"}))?;
         let infos = list["sessions"].as_array().cloned().unwrap_or_default();
@@ -871,6 +920,7 @@ impl Harness {
             });
         }
         let processes = self.processes();
+        lock(&self.activity).retain(|pid, _| processes.iter().any(|p| p.pid == *pid));
         let store = lock(&self.store);
         let home = dirs::home_dir();
         let recent = now_ms().saturating_sub(3_600_000);
@@ -900,7 +950,7 @@ impl Harness {
                 out["unread"] = json!(store.unread(id));
                 out["peers"] = json!(store.talked_with(id, &ids));
                 if let (true, true, Some(pid)) = (info["exit"].is_null(), adapter(&tracked.profile).is_agent(), info["pid"].as_i64()) {
-                    out["shells"] = json!(shells(&processes, pid as i32, now_ms()));
+                    out["shells"] = json!(self.with_activity(shells(&processes, pid as i32, now_ms()), now_ms()));
                 }
                 if let (true, Some(home), Some(transcript)) = (info["exit"].is_null(), &home, &tracked.transcript) {
                     out["subagents"] = json!(subagents(home, transcript, recent));
@@ -2495,7 +2545,7 @@ mod tests {
 
     #[test]
     fn running_shells_come_from_the_process_table() {
-        let p = |pid: i32, parent: i32, secs: u64, command: &str| (pid, parent, secs, command.to_string());
+        let p = |pid: i32, parent: i32, elapsed: u64, command: &str| Process { pid, parent, elapsed, cpu: 0.5, state: if pid == 30 { "T" } else { "S" }.into(), command: command.to_string() };
         let table = vec![
             p(10, 1, 3000, "claude --permission-mode acceptEdits"),
             p(11, 10, 3000, "npm exec kubernetes-mcp-server@0.0.67"),
@@ -2511,6 +2561,14 @@ mod tests {
         let found = shells(&table, 10, 1_000_000);
         // Oldest first; named by what runs inside, never by the MCP servers or the bridge
         assert_eq!(found.iter().map(|s| (s.pid, s.command.as_str(), s.started)).collect::<Vec<_>>(), [(20, "cargo test -p kafka --lib control", 869_000), (30, "sleep 240", 995_000)]);
-        assert_eq!((elapsed_seconds("02:11"), elapsed_seconds("1:00:05"), elapsed_seconds("2-01:00:00")), (131, 3605, 176_400));
+        // Processor time is the whole tree's; a suspended process is told apart
+        assert_eq!((found[0].cpu, found[0].stopped, found[1].cpu, found[1].stopped), (2.0, false, 0.5, true));
+        assert_eq!((clock_seconds("02:11"), clock_seconds("1:00:05"), clock_seconds("2-01:00:00"), clock_seconds("0:01.26")), (131.0, 3605.0, 176_400.0, 1.26));
+
+        // Quiet since: the moment the service last saw the processor time move
+        let dir = std::env::temp_dir().join(format!("agent-mcr-activity-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let at = |cpu: f64, now: u64| harness.with_activity(vec![Shell { pid: 20, command: String::new(), started: 0, cpu, stopped: false, quiet_since: now }], now)[0].quiet_since;
+        assert_eq!((at(2.0, 1_000), at(2.0, 61_000), at(2.4, 90_000), at(2.4, 200_000)), (1_000, 1_000, 90_000, 90_000));
     }
 }

@@ -3,7 +3,7 @@ import { BarChart3, BellRing, Copy, Terminal, FolderOpen, MoreHorizontal, Play, 
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
-import { canRestart, groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { useStore } from '../store';
@@ -160,11 +160,19 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
       </button>
       <RowMenu label={label} actions={actions(h)}/>
       {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
-        {shells.map(sh => <li key={sh.pid} className="active" title={`${sh.command}\npid ${sh.pid} · running for ${runningFor(sh.started, Date.now())}`}>
-          <Terminal size={11} aria-label="running shell"/>
-          <span className="hs-item-text"><strong>{sh.command}</strong></span>
-          <small>{runningFor(sh.started, Date.now())}</small>
-        </li>)}
+        {shells.map(sh => {
+          const now = Date.now();
+          const health = shellHealth(sh, now);
+          const quiet = health === 'quiet' ? runningFor(sh.quietSince ?? now, now) : '';
+          const why = health === 'stopped' ? 'Suspended: it is not running until it is continued.'
+            : health === 'quiet' ? `No processor use for ${quiet}: it may be waiting (the network, a lock, a sleep) or stuck.`
+            : 'Using the processor: alive.';
+          return <li key={sh.pid} className={health} title={`${sh.command}\npid ${sh.pid} · running for ${runningFor(sh.started, now)}${sh.cpu !== undefined ? ` · ${sh.cpu < 10 ? sh.cpu.toFixed(1) : Math.round(sh.cpu)}s of processor time` : ''}\n${why}`}>
+            <Terminal size={11} aria-label={`${health} shell`}/>
+            <span className="hs-item-text"><strong>{sh.command}</strong></span>
+            <small>{health === 'stopped' ? 'stopped · ' : quiet ? `quiet ${quiet} · ` : ''}{runningFor(sh.started, now)}</small>
+          </li>;
+        })}
       </ul>}
       {subs.length > 0 && <ul className="hs-subs" aria-label={`Subagents of ${label}`}>
         {subs.map(a => {

@@ -133,7 +133,11 @@ describe('Live workspace', () => {
     const now = Date.now();
     const parent: Hosted = {
       ...running, id: 'p1', unread: 2,
-      shells: [{ pid: 901, command: 'cargo test -p kafka --lib control', started: now - 131_000 }],
+      shells: [
+        { pid: 901, command: 'cargo test -p kafka --lib control', started: now - 131_000, cpu: 42, quietSince: now - 5_000 },
+        { pid: 902, command: 'kafka-c8c1 control', started: now - 1_500_000, cpu: 1.31, quietSince: now - 1_440_000 },
+        { pid: 903, command: 'vim notes', started: now - 60_000, cpu: 0.2, stopped: true, quietSince: now - 1_000 },
+      ],
       harness: { name: 'Memory', profile: 'claude', state: 'working', since: 1, precise: true, agentSession: null, lastMessage: null, attention: null, status: 'running the regrade' },
       subagents: [
         { id: 'a1', description: 'MEM-653 false-premise template', agentType: 'general-purpose', model: 'sonnet', started: now - 60_000, lastActivity: now - 5_000 },
@@ -146,9 +150,15 @@ describe('Live workspace', () => {
     expect(host.textContent).toContain('2 unread');
     expect(host.querySelector('.hs-status')?.textContent).toBe('running the regrade');
     // A shell command it left running, with how long
-    const shell = host.querySelector('.hs-shells li');
-    expect(shell?.textContent).toBe('cargo test -p kafka --lib control2m');
-    expect(shell?.getAttribute('title')).toContain('pid 901');
+    const shell = [...host.querySelectorAll('.hs-shells li')];
+    expect(shell.map(li => li.className)).toEqual(['active', 'quiet', 'stopped']);
+    expect(shell[0].textContent).toBe('cargo test -p kafka --lib control2m');
+    expect(shell[0].getAttribute('title')).toContain('pid 901');
+    // No processor use for a long time: said as quiet, since waiting and stuck look alike
+    expect(shell[1].textContent).toBe('kafka-c8c1 controlquiet 24m · 25m');
+    expect(shell[1].getAttribute('title')).toContain('1.3s of processor time');
+    expect(shell[1].getAttribute('title')).toContain('may be waiting');
+    expect(shell[2].textContent).toBe('vim notesstopped · 1m');
     const subs = [...host.querySelectorAll('.hs-subs:not(.hs-shells) li')];
     // Finished ones are not shown; the rest are one line each, details in the tooltip
     expect(subs.map(li => li.className)).toEqual(['active', '']);

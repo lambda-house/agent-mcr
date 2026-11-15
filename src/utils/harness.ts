@@ -17,7 +17,15 @@ export interface Tracked {
 /** A subagent a Claude session started, as its files show it (activity, not verified liveness). */
 export interface Subagent { id: string; description: string; agentType: string; model: string; started: number; lastActivity: number; finished?: boolean }
 /** A command the agent started in a shell and that is still running (from the process table). */
-export interface RunningShell { pid: number; command: string; started: number }
+export interface RunningShell {
+  pid: number; command: string; started: number;
+  /** Processor seconds used by the shell and everything under it */
+  cpu?: number;
+  /** Suspended (Ctrl-Z, a debugger) */
+  stopped?: boolean;
+  /** Since when its processor time has not moved, as the service saw it */
+  quietSince?: number;
+}
 /** A terminal the runner hosts (`runner::Info`), with the service's view of it. */
 export interface Hosted {
   id: string; pid: number | null; argv: string[]; cwd: string; started: number;
@@ -155,4 +163,16 @@ export function runningFor(started: number, now: number): string {
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** A shell whose processor time has not moved for this long is shown as quiet. */
+export const SHELL_QUIET_MS = 120_000;
+
+/**
+ * Alive, quiet or suspended. Quiet means no processor use: the command may be
+ * waiting (the network, a lock, a sleep) or stuck; the two look the same.
+ */
+export function shellHealth(sh: RunningShell, now: number): 'active' | 'quiet' | 'stopped' {
+  if (sh.stopped) return 'stopped';
+  return sh.quietSince !== undefined && now - sh.quietSince >= SHELL_QUIET_MS ? 'quiet' : 'active';
 }

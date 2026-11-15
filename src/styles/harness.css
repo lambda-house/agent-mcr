@@ -110,3 +110,6 @@
 .hs-list ul.hs-shells li > svg { flex: 0 0 auto; }
 .hs-list ul.hs-shells li > small { flex: 0 0 auto; color: var(--sc-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .hs-shells .hs-item-text strong { font-family: "SF Mono", Menlo, monospace; font-size: 10.5px; color: var(--sc-text); }
+.hs-list ul.hs-shells li.quiet, .hs-list ul.hs-shells li.stopped { color: #e0a23c; }
+.hs-list ul.hs-shells li.quiet > small, .hs-list ul.hs-shells li.stopped > small { color: #e0a23c; }
+.hs-shells li.quiet .hs-item-text strong, .hs-shells li.stopped .hs-item-text strong { color: var(--sc-muted); }
