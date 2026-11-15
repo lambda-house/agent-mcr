@@ -16,6 +16,8 @@ export interface Tracked {
 }
 /** A subagent a Claude session started, as its files show it (activity, not verified liveness). */
 export interface Subagent { id: string; description: string; agentType: string; model: string; started: number; lastActivity: number; finished?: boolean }
+/** A command the agent started in a shell and that is still running (from the process table). */
+export interface RunningShell { pid: number; command: string; started: number }
 /** A terminal the runner hosts (`runner::Info`), with the service's view of it. */
 export interface Hosted {
   id: string; pid: number | null; argv: string[]; cwd: string; started: number;
@@ -26,6 +28,8 @@ export interface Hosted {
   unread?: number;
   /** Live sessions it exchanged messages with in the last day (ids) */
   peers?: string[];
+  /** Shell commands of the agent that are running now, oldest first */
+  shells?: RunningShell[];
   /** Subagents active in the last hour, newest first */
   subagents?: Subagent[];
 }
@@ -144,3 +148,11 @@ export function sessionReference(h: Hosted): string {
 
 /** A session whose agent can be ended and started again on the same conversation. */
 export const canRestart = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');
+
+/** How long something has been running, short: 40s, 12m, 3h 5m. */
+export function runningFor(started: number, now: number): string {
+  const seconds = Math.max(0, Math.round((now - started) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}

@@ -217,6 +217,72 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
     })
 }
 
+/// A command an agent started in a shell and that is still running, from the
+/// process table (so, unlike subagents, verified to be alive).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Shell {
+    pub pid: i32,
+    pub command: String,
+    pub started: u64,
+}
+
+/// One row of `ps`: pid, parent, seconds running, command line.
+pub type Process = (i32, i32, u64, String);
+
+/// `[[dd-]hh:]mm:ss` as `ps` prints elapsed time.
+fn elapsed_seconds(text: &str) -> u64 {
+    let (days, rest) = text.split_once('-').map_or((0, text), |(d, r)| (d.parse().unwrap_or(0), r));
+    rest.split(':').fold(0, |total, part| total * 60 + part.parse::<u64>().unwrap_or(0)) + days * 86_400
+}
+
+pub fn process_table() -> Vec<Process> {
+    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,etime=,command="]).output() else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let (pid, parent, elapsed) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, elapsed_seconds(parts.next()?));
+            Some((pid, parent, elapsed, parts.collect::<Vec<_>>().join(" ")))
+        })
+        .collect()
+}
+
+fn is_command_shell(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let name = words.next().unwrap_or("").rsplit('/').next().unwrap_or("");
+    ["bash", "zsh", "sh", "dash", "fish"].contains(&name) && words.next().is_some_and(|flag| flag.starts_with('-') && flag.contains('c'))
+}
+
+/// The shells running under an agent's process: each `sh -c …` among its
+/// descendants, named by the command it runs. Its helpers that are not shells
+/// (MCP servers, the harness bridge) are not listed.
+pub fn shells(table: &[Process], root: i32, now: u64) -> Vec<Shell> {
+    let children = |pid: i32| table.iter().filter(move |p| p.1 == pid);
+    let mut out = Vec::new();
+    let mut queue: Vec<i32> = children(root).map(|p| p.0).collect();
+    while let Some(pid) = queue.pop() {
+        let Some(process) = table.iter().find(|p| p.0 == pid) else { continue };
+        if !is_command_shell(&process.3) {
+            queue.extend(children(pid).map(|p| p.0));
+            continue;
+        }
+        // What it runs: its first child, or else the text it was given
+        let inner = children(pid).min_by_key(|p| p.0).map(|p| {
+            let (program, rest) = p.3.split_once(' ').unwrap_or((&p.3, ""));
+            format!("{} {rest}", program.rsplit('/').next().unwrap_or(program))
+        });
+        let given = || process.3.rsplit_once("eval ").map(|(_, c)| c).or(process.3.split_once("c ").map(|(_, c)| c)).unwrap_or(&process.3).to_string();
+        let command: String = inner.unwrap_or_else(given).trim().chars().filter(|c| !c.is_control()).take(160).collect();
+        out.push(Shell { pid, command, started: now.saturating_sub(process.2 * 1000) });
+        if out.len() == 12 {
+            break;
+        }
+    }
+    out.sort_by_key(|s| s.started);
+    out
+}
+
 /// Whether a conversation is one a person runs (`true`) or one started by
 /// another agent (`false`); `None` when no transcript of it is found.
 pub fn top_level_thread(home: &Path, id: &str) -> Option<bool> {
@@ -660,6 +726,8 @@ pub struct Harness {
     store: Mutex<Store>,
     changed: Condvar,
     connections: AtomicUsize,
+    /// The process table, read at most every two seconds
+    processes: Mutex<(Option<Instant>, Arc<Vec<Process>>)>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -727,7 +795,7 @@ impl Harness {
         let mut store: Store = std::fs::read(dir.join("harness-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0) }
+        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))) }
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
@@ -766,6 +834,14 @@ impl Harness {
     }
 
     /// The runner's terminals with what this service knows about each.
+    fn processes(&self) -> Arc<Vec<Process>> {
+        let mut cached = lock(&self.processes);
+        if cached.0.is_none_or(|at| at.elapsed() > Duration::from_secs(2)) {
+            *cached = (Some(Instant::now()), Arc::new(process_table()));
+        }
+        cached.1.clone()
+    }
+
     fn sessions(&self) -> Result<Vec<Value>, String> {
         let list = self.runner(json!({"op": "list"}))?;
         let infos = list["sessions"].as_array().cloned().unwrap_or_default();
@@ -794,6 +870,7 @@ impl Harness {
                 }
             });
         }
+        let processes = self.processes();
         let store = lock(&self.store);
         let home = dirs::home_dir();
         let recent = now_ms().saturating_sub(3_600_000);
@@ -822,6 +899,9 @@ impl Harness {
                 out["openTasks"] = json!(open);
                 out["unread"] = json!(store.unread(id));
                 out["peers"] = json!(store.talked_with(id, &ids));
+                if let (true, true, Some(pid)) = (info["exit"].is_null(), adapter(&tracked.profile).is_agent(), info["pid"].as_i64()) {
+                    out["shells"] = json!(shells(&processes, pid as i32, now_ms()));
+                }
                 if let (true, Some(home), Some(transcript)) = (info["exit"].is_null(), &home, &tracked.transcript) {
                     out["subagents"] = json!(subagents(home, transcript, recent));
                 }
@@ -2411,5 +2491,26 @@ mod tests {
         assert_eq!(s.talked_with("b", &live), ["a"]);
         s.messages.values_mut().for_each(|m| m.created = 1);
         assert!(s.talked_with("a", &live).is_empty(), "old conversations no longer group sessions");
+    }
+
+    #[test]
+    fn running_shells_come_from_the_process_table() {
+        let p = |pid: i32, parent: i32, secs: u64, command: &str| (pid, parent, secs, command.to_string());
+        let table = vec![
+            p(10, 1, 3000, "claude --permission-mode acceptEdits"),
+            p(11, 10, 3000, "npm exec kubernetes-mcp-server@0.0.67"),
+            p(12, 11, 3000, "node /x/kubernetes-mcp-server"),
+            p(13, 10, 3000, "/Apps/agent-mcr --harness-mcp"),
+            p(20, 10, 131, "/bin/bash -c source /Users/me/.claude/shell-snapshots/s.sh 2>/dev/null || true && eval 'cargo test -p kafka | tail -25'"),
+            p(21, 20, 131, "/Users/me/.rustup/toolchains/1.99/bin/cargo test -p kafka --lib control"),
+            p(22, 21, 90, "/work/target/debug/deps/kafka-c8c1 control"),
+            p(23, 20, 131, "tail -25"),
+            p(30, 10, 5, "/bin/zsh -lc sleep 240"),
+            p(40, 1, 9, "/bin/zsh -c other session"),
+        ];
+        let found = shells(&table, 10, 1_000_000);
+        // Oldest first; named by what runs inside, never by the MCP servers or the bridge
+        assert_eq!(found.iter().map(|s| (s.pid, s.command.as_str(), s.started)).collect::<Vec<_>>(), [(20, "cargo test -p kafka --lib control", 869_000), (30, "sleep 240", 995_000)]);
+        assert_eq!((elapsed_seconds("02:11"), elapsed_seconds("1:00:05"), elapsed_seconds("2-01:00:00")), (131, 3605, 176_400));
     }
 }

@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3, BellRing, Copy, FolderOpen, MoreHorizontal, Play, Radar, RotateCw, X } from 'lucide-react';
+import { BarChart3, BellRing, Copy, Terminal, FolderOpen, MoreHorizontal, Play, Radar, RotateCw, X } from 'lucide-react';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
-import { canRestart, groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, sessionReference, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, groupSessions, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { useStore } from '../store';
@@ -147,7 +147,8 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
       ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
       : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', referenced === h.id ? 'reference copied' : ''].filter(Boolean).join(' · ');
     const subs = (h.subagents ?? []).filter(a => !a.finished);
-    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) ? 'idle' : ''].filter(Boolean).join(' ')}>
+    const shells = h.exit ? [] : h.shells ?? [];
+    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : ''].filter(Boolean).join(' ')}>
       <button className="hs-item" onClick={() => select(h.id)} title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}`}>
         <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
         <span className="hs-item-text">
@@ -158,6 +159,13 @@ export default function LiveWorkspace({ active, recentDirectories }: { active: b
         </span>
       </button>
       <RowMenu label={label} actions={actions(h)}/>
+      {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
+        {shells.map(sh => <li key={sh.pid} className="active" title={`${sh.command}\npid ${sh.pid} · running for ${runningFor(sh.started, Date.now())}`}>
+          <Terminal size={11} aria-label="running shell"/>
+          <span className="hs-item-text"><strong>{sh.command}</strong></span>
+          <small>{runningFor(sh.started, Date.now())}</small>
+        </li>)}
+      </ul>}
       {subs.length > 0 && <ul className="hs-subs" aria-label={`Subagents of ${label}`}>
         {subs.map(a => {
           const live = subagentActive(a, Date.now());

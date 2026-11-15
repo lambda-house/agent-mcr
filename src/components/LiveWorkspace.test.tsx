@@ -133,6 +133,7 @@ describe('Live workspace', () => {
     const now = Date.now();
     const parent: Hosted = {
       ...running, id: 'p1', unread: 2,
+      shells: [{ pid: 901, command: 'cargo test -p kafka --lib control', started: now - 131_000 }],
       harness: { name: 'Memory', profile: 'claude', state: 'working', since: 1, precise: true, agentSession: null, lastMessage: null, attention: null, status: 'running the regrade' },
       subagents: [
         { id: 'a1', description: 'MEM-653 false-premise template', agentType: 'general-purpose', model: 'sonnet', started: now - 60_000, lastActivity: now - 5_000 },
@@ -144,7 +145,11 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(host.textContent).toContain('2 unread');
     expect(host.querySelector('.hs-status')?.textContent).toBe('running the regrade');
-    const subs = [...host.querySelectorAll('.hs-subs li')];
+    // A shell command it left running, with how long
+    const shell = host.querySelector('.hs-shells li');
+    expect(shell?.textContent).toBe('cargo test -p kafka --lib control2m');
+    expect(shell?.getAttribute('title')).toContain('pid 901');
+    const subs = [...host.querySelectorAll('.hs-subs:not(.hs-shells) li')];
     // Finished ones are not shown; the rest are one line each, details in the tooltip
     expect(subs.map(li => li.className)).toEqual(['active', '']);
     expect(subs[0].textContent).toBe('MEM-653 false-premise template');

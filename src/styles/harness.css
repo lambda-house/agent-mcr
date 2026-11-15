@@ -104,3 +104,9 @@
 .hs-stats li i { position: absolute; left: 0; bottom: 0; height: 2px; border-radius: 1px; background: var(--sc-accent); opacity: .7; }
 .hs-stats li.hs-stats-more { display: block; color: var(--sc-muted); }
 .hs-stats-note { margin: 8px 0 0; color: var(--sc-muted); font-size: 11px; line-height: 1.4; }
+
+/* Shell commands an agent has running: rows under it, like subagents */
+.hs-list ul.hs-shells li { align-items: center; color: var(--sc-accent); }
+.hs-list ul.hs-shells li > svg { flex: 0 0 auto; }
+.hs-list ul.hs-shells li > small { flex: 0 0 auto; color: var(--sc-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.hs-shells .hs-item-text strong { font-family: "SF Mono", Menlo, monospace; font-size: 10.5px; color: var(--sc-text); }
