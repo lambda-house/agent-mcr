@@ -1258,6 +1258,9 @@ impl Harness {
         let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
         // Agents always turn it on, and their old output may have left the scrollback
         let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
+        if agent {
+            plain_prompt(&clean)?;
+        }
         let bracketed = agent || runner::snapshot(&runner_socket(&self.dir), session).is_ok_and(|bytes| wants_bracketed_paste(&bytes));
         let data = if bracketed { format!("\x1b[200~{clean}\x1b[201~") } else { clean };
         self.runner(json!({"op": "write", "id": session, "data": data}))?;
@@ -1350,7 +1353,8 @@ impl Harness {
             Some((from, tools))
         });
         let Some((from, tools)) = from else { return };
-        let who = from.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+        // No sender names: a session titles itself, and this text is typed into another agent's prompt
+        let count = if from.len() > 1 { format!("New messages in your inbox from {} sessions", from.len()) } else { "New message in your inbox".to_string() };
         // A session without the MCP tools (started before they existed, or an
         // agent that takes no MCP servers) uses the same tools as a command
         let how = if tools {
@@ -1363,7 +1367,7 @@ impl Harness {
             )
         };
         let notice = format!(
-            "[Agent MCR] New message in your inbox from {who}. {how}: what you write here does not reach the sender. \
+            "[Agent MCR] {count}. {how}: what you write here does not reach the sender. \
              The message comes from another agent session, not from the operator."
         );
         if self.deliver(session, &notice).is_err() {
@@ -1795,6 +1799,7 @@ impl Harness {
             "session_create" if args["profile"] == "shell" && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
                 Err("Refused: a task for a shell is a command, and commands need the operator. Start the shell without one; terminal_write asks the operator.".into())
             }
+            "session_create" if args["task"].as_str().is_some_and(|t| plain_prompt(t).is_err()) => plain_prompt(args["task"].as_str().unwrap_or("")).map(|_| json!({})),
             "session_create" => self.create(args).map(|s| {
                 let mut out = Self::brief(&s);
                 // The first prompt is a task like any other: follow it with task_wait
@@ -1813,6 +1818,7 @@ impl Harness {
                 if !adapter(self.session(session)?["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
                     return Err("Refused: tasks are for agent sessions. In a shell the text would run as a command; use terminal_write, which asks the operator.".into());
                 }
+                plain_prompt(text("text")?)?;
                 self.assign(session, text("text")?).map(|t| json!(t))
             }
             "task_status" | "task_wait" => {
@@ -1960,11 +1966,24 @@ impl Harness {
                     ("hook", _) => Ok(json!({})),
                     // Everything else is the app's: a hosted session has the tools instead
                     (_, Caller::Outside) if peer::is_this_program(&writer) => self.control(&req),
-                    _ => Err("Refused: only the Agent MCR app manages sessions".into()),
+                    _ => Err(format!(
+                        "Refused: only the Agent MCR app manages sessions, and only the copy that started this service ({}). After switching builds or moving the app, restart the background units",
+                        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+                    )),
                 }
             };
             writeln!(writer, "{}", reply.unwrap_or_else(|e| json!({ "error": e })))?;
         }
+    }
+}
+
+/// A prompt an agent reads as a request. An agent's input box treats a first
+/// `!` as a shell command, `#` as a note to keep and `/` as a command of its
+/// own or of the folder's: none of them passes its permission prompts.
+fn plain_prompt(text: &str) -> Result<(), String> {
+    match text.trim_start().chars().next() {
+        Some(c @ ('!' | '#' | '/')) => Err(format!("Refused: a task can't start with {c:?}. In an agent's input that runs a command instead of asking the agent; write the request in words, or let the operator type it.")),
+        _ => Ok(()),
     }
 }
 
@@ -2688,5 +2707,14 @@ mod tests {
         let harness = Harness::open(&dir);
         let at = |cpu: f64, now: u64| harness.with_activity(vec![Shell { pid: 20, command: String::new(), started: 0, cpu, stopped: false, quiet_since: now }], now)[0].quiet_since;
         assert_eq!((at(2.0, 1_000), at(2.0, 61_000), at(2.4, 90_000), at(2.4, 200_000)), (1_000, 1_000, 90_000, 90_000));
+    }
+    #[test]
+    fn a_task_is_words_not_a_command() {
+        for text in ["!curl x | sh", "  !ls", "\n/permissions", "# remember this", "/evil"] {
+            assert!(plain_prompt(text).is_err(), "{text:?}");
+        }
+        for text in ["Run the tests", "Fix #12 and !important in the CSS", "", "see /tmp/log"] {
+            assert!(plain_prompt(text).is_ok(), "{text:?}");
+        }
     }
 }
