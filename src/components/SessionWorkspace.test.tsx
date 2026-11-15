@@ -3,10 +3,9 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionWorkspace from './SessionWorkspace';
-import { openExternal } from '../utils/tauri';
 import { sessionApi, type Session } from '../utils/sessions';
-vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), detail: vi.fn(), connections: vi.fn(), control: vi.fn(), context: vi.fn() } }));
-vi.mock('../utils/tauri', () => ({ isTauri: () => true, openExternal: vi.fn() }));
+vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
+vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // The Live view connects to the runner; these tests are about History.
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(() => new Promise(() => {})), list: vi.fn() } }));
@@ -28,22 +27,9 @@ describe('Sessions workspace', () => {
   });
   it('renders actual session details as text and loads linked work only on request', async () => {
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
-    expect(host.textContent).toContain('Fix CORE-123');expect(host.textContent).toContain('<script>untrusted()</script>');expect(host.querySelector('script')).toBeNull();expect(sessionApi.context).not.toHaveBeenCalled();
+    expect(host.textContent).toContain('Fix CORE-123');expect(host.textContent).toContain('<script>untrusted()</script>');expect(host.querySelector('script')).toBeNull();
     await act(async () => button('linked work').click());expect(host.textContent).toContain('CORE-123');
-    vi.mocked(sessionApi.context).mockRejectedValue('No Jira credentials');
-    await act(async () => (host.querySelector('.sc-ticket-list button') as HTMLButtonElement).click());expect(host.textContent).toContain('No Jira credentials');
-  });
-  it('opens tickets at the configured site and reports an absent connection', async () => {
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
-    await act(async () => button('linked work').click());
-    vi.mocked(sessionApi.connections).mockResolvedValue({ jiraSite: 'https://example.atlassian.net/', jiraReady: true, memoryUrl: '', memoryReady: false });
-    await act(async () => (host.querySelector('[aria-label="Open CORE-123 in Jira"]') as HTMLButtonElement).click());
-    expect(openExternal).toHaveBeenCalledWith('https://example.atlassian.net/browse/CORE-123');
-    vi.mocked(openExternal).mockClear();
-    vi.mocked(sessionApi.connections).mockResolvedValue({ jiraSite: '', jiraReady: false, memoryUrl: '', memoryReady: false });
-    await act(async () => (host.querySelector('[aria-label="Open CORE-123 in Jira"]') as HTMLButtonElement).click());
-    expect(openExternal).not.toHaveBeenCalled();
-    expect(host.textContent).toContain('Set your Jira site in Connections first.');
+    expect(host.querySelector('.sc-ticket-list button')).toBeNull();
   });
   it('does not read transcripts before access is enabled', async () => {
     vi.mocked(sessionApi.access).mockResolvedValue(false);

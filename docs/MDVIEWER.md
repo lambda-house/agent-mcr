@@ -100,7 +100,7 @@ On Linux, install the WebKitGTK build dependencies first:
 
 ### Releasing
 
-For the first signed release and account setup, follow [the 1.1.0 release plan](docs/RELEASE_1.1.0.md). The bundle identifier is `cc.lambdahouse.mdviewer`. 1.1.0 is signed for macOS under an individual Apple Developer ID; the Windows installers are not code-signed yet.
+For the first signed release and account setup, follow [the 1.1.0 release plan](https://github.com/lambda-house/mdviewer-mj/blob/main/docs/RELEASE_1.1.0.md). The bundle identifier is `cc.lambdahouse.mdviewer`. 1.1.0 is signed for macOS under an individual Apple Developer ID; the Windows installers are not code-signed yet.
 
 CI (`.github/workflows/ci.yml`) typechecks the frontend and checks the Rust backend on every push and pull request.
 

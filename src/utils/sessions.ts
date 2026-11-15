@@ -12,8 +12,6 @@ export interface Session {
   context?: ContextStats;
 }
 export interface Snapshot { sessions: Session[]; errors: string[]; scannedFiles: number; pendingFiles: number; indexedAt: number; cachePath?: string | null; restoredFiles?: number; bytesRead?: number; currentDirectory?: string }
-export interface Connections { jiraSite: string; jiraEmail: string; jiraToken: string; memoryUrl: string; memoryToken: string }
-export interface ConnectionStatus { jiraSite: string; jiraReady: boolean; memoryUrl: string; memoryReady: boolean }
 export interface MemoryItem { key: string; title: string; provider: string; scope: string; path: string; modified: number; description: string }
 export interface MemoryCatalog { entries: MemoryItem[]; notes: string[] }
 export interface MemoryDocument { title: string; content: string; provenance: string; note: string }
@@ -30,9 +28,6 @@ export const sessionApi = {
   stats: (provider: string, id: string) => invoke<Session>('session_stats', { provider, id }),
   detail: (provider: string, id: string) => invoke<Session>('session_details', { provider, id }),
   snapshot: () => invoke<Snapshot>('sessions_snapshot'),
-  connections: () => invoke<ConnectionStatus>('session_connections'),
-  configure: (connections: Connections) => invoke<void>('configure_session_connections', { connections }),
-  context: (provider: string, key: string) => invoke<unknown>('session_context', { provider, key }),
   control: (action: string, id: string, turnId?: string, text?: string) => invoke<unknown>('session_control', { action, id, turnId, text }),
 };
 export function sessionKey(s: Session): string { return `${s.provider}:${s.id}`; }

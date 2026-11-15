@@ -1,5 +1,4 @@
 use crate::{sessions, AccessState};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
@@ -8,24 +7,6 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 #[derive(Default)]
 pub struct SessionState {
     pub index: Arc<Mutex<sessions::Index>>,
-    connections: Mutex<Connections>,
-}
-#[derive(Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Connections {
-    jira_site: String,
-    jira_email: String,
-    jira_token: String,
-    memory_url: String,
-    memory_token: String,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectionStatus {
-    jira_site: String,
-    jira_ready: bool,
-    memory_url: String,
-    memory_ready: bool,
 }
 fn allowed(access: &AccessState) -> Result<(), String> {
     if access
@@ -74,10 +55,6 @@ pub async fn disable_sessions(
         access.save(&a);
     }
     analysis.0.revoke();
-    *state
-        .connections
-        .lock()
-        .map_err(|_| "Connection lock poisoned")? = Connections::default();
     let index = state.index.clone();
     let cache = crate::get_config_dir()
         .map_err(|e| e.message)?
@@ -113,135 +90,6 @@ pub async fn sessions_snapshot(
     .await
     .map_err(|e| e.to_string())?
 }
-#[tauri::command]
-pub fn session_connections(state: State<'_, SessionState>) -> Result<ConnectionStatus, String> {
-    let c = state
-        .connections
-        .lock()
-        .map_err(|_| "Connection lock poisoned")?;
-    Ok(ConnectionStatus {
-        jira_site: c.jira_site.clone(),
-        jira_ready: !c.jira_token.is_empty() && !c.jira_email.is_empty(),
-        memory_url: c.memory_url.clone(),
-        memory_ready: !c.memory_token.is_empty(),
-    })
-}
-fn https_url(raw: &str) -> Result<reqwest::Url, String> {
-    let u = reqwest::Url::parse(raw).map_err(|_| "Invalid connection URL")?;
-    if u.scheme() != "https"
-        || u.host_str().is_none()
-        || !u.username().is_empty()
-        || u.password().is_some()
-        || u.query().is_some()
-        || u.fragment().is_some()
-    {
-        return Err("Use an HTTPS URL without embedded credentials, query or fragment".into());
-    }
-    Ok(u)
-}
-#[tauri::command]
-pub fn configure_session_connections(
-    connections: Connections,
-    access: State<'_, AccessState>,
-    state: State<'_, SessionState>,
-) -> Result<(), String> {
-    allowed(&access)?;
-    if !connections.jira_site.is_empty() {
-        let u = https_url(&connections.jira_site)?;
-        if !u.host_str().unwrap_or("").ends_with(".atlassian.net") || u.path() != "/" {
-            return Err("Jira site must be an atlassian.net origin".into());
-        }
-    }
-    if !connections.memory_url.is_empty() {
-        https_url(&connections.memory_url)?;
-    }
-    *state
-        .connections
-        .lock()
-        .map_err(|_| "Connection lock poisoned")? = connections;
-    Ok(())
-}
-fn context_client() -> Result<reqwest::Client, String> {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "HTTP client unavailable".into())
-}
-async fn answer(request: reqwest::RequestBuilder) -> Result<Value, String> {
-    let mut r = request
-        .send()
-        .await
-        .map_err(|_| "Connection failed; check the endpoint and network")?;
-    if !r.status().is_success() {
-        return Err(format!("Service returned HTTP {}", r.status().as_u16()));
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = r.chunk().await.map_err(|_| "Response interrupted")? {
-        if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
-            return Err("Response exceeds 4 MiB".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let v: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "Service returned a non-JSON response")?;
-    if v.get("error").is_some() || v["result"]["isError"] == true {
-        return Err("Service rejected the request; verify credentials and scope".into());
-    }
-    Ok(v)
-}
-#[tauri::command]
-pub async fn session_context(
-    provider: String,
-    key: String,
-    access: State<'_, AccessState>,
-    state: State<'_, SessionState>,
-) -> Result<Value, String> {
-    allowed(&access)?;
-    let c = state
-        .connections
-        .lock()
-        .map_err(|_| "Connection lock poisoned")?
-        .clone();
-    let client = context_client()?;
-    match provider.as_str() {
-        "jira" => {
-            if c.jira_email.is_empty() || c.jira_token.is_empty() {
-                return Err("Configure Jira credentials in Connections".into());
-            }
-            if key.len() > 30
-                || !key
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
-            {
-                return Err("Invalid issue key".into());
-            }
-            let mut url = https_url(&c.jira_site)?;
-            url.set_path(&format!("/rest/api/3/issue/{key}"));
-            url.query_pairs_mut().append_pair(
-                "fields",
-                "summary,status,assignee,priority,description,issuelinks",
-            );
-            answer(client.get(url).basic_auth(c.jira_email, Some(c.jira_token))).await
-        }
-        "memory" => {
-            if c.memory_token.is_empty() {
-                return Err("Configure a TEOB memory access token in Connections".into());
-            }
-            if key.len() > 500 {
-                return Err("Memory run id is too long".into());
-            }
-            answer(client.post(https_url(&c.memory_url)?).bearer_auth(c.memory_token).header("Accept","application/json, text/event-stream")
-                .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_run","arguments":{"run":key}}}))).await
-        }
-        _ => Err("Unknown context provider".into()),
-    }
-}
-
 // Connect ONLY to the existing daemon. Never start/resume another writer against a live transcript.
 #[cfg(unix)]
 fn codex_request(method: &str, params: Value) -> Result<Value, String> {
@@ -419,27 +267,6 @@ pub async fn session_events(
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn endpoints_refuse_plaintext_and_embedded_credentials() {
-        for url in [
-            "http://example.com",
-            "https://user:secret@example.com",
-            "https://example.com?token=secret",
-            "file:///etc/passwd",
-        ] {
-            assert!(https_url(url).is_err());
-        }
-        assert!(https_url("https://mcp.memory.teob.cc/mcp").is_ok());
-    }
-    #[test]
-    fn http_client_has_a_tls_provider() {
-        assert!(context_client().is_ok());
-    }
 }
 
 #[tauri::command]

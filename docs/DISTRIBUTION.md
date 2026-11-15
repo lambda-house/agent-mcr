@@ -19,7 +19,7 @@ This document is the plan for getting from here to there, in the order that make
 | Package channels | Homebrew tap (`lambda-house/homebrew-tap`), apt/dnf repository (`lambda-house/mdviewer-packages` on GitHub Pages) and AUR `mdviewer-bin` (no account yet: registration paused), updated by the release workflow after each tag (README, "Package channels") |
 | Download verification | `SHA256SUMS` and a build provenance attestation per release file |
 
-The release pipeline is prepared. Publishing 1.1.0 depends on the package channel secrets, key backups and install checks (`docs/RELEASE_1.1.0.md`).
+The release pipeline is prepared. Publishing 1.1.0 depends on the package channel secrets, key backups and install checks (the 1.1.0 release plan in the MDViewer repository).
 
 ## Phase 0: decisions before 1.1.0 (no cost)
 
@@ -42,7 +42,7 @@ The updater keypair already exists: the public key is in `tauri.conf.json`. Stor
 3. Run the manual release workflow on `main` and check all four build targets. Test installed packages on each platform, especially `.md` and `.markdown` association, folder opening and the updater package signatures.
 4. After installer signing and checks, tag `v1.1.0`; check `latest.json` lists all four platforms.
 
-The current release plan is to sign the macOS and Windows installers as well as updater packages before tagging. See `docs/RELEASE_1.1.0.md` for the operational sequence.
+The current release plan is to sign the macOS and Windows installers as well as updater packages before tagging. See the 1.1.0 release plan in the MDViewer repository for the operational sequence.
 
 ## Phase 1: signing
 
