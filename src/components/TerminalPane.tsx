@@ -5,6 +5,9 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, shellQuote } from '../utils/harness';
 
+/** How long the pane's size must stay the same before the terminal is fitted to it. */
+export const RESIZE_SETTLE_MS = 200;
+
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 
 /** Colours from the Sessions palette the pane sits in (light and dark). */
@@ -81,10 +84,19 @@ export default function TerminalPane({ id, active }: { id: string; active: boole
     // Capture phase: before xterm's own textarea handler pastes nothing
     element.addEventListener('paste', onPaste, true);
 
-    const observer = new ResizeObserver(() => { try { f.fit(); } catch { /* hidden */ } });
+    // Fit once the size has settled. Every new size reaches the agent as a
+    // window change, and Claude Code and Codex repaint their whole transcript
+    // for each one: fitting on every frame of a window drag floods the
+    // terminal with repaints that keep flickering long after the drag.
+    let settle: ReturnType<typeof setTimeout> | undefined;
+    const observer = new ResizeObserver(() => {
+      clearTimeout(settle);
+      settle = setTimeout(() => { try { f.fit(); } catch { /* hidden */ } }, RESIZE_SETTLE_MS);
+    });
     observer.observe(element);
     return () => {
       disposed = true;
+      clearTimeout(settle);
       observer.disconnect();
       element.removeEventListener('paste', onPaste, true);
       typed.dispose(); resized.dispose();

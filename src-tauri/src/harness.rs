@@ -1900,21 +1900,155 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// How long a bridge keeps trying to reach a restarted service.
+const BRIDGE_RETRY: Duration = Duration::from_secs(120);
+
+#[derive(Default)]
+struct BridgeState {
+    stream: Option<UnixStream>,
+    /// The client's `initialize` and `notifications/initialized`, replayed to a restarted service
+    initialize: Option<Vec<u8>>,
+    initialized: Option<Vec<u8>>,
+    /// Requests the service hasn't answered yet (JSON-RPC ids as text)
+    pending: BTreeSet<String>,
+    closed: bool,
+}
+
+/// An agent's stdio ⇄ the service, kept across a service restart: the bridge
+/// reconnects, replays the MCP handshake and fails the calls that were in
+/// flight, so the agent keeps its tools instead of losing the server.
+fn bridge<R: Read + Send + 'static, W: Write + Send + 'static>(input: R, output: W, retry: Duration, connect: impl Fn() -> Result<UnixStream, String>) -> Result<(), String> {
+    let state = Arc::new((Mutex::new(BridgeState::default()), Condvar::new()));
+    let output = Arc::new(Mutex::new(output));
+    let emit = |output: &Mutex<W>, line: &[u8]| {
+        let mut out = lock(output);
+        let _ = out.write_all(line).and_then(|_| out.flush());
+    };
+    let failed = |id: &str, message: &str| format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32000,\"message\":{}}}}}\n", json!(message)).into_bytes();
+    let mut socket = connect()?;
+    lock(&state.0).stream = Some(socket.try_clone().map_err(|e| e.to_string())?);
+
+    let (shared, out) = (state.clone(), output.clone());
+    std::thread::spawn(move || {
+        let mut input = BufReader::new(input);
+        loop {
+            let mut line = Vec::new();
+            let max = crate::session_mcp::MAX_MESSAGE;
+            if (&mut input).take(max + 1).read_until(b'\n', &mut line).is_err() || line.is_empty() || line.len() as u64 > max || line.last() != Some(&b'\n') {
+                break;
+            }
+            let frame: Value = serde_json::from_slice(&line).unwrap_or(Value::Null);
+            let id = (!frame["id"].is_null() && frame["method"].is_string()).then(|| frame["id"].to_string());
+            let mut s = lock(&shared.0);
+            match frame["method"].as_str() {
+                Some("initialize") => s.initialize = Some(line.clone()),
+                Some("notifications/initialized") => s.initialized = Some(line.clone()),
+                _ => {}
+            }
+            // Wait out a restart; a request that can't be passed on is answered here
+            let until = Instant::now() + retry;
+            let sent = loop {
+                if let Some(stream) = s.stream.as_mut() {
+                    if stream.write_all(&line).and_then(|_| stream.flush()).is_ok() {
+                        break true;
+                    }
+                    s.stream = None;
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() || s.closed {
+                    break false;
+                }
+                s = shared.1.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
+            };
+            match (sent, id) {
+                (true, Some(id)) => { s.pending.insert(id); }
+                (false, Some(id)) => emit(&out, &failed(&id, "The Agent MCR harness service is not reachable")),
+                _ => {}
+            }
+        }
+        let mut s = lock(&shared.0);
+        s.closed = true;
+        if let Some(stream) = s.stream.as_ref() {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+        shared.1.notify_all();
+    });
+
+    loop {
+        let mut reader = BufReader::new(socket.try_clone().map_err(|e| e.to_string())?);
+        loop {
+            let mut line = Vec::new();
+            if reader.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if let Ok(frame) = serde_json::from_slice::<Value>(&line) {
+                if !frame["id"].is_null() && frame["method"].is_null() {
+                    lock(&state.0).pending.remove(&frame["id"].to_string());
+                }
+            }
+            emit(&output, &line);
+        }
+        // The service went away: fail what it owed, then find the new one
+        let (replay, announce) = {
+            let mut s = lock(&state.0);
+            s.stream = None;
+            if s.closed {
+                return Ok(());
+            }
+            for id in std::mem::take(&mut s.pending) {
+                emit(&output, &failed(&id, "The Agent MCR harness service restarted during this call; call again"));
+            }
+            (s.initialize.clone(), s.initialized.clone())
+        };
+        let until = Instant::now() + retry;
+        socket = loop {
+            std::thread::sleep(Duration::from_millis(300));
+            if lock(&state.0).closed {
+                return Ok(());
+            }
+            let fresh = connect().and_then(|mut stream| {
+                if let Some(initialize) = &replay {
+                    stream.write_all(initialize).map_err(|e| e.to_string())?;
+                    // Its answer went to the agent the first time
+                    let mut answer = Vec::new();
+                    BufReader::new(stream.try_clone().map_err(|e| e.to_string())?).read_until(b'\n', &mut answer).map_err(|e| e.to_string())?;
+                    if let Some(initialized) = &announce {
+                        stream.write_all(initialized).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(stream)
+            });
+            match fresh {
+                Ok(stream) => break stream,
+                Err(e) if Instant::now() >= until => return Err(format!("Harness service unavailable: {e}")),
+                Err(_) => {}
+            }
+        };
+        let mut s = lock(&state.0);
+        s.stream = Some(socket.try_clone().map_err(|e| e.to_string())?);
+        state.1.notify_all();
+    }
+}
+
+fn bridge_to(path: PathBuf, op: &'static str) -> impl Fn() -> Result<UnixStream, String> {
+    move || {
+        let mut stream = UnixStream::connect(&path).map_err(|e| format!("Harness service unavailable: {e}"))?;
+        writeln!(stream, "{}", json!({ "op": op })).map_err(|e| e.to_string())?;
+        Ok(stream)
+    }
+}
+
 /// `--supervise`: an outside agent's stdio ⇄ the service's supervisor MCP.
 pub fn supervise_bridge(dir: &Path) -> Result<(), String> {
-    ensure(dir)?;
-    let mut stream = UnixStream::connect(socket(dir)).map_err(|e| format!("Harness service unavailable: {e}"))?;
-    writeln!(stream, "{}", json!({"op": "supervise"})).map_err(|e| e.to_string())?;
-    crate::session_mcp::bridge_stream(stream)
+    let (dir, connect) = (dir.to_path_buf(), bridge_to(socket(dir), "supervise"));
+    bridge(std::io::stdin(), std::io::stdout(), BRIDGE_RETRY, move || ensure(&dir).and_then(|_| connect()))
 }
 
 /// `--harness-mcp`: a hosted agent's stdio ⇄ the harness tools. The service
 /// works out which session is calling from this process's ancestry.
 pub fn agent_bridge(dir: &Path) -> Result<(), String> {
     let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
-    let mut stream = UnixStream::connect(path).map_err(|e| format!("Harness service unavailable: {e}"))?;
-    writeln!(stream, "{}", json!({"op": "agent"})).map_err(|e| e.to_string())?;
-    crate::session_mcp::bridge_stream(stream)
+    bridge(std::io::stdin(), std::io::stdout(), BRIDGE_RETRY, bridge_to(path, "agent"))
 }
 
 /// `--harness-tool <name> [json]`: one harness tool call from a shell, for a
@@ -2209,5 +2343,50 @@ mod tests {
         assert!(find_resumable(&home, "../../etc/passwd").is_none());
         assert!(resumable(&home, now_ms() + 60_000, 10).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn bridge_survives_a_service_restart() {
+        let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (mut agent, input) = UnixStream::pair().unwrap();
+        let (output, from_bridge) = UnixStream::pair().unwrap();
+        let mut from_bridge = BufReader::new(from_bridge);
+        std::thread::spawn(move || bridge(input, output, Duration::from_secs(10), bridge_to(path, "agent")));
+        let line = |r: &mut BufReader<UnixStream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
+
+        // First service: handshake, then it dies with a call in flight
+        let (first, _) = listener.accept().unwrap();
+        let mut service = BufReader::new(first.try_clone().unwrap());
+        writeln!(agent, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).unwrap();
+        assert_eq!(line(&mut service)["op"], "agent");
+        assert_eq!(line(&mut service)["method"], "initialize");
+        writeln!(&first, "{}", json!({"jsonrpc": "2.0", "id": 1, "result": {"first": true}})).unwrap();
+        assert_eq!(line(&mut from_bridge)["result"]["first"], true);
+        writeln!(agent, "{}", json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).unwrap();
+        assert_eq!(line(&mut service)["method"], "notifications/initialized");
+        writeln!(agent, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call"})).unwrap();
+        assert_eq!(line(&mut service)["id"], 2);
+        drop(service);
+        first.shutdown(std::net::Shutdown::Both).unwrap();
+        let lost = line(&mut from_bridge);
+        assert_eq!(lost["id"], 2);
+        assert!(lost["error"]["message"].as_str().unwrap().contains("restarted"));
+
+        // Second service: the handshake is replayed, its answer kept from the agent
+        let (second, _) = listener.accept().unwrap();
+        let mut service = BufReader::new(second.try_clone().unwrap());
+        assert_eq!(line(&mut service)["op"], "agent");
+        assert_eq!(line(&mut service)["method"], "initialize");
+        writeln!(&second, "{}", json!({"jsonrpc": "2.0", "id": 1, "result": {"second": true}})).unwrap();
+        assert_eq!(line(&mut service)["method"], "notifications/initialized");
+        writeln!(agent, "{}", json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})).unwrap();
+        assert_eq!(line(&mut service)["id"], 3);
+        writeln!(&second, "{}", json!({"jsonrpc": "2.0", "id": 3, "result": {"tools": []}})).unwrap();
+        let reply = line(&mut from_bridge);
+        assert_eq!(reply["id"], 3, "the replayed handshake's answer must not reach the agent: {reply}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
