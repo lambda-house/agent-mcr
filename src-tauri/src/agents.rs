@@ -4,7 +4,7 @@
 //! and how it reports. The harness service asks the adapter and never names
 //! an agent itself, so another agent is another adapter.
 
-use crate::harness::{claude_mcp, claude_plugin, claude_settings, Resumable, AGENT_SERVER, PEER_NOTE, PROFILES};
+use crate::harness::{claude_mcp, claude_plugin, claude_settings, Resumable, Subagent, AGENT_SERVER, PEER_NOTE, PROFILES};
 use serde_json::json;
 use std::io::Read;
 use std::path::Path;
@@ -28,7 +28,7 @@ pub fn modified_ms(path: &Path) -> u64 {
 
 /// The first JSON string value of `key` in the head of a transcript. Lines
 /// can be megabytes long, so this never parses whole lines.
-fn head_value(path: &Path, key: &str, limit: u64) -> Option<String> {
+pub fn head_value(path: &Path, key: &str, limit: u64) -> Option<String> {
     let mut head = Vec::new();
     std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
     let needle = format!("\"{key}\":\"");
@@ -111,6 +111,12 @@ pub trait Adapter: Sync {
     fn resumable(&self, _path: &Path) -> Option<Resumable> {
         None
     }
+    /// The subagents a session started that were active since `since`, from
+    /// its files: `transcript` is the path the agent reported, `conversation`
+    /// its id. Activity seen in files, not verified liveness.
+    fn subagents(&self, _home: &Path, _transcript: Option<&str>, _conversation: Option<&str>, _since: u64) -> Vec<Subagent> {
+        Vec::new()
+    }
 }
 
 pub struct Claude;
@@ -172,6 +178,9 @@ impl Adapter for Claude {
         let cwd = head_value(path, "cwd", 1024 * 1024)?;
         Some(Resumable { agent: self.id(), id, cwd, modified: modified_ms(path) })
     }
+    fn subagents(&self, home: &Path, transcript: Option<&str>, _conversation: Option<&str>, since: u64) -> Vec<Subagent> {
+        transcript.map(|t| crate::harness::subagents(home, t, since)).unwrap_or_default()
+    }
 }
 
 impl Adapter for Codex {
@@ -228,6 +237,9 @@ impl Adapter for Codex {
         }
         let cwd = head_value(path, "cwd", 8192)?;
         Some(Resumable { agent: self.id(), id, cwd, modified: modified_ms(path) })
+    }
+    fn subagents(&self, home: &Path, _transcript: Option<&str>, conversation: Option<&str>, since: u64) -> Vec<Subagent> {
+        conversation.map(|c| crate::harness::codex_subagents(home, c, since)).unwrap_or_default()
     }
 }
 

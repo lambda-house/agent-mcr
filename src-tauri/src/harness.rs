@@ -389,19 +389,66 @@ pub struct Subagent {
 /// wording depends on the Claude Code version; when it isn't recognised the
 /// subagent shows as quiet, not finished). Only the last record is looked at.
 fn subagent_finished(path: &Path) -> bool {
-    use std::io::{Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else { return false };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let _ = file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)));
-    let mut tail = Vec::new();
-    let _ = file.take(256 * 1024).read_to_end(&mut tail);
-    let text = String::from_utf8_lossy(&tail);
-    let Some(last) = text.lines().rev().find(|l| !l.trim().is_empty()) else { return false };
-    match serde_json::from_str::<Value>(last) {
+    let Some(last) = last_record(path) else { return false };
+    match serde_json::from_str::<Value>(&last) {
         Ok(v) if v["type"] == "assistant" => v["message"]["stop_reason"] == "end_turn",
         Ok(v) if v["type"] == "user" => last.contains("Report delivered to your caller"),
         _ => false,
     }
+}
+
+/// The last complete record of a transcript, read from its tail only.
+fn last_record(path: &Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)));
+    let mut tail = Vec::new();
+    let _ = file.take(256 * 1024).read_to_end(&mut tail);
+    String::from_utf8_lossy(&tail).lines().rev().find(|l| !l.trim().is_empty()).map(str::to_owned)
+}
+
+/// Subagents a Codex conversation started that wrote something since `since`,
+/// newest first: the transcripts whose head names it as their parent thread.
+/// Only the head (who started it, its name) and the type of the last record
+/// are read, never what it said.
+pub fn codex_subagents(home: &Path, thread: &str, since: u64) -> Vec<Subagent> {
+    if !is_uuid(thread) {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    jsonl_files(&home.join(".codex/sessions"), 3, &mut files);
+    let clean = |text: String| text.chars().filter(|c| !c.is_control()).take(120).collect::<String>();
+    let mut out: Vec<Subagent> = files
+        .iter()
+        .filter_map(|path| {
+            let last_activity = modified_ms(path);
+            if last_activity < since || crate::agents::head_value(path, "parent_thread_id", 8192).as_deref() != Some(thread) {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            let id = stem.get(stem.len().checked_sub(36)?..)?.to_string();
+            // What it is for is the last part of its path (/root/belief_details); its nickname is how Codex shows it
+            let task = crate::agents::head_value(path, "agent_path", 8192).unwrap_or_default();
+            let nickname = crate::agents::head_value(path, "agent_nickname", 8192).unwrap_or_default();
+            let created = std::fs::metadata(path).and_then(|m| m.created()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
+            let finished = last_record(path)
+                .and_then(|l| serde_json::from_str::<Value>(&l).ok())
+                .is_some_and(|v| ["task_complete", "task_completed", "turn_aborted"].contains(&v["payload"]["type"].as_str().unwrap_or("")));
+            Some(Subagent {
+                id,
+                description: clean(task.rsplit('/').next().unwrap_or("").replace('_', " ")),
+                agent_type: clean(nickname),
+                model: String::new(),
+                started: created.unwrap_or(last_activity).min(last_activity),
+                last_activity,
+                finished,
+            })
+        })
+        .collect();
+    out.sort_by_key(|a| std::cmp::Reverse(a.last_activity));
+    out.truncate(MAX_SUBAGENTS);
+    out
 }
 
 const MAX_SUBAGENTS: usize = 20;
@@ -763,6 +810,8 @@ pub struct Harness {
     processes: Mutex<(Option<Instant>, Arc<Vec<Process>>)>,
     /// Per running shell: its processor time and when that last moved
     activity: Mutex<BTreeMap<i32, (f64, u64)>>,
+    /// Subagents per session, looked up in the agents' files at most every five seconds
+    subagents: Mutex<BTreeMap<String, (Instant, Vec<Subagent>)>>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -830,7 +879,7 @@ impl Harness {
         let mut store: Store = std::fs::read(dir.join("harness-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()) }
+        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()) }
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
@@ -921,6 +970,7 @@ impl Harness {
         }
         let processes = self.processes();
         lock(&self.activity).retain(|pid, _| processes.iter().any(|p| p.pid == *pid));
+        lock(&self.subagents).retain(|id, _| ids.contains(id.as_str()));
         let store = lock(&self.store);
         let home = dirs::home_dir();
         let recent = now_ms().saturating_sub(3_600_000);
@@ -952,8 +1002,13 @@ impl Harness {
                 if let (true, true, Some(pid)) = (info["exit"].is_null(), adapter(&tracked.profile).is_agent(), info["pid"].as_i64()) {
                     out["shells"] = json!(self.with_activity(shells(&processes, pid as i32, now_ms()), now_ms()));
                 }
-                if let (true, Some(home), Some(transcript)) = (info["exit"].is_null(), &home, &tracked.transcript) {
-                    out["subagents"] = json!(subagents(home, transcript, recent));
+                if let (true, Some(home)) = (info["exit"].is_null(), &home) {
+                    let mut cached = lock(&self.subagents);
+                    let entry = cached.entry(id.to_string()).or_insert_with(|| (Instant::now() - Duration::from_secs(60), Vec::new()));
+                    if entry.0.elapsed() > Duration::from_secs(5) {
+                        *entry = (Instant::now(), adapter(&tracked.profile).subagents(home, tracked.transcript.as_deref(), tracked.agent_session.as_deref(), recent));
+                    }
+                    out["subagents"] = json!(entry.1);
                 }
                 out
             })
@@ -2423,6 +2478,28 @@ mod tests {
         assert_eq!(found.iter().find(|a| a.id == "b2").unwrap().description, "");
         assert!(subagents(&home, &transcript, now_ms() + 60_000).is_empty(), "older than the window");
         assert!(subagents(&home, "/etc/S1.jsonl", 0).is_empty(), "only under ~/.claude/projects");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn codex_subagents_are_the_transcripts_that_name_the_session_as_parent() {
+        let home = std::env::temp_dir().join(format!("agent-mcr-cxsub-{}", runner::random_id()));
+        let day = home.join(".codex/sessions/2026/11/15");
+        std::fs::create_dir_all(&day).unwrap();
+        let (own, other) = ("01a1df1e-d811-7d72-8107-d56c08fccd27", "01a1df2d-e803-7b13-ad99-0ec9696d0303");
+        let child = |id: &str, parent: &str, path: &str, nick: &str, last: &str| {
+            let meta = json!({"type": "session_meta", "payload": {"id": id, "parent_thread_id": parent, "cwd": "/w", "thread_source": "subagent", "agent_nickname": nick, "agent_path": path}});
+            std::fs::write(day.join(format!("rollout-2026-11-15T17-15-23-{id}.jsonl")), format!("{meta}\n{last}\n")).unwrap();
+        };
+        child("01a1dffd-ed6a-7882-8bd3-38809e385138", own, "/root/belief_details", "Kepler", r#"{"type":"event_msg","payload":{"type":"token_count"}}"#);
+        child("01a1dffd-b6b7-7372-b109-4ddc81310000", own, "/root/audit", "Noether", r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#);
+        child("01a1dffe-4049-7453-8cdf-171ecfac0000", other, "/root/elsewhere", "Gauss", "{}");
+        let mut found = codex_subagents(&home, own, 0);
+        found.sort_by(|a, b| a.description.cmp(&b.description));
+        assert_eq!(found.iter().map(|a| (a.description.as_str(), a.agent_type.as_str(), a.finished)).collect::<Vec<_>>(), [("audit", "Noether", true), ("belief details", "Kepler", false)]);
+        assert_eq!(found[1].id, "01a1dffd-ed6a-7882-8bd3-38809e385138");
+        assert!(codex_subagents(&home, own, now_ms() + 60_000).is_empty(), "only those active in the window");
+        assert!(codex_subagents(&home, "not-a-thread", 0).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 

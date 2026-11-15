@@ -121,7 +121,9 @@
 .hs-dir.live .hs-dir-path { color: var(--sc-accent); }
 .hs-dir-rule { flex: 1 1 6px; min-width: 6px; }
 .hs-dir-head > small { flex: 0 0 auto; padding: 0 5px; background: var(--sc-panel); color: var(--sc-muted); font-size: 10.5px; line-height: 16px; }
-.hs-dir-tools { flex: 0 0 auto; display: flex; align-items: center; padding: 0 2px 0 4px; background: var(--sc-panel); color: var(--sc-muted); font-size: 11px; }
+.hs-dir-tools { flex: 0 0 auto; display: flex; align-items: center; background: var(--sc-panel); }
+.session-cockpit .hs-dir-tools > button { height: 16px; padding: 0 4px; border: 0; border-radius: 4px; background: var(--sc-panel); color: var(--sc-muted); }
+.session-cockpit .hs-dir-tools > button:hover:not(:disabled), .session-cockpit .hs-dir-tools > button[aria-expanded='true'] { color: var(--sc-text); background: var(--sc-card); }
 .session-cockpit .hs-dir-start { flex: 0 0 auto; height: 16px; padding: 0 3px; border: 0; border-radius: 4px; background: var(--sc-panel); color: var(--sc-muted); opacity: .8; }
 .session-cockpit .hs-dir-start:hover:not(:disabled) { opacity: 1; color: var(--sc-text); background: var(--sc-card); }
 .hs-list li.hs-dir > ul { overflow: hidden; padding: 0; min-width: 0; }

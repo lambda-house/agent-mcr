@@ -13,8 +13,8 @@ const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 
 interface Action { label: string; icon: React.ReactNode; run: () => void }
 
-/** The one button of a session row: its actions open as a menu. */
-function RowMenu({ label, actions }: { label: string; actions: Action[] }) {
+/** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
+function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', disabled = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; disabled?: boolean }) {
   const [at, setAt] = useState<{ top: number; right: number } | null>(null);
   const wrap = useRef<HTMLSpanElement>(null);
   useEffect(() => {
@@ -24,12 +24,12 @@ function RowMenu({ label, actions }: { label: string; actions: Action[] }) {
     document.addEventListener('mousedown', outside); document.addEventListener('keydown', key);
     return () => { document.removeEventListener('mousedown', outside); document.removeEventListener('keydown', key); };
   }, [at]);
-  return <span className="hs-actions" ref={wrap}>
-    <button type="button" aria-haspopup="menu" aria-expanded={!!at} aria-label={`Actions for ${label}`} title="Actions" onClick={e => {
+  return <span className={className} ref={wrap}>
+    <button type="button" aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={e => {
       // Fixed position: the list scrolls and would clip a menu placed inside it
       const box = e.currentTarget.getBoundingClientRect();
       setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
-    }}><MoreHorizontal size={14}/></button>
+    }}>{icon ?? <MoreHorizontal size={14}/>}</button>
     {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }}>
       {actions.map(a => <button key={a.label} type="button" role="menuitem" onClick={() => { setAt(null); a.run(); }}>{a.icon} {a.label}</button>)}
     </div>}
@@ -41,7 +41,7 @@ function RowMenu({ label, actions }: { label: string; actions: Action[] }) {
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
  */
 const PINNED_KEY = 'hs-dirs';
-const START: [string, string][] = [['claude', 'Claude Code'], ['codex', 'Codex'], ['shell', 'a shell']];
+const START: [string, string][] = [['claude', 'Claude Code'], ['codex', 'Codex']];
 /** Folders with only history shown before "more" is asked for. */
 const HISTORY_FOLDERS = 6;
 
@@ -178,7 +178,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
         </span>
       </button>
-      <RowMenu label={label} actions={actions(h)}/>
+      <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
       {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
         {shells.map(sh => {
           const now = Date.now();
@@ -220,7 +220,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
             {supervisor?.harness?.status && <small className="hs-status">{supervisor.harness.status}</small>}
           </span>
         </button>
-        {supervisor && <RowMenu label="the supervisor" actions={actions(supervisor)}/>}
+        {supervisor && <RowMenu label="Actions for the supervisor" actions={actions(supervisor)}/>}
       </div>
       <form className="hs-add" onSubmit={e => { e.preventDefault(); addFolder(cwd); }}>
         <input aria-label="Add a folder" list="hs-folders" value={cwd} onChange={e => setCwd(e.target.value)} placeholder="Add a folder to work in…"/>
@@ -238,9 +238,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
             <header className="hs-dir-head">
               <span className="hs-dir-path" title={d.path}>{shortPath(name)}</span>
               <span className="hs-dir-rule"/>
-              <span className="hs-dir-tools" title="Start a session in this folder"><Plus size={10}/>
-                {START.map(([profile, what]) => <button key={profile} type="button" className="hs-dir-start" disabled={!status || starting} title={`Start ${what} in ${name}`} aria-label={`Start ${what} in ${d.path}`} onClick={() => void start(profile, d.path)}><AgentMark profile={profile} size={12}/></button>)}
-              </span>
+              <RowMenu className="hs-dir-tools" label={`Start a session in ${d.path}`} title={`Start a session in ${name}`} icon={<Plus size={13}/>} disabled={!status || starting}
+                actions={START.map(([profile, what]) => ({ label: what, icon: <AgentMark profile={profile} size={13}/>, run: () => void start(profile, d.path) }))}/>
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
             </header>

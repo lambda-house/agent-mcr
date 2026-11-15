@@ -57,6 +57,7 @@ describe('Live workspace', () => {
     vi.mocked(harnessApi.signal).mockResolvedValue(); vi.mocked(harnessApi.forget).mockResolvedValue();
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(host.querySelectorAll('.hs-dir .hs-actions button')).toHaveLength(2);
+    expect(host.querySelectorAll('.hs-dir-head button')).toHaveLength(1);
     expect(host.querySelector('[role="menu"]')).toBeNull();
     const item = (text: string) => [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes(text)) as HTMLButtonElement;
     await act(async () => button('Actions for Fixing tests').click());
@@ -125,7 +126,11 @@ describe('Live workspace', () => {
     await act(async () => button('Add folder').click());
     expect(folders().map(f => f.querySelector('.hs-dir-path')?.textContent)).toEqual(['~/new']);
     vi.mocked(harnessApi.list).mockResolvedValue([{ ...running, cwd: '/Users/me/new' }]);
-    await act(async () => button('Start Codex in /Users/me/new').click()); await flush();
+    // One "+" per folder: its menu offers the agents, not a shell
+    await act(async () => button('Start a session in /Users/me/new').click());
+    const offered = [...host.querySelectorAll('[role="menuitem"]')] as HTMLButtonElement[];
+    expect(offered.map(b => b.textContent?.trim())).toEqual(['Claude Code', 'Codex']);
+    await act(async () => offered[1].click()); await flush();
     expect(harnessApi.spawn).toHaveBeenCalledWith('codex', '/Users/me/new', 120, 32);
     expect(host.querySelector('[data-terminal="r1"]')).not.toBeNull();
   });
@@ -235,7 +240,8 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} onSearch={onSearch}/>)); await flush();
     await act(async () => button('Search the history of /work/repo').click());
     expect(onSearch).toHaveBeenCalledWith('/work/repo');
-    await act(async () => button('Start Claude Code in /work/repo').click()); await flush();
+    await act(async () => button('Start a session in /work/repo').click());
+    await act(async () => (host.querySelector('[role="menuitem"]') as HTMLButtonElement).click()); await flush();
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('Start sessions in a folder you opened');
   });
 });
