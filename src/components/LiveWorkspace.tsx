@@ -103,9 +103,10 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   };
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...openedFolders, ...recentDirectories].filter(Boolean))].slice(0, 40), [status, openedFolders, recentDirectories]);
-  // Sessions that need the person come first, ended ones last. The supervisor has its own tile above the list
+  // Rows keep their place: running ones in the order they were started, ended ones after them.
+  // One that needs the person is marked, not moved. The supervisor has its own tile above the list
   const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
-  const sorted = useMemo(() => hosted.filter(h => h.exit || !isSupervisor(h)).sort((a, b) => Number(needsYou(b)) - Number(needsYou(a)) || Number(!!a.exit) - Number(!!b.exit) || b.started - a.started), [hosted]);
+  const sorted = useMemo(() => hosted.filter(h => h.exit || !isSupervisor(h)).sort((a, b) => Number(!!a.exit) - Number(!!b.exit) || a.started - b.started || a.id.localeCompare(b.id)), [hosted]);
   const running = hosted.filter(h => !h.exit).length;
 
   const launch = async (spawn: () => Promise<Hosted>) => {
@@ -155,8 +156,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const home = status?.home ?? '';
   // The supervisor's own folder is not a place to work in
   const sections = useMemo(() => directorySections(sorted, resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
-  const withHistoryOnly = sections.filter(d => !d.sessions.length && !d.pinned);
-  const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || withHistoryOnly.indexOf(d) < HISTORY_FOLDERS);
+  // Of the folders that only have history, the most recently used few are listed until more are asked for
+  const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
+  const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
   const names = new Map(hosted.map(h => [h.id, hostedLabel(h)]));
   const row = (h: Hosted) => {
     const state = hostedState(h);

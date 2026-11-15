@@ -155,10 +155,9 @@ export function shellHealth(sh: RunningShell, now: number): 'active' | 'quiet' |
 export interface DirSection { path: string; sessions: Hosted[]; earlier: Resumable[]; pinned: boolean; latest: number }
 
 /**
- * The Live list by folder. `sessions` come in list order (the ones that need
- * the person first). Folders with someone waiting come first, then folders
- * with live sessions, then pinned ones, then folders that only have history,
- * most recent first.
+ * The Live list by folder, in an order that does not move while work goes on:
+ * folders with at least one running session first, then the rest, each group
+ * sorted by path. A session that starts waiting changes its row, not its place.
  */
 export function directorySections(sessions: Hosted[], resumable: Resumable[], pinned: string[]): DirSection[] {
   const by = new Map<string, DirSection>();
@@ -170,8 +169,9 @@ export function directorySections(sessions: Hosted[], resumable: Resumable[], pi
   pinned.forEach(at);
   for (const h of sessions) { const d = at(h.cwd); d.sessions.push(h); d.latest = Math.max(d.latest, h.started); }
   for (const r of resumable) { const d = at(r.cwd); d.earlier.push(r); d.latest = Math.max(d.latest, r.modified); }
-  const rank = (d: DirSection) => d.sessions.some(h => !h.exit && h.harness?.attention) ? 0 : d.sessions.some(h => !h.exit) ? 1 : d.sessions.length || d.pinned ? 2 : 3;
-  return [...by.values()].map(d => ({ ...d, earlier: [...d.earlier].sort((a, b) => b.modified - a.modified) })).sort((a, b) => rank(a) - rank(b) || b.latest - a.latest);
+  const active = (d: DirSection) => d.sessions.some(h => !h.exit);
+  return [...by.values()].map(d => ({ ...d, earlier: [...d.earlier].sort((a, b) => b.modified - a.modified) }))
+    .sort((a, b) => Number(active(b)) - Number(active(a)) || a.path.localeCompare(b.path, undefined, { sensitivity: 'base' }));
 }
 
 /** A path for a section heading: the last two folders, since the start is the same everywhere. */

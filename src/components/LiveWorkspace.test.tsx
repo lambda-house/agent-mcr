@@ -91,7 +91,7 @@ describe('Live workspace', () => {
     expect(harnessApi.forget).toHaveBeenCalledWith('e1');
   });
 
-  it('orders folders: waiting first, then live, then added, then history only', async () => {
+  it('keeps folders in place: active ones first, then the rest, each by path', async () => {
     const s = (id: string, started: number, cwd: string, extra: Partial<Hosted> = {}): Hosted => ({ ...running, id, started, title: `${id} job`, cwd, ...extra });
     const tracked = { name: '', profile: 'claude', since: 1, precise: true, agentSession: null, lastMessage: null };
     localStorage.setItem('hs-dirs', JSON.stringify(['/Users/me/notes']));
@@ -101,13 +101,13 @@ describe('Live workspace', () => {
     ]);
     vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'old-1', cwd: '/Users/me/legacy', modified: 5 }, { agent: 'claude', id: 'old-2', cwd: '/Users/me/api', modified: 4 }]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    expect(folders().map(f => `${f.querySelector('.hs-dir-path')?.textContent}${f.className.includes('live') ? ' (live)' : ''}`)).toEqual(['~/web (live)', '~/api (live)', '~/notes', '~/legacy']);
-    expect([...folders()[1].querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim())).toEqual(['one job', 'two job']);
+    expect(folders().map(f => `${f.querySelector('.hs-dir-path')?.textContent}${f.className.includes('live') ? ' (live)' : ''}`)).toEqual(['~/api (live)', '~/web (live)', '~/legacy', '~/notes']);
+    expect([...folders()[0].querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim())).toEqual(['two job', 'one job']);
     // Who a session talks to is in its tooltip, wherever the peer runs
-    expect(folders()[1].querySelectorAll('.hs-item')[1].getAttribute('title')).toContain('In contact with: ask job');
+    expect(folders()[0].querySelectorAll('.hs-item')[0].getAttribute('title')).toContain('In contact with: ask job');
     // The terminal is headed by the name its session has in the list
-    await act(async () => (folders()[1].querySelector('.hs-item') as HTMLButtonElement).click()); await flush();
-    expect(host.querySelector('.hs-pane:not([hidden]) .hs-pane-title strong')?.textContent).toBe('one job');
+    await act(async () => (folders()[0].querySelector('.hs-item') as HTMLButtonElement).click()); await flush();
+    expect(host.querySelector('.hs-pane:not([hidden]) .hs-pane-title strong')?.textContent).toBe('two job');
     expect(host.querySelector('.hs-pane:not([hidden]) .hs-pane-title')?.textContent).toContain('/Users/me/api');
     // An added folder with nothing in it can be removed again
     await act(async () => button('Remove folder /Users/me/notes').click());
@@ -130,7 +130,7 @@ describe('Live workspace', () => {
     expect(host.querySelector('[data-terminal="r1"]')).not.toBeNull();
   });
 
-  it('shows what each session is doing and puts the ones waiting for the person on top', async () => {
+  it('shows what each session is doing and marks the one waiting for the person without moving it', async () => {
     const tracked = { name: '', profile: 'claude', since: 1, precise: true, agentSession: null, lastMessage: null };
     const working: Hosted = { ...running, id: 'w1', openTasks: 2, harness: { ...tracked, state: 'working', attention: null } };
     const blocked: Hosted = { ...running, id: 'b1', harness: { ...tracked, name: 'reviewer', state: 'waiting', attention: { kind: 'permission', text: 'Claude needs your permission to use Bash', since: 5 } } };
@@ -138,7 +138,7 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(host.textContent).toContain('2 tasks');
     expect(host.querySelector('.hs-dot.waiting')?.getAttribute('aria-label')).toBe('waiting for you');
-    // One row per session: the waiting one is first and says why, with no second card for it
+    // One row per session, in start order: the waiting one says why, with no second card for it
     expect(host.querySelector('.hs-attention')?.textContent).toContain('1 session is waiting for you');
     expect(rows()).toHaveLength(2);
     expect(rows()[0].className).toContain('needs-you');
