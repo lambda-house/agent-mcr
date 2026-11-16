@@ -100,47 +100,6 @@ function findRanges(root: Element, regex: RegExp): Range[] {
   return ranges;
 }
 
-/** Index of the rendered match that corresponds to a source match. */
-function resolveSourceMatch(
-  root: Element,
-  ranges: Range[],
-  source: string,
-  line: number,
-  column: number,
-  regex: RegExp
-): number {
-  // Deepest block element that starts at or before the source line
-  let block: HTMLElement | null = null;
-  let blockLine = -1;
-  root.querySelectorAll<HTMLElement>('[data-line]').forEach((el) => {
-    const elLine = Number(el.dataset.line);
-    if (elLine <= line && elLine >= blockLine) {
-      block = el;
-      blockLine = elLine;
-    }
-  });
-
-  // Matches between the block's first line and the target match in the source
-  let before = 0;
-  const lines = source.split(/\r?\n/);
-  for (let i = Math.max(0, blockLine); i <= line && i < lines.length; i++) {
-    for (const match of iterateMatches(lines[i], regex)) {
-      if (i === line && match.index >= column) break;
-      before++;
-    }
-  }
-
-  let first = 0;
-  if (block) {
-    const blockRange = document.createRange();
-    blockRange.selectNodeContents(block);
-    first = ranges.findIndex((r) => r.compareBoundaryPoints(Range.START_TO_START, blockRange) >= 0);
-    if (first === -1) first = ranges.length - 1;
-  }
-
-  return Math.max(0, Math.min(ranges.length - 1, first + before));
-}
-
 /** Whether `rect` is inside the container's viewport (without scrollbars) and not under a bar. */
 function isRectVisible(container: HTMLElement, rect: DOMRect): boolean {
   const box = container.getBoundingClientRect();
@@ -210,11 +169,9 @@ const FindBar: React.FC<FindBarProps> = ({ scrollRef, activePath }) => {
   const query = useStore((s) => s.findQuery);
   const options = useStore((s) => s.searchOptions);
   const focusNonce = useStore((s) => s.findFocusNonce);
-  const findRequest = useStore((s) => s.findRequest);
   const setFindQuery = useStore((s) => s.setFindQuery);
   const setSearchOptions = useStore((s) => s.setSearchOptions);
   const closeFind = useStore((s) => s.closeFind);
-  const clearFindRequest = useStore((s) => s.clearFindRequest);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const rangesRef = useRef<Range[]>([]);
@@ -299,18 +256,6 @@ const FindBar: React.FC<FindBarProps> = ({ scrollRef, activePath }) => {
       setWrapped(null);
     }
 
-    // Jump requested by the search panel - once this document is rendered
-    if (findRequest && findRequest.path === activePath && renderedPath === activePath) {
-      const source = useStore.getState().documents[findRequest.path]?.content ?? '';
-      setCurrent(ranges.length > 0
-        ? resolveSourceMatch(root, ranges, source, findRequest.line, findRequest.column, regex)
-        : -1);
-      scrollPendingRef.current = true;
-      clearFindRequest();
-      return;
-    }
-    if (findRequest) return; // wait for the requested document to render
-
     setCurrent((prev) => {
       if (ranges.length === 0) return -1;
       if (!isNewSearch && prev >= 0) return Math.min(prev, ranges.length - 1);
@@ -319,7 +264,7 @@ const FindBar: React.FC<FindBarProps> = ({ scrollRef, activePath }) => {
       return firstVisible === -1 ? 0 : firstVisible;
     });
     // `regex` is derived from query + options
-  }, [findOpen, query, options, activePath, domVersion, findRequest, scrollRef, clearFindRequest]);
+  }, [findOpen, query, options, activePath, domVersion, scrollRef]);
 
   // Paint highlights and bring the current match into view
   useEffect(() => {

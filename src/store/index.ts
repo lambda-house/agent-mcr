@@ -2,7 +2,6 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { DEFAULT_SEARCH_OPTIONS, type SearchOptions } from '../utils/search';
 import type { ColorTheme } from '../utils/markdown';
-import { normalizeDirPath, isPathInside, pathChain, reuseUnchangedNodes } from '../utils/files';
 import type { AgentEntry } from '../utils/tauri';
 import { sameScrollPosition, type ScrollPosition } from '../utils/scrollAnchor';
 import { documentWindowPath, documentWindowStorage } from '../utils/documentWindow';
@@ -23,6 +22,12 @@ export const DEFAULT_MARKDOWN_TEXT_COLOR_LIGHT = '#1f1f1f';
 /** Default text color before 1.0.3 - migrated to the new default if never changed. */
 const LEGACY_MARKDOWN_TEXT_COLOR = '#cccccc';
 
+/** Persisted by versions that had a file tree; dropped when read. */
+const REMOVED_KEYS = [
+  'directories', 'expandedPaths', 'agentVisible', 'autoRefresh', 'showTextFiles',
+  'searchScope', 'workspaces', 'activeWorkspace', 'checkUpdatesOnStart',
+];
+
 const clampZoom = (zoom: number) => Math.round(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom)));
 
 export const PANEL_MIN_WIDTH = 200;
@@ -42,16 +47,6 @@ const clampPanelZoom = (zoom: number) =>
 // ============================================================
 // Types
 // ============================================================
-
-export interface FileNode {
-  id: string;
-  name: string;
-  path: string;
-  displayPath: string;
-  type: 'file' | 'directory';
-  children?: FileNode[];
-  isExpanded?: boolean;
-}
 
 export interface Document {
   path: string;
@@ -81,39 +76,6 @@ export interface Tab {
   isPreview?: boolean;
 }
 
-/** A saved set of open folders and tabs. */
-export interface Workspace {
-  name: string;
-  directories: string[];
-  expandedPaths: string[];
-  /** Paths of the open tabs, in order. */
-  tabs: string[];
-  activePath: string | null;
-  savedAt: number;
-}
-
-/** What `addDirectory` did with an overlapping directory. */
-export interface AddDirectoryResult {
-  success: boolean;
-  error?: string;
-  /** Already shown inside this open directory - it was revealed there instead. */
-  containedIn?: string;
-  /** Open directories inside the new one, which it replaced. */
-  replaced?: string[];
-}
-
-/** Where the search panel looks. */
-export type SearchScope = 'tabs' | 'folders';
-
-/** Jump to a search result once its document is rendered. */
-export interface FindRequest {
-  path: string;
-  /** 0-based source line and column of the match. */
-  line: number;
-  column: number;
-  nonce: number;
-}
-
 export interface OpenDocumentOptions {
   /** Open in (or replace) the preview tab instead of a permanent tab. */
   preview?: boolean;
@@ -136,13 +98,6 @@ export interface RestoredDocument {
 // ============================================================
 
 export interface AppState {
-  // File Panel (use arrays for serialization)
-  directories: string[];
-  files: FileNode[];
-  expandedPaths: string[];
-  selectedPath: string | null;
-  filterQuery: string;
-  
   // Document Panel (use Record for serialization)
   documents: Record<string, Document>;
   tabs: Tab[];
@@ -171,9 +126,6 @@ export interface AppState {
   statusBarVisible: boolean;
   statusBarPinned: boolean;
   activeHeadingId: string | null;
-  autoRefresh: boolean;
-  /** List other text files (code, txt, fb2...) in the file tree, not just markdown. */
-  showTextFiles: boolean;
   smoothScroll: boolean;
   /** Show web images in documents without asking first. */
   loadRemoteImages: boolean;
@@ -197,50 +149,18 @@ export interface AppState {
   /** The "Save All Files?" dialog is showing. */
   saveAllPromptOpen: boolean;
 
-  // History
-  historyVisible: boolean;
-  historyContent: string;
-
-  // Whether the global agent files root is shown in the Files panel.
-  agentVisible: boolean;
   /** Agent files from the last scan; empty while the workspace is off. */
   agentEntries: AgentEntry[];
   /** The session folders the last scan looked through, most recent first */
   agentFolders: string[];
 
-  // Workspaces
-  workspaces: Workspace[];
-  /** Name of the workspace the current folders/tabs belong to. */
-  activeWorkspace: string | null;
-
-  // Search - options are shared by find-in-document and the search panel
+  // Find in document
   searchOptions: SearchOptions;
   findOpen: boolean;
   findQuery: string;
   /** Bumped to (re)focus the find input. */
   findFocusNonce: number;
-  findRequest: FindRequest | null;
-  searchVisible: boolean;
-  searchQuery: string;
-  searchScope: SearchScope;
-  /** Bumped to (re)focus the search panel input. */
-  searchFocusNonce: number;
-  
-  // Actions - Files
-  setDirectories: (dirs: string[]) => void;
-  /**
-   * Add a directory to the file tree. A directory inside an open one is only
-   * revealed there; a parent of open directories replaces them.
-   */
-  addDirectory: (dir: string) => AddDirectoryResult;
-  /** Expand the tree down to `path` (inside an open directory) and select it. */
-  revealPath: (path: string) => void;
-  removeDirectory: (dir: string) => void;
-  setFiles: (files: FileNode[]) => void;
-  toggleExpanded: (path: string) => void;
-  setSelectedPath: (path: string | null) => void;
-  setFilterQuery: (query: string) => void;
-  
+
   // Actions - Documents
   openDocument: (
     path: string,
@@ -292,8 +212,6 @@ export interface AppState {
   setActiveHeadingId: (id: string | null) => void;
   setSettingsOpen: (open: boolean) => void;
   setSaveAllPromptOpen: (open: boolean) => void;
-  setAutoRefresh: (enabled: boolean) => void;
-  setShowTextFiles: (enabled: boolean) => void;
   setSmoothScroll: (enabled: boolean) => void;
   setLoadRemoteImages: (enabled: boolean) => void;
 
@@ -308,11 +226,6 @@ export interface AppState {
   removeLanguageAlias: (alias: string) => void;
   setLanguageAliases: (aliases: Record<string, string>) => void;
 
-  // History
-  setHistoryVisible: (visible: boolean) => void;
-  toggleHistoryVisible: () => void;
-  setAgentVisible: (visible: boolean) => void;
-  toggleAgentVisible: () => void;
   setAgentEntries: (entries: AgentEntry[], folders?: string[]) => void;
   /**
    * Show what is on disk now in an open document, unless it has unsaved
@@ -320,33 +233,12 @@ export interface AppState {
    */
   reloadDocument: (path: string, content: string) => boolean;
 
-  // Workspaces
-  /** Save the current folders and tabs under `name` (replacing one of that name). */
-  saveWorkspace: (name: string) => { success: boolean; error?: string };
-  deleteWorkspace: (name: string) => void;
-  /** Detach from the active workspace, keeping the current folders and tabs. */
-  closeWorkspace: () => void;
-  /**
-   * Replace folders and tabs with the workspace's. The tabs' documents still
-   * have to be read and passed to `restoreSession`.
-   */
-  loadWorkspace: (name: string) => Workspace | null;
-
   // Search
   setSearchOptions: (options: Partial<SearchOptions>) => void;
   /** Open (and focus) the find bar, optionally with a new query. */
   openFind: (query?: string) => void;
   closeFind: () => void;
   setFindQuery: (query: string) => void;
-  /** Open the find bar on `query` and jump to the match at path:line:column. */
-  requestFindAt: (path: string, line: number, column: number, query: string) => void;
-  clearFindRequest: () => void;
-  setSearchVisible: (visible: boolean) => void;
-  /** Show (and focus) the search panel, optionally with a new query. */
-  openSearch: (query?: string) => void;
-  setSearchQuery: (query: string) => void;
-  setSearchScope: (scope: SearchScope) => void;
-  setHistoryContent: (content: string) => void;
 }
 
 // ============================================================
@@ -437,12 +329,10 @@ function removeTabs(state: AppState, tabIds: string[]): Partial<AppState> {
     const left = state.tabs.slice(0, oldIndex).reverse().find((t) => !ids.has(t.id));
     newActiveTabId = (right ?? left)?.id ?? null;
   }
-  const newActiveTab = newTabs.find((t) => t.id === newActiveTabId);
 
   return {
     tabs: newTabs,
     activeTabId: newActiveTabId,
-    selectedPath: newActiveTab?.path ?? state.selectedPath,
     documents: newDocuments,
     recentlyClosed: newRecentlyClosed,
     // Keep the offset of recently closed docs so reopening returns to it
@@ -502,11 +392,6 @@ export const useStore = create<AppState>()(
   persist(
     (set, get) => ({
       // Initial State - Files
-      directories: [],
-      files: [],
-      expandedPaths: [],
-      selectedPath: null,
-      filterQuery: '',
       
       // Initial State - Documents
       documents: {},
@@ -528,8 +413,6 @@ export const useStore = create<AppState>()(
       statusBarVisible: false,
       statusBarPinned: false,
       activeHeadingId: null,
-      autoRefresh: true,
-      showTextFiles: true,
       smoothScroll: true,
       loadRemoteImages: false,
 
@@ -560,92 +443,13 @@ export const useStore = create<AppState>()(
       settingsOpen: false,
       saveAllPromptOpen: false,
 
-      // History
-      historyVisible: false,
-      agentVisible: true,
       agentEntries: [],
       agentFolders: [],
-      workspaces: [],
-      activeWorkspace: null,
       searchOptions: DEFAULT_SEARCH_OPTIONS,
       findOpen: false,
       findQuery: '',
       findFocusNonce: 0,
-      findRequest: null,
-      searchVisible: false,
-      searchQuery: '',
-      searchScope: 'folders',
-      searchFocusNonce: 0,
-      historyContent: '',
-      
-      // ============================================================
-      // Actions - Files
-      // ============================================================
-      
-      setDirectories: (dirs) => set({ directories: dirs }),
-      
-      addDirectory: (rawDir) => {
-        const state = get();
-        const dir = normalizeDirPath(rawDir);
 
-        const container = state.directories.find((d) => d === dir || isPathInside(dir, d));
-        if (container) {
-          if (container !== dir) get().revealPath(dir);
-          return { success: true, containedIn: container };
-        }
-
-        const inside = state.directories.filter((d) => isPathInside(d, dir));
-        if (inside.length === 0) {
-          set({ directories: [...state.directories, dir] });
-          return { success: true };
-        }
-
-        // Take the place of the first replaced directory, and keep what was
-        // visible of the replaced ones expanded
-        const firstIndex = state.directories.indexOf(inside[0]);
-        const directories = state.directories.filter((d) => !inside.includes(d));
-        directories.splice(firstIndex, 0, dir);
-        const expanded = new Set(state.expandedPaths);
-        for (const child of inside) {
-          pathChain(dir, child).forEach((p) => expanded.add(p));
-        }
-        set({ directories, expandedPaths: [...expanded] });
-        return { success: true, replaced: inside };
-      },
-
-      revealPath: (path) => set((state) => {
-        const root = state.directories.find((d) => isPathInside(path, d));
-        if (!root) return { selectedPath: path };
-        const expanded = new Set(state.expandedPaths);
-        // Expand the ancestors; `path` itself too when it is a directory
-        pathChain(root, path).forEach((p) => expanded.add(p));
-        return { expandedPaths: [...expanded], selectedPath: path };
-      }),
-      
-      removeDirectory: (dir) => set((state) => ({
-        directories: state.directories.filter((d) => d !== dir),
-      })),
-      
-      // Rescans usually change little or nothing - keep unchanged nodes so the
-      // tree does not re-render as a whole
-      setFiles: (files) => set((state) => {
-        const merged = reuseUnchangedNodes(state.files, files);
-        return merged === state.files ? state : { files: merged };
-      }),
-      
-      toggleExpanded: (path) => set((state) => {
-        const isExpanded = state.expandedPaths.includes(path);
-        return {
-          expandedPaths: isExpanded
-            ? state.expandedPaths.filter((p) => p !== path)
-            : [...state.expandedPaths, path],
-        };
-      }),
-      
-      setSelectedPath: (path) => set({ selectedPath: path }),
-      
-      setFilterQuery: (query) => set({ filterQuery: query }),
-      
       // ============================================================
       // Actions - Documents
       // ============================================================
@@ -660,7 +464,6 @@ export const useStore = create<AppState>()(
         if (existingTab) {
           set({
             activeTabId: existingTab.id,
-            selectedPath: path,
             tabs: !preview && existingTab.isPreview
               ? state.tabs.map((t) => (t.id === existingTab.id ? { ...t, isPreview: false } : t))
               : state.tabs,
@@ -698,7 +501,6 @@ export const useStore = create<AppState>()(
             tabs: state.tabs.map((t) => (t.id === previewTab.id ? newTab : t)),
             activeTabId: tabId,
             documents,
-            selectedPath: path,
           });
           return { success: true };
         }
@@ -707,7 +509,6 @@ export const useStore = create<AppState>()(
           tabs: [...state.tabs, newTab],
           activeTabId: tabId,
           documents: { ...state.documents, [path]: newDocument },
-          selectedPath: path,
         });
         
         return { success: true };
@@ -800,10 +601,8 @@ export const useStore = create<AppState>()(
       
       setActiveTab: (tabId) => set((state) => {
         if (state.activeTabId === tabId) return state;
-        const tab = state.tabs.find((t) => t.id === tabId);
         return {
           activeTabId: tabId,
-          selectedPath: tab?.path || state.selectedPath,
         };
       }),
       
@@ -907,13 +706,11 @@ export const useStore = create<AppState>()(
         const activeTabId = tabs.some((t) => t.id === state.activeTabId)
           ? state.activeTabId
           : tabs[0]?.id ?? null;
-        const activeTab = tabs.find((t) => t.id === activeTabId);
 
         return {
           tabs,
           documents,
           activeTabId,
-          selectedPath: activeTab?.path ?? state.selectedPath,
           scrollPositions: pruneScrollPositions(
             state.scrollPositions,
             tabs.map((t) => t.path)
@@ -941,11 +738,7 @@ export const useStore = create<AppState>()(
         panelWidth: Math.round(Math.max(PANEL_MIN_WIDTH, Math.min(PANEL_MAX_WIDTH, width))) 
       }),
 
-      setFilePanelVisible: (visible) => set((state) => ({
-        filePanelVisible: visible,
-        historyVisible: visible ? false : state.historyVisible,
-        searchVisible: visible ? false : state.searchVisible,
-      })),
+      setFilePanelVisible: (visible) => set({ filePanelVisible: visible }),
       
       setTocWidth: (width) => set({ 
         tocWidth: Math.round(Math.max(TOC_MIN_WIDTH, Math.min(TOC_MAX_WIDTH, width))) 
@@ -987,10 +780,6 @@ export const useStore = create<AppState>()(
 
       setSaveAllPromptOpen: (open) => set({ saveAllPromptOpen: open }),
 
-      setAutoRefresh: (enabled) => set({ autoRefresh: enabled }),
-
-      setShowTextFiles: (enabled) => set({ showTextFiles: enabled }),
-
       setSmoothScroll: (enabled) => set({ smoothScroll: enabled }),
 
       setLoadRemoteImages: (enabled) => set({ loadRemoteImages: enabled }),
@@ -1022,32 +811,6 @@ export const useStore = create<AppState>()(
 
       setLanguageAliases: (aliases) => set({ languageAliases: aliases }),
 
-      // History
-      setHistoryVisible: (visible) => set((state) => ({
-        historyVisible: visible,
-        searchVisible: visible ? false : state.searchVisible,
-      })),
-
-      toggleHistoryVisible: () => set((state) => ({
-        historyVisible: !state.historyVisible,
-        // History and search share the left slot with Files
-        searchVisible: state.historyVisible ? state.searchVisible : false,
-      })),
-
-      setAgentVisible: (visible) => set((state) => ({
-        agentVisible: visible,
-        filePanelVisible: visible ? true : state.filePanelVisible,
-        historyVisible: visible ? false : state.historyVisible,
-        searchVisible: visible ? false : state.searchVisible,
-      })),
-
-      toggleAgentVisible: () => {
-        const state = get();
-        // From Search, History or a hidden left column, the shortcut reveals
-        // the root instead of hiding an entry the user cannot see.
-        get().setAgentVisible(!state.agentVisible || !state.filePanelVisible || state.searchVisible || state.historyVisible);
-      },
-
       setAgentEntries: (entries, folders) => set((state) => ({ agentEntries: entries, agentFolders: folders ?? state.agentFolders })),
 
       reloadDocument: (path, content) => {
@@ -1062,64 +825,6 @@ export const useStore = create<AppState>()(
         return true;
       },
 
-      // Workspaces
-      saveWorkspace: (rawName) => {
-        const name = rawName.trim();
-        if (!name) return { success: false, error: 'Workspace name is empty' };
-
-        const state = get();
-        const workspace: Workspace = {
-          name,
-          directories: state.directories,
-          expandedPaths: state.expandedPaths,
-          tabs: state.tabs.map((t) => t.path),
-          activePath: state.tabs.find((t) => t.id === state.activeTabId)?.path ?? null,
-          savedAt: Date.now(),
-        };
-        const index = state.workspaces.findIndex((w) => w.name === name);
-        const workspaces = index === -1
-          ? [...state.workspaces, workspace]
-          : state.workspaces.map((w, i) => (i === index ? workspace : w));
-        set({ workspaces, activeWorkspace: name });
-        return { success: true };
-      },
-
-      deleteWorkspace: (name) => set((state) => ({
-        workspaces: state.workspaces.filter((w) => w.name !== name),
-        activeWorkspace: state.activeWorkspace === name ? null : state.activeWorkspace,
-      })),
-
-      closeWorkspace: () => set({ activeWorkspace: null }),
-
-      loadWorkspace: (name) => {
-        const workspace = get().workspaces.find((w) => w.name === name);
-        if (!workspace) return null;
-
-        const tabs: Tab[] = workspace.tabs.map((path) => ({
-          id: generateId(),
-          path,
-          title: getFileName(path),
-          isDirty: false,
-        }));
-        const active = tabs.find((t) => t.path === workspace.activePath) ?? tabs[0];
-
-        set({
-          activeWorkspace: name,
-          directories: workspace.directories,
-          expandedPaths: workspace.expandedPaths,
-          files: [],
-          tabs,
-          activeTabId: active?.id ?? null,
-          selectedPath: active?.path ?? null,
-          documents: {},
-          navHistory: [],
-          navIndex: -1,
-          findOpen: false,
-          findRequest: null,
-        });
-        return workspace;
-      },
-
       // Search
       setSearchOptions: (options) => set((state) => ({
         searchOptions: { ...state.searchOptions, ...options },
@@ -1131,54 +836,24 @@ export const useStore = create<AppState>()(
         findFocusNonce: state.findFocusNonce + 1,
       })),
 
-      closeFind: () => set({ findOpen: false, findRequest: null }),
+      closeFind: () => set({ findOpen: false }),
 
       setFindQuery: (query) => set({ findQuery: query }),
 
-      requestFindAt: (path, line, column, query) => set((state) => ({
-        findOpen: true,
-        findQuery: query,
-        findRequest: { path, line, column, nonce: (state.findRequest?.nonce ?? 0) + 1 },
-      })),
-
-      clearFindRequest: () => set({ findRequest: null }),
-
-      setSearchVisible: (visible) => set((state) => ({
-        searchVisible: visible,
-        historyVisible: visible ? false : state.historyVisible,
-      })),
-
-      openSearch: (query) => set((state) => ({
-        searchVisible: true,
-        historyVisible: false,
-        searchQuery: query ?? state.searchQuery,
-        searchFocusNonce: state.searchFocusNonce + 1,
-      })),
-
-      setSearchQuery: (query) => set({ searchQuery: query }),
-
-      setSearchScope: (scope) => set({ searchScope: scope }),
-
-      setHistoryContent: (content) => set({ historyContent: content }),
     }),
     {
       name: 'mdviewer-storage',
-      version: 4,
+      version: 5,
       storage: createJSONStorage(() => documentWindowPath ? documentWindowStorage(localStorage) : localStorage),
       partialize: (state) => ({
         // Only persist these fields
-        directories: state.directories,
-        expandedPaths: state.expandedPaths,
         panelWidth: state.panelWidth,
         filePanelVisible: state.filePanelVisible,
-        agentVisible: state.agentVisible,
         tocWidth: state.tocWidth,
         tocVisible: state.tocVisible,
         zoom: state.zoom,
         panelZoom: state.panelZoom,
         statusBarPinned: state.statusBarPinned,
-        autoRefresh: state.autoRefresh,
-        showTextFiles: state.showTextFiles,
         smoothScroll: state.smoothScroll,
         loadRemoteImages: state.loadRemoteImages,
         markdownTextColor: state.markdownTextColor,
@@ -1187,9 +862,6 @@ export const useStore = create<AppState>()(
         editMode: state.editMode,
         languageAliases: state.languageAliases,
         searchOptions: state.searchOptions,
-        searchScope: state.searchScope,
-        workspaces: state.workspaces,
-        activeWorkspace: state.activeWorkspace,
         // Session restore: tab identity + which one was active + where each
         // document was scrolled to (documents themselves are re-read on start)
         tabs: state.tabs.map((t) => ({
@@ -1204,16 +876,17 @@ export const useStore = create<AppState>()(
       }),
       // Nothing to transform here - `merge` below normalizes every shape we
       // have ever written. Without this, zustand would silently drop the whole
-      // persisted state (directories, aliases, ...) on a version bump.
+      // persisted state (tabs, aliases, ...) on a version bump.
       migrate: (persistedState, version) => {
         const persisted = (persistedState ?? {}) as Partial<AppState>;
         // v3: new dark-mode text default; keep colors the user picked themselves
         if (version < 3 && persisted.markdownTextColor?.toLowerCase() === LEGACY_MARKDOWN_TEXT_COLOR) {
           persisted.markdownTextColor = DEFAULT_MARKDOWN_TEXT_COLOR;
         }
-        // The old flag meant "open the separate agent panel". The new root
-        // starts visible (collapsed) for existing users too.
-        if (version < 4) persisted.agentVisible = true;
+        // v5: the file tree, text search, history and saved workspaces are gone
+        if (version < 5) {
+          for (const key of REMOVED_KEYS) delete (persisted as Record<string, unknown>)[key];
+        }
         return persisted;
       },
       merge: (persistedState, currentState) => {

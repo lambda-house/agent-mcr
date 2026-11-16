@@ -7,7 +7,6 @@ import SessionMetrics, { useSessionMetrics } from './SessionMetrics';
 import { canRestart, directorySections, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
-import { useStore } from '../store';
 import '../styles/harness.css';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -74,7 +73,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
   // Sessions the person closed: once they have ended they leave the list too
   const closing = useRef(new Set<string>());
-  const openedFolders = useStore(s => s.directories);
   const mounted = useRef(true);
 
   const refresh = useCallback(async () => {
@@ -104,7 +102,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     if (hosted.find(h => h.id === id)?.harness?.attention?.kind === 'notification') void harnessApi.ack(id).then(refresh).catch(() => {});
   };
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
-  const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...openedFolders, ...recentDirectories].filter(Boolean))].slice(0, 40), [status, openedFolders, recentDirectories]);
+  const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
   // Rows keep their place: running ones in the order they were started, ended ones after them.
   // One that needs the person is marked, not moved. The supervisor has its own tile above the list
   const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
