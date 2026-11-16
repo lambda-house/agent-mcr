@@ -35,7 +35,6 @@
     "mermaid": "^11.17.2",
     "motion": "^14.14.0",
     "react": "^19.3.1",
-    "react-custom-scrollbars-2": "^4.5.0",
     "react-dom": "^19.3.1",
     "recharts": "^3.10.1",
     "shiki": "^1.0.0",
@@ -54,10 +53,6 @@
     "vitest": "^5.0.2"
   },
   "overrides": {
-    "katex": "^0.19.0",
-    "react-custom-scrollbars-2": {
-      "react": "$react",
-      "react-dom": "$react-dom"
-    }
+    "katex": "^0.19.0"
   }
 }
