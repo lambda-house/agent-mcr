@@ -32,7 +32,7 @@
 
 /* The supervisor: calm utility row */
 .hs-plugin-sidebar-section { margin-bottom: 6px; }
-.hs-plugin-sidebar-section .cmd-trigger-btn { display: flex; width: 100%; }
+.hs-plugin-sidebar-section .cmd-trigger-btn { display: flex; width: 100%; height: 34px; }
 .hs-plugin-sidebar-section .cmd-trigger-btn__label { flex: 1; text-align: left; }
 .hs-supervisor { display: flex; align-items: center; border-radius: 8px; border: 1px solid transparent; transition: background .15s ease, border-color .15s ease; }
 .hs-supervisor:hover { background: var(--layer-1); }
@@ -305,8 +305,8 @@
 .hs-shells li.quiet .hs-item-text strong, .hs-shells li.stopped .hs-item-text strong { color: var(--sc-muted); }
 
 /* Add a folder: one line above the sections */
-.hs-add { display: flex; justify-content: flex-end; padding: 8px 8px 0; margin-bottom: -6px; }
-.session-cockpit .hs-add button { color: var(--sc-muted); }
+.hs-add { display: flex; justify-content: flex-end; padding: 6px 0 0; margin-bottom: -6px; }
+.session-cockpit .hs-add button { color: var(--sc-muted); height: 22px; padding: 0 6px; font-size: 11px; gap: 4px; }
 /* A folder: a bracket on the left and a line on top, with the folder's path set into the line */
 .hs-list li.hs-dir, .ss-dir { display: block; margin: 14px 0 6px 2px; padding: 0 0 2px 3px; border-left: 2px solid var(--sc-border); border-top: 1px solid var(--sc-border); border-radius: 6px 0 0 6px; min-width: 0; max-width: none; }
 .hs-list li.hs-dir.live { border-color: var(--sc-accent); border-top-color: color-mix(in srgb, var(--sc-accent) 55%, var(--sc-border)); }
