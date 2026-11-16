@@ -3,6 +3,7 @@ import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, Terminal, FolderO
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
+import SessionMetrics, { useSessionMetrics } from './SessionMetrics';
 import { canRestart, directorySections, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -52,6 +53,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   /** Open the search view narrowed to a folder */
   onSearch?: (directory: string) => void;
 }) {
+  const metrics = useSessionMetrics(active);
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
   const [error, setError] = useState('');
@@ -173,6 +175,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
         <span className="hs-item-text">
           <strong><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}</strong>
+          <SessionMetrics hosted={h} data={metrics}/>
           {detail && <small>{detail}</small>}
           {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
           {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
@@ -214,6 +217,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           <Radar size={18}/>
           <span className="hs-item-text">
             <strong>{supervisor ? 'Supervisor' : 'Open supervisor'}{supervisor && <span className={`hs-dot ${hostedState(supervisor)}`} aria-label={STATE_LABEL[hostedState(supervisor)]}/>}</strong>
+            {supervisor && <SessionMetrics hosted={supervisor} data={metrics}/>}
             {!supervisor && <small>Sees and directs all sessions</small>}
             {supervisor && referenced === supervisor.id && <small>reference copied</small>}
             {supervisor && needsYou(supervisor) && <small className="hs-needs">{supervisor.harness?.attention?.text}</small>}
