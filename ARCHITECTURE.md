@@ -1,218 +1,191 @@
-# MDViewer architecture
+# Agent MCR architecture
 
-MDViewer is a desktop viewer and light editor for Markdown and other text documents. It is a [Tauri 2](https://tauri.app) app: a Rust process owns the window, the file system and the OS integration, and a React UI runs in the platform webview (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux). The two talk only through Tauri commands, events and one custom protocol.
+Agent MCR (Agent Mission Control Room) is a local harness for a group of coding agents on one Mac. It runs Claude Code, Codex and shell sessions in terminals that outlive the app, lets the sessions talk to each other, puts the ones that need a person in front of that person, and keeps a search index of past sessions.
 
-This document explains how the pieces fit and why they're shaped this way. For build commands and a file-by-file reference, see [README.md](README.md) and [CLAUDE.md](CLAUDE.md).
+This document shows how the parts fit and why they are shaped this way. It describes what is built. The design the harness is growing towards, with its signed decisions (D1 to D12), is in [docs/AGENT_HARNESS_DESIGN.md](docs/AGENT_HARNESS_DESIGN.md). Build commands are in [README.md](README.md); the file-by-file reference and the rules for changing the code are in [CLAUDE.md](CLAUDE.md).
 
-## Overview
+## Processes
+
+One binary, `agent-mcr`, runs in several roles. The role is chosen by the first argument, before any window code starts.
 
 ```mermaid
 flowchart LR
-  subgraph OS["Operating system"]
-    FS[(Files and folders)]
-    Dlg[Native dialogs]
-    Shell[Browser / Finder / Explorer]
+  subgraph App["App (window)"]
+    Web[Webview: React]
+    Rust[Tauri commands]
   end
 
-  subgraph Rust["Rust process (src-tauri/src/main.rs)"]
-    Cmd[Tauri commands]
-    Acc[Access list<br/>access.json]
-    Watch[File watcher<br/>notify]
-    Proto[localfile:// protocol]
-    Upd[Updater plugin]
-    Guard[Navigation guard]
+  subgraph Units["LaunchAgents (started on demand)"]
+    Harness["Harness service<br/>--harness"]
+    Runner["Runner<br/>--runner"]
   end
 
-  subgraph Web["Webview (src/)"]
-    Store[Zustand store<br/>localStorage]
-    UI[React components]
-    Render[Render pipeline<br/>markdown-it, Shiki, Mermaid]
+  subgraph Session["Hosted session (one per terminal)"]
+    Agent[claude / codex / shell]
+    Bridge["mcr bridge<br/>--harness-mcp"]
+    Hook["hook<br/>--harness-hook"]
   end
 
-  UI -- invoke --> Cmd
-  Cmd --> Acc
-  Cmd --> FS
-  Cmd --> Dlg
-  Cmd --> Shell
-  Watch -- events --> UI
-  Render -- img src --> Proto
-  Proto --> Acc
-  Upd -- latest.json --> GH[(GitHub Releases)]
-  UI <--> Store
-  UI --> Render
+  Outside["Outside agent<br/>--supervise bridge"]
+
+  Web -- invoke --> Rust
+  Rust -- harness.sock --> Harness
+  Rust -- "runner.sock (terminal bytes)" --> Runner
+  Harness -- runner.sock --> Runner
+  Runner -- PTY --> Agent
+  Agent -- stdio MCP --> Bridge
+  Bridge -- harness.sock --> Harness
+  Agent -. "turn start / end" .-> Hook
+  Hook -- harness.sock --> Harness
+  Outside -- harness.sock --> Harness
 ```
 
-| Layer | Technology | Where |
+| Process | Started by | Owns | Restart |
+|---|---|---|---|
+| **App** | The person | The window, the access list, the session index | Free: sessions keep running |
+| **Runner** (`--runner`) | LaunchAgent `cc.lambdahouse.agent-mcr.runner` | The agents' terminals (PTYs), 4 MB of output per session, exit codes | Ends every session. Avoid |
+| **Harness service** (`--harness`) | LaunchAgent `cc.lambdahouse.agent-mcr.harness` | Session state, tasks, messages, reports, the bulletin board, both MCP servers | Safe: bridges reconnect and replay their handshake |
+| **Bridges** (`--harness-mcp`, `--supervise`, `--mcp`) | The agent, as an MCP server command | Nothing: they copy stdio to a socket | With their agent |
+| **Hook** (`--harness-hook`) | The agent, on its own events | Nothing: one report, then exit | — |
+
+The split follows one rule: **running is separate from deciding, and both are separate from viewing.** The runner has no policy, so it almost never needs a new build and agents survive everything else being rebuilt. The harness service holds the policy and can be restarted at any time. The app is a view: closing it stops nothing.
+
+Both units exit after ten idle minutes with nothing running, and neither starts at login.
+
+## What a hosted session gets
+
+The harness passes everything per launch. Nothing is written into the person's own agent configuration.
+
+| | Claude Code | Codex |
 |---|---|---|
-| Shell | Tauri 2, Rust | `src-tauri/` |
-| UI | React 18, TypeScript, Vite | `src/` |
-| State | Zustand with `persist` (localStorage) | `src/store/index.ts` |
-| Rendering | markdown-it, Shiki, Mermaid, KaTeX (via Mermaid) | `src/utils/markdown.ts` |
-| Editing | CodeMirror 6, lazy-loaded | `src/components/Editor.tsx` |
-| Packaging | tauri-action on GitHub Actions | `.github/workflows/release.yml` |
+| State reports | `--settings` with hooks: SessionStart, UserPromptSubmit, PostToolUse, Notification, Stop | `-c notify=…` (turn end only) |
+| `mcr` tools | `--mcp-config` | `-c mcp_servers.mcr.*` |
+| Start-up note | `--append-system-prompt` | `-c developer_instructions=…` |
+| Working rules | Two skills from a per-launch plugin (`agent-mcr:peers`, `agent-mcr:reporting`) | The `guide` tool |
 
-## Trust boundary
+Everything specific to one agent program is in one adapter (`agents.rs`): its command line, the files a launch reads, how it reports, how a turn is interrupted. `harness.rs` asks the adapter and never compares agent names, so another agent is another adapter.
 
-The central design decision: **the webview is untrusted.** It renders documents written by other people, so anything in it may be hostile. Everything that touches the system goes through Rust, and Rust decides on its own whether a request is allowed.
+## State and attention
 
-- **Capabilities.** `capabilities/default.json` grants only `core:default` (plus window destroy). The JS file system, dialog, shell and opener plugins aren't exposed. Dialogs, the folder picker and opening links happen in Rust.
-- **Access list.** Rust keeps a list of the files and folders the user opened (`Access` / `AccessState`, persisted to `access.json` in the config dir). Paths are added only by user actions that Rust observes itself: the folder and file pickers, drag and drop (`on_window_event`), command-line and single-instance launch paths, and a confirmed `follow_local_link` dialog. No command adds a path just because the webview passed it.
-- **Checks.** Every command turns its path argument into a `Target` (`named`, the path as given, and `real`, canonicalized with `dunce`) and calls `AccessState::check(target, Use)`. The `Use` says what the path is for:
+Session state is `starting`, `working`, `idle`, `waiting`, `unknown` or `exited`. It comes from the agent's own hooks, not from guessing at terminal output. `apply_hook` is the pure state machine and the place to test changes.
 
-  | Use | Allowed when |
-  |---|---|
-  | `List` (scan, watch) | the folder was opened, or is inside an opened folder |
-  | `Open` (read, write, history) | an opened file, or a viewable document inside an opened folder |
-  | `Stat` (metadata, reveal in file manager) | an opened file, or anything inside an opened folder |
-  | `Image` (`localfile://`) | an image inside an opened folder, or in or below the folder of an opened file |
+Three things no hook reports are handled separately. Each was found in a live run:
 
-  With the agent workspace on, `Open` and `Stat` also allow markdown in fixed places inside the agents' folders (see [Agent workspace](#agent-workspace)).
+- A Claude session that asks something before it starts (trust this folder?) fires no hook: a session that printed, went quiet and never reported is marked as waiting.
+- Codex reports turn ends of other threads (its title writer, subagents): only the session's own thread counts, and the transcripts say which that is.
+- Codex reports nothing before its first turn ends: a task is typed only when its input box is on screen.
 
-  A symlink inside an opened folder passes when its real target fits the use (`Use::fits_target`): a `.md` link to a binary is neither listed nor readable. Paths containing `..` count only as their real location.
-- **Rendering.** markdown-it runs with `html: false`, so raw HTML in documents is escaped, and every custom renderer rule escapes what it emits. Mermaid runs with `securityLevel: 'strict'`.
-- **CSP** (`tauri.conf.json`): scripts only from the app (`'wasm-unsafe-eval'` for Shiki's regex engine), no frames, no objects, no forms, and `connect-src` limited to Tauri IPC. Documents can't phone home with `fetch`.
-- **Navigation guard.** A small Tauri plugin (`navigation_guard`) blocks the webview from navigating away from the app's own pages. Link clicks are intercepted in `App.tsx` and routed: `#anchors` scroll, http(s)/mailto go to `open_external`, local files go to `follow_local_link`.
-- **Remote images** are blocked by default: they render as `span.remote-image` placeholders, which avoids tracking pixels. The user can load them per document or turn them on in Settings.
-- **Limits.** Documents are capped at 10 MB and images at 50 MB.
+A session that needs the person carries an **attention** mark, shown in the Live list and as a notification:
 
-### Following a link
+| Kind | Raised by | Cleared when |
+|---|---|---|
+| `permission` | The agent's permission prompt, or a start-up question | The agent moves on |
+| `assessment` | The agent's own `report` with `needs_human` | The person types into the session |
+| `notification` | The agent's `report` with `done`, or a terminal notification | The person looks at the session |
 
-Opening a link to a file outside what the user opened is the one place where the webview's request can lead to new access, so Rust asks the user first:
+**Only the person answers a permission prompt (D6).** While a session waits on one, the supervisor's input to it is refused, and notices are never typed into it.
 
-```mermaid
-sequenceDiagram
-  participant D as Document (webview)
-  participant A as App.tsx
-  participant R as Rust: follow_local_link
-  participant U as User
+## Tools between sessions
 
-  D->>A: click ./notes/other.md
-  A->>R: followLocalLink(resolved path)
-  alt already allowed
-    R-->>A: open
-  else outside the access list
-    R->>U: native dialog "Open linked file?"
-    U-->>R: Open / Show in Finder / Cancel
-    R-->>A: open (path granted) / revealed / cancelled
-  end
-  A->>A: openPath() when the result is open
-```
+Two MCP servers, both served by the harness service.
 
-The dialog is native, so script in the webview can't answer it.
+**`mcr`, for every hosted agent:**
 
-## Backend (Rust)
-
-Backend code lives in `src-tauri/src/main.rs`, with the agent workspace in `agent.rs`; unit tests are at the bottom of each (`cargo test`).
-
-| Area | Commands / pieces |
+| Purpose | Tools |
 |---|---|
-| Files | `scan_directories`, `read_file`, `write_file`, `get_file_info` |
-| Watching | `start_watching`, `stop_watching` (`notify`, one event per change, `node_modules`/`target`/`.git` ignored) |
-| Dialogs | `pick_directory`, `pick_files`, `export_file` |
-| Links and shell | `follow_local_link`, `open_external`, `open_in_explorer` |
-| History | `read_history`, `append_to_history`, `clear_history`, `get_history_path` |
-| Session | `take_launch_paths`, `adopt_session_access` (one-time migration from before the access list) |
-| Agent workspace | `agent_workspace`, `enable_agent_workspace`, `disable_agent_workspace`, `read_snapshot`, `mark_read` (`agent.rs`) |
-| Updates | `check_for_update`, `install_update` |
-| Protocol | `localfile://` serves images for `<img>` tags |
+| See | `whoami`, `list_peers` (sessions in the caller's folder first, with their role), `guide` |
+| Say | `set_status` (what it is doing, and its role) |
+| Talk | `send_message`, `ask`, `reply`, `read_inbox`, `listen` |
+| Report | `report`: `needs_human` or `done`, at the agent's own judgment |
+| Leave notes | `bulletin_post`, `bulletin_read`, `bulletin_remove` |
 
-Notable behaviour:
+**Supervisor, for the Supervisor session** (and for an outside agent only while the person has allowed it): create, resume, restart and end sessions; assign tasks and wait for them; read terminals; list messages, reports and waiting sessions; manage the bulletin board. Typing raw input into a terminal asks the person each time.
 
-- **Encodings.** `read_file` decodes UTF-8, UTF-16 with BOM and XML-declared encodings (`encoding_rs`). `write_file` encodes back the same way and refuses encodings it can't round-trip.
-- **Atomic saves.** `write_file` writes a temp file next to the target and renames it over the original.
-- **Scanning.** `scan_directory_recursive` remembers which real folders it has listed, so a symlink back to a parent folder doesn't repeat the tree.
-- **Single instance.** Launching MDViewer again with a path forwards that path to the running window (`tauri-plugin-single-instance`).
-- **Errors.** Commands return `Result<_, AppError>`, which the frontend sees as a rejected promise with a message.
+How text reaches an agent matters more than which tool sent it:
 
-The config dir (`dirs::config_dir()/mdviewer`) holds only `access.json`, `history/history.md` and the agent workspace's `read-state/`. History is capped at 1000 entries, and its writes are serialized.
+- **A message body is never typed into a terminal.** When a session is idle, a fixed notice is typed ("new message in your inbox") and the agent reads the message with a tool, labelled as data from another session.
+- **A task is words, not a command.** It can't start with `!`, `#` or `/`, and a shell can't be given one.
+- **A bulletin note is read with a tool, never injected.** A note needs an expiry (1 hour to 14 days), can end with its author's session, and is scoped to a folder or to all sessions.
+- **Sending is limited**: 40 messages and 6 reports per session in ten minutes, which stops answer loops.
 
-## Agent workspace
+## Trust boundaries
 
-The agent panel shows what coding agents read and write: instructions, rules, memory, plans, skills, subagents and commands of Claude Code, Codex and Gemini CLI, and agent files in the opened folders (Cursor's `.cursor/rules/*.mdc` and `.cursorrules` among them). Discovery runs in Rust (`src-tauri/src/agent.rs`), so the webview never names the paths it gets.
+There are three, and they are different in kind.
 
-- **Turning it on** is a native dialog (`enable_agent_workspace`). It sets `agent_workspace` in `access.json` instead of adding folders: granting `~/.claude` would expose settings and credentials, and `~/.claude/projects` holds session transcripts. While it's on, `agent::is_agent_document` allows only markdown at fixed paths (`CLAUDE.md`, `projects/*/memory/**`, `plans`, `skills`, `rules`, `agents`, `commands`, plugin skills; `AGENTS.md` and `prompts` for Codex; `GEMINI.md`). Paths are checked as named and as resolved, so a skill folder symlinked into a repo still works.
-- **Read state.** `mark_read` stores a copy of the file in `read-state/` in the config dir. A scan marks a file unread when it changed after its copy and the text differs. Turning the workspace on marks everything read, so only later changes show.
-- **What changed.** Opening an agent file fetches its copy (`read_snapshot`), diffs the lines (`diffContent` in `utils/agent.ts`, blank lines ignored), and marks the rendered blocks whose `data-line` range holds a changed line. Leaving the document marks it read.
-- **Refresh.** `agent::Watch` watches the agents' homes (not recursively: they also hold transcripts), their agent subfolders and the opened folders, and emits `agent-files-changed` when an agent file changes (content events only; our own reads raise `Access` events). Each `agent_workspace` scan re-arms it, so newly opened or created folders are covered. While the panel or an agent file is open, the frontend rescans 500 ms after the last event and on window focus; if the watcher couldn't start, it polls every 10 s. Open agent files without unsaved edits reload when they change on disk.
-- **Project names.** Claude Code names `~/.claude/projects/<dir>` after the project path with every non-alphanumeric character replaced by `-`. `decode_project_dir` walks the file system matching encoded folder names to recover the real path for the group label.
+### 1. The webview is untrusted
 
-## Frontend (React)
+It renders Markdown and terminal output written by agents, so anything in it may be hostile. Everything that touches the system goes through Rust, and Rust decides on its own.
 
-```mermaid
-flowchart TB
-  App[App.tsx<br/>shortcuts, link routing, watcher events, update check]
-  App --> Toolbar & TabBar & FilePanel & DocumentPanel & TocSidebar & StatusBar
-  App --> UpdateBanner & SettingsModal & SearchPanel & FindBar & AgentPanel
-  DocumentPanel --> Viewer[MarkdownViewer]
-  DocumentPanel --> Editor[Editor, CodeMirror 6]
-  FilePanel & TabBar & DocumentPanel & TocSidebar --> Store[(Zustand store)]
-  Store -- invoke --> Tauri[utils/tauri.ts]
-```
+- **Capabilities** grant only `core:default` and window destroy. The JS file system, dialog, shell and opener plugins are not exposed.
+- **Access list** (`Access` in `main.rs`, saved to `access.json`). Each grant is a native confirmation Rust shows itself: the folder picker in Live, the agent documents, the Sessions index, memory views. No command adds a path because the webview passed it. Dropped files, command-line paths and files handed over by the system are not opened and grant nothing.
+- **Session folders** (the folders agents work in) are found by Rust from the harness and the index. Inside one, only the agent files open: `CLAUDE.md`, `AGENTS.md`, rules, plans, skills and the like, never the folder's other files.
+- **Rendering**: markdown-it with raw HTML off, a strict CSP, Mermaid at its strict security level, a navigation guard that keeps the window on the app's own pages. Remote images are placeholders until the person allows them.
+- **Symlinks** inside a granted folder are followed only to Markdown files and images.
 
-- **One store.** `src/store/index.ts` holds everything: folders and file tree, open documents and tabs, navigation history, panel sizes, zoom, theme and settings. `persist` saves UI state, folders, tabs and workspaces to localStorage; document contents are re-read from disk on start. Actions that can fail return `{ success, error? }` instead of throwing.
-- **Thin IPC layer.** `src/utils/tauri.ts` wraps every `invoke` with types. Components never call `invoke` directly.
-- **One list of commands.** `buildMenu` in `src/utils/commands.ts` defines every command once: label, shortcut, when it is enabled or checked, and what it runs. The toolbar's menu (`MainMenu`) renders the list and the key handler in `App.tsx` matches key presses against it, so the menu can't show a shortcut that does something else. Shortcuts are written per platform (`Ctrl+Shift+S`, `⇧⌘S`), and on a keyboard layout without Latin letters the physical key decides.
-- **Watching.** With auto-refresh on (the default), watcher events trigger a debounced rescan of the file tree (300 ms, never overlapping), and `setFiles` keeps unchanged tree nodes so React doesn't re-render the whole tree.
-- **Editing.** `Ctrl+E` swaps the viewer for a CodeMirror editor. Editor state per document lives in `utils/editorRegistry.ts`, and `utils/save.ts` saves through `write_file`. Closing a tab with unsaved changes asks first, and installing an update is blocked while any tab has them. Save All asks too (`SaveAllDialog`); its buttons follow the platform: the action first on Windows, Cancel first on macOS and Linux.
-- **Workspaces** save a set of folders, expanded paths and tabs under a name (`WorkspaceMenu`).
-- **Theming.** CSS custom properties, dark by default with light overrides under `:root[data-theme='light']`. Shiki emits both themes at once, and Mermaid is re-initialized with matching theme variables.
+### 2. Local sockets identify their caller by the kernel
 
-### Render pipeline
+`runner.sock` and `harness.sock` are Unix sockets in a `0700` folder. A caller's identity is its process, as the kernel reports it (`peer.rs`): the user, the program, and which hosted session's process tree it belongs to. Nothing a caller says about itself is believed.
 
-```mermaid
-flowchart LR
-  F[file content] --> K{getFileKind}
-  K -- markdown --> FM[frontmatter] --> MI[markdown-it<br/>html: false]
-  K -- fb2 --> FB[fb2.ts to Markdown] --> MI
-  K -- code --> Fence[one fenced block] --> MI
-  K -- text --> Pre[escaped pre]
-  MI --> HTML[HTML with data-line<br/>heading ids, image rewrite]
-  HTML --> DOM[MarkdownViewer]
-  DOM --> Shiki[Shiki: code blocks]
-  DOM --> Mer[Mermaid: diagrams, lazily]
-  DOM --> Img[remote images: placeholders]
-```
+- The runner answers only Agent MCR itself, and only from outside every hosted session.
+- A hosted session gets the `mcr` tools and nothing else. A hook report counts for the session its process runs in.
+- The supervisor tools belong to the Supervisor session.
 
-`renderFile` turns content into HTML synchronously, so the document appears at once. Code highlighting and diagrams are filled in afterwards on the live DOM. Block elements carry `data-line` (the 0-based source line), which maps search hits and the editor position back to the rendered document. Relative image paths are rewritten to `localfile://` URLs, and Rust checks those against the access list when they're requested.
+### 3. What this does not protect
 
-## Updates
+**Every agent runs as the person's macOS user. The socket checks are not a wall between that user's programs.** They stop a hosted agent from reaching the sockets with one plain command, and they give correct attribution. A program written to get around them can, because it runs as the same user. Trust also rests on the binary's path: an agent that rebuilds the app passes as the app. Real isolation would need a sandbox per agent; that is a recorded option, not something built.
 
-```mermaid
-sequenceDiagram
-  participant App
-  participant R as Rust: tauri-plugin-updater
-  participant GH as GitHub Releases
+The harness holds no third-party credentials and makes no network request of its own, except images the person allowed. There is no updater.
 
-  App->>R: check_for_update (5 s after start, if enabled)
-  R->>GH: GET releases/latest/download/latest.json
-  GH-->>R: version, per-platform URL and signature
-  R-->>App: UpdateInfo or none
-  App->>App: UpdateBanner "Install and restart"
-  App->>R: install_update (blocked while tabs are dirty)
-  R->>GH: download package
-  R->>R: verify minisign signature against pubkey in tauri.conf.json
-  R->>R: install, restart
-```
+## The app
 
-The updater is used only from Rust; the webview just gets the version and notes. A package that doesn't match the public key in `tauri.conf.json` is rejected, so a compromised download host alone can't push code.
+Two surfaces in one window (`App.tsx`).
 
-## Build and release
+**Sessions** (`SessionWorkspace.tsx`):
 
-- **CI** (`ci.yml`, on push and pull request): TypeScript build, Vitest (`npm test`), `cargo clippy`, `cargo test`.
-- **Release** (`release.yml`, on `v*` tags or manual run): a matrix builds macOS arm64 and x64, Windows x64 and Linux x64 with `tauri-action`, and attaches dmg, app.tar.gz, msi, NSIS exe, deb, rpm and AppImage to a GitHub release.
-  - Update packages are signed with `TAURI_SIGNING_PRIVATE_KEY` (required, because `bundle.createUpdaterArtifacts` is on).
-  - macOS code signing and notarization, and Windows signing via Azure Trusted Signing, switch on only when their secrets exist. Without them the builds are unsigned.
-  - After all builds, the `updater-manifest` job collects the `.sig` files and publishes `latest.json`, which the installed apps poll.
-- Manual runs (not tags) upload the binaries as workflow artifacts instead of making a release.
+- **Live** (`LiveWorkspace.tsx`, `TerminalPane.tsx` with xterm.js): the hosted sessions by working folder, their state, subagents and running shells, and their terminals. Terminal bytes go from the runner to the webview over a raw channel and never pass through the harness service.
+- **Search**: past Claude and Codex sessions from the index, with activity, subagents, usage, memories and linked work. A past session can be resumed in Live.
+
+**Documents** (`AgentPanel.tsx`, `DocumentPanel.tsx`): the agents' Markdown and nothing else. Instructions, rules, memory, plans, skills, agents and commands, grouped by the folder sessions work in, then the agents' own folders. Changes since the person last read a document are marked. The reader has tabs, a table of contents, find, a source editor (CodeMirror 6) and export. A memory opened from Sessions gets its own reader window, which shares preferences read-only and nothing else.
+
+Markdown is rendered synchronously (markdown-it), then enhanced: Shiki highlights code and Mermaid draws diagrams as they scroll into view, so text is readable at once.
+
+## The session index
+
+`sessions.rs` reads the Claude and Codex transcript files incrementally into SQLite (`session_db.rs`): checkpoints per file, paged events, usage records deduplicated across restarts. It is derived data: revoking the Sessions grant clears it.
+
+It is read three ways: the Search view, the usage pane in Live, and a read-only analysis MCP server (`session_mcp.rs`, bridge `--mcp`) that an agent can be given after a native confirmation.
+
+Two rules keep it honest. Status inferred from files is never shown as verified process liveness: a transcript written a minute ago does not prove a running agent. And figures come from the transcripts, never from what an agent says about itself.
+
+## Where data lives
+
+`~/Library/Application Support/agent-mcr/`, all files `0600`:
+
+| File | Holds | Truth or derived |
+|---|---|---|
+| `access.json` | What the person allowed | Truth |
+| `harness-state.json` | Session states, tasks, messages, reports, bulletin notes | Truth |
+| `runner.sock`, `harness.sock` | — | — |
+| `sessions/index.sqlite` | The index of past sessions | Derived |
+| `read-state/` | Copies of agent documents as last read | Derived |
+| `claude-*.json`, `claude-plugin/` | What a Claude launch reads, rewritten before every launch | Derived |
+
+UI state (panel sizes, tabs, theme, folders pinned in Live) is in the webview's localStorage.
+
+## Build
+
+Local builds only (D12): `npm run build:app` makes `Agent MCR.app`. The code must still compile on Linux. CI runs the TypeScript build, Vitest, `cargo clippy` and `cargo test`. There are no published builds.
 
 ## Design choices
 
 | Choice | Reason |
 |---|---|
-| Tauri, not Electron | Small download (about 8 MB on macOS), native webview, and a Rust side that is a natural place for the security boundary. |
-| All system access in Rust, behind an access list | Documents are untrusted input, so a rendering bug must not become file system access. |
-| Dialogs and links handled in Rust | Script in the page can't fake or click through a native dialog. |
-| No raw HTML in Markdown | Removes the biggest XSS surface; the cost is that inline HTML shows as text. |
-| One Zustand store | Small app; one place to look for state and persistence. |
-| Synchronous render, async enhancement | The text is readable immediately; highlighting and diagrams fill in. |
-| Updater keys separate from code-signing certs | Updates work and are verified even while the apps are unsigned. |
+| One binary in several roles | One thing to build, sign and keep in step; a version mismatch between the parts is detected and named |
+| Runner without policy | It never needs a restart for a new feature, so agents survive rebuilds |
+| State from hooks, not from the screen | A screen can be imitated and changes with every agent release; a hook is the agent's own word |
+| Identity from the kernel | A caller can't claim to be another session by passing its id |
+| Fixed notices, bodies read by tool | Text from one agent never arrives in another's prompt as if a person typed it |
+| Only the person answers prompts | A supervisor that approves for the person removes the one control they have |
+| Per-launch configuration | The person's own agent setup is never changed, and removing the app leaves it as it was |
+| No network client | No credentials to hold, nothing to leak, and the app's traffic is easy to check |
+| All system access in Rust, behind an access list | Rendered text is untrusted, so a rendering bug must not become file access |

@@ -3,7 +3,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { DEFAULT_SEARCH_OPTIONS, type SearchOptions } from '../utils/search';
 import type { ColorTheme } from '../utils/markdown';
 import { normalizeDirPath, isPathInside, pathChain, reuseUnchangedNodes } from '../utils/files';
-import type { AgentEntry, UpdateInfo } from '../utils/tauri';
+import type { AgentEntry } from '../utils/tauri';
 import { sameScrollPosition, type ScrollPosition } from '../utils/scrollAnchor';
 import { documentWindowPath, documentWindowStorage } from '../utils/documentWindow';
 
@@ -177,10 +177,6 @@ export interface AppState {
   smoothScroll: boolean;
   /** Show web images in documents without asking first. */
   loadRemoteImages: boolean;
-  /** Look for a new version shortly after start. */
-  checkUpdatesOnStart: boolean;
-  /** A newer version found by the update check. Not persisted. */
-  availableUpdate: UpdateInfo | null;
 
   // Appearance
   /** Rendered markdown text color in the dark theme. */
@@ -300,8 +296,6 @@ export interface AppState {
   setShowTextFiles: (enabled: boolean) => void;
   setSmoothScroll: (enabled: boolean) => void;
   setLoadRemoteImages: (enabled: boolean) => void;
-  setCheckUpdatesOnStart: (enabled: boolean) => void;
-  setAvailableUpdate: (update: UpdateInfo | null) => void;
 
   // Appearance
   setMarkdownTextColor: (color: string) => void;
@@ -538,8 +532,6 @@ export const useStore = create<AppState>()(
       showTextFiles: true,
       smoothScroll: true,
       loadRemoteImages: false,
-      checkUpdatesOnStart: true,
-      availableUpdate: null,
 
       // Appearance
       markdownTextColor: DEFAULT_MARKDOWN_TEXT_COLOR,
@@ -1003,9 +995,7 @@ export const useStore = create<AppState>()(
 
       setLoadRemoteImages: (enabled) => set({ loadRemoteImages: enabled }),
 
-      setCheckUpdatesOnStart: (enabled) => set({ checkUpdatesOnStart: enabled }),
 
-      setAvailableUpdate: (update) => set({ availableUpdate: update }),
 
       // Appearance
       setMarkdownTextColor: (color) => set({ markdownTextColor: color }),
@@ -1191,7 +1181,6 @@ export const useStore = create<AppState>()(
         showTextFiles: state.showTextFiles,
         smoothScroll: state.smoothScroll,
         loadRemoteImages: state.loadRemoteImages,
-        checkUpdatesOnStart: state.checkUpdatesOnStart,
         markdownTextColor: state.markdownTextColor,
         markdownTextColorLight: state.markdownTextColorLight,
         theme: state.theme,

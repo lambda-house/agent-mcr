@@ -15,7 +15,7 @@ export function documentWindowStorage(source: Pick<Storage, 'getItem'>) {
       } catch { /* Use the reader defaults if the saved preferences are invalid. */ }
       return JSON.stringify({ version: 4, state: {
         ...preferences, filePanelVisible: false, agentVisible: false,
-        checkUpdatesOnStart: false, editMode: false,
+        editMode: false,
       } });
     },
     setItem: () => {},

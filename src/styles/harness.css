@@ -331,3 +331,12 @@
 .session-cockpit .hs-more-folders { margin: 2px 8px 8px; padding: 3px 8px; border: 0; background: transparent; color: var(--sc-muted); font-size: 11px; justify-content: flex-start; }
 .hs-outside { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; }
 .hs-outside input { margin: 0; }
+
+/* Session telemetry stays readable independently of the activity dot. */
+.hs-metrics { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 10px; margin: 4px 0 2px; color: var(--sc-muted); font-size: 10px; font-variant-numeric: tabular-nums; line-height: 1.5; }
+.hs-metrics > span { white-space: nowrap; }
+.hs-metric-context { display: inline-flex; align-items: center; gap: 4px; }
+.hs-metric-context.high { color: #e0a23c; }
+.hs-metric-bar { width: 24px; height: 3px; border-radius: 2px; background: var(--sc-border); overflow: hidden; }
+.hs-metric-bar i { display: block; height: 100%; background: var(--sc-accent); }
+.hs-metric-context.high .hs-metric-bar i { background: #e0a23c; }

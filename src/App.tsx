@@ -6,7 +6,6 @@ import {
   onMenuCommand,
   openExternal,
   followLocalLink,
-  checkForUpdate,
   onAgentFilesChanged,
 } from './utils/tauri';
 import { buildMenu, menuCommands, commandForKey } from './utils/commands';
@@ -20,7 +19,6 @@ import StatusBar from './components/StatusBar';
 import SettingsModal from './components/SettingsModal';
 import SaveAllDialog from './components/SaveAllDialog';
 import { agentFilesWatched, refreshAgentWorkspace } from './utils/agent';
-import UpdateBanner from './components/UpdateBanner';
 import SessionWorkspace from './components/SessionWorkspace';
 import { documentWindowPath } from './utils/documentWindow';
 
@@ -184,17 +182,6 @@ const App: React.FC = () => {
     window.addEventListener('focus', refresh);
     return () => window.removeEventListener('focus', refresh);
   }, [sessionRestored, openPath]);
-
-  // Look for a new version a few seconds after start (not during startup work)
-  useEffect(() => {
-    if (!isTauri() || !useStore.getState().checkUpdatesOnStart) return;
-    const timer = setTimeout(() => {
-      checkForUpdate()
-        .then((update) => useStore.getState().setAvailableUpdate(update))
-        .catch((error) => console.warn('Update check failed:', error));
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, []);
 
   // Links in the document. The window itself never navigates (the backend
   // blocks it): anchors scroll, web/mail links open in the default browser,
@@ -423,8 +410,6 @@ const App: React.FC = () => {
         filePanelVisible={filePanelVisible}
         onToggleFilePanel={documentWindowPath ? undefined : handleToggleFilePanel}
       />
-
-      <UpdateBanner />
 
       <div className="main-content">
         {filePanelVisible && <AgentPanel width={panelWidth} />}
