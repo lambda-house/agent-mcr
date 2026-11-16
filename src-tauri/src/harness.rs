@@ -366,15 +366,198 @@ pub fn process_table() -> Vec<Process> {
         .collect()
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn windows_process_cpu_seconds(pid: u32) -> f64 {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return 0.0;
+        }
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+        );
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            return 0.0;
+        }
+        let to_ticks = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+        (to_ticks(kernel).saturating_add(to_ticks(user))) as f64 / 10_000_000.0
+    }
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn format_windows_command(cmd: &[String], exe: Option<&str>) -> String {
+    if cmd.is_empty() {
+        return exe.unwrap_or("").to_string();
+    }
+    cmd.iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '"') {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn map_windows_process(
+    pid: u32,
+    parent: Option<u32>,
+    run_time: u64,
+    cpu_seconds: f64,
+    stopped: bool,
+    cmd: &[String],
+    exe: Option<&str>,
+) -> Option<Process> {
+    let pid = i32::try_from(pid).ok().filter(|&p| p > 0)?;
+    let parent = parent.and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+    Some(Process {
+        pid,
+        parent,
+        elapsed: run_time,
+        cpu: cpu_seconds,
+        state: if stopped { "T" } else { "S" }.into(),
+        command: format_windows_command(cmd, exe),
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn process_table() -> Vec<Process> {
+    use sysinfo::{ProcessRefreshKind, ProcessStatus, RefreshKind, System, UpdateKind};
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)),
+    );
+    system
+        .processes()
+        .values()
+        .filter_map(|p| {
+            let pid = p.pid().as_u32();
+            let cmd: Vec<String> = p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+            let exe = p.exe().map(|path| path.to_string_lossy().into_owned());
+            map_windows_process(
+                pid,
+                p.parent().map(|pp| pp.as_u32()),
+                p.run_time(),
+                windows_process_cpu_seconds(pid),
+                matches!(p.status(), ProcessStatus::Stop),
+                &cmd,
+                exe.as_deref(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 pub fn process_table() -> Vec<Process> {
     Vec::new()
 }
 
+/// Splits the first argument (supporting double-quoted paths with spaces) and returns `(first, rest_trimmed)`.
+fn split_first_arg(command: &str) -> (&str, &str) {
+    let trimmed = command.trim_start();
+    if let Some(after_quote) = trimmed.strip_prefix('"') {
+        if let Some(end) = after_quote.find('"') {
+            return (&after_quote[..end], after_quote[end + 1..].trim_start());
+        }
+    }
+    match trimmed.find(char::is_whitespace) {
+        Some(idx) => (&trimmed[..idx], trimmed[idx..].trim_start()),
+        None => (trimmed, ""),
+    }
+}
+
+fn shell_kind(command: &str) -> Option<&'static str> {
+    let (program, _) = split_first_arg(command);
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lower = base.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    match stem {
+        "bash" | "zsh" | "sh" | "dash" | "fish" => Some("posix"),
+        "cmd" => Some("cmd"),
+        "powershell" | "pwsh" => Some("powershell"),
+        _ => None,
+    }
+}
+
+fn match_shell_flag<'a>(kind: &str, rest: &'a str) -> Option<(bool, &'a str)> {
+    let mut cursor = rest.trim_start();
+    while !cursor.is_empty() {
+        let (tok, next) = split_first_arg(cursor);
+        match kind {
+            "posix" => {
+                return (tok.starts_with('-') && tok.contains('c')).then_some((false, next));
+            }
+            "cmd" => {
+                if !tok.starts_with('/') {
+                    return None;
+                }
+                if tok.eq_ignore_ascii_case("/c") {
+                    return Some((false, next));
+                }
+            }
+            "powershell" => {
+                let flag = tok.strip_prefix('-').or_else(|| tok.strip_prefix('/'))?;
+                if flag.eq_ignore_ascii_case("command") || flag.eq_ignore_ascii_case("c") {
+                    return Some((false, next));
+                }
+                if ["encodedcommand", "enc", "ec", "e"].iter().any(|k| flag.eq_ignore_ascii_case(k)) {
+                    return Some((true, next));
+                }
+                if ["executionpolicy", "ep", "windowstyle", "w", "inputformat", "if", "outputformat", "of"]
+                    .iter()
+                    .any(|k| flag.eq_ignore_ascii_case(k))
+                {
+                    let (_, after_val) = split_first_arg(next);
+                    cursor = after_val;
+                    continue;
+                }
+            }
+            _ => return None,
+        }
+        cursor = next;
+    }
+    None
+}
+
 fn is_command_shell(command: &str) -> bool {
-    let mut words = command.split_whitespace();
-    let name = words.next().unwrap_or("").rsplit('/').next().unwrap_or("");
-    ["bash", "zsh", "sh", "dash", "fish"].contains(&name) && words.next().is_some_and(|flag| flag.starts_with('-') && flag.contains('c'))
+    let (_, rest) = split_first_arg(command);
+    shell_kind(command).is_some_and(|kind| match_shell_flag(kind, rest).is_some())
+}
+
+fn extract_shell_command(command: &str) -> String {
+    let (_, rest) = split_first_arg(command);
+    if let Some(kind) = shell_kind(command) {
+        if let Some((encoded, body)) = match_shell_flag(kind, rest) {
+            if encoded {
+                return if kind == "powershell" { "powershell -EncodedCommand" } else { "<encoded command>" }.to_string();
+            }
+            if kind == "posix" {
+                if let Some((_, after_eval)) = body.rsplit_once("eval ") {
+                    return after_eval.to_string();
+                }
+            }
+            let body = body.trim();
+            if let Some(unquoted) = body.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                return unquoted.to_string();
+            }
+            return body.to_string();
+        }
+    }
+    command
+        .rsplit_once("eval ")
+        .map(|(_, c)| c)
+        .or(command.split_once("c ").map(|(_, c)| c))
+        .unwrap_or(command)
+        .to_string()
 }
 
 /// The shells running under an agent's process: each `sh -c …` among its
@@ -392,11 +575,17 @@ pub fn shells(table: &[Process], root: i32, now: u64) -> Vec<Shell> {
         }
         // What it runs: its first child, or else the text it was given
         let inner = children(pid).min_by_key(|p| p.pid).map(|p| {
-            let (program, rest) = p.command.split_once(' ').unwrap_or((&p.command, ""));
-            format!("{} {rest}", program.rsplit('/').next().unwrap_or(program))
+            let (program, rest) = split_first_arg(&p.command);
+            let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+            if rest.is_empty() { name.to_string() } else { format!("{name} {rest}") }
         });
-        let given = || process.command.rsplit_once("eval ").map(|(_, c)| c).or(process.command.split_once("c ").map(|(_, c)| c)).unwrap_or(&process.command).to_string();
-        let command: String = inner.unwrap_or_else(given).trim().chars().filter(|c| !c.is_control()).take(160).collect();
+        let command: String = inner
+            .unwrap_or_else(|| extract_shell_command(&process.command))
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(160)
+            .collect();
         // The whole tree under the shell: the work is usually in a grandchild
         let (mut cpu, mut stopped, mut tree) = (0.0, false, vec![pid]);
         while let Some(member) = tree.pop() {
@@ -824,7 +1013,7 @@ impl Store {
     fn next(&mut self, session: &str, at_prompt: bool) -> Option<Task> {
         let ready = self.sessions.get(session).is_some_and(|t| {
             t.state == "idle"
-                || (t.state == "unknown" && adapter(&t.profile).detects_prompt() && at_prompt)
+                || (t.state == "unknown" && (!adapter(&t.profile).detects_prompt() || at_prompt))
         });
         if !ready || self.tasks.values().any(|t| t.session == session && t.state == "working") {
             return None;
@@ -3081,8 +3270,11 @@ mod tests {
         assert!(command_line(&Launch { task: Some("x"), ..launch("shell") }).is_err());
         assert!(command_line(&Launch { resume: Some("x; rm -rf /"), ..launch("claude") }).is_err());
         assert!(command_line(&launch("rm -rf /")).is_err());
-        let argv = argv_for(&launch("claude")).unwrap();
-        assert_eq!(&argv[1..4], &["-l", "-i", "-c"]);
+        #[cfg(unix)]
+        {
+            let argv = argv_for(&launch("claude")).unwrap();
+            assert_eq!(&argv[1..4], &["-l", "-i", "-c"]);
+        }
         let hooks = claude_settings("/Apps/Agent MCR.app/agent-mcr", false);
         assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "'/Apps/Agent MCR.app/agent-mcr' --harness-hook Stop");
     }
@@ -3546,6 +3738,65 @@ mod tests {
         let at = |cpu: f64, now: u64| harness.with_activity(vec![Shell { pid: 20, command: String::new(), started: 0, cpu, stopped: false, quiet_since: now }], now)[0].quiet_since;
         assert_eq!((at(2.0, 1_000), at(2.0, 61_000), at(2.4, 90_000), at(2.4, 200_000)), (1_000, 1_000, 90_000, 90_000));
     }
+    #[test]
+    fn windows_process_mapping_units_and_missing_parents() {
+        assert!(map_windows_process(0, Some(1), 10, 1.5, false, &[], None).is_none());
+        assert!(map_windows_process(u32::MAX, Some(1), 10, 1.5, false, &[], None).is_none());
+        let proc = map_windows_process(
+            420,
+            None,
+            131,
+            2.75,
+            false,
+            &["C:\\Program Files\\Git\\bin\\bash.exe".into(), "-c".into(), "cargo test".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!((proc.pid, proc.parent, proc.elapsed, proc.cpu, proc.state.as_str()), (420, 0, 131, 2.75, "S"));
+        assert_eq!(proc.command, "\"C:\\Program Files\\Git\\bin\\bash.exe\" -c \"cargo test\"");
+
+        let fallback_exe = map_windows_process(421, Some(420), 5, 0.25, true, &[], Some("C:\\Windows\\System32\\cmd.exe")).unwrap();
+        assert_eq!((fallback_exe.parent, fallback_exe.state.as_str(), fallback_exe.command.as_str()), (420, "T", "C:\\Windows\\System32\\cmd.exe"));
+    }
+
+    #[test]
+    fn windows_shells_match_paths_quotes_options_and_filter_helpers() {
+        let p = |pid: i32, parent: i32, elapsed: u64, cpu: f64, command: &str| Process {
+            pid,
+            parent,
+            elapsed,
+            cpu,
+            state: "S".into(),
+            command: command.to_string(),
+        };
+        let table = vec![
+            p(100, 1, 500, 1.0, "\"C:\\Program Files\\nodejs\\node.exe\" claude.js"),
+            p(101, 100, 500, 3.0, "C:\\Apps\\agent-mcr.exe --harness-mcp"),
+            p(102, 100, 500, 2.0, "\"C:\\Program Files\\nodejs\\node.exe\" mcp-server.js"),
+            p(103, 100, 500, 0.5, "C:\\Windows\\System32\\cmd.exe /k"),
+            p(200, 100, 60, 0.2, "\"C:\\Program Files\\Git\\bin\\bash.exe\" -c \"cargo test --lib\""),
+            p(201, 200, 59, 1.8, "\"C:\\Users\\me\\.cargo\\bin\\cargo.exe\" test --lib"),
+            p(210, 100, 40, 0.4, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE -NoProfile -ExecutionPolicy Bypass -Command \"Get-ChildItem\""),
+            p(220, 100, 30, 0.6, "PWSH.EXE -command \"Write-Host ok\""),
+            p(230, 100, 20, 0.8, "powershell.exe -EncodedCommand RwBlAHQALQBEAGEAdABlAA=="),
+            p(240, 100, 10, 1.1, "C:\\Windows\\System32\\CMD.EXE /d /C \"dir /b\""),
+            p(300, 1, 90, 5.0, "cmd.exe /c \"other session\""),
+        ];
+        let found = shells(&table, 100, 1_000_000);
+        let summary: Vec<(i32, &str, u64, f64)> = found.iter().map(|s| (s.pid, s.command.as_str(), s.started, s.cpu)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (200, "cargo.exe test --lib", 940_000, 2.0),
+                (210, "Get-ChildItem", 960_000, 0.4),
+                (220, "Write-Host ok", 970_000, 0.6),
+                (230, "powershell -EncodedCommand", 980_000, 0.8),
+                (240, "dir /b", 990_000, 1.1),
+            ]
+        );
+        assert!(!found.iter().any(|s| s.command.contains("RwBlAHQ")));
+    }
+
     #[test]
     fn a_task_is_words_not_a_command() {
         for text in ["!curl x | sh", "  !ls", "\n/permissions", "# remember this", "/evil"] {

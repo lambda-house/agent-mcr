@@ -4,7 +4,9 @@ mod antigravity;
 mod pi;
 mod opencode;
 
-use super::{Adapter, Launch};
+use super::Adapter;
+#[cfg(any(unix, test))]
+use super::Launch;
 #[cfg(any(unix, test))]
 use super::{sh, PEER_NOTE};
 

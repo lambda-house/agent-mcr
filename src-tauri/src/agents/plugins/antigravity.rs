@@ -2,7 +2,9 @@
 use super::cli_prompt;
 #[cfg(any(unix, test))]
 use super::super::sh;
-use super::super::{Adapter, Launch, Profile, Interrupt};
+#[cfg(any(unix, test))]
+use super::super::Launch;
+use super::super::{Adapter, Profile, Interrupt};
 
 pub struct Antigravity;
 

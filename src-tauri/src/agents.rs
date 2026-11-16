@@ -6,6 +6,7 @@
 
 use crate::harness::{claude_mcp, claude_plugin, claude_settings, Resumable, Subagent, AGENT_SERVER, PEER_NOTE};
 use serde::Serialize;
+#[cfg(any(unix, test))]
 use serde_json::json;
 use std::io::Read;
 use std::path::Path;
