@@ -54,6 +54,40 @@ export interface HarnessStatus {
   outsideSupervisors?: boolean;
 }
 
+/** What an agent told the person with its `report` tool. */
+export interface Report { id: string; session: string; name: string; cwd: string; kind: 'needs_human' | 'done'; text: string; created: number }
+/** A note on the bulletin board, read by sessions until it expires. */
+export interface Note {
+  id: string; from: { id: string; name: string }; folder: string; scope: 'folder' | 'all'; text: string;
+  posted: number; expires: number; untilItsSessionEnds: boolean; readBy: number;
+}
+export interface Board { reports: Report[]; notes: Note[] }
+
+/** How long until a moment: "in 20 min", "in 5 h", "in 3 days". */
+export function formatUntil(ms: number, now = Date.now()): string {
+  const minutes = Math.round((ms - now) / 60000);
+  if (minutes < 1) return 'now';
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `in ${hours} h`;
+  return `in ${Math.round(hours / 24)} days`;
+}
+
+/**
+ * Reports the person has not acted on: the newest report of each session that
+ * still carries its own report as its mark.
+ */
+export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
+  const open = new Set<string>();
+  for (const h of hosted) {
+    const kind = h.exit ? undefined : h.harness?.attention?.report;
+    if (!kind) continue;
+    const last = reports.filter(r => r.session === h.id && r.kind === kind).pop();
+    if (last) open.add(last.id);
+  }
+  return open;
+}
+
 export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
@@ -65,6 +99,9 @@ export const harnessApi = {
   /** End the agent and continue its conversation in a new process; the session id changes */
   restart: (id: string) => invoke<Hosted & { replaced: string; resumed: boolean }>('harness_restart', { id }),
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
+  /** What sessions reported to the person, and the live notes of the bulletin board */
+  board: () => invoke<Board>('harness_board'),
+  removeNote: (note: string) => invoke<void>('harness_note_remove', { note }),
   /** The person looked at a session's notification */
   ack: (id: string) => invoke<void>('harness_ack', { id }),
   signal: (id: string, signal: 'INT' | 'TERM' | 'HUP' | 'KILL') => invoke<void>('harness_signal', { id, signal }),

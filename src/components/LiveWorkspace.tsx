@@ -45,8 +45,10 @@ const START: [string, string][] = [['claude', 'Claude Code'], ['codex', 'Codex']
 /** Folders with only history shown before "more" is asked for. */
 const HISTORY_FOLDERS = 6;
 
-export default function LiveWorkspace({ active, recentDirectories, titles = {}, onSearch }: {
+export default function LiveWorkspace({ active, recentDirectories, titles = {}, onSearch, focus }: {
   active: boolean; recentDirectories: string[];
+  /** A session to show, asked for from another view; `at` makes a repeated ask count */
+  focus?: { id: string; at: number };
   /** Titles of earlier sessions by conversation id, when the Sessions index has them */
   titles?: Record<string, string>;
   /** Open the search view narrowed to a folder */
@@ -101,6 +103,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     setSelected(id); setOpened(o => o.includes(id) ? o : [...o, id]);
     if (hosted.find(h => h.id === id)?.harness?.attention?.kind === 'notification') void harnessApi.ack(id).then(refresh).catch(() => {});
   };
+  useEffect(() => { if (focus?.id) select(focus.id); }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
   // Rows keep their place: running ones in the order they were started, ended ones after them.

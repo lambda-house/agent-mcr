@@ -855,6 +855,23 @@ impl Store {
         notes
     }
 
+    /// What the app shows: the latest reports (newest last) and the live notes.
+    fn board(&self) -> Value {
+        let now = now_ms();
+        let mut notes: Vec<&Note> = self.notes.values().filter(|n| n.expires > now).collect();
+        notes.sort_by_key(|n| n.created);
+        let notes: Vec<Value> = notes
+            .iter()
+            .map(|n| {
+                let mut shown = n.shown("");
+                // Its author does not count as a reader
+                shown["readBy"] = json!(n.seen.iter().filter(|s| **s != n.from).count());
+                shown
+            })
+            .collect();
+        json!({ "reports": &self.reports[self.reports.len().saturating_sub(BOARD_REPORTS)..], "notes": notes })
+    }
+
     /// Notes this session has not read yet.
     fn unseen_notes(&self, session: &str) -> usize {
         let cwd = self.sessions.get(session).map(|t| t.cwd.as_str()).unwrap_or("");
@@ -912,6 +929,9 @@ impl Store {
         }
     }
 }
+
+/// Reports the app lists, newest last.
+const BOARD_REPORTS: usize = 200;
 
 /// How long after the harness typed into a session a prompt counts as its own.
 const INJECTED_PROMPT_MS: u64 = 10_000;
@@ -2051,6 +2071,13 @@ impl Harness {
                 }
                 Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors }))
             }
+            // What the app shows of the reports and the bulletin board
+            "board" => Ok(lock(&self.store).board()),
+            // The human took a note off the board
+            "note_remove" => {
+                let note = req["note"].as_str().ok_or("Missing note")?;
+                self.update(|s| s.notes.remove(note)).map(|_| json!({})).ok_or_else(|| format!("No note {note}"))
+            }
             // The human looked at it
             "ack" => {
                 let id = id()?;
@@ -2945,6 +2972,14 @@ mod tests {
         assert_eq!(s.notes[&local.id].shown("b")["new"], true);
         s.notes.get_mut(&local.id).unwrap().seen.insert("b".into());
         assert_eq!(s.unseen_notes("b"), 1);
+
+        // The app's view: every live note with its readers, the author not counted
+        s.report("a", "done", "merged").unwrap();
+        let board = s.board();
+        assert_eq!(board["notes"].as_array().unwrap().len(), 2);
+        let shown = board["notes"].as_array().unwrap().iter().find(|n| n["id"] == local.id.as_str()).unwrap();
+        assert_eq!((shown["readBy"].as_u64(), shown["from"]["name"].as_str(), shown["untilItsSessionEnds"].as_bool()), (Some(1), Some("claude"), Some(true)));
+        assert_eq!((board["reports"][0]["kind"].as_str(), board["reports"][0]["text"].as_str(), board["reports"][0]["cwd"].as_str()), (Some("done"), Some("merged"), Some("/w/app")));
 
         // Expired notes are gone for readers at once, and from the store at the next change
         s.notes.get_mut(&local.id).unwrap().expires = now_ms() - 1;

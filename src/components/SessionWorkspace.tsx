@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronRight, Play, RefreshCw, Search, Shield, Terminal, X, Zap } from 'lucide-react';
+import { Bot, ChevronRight, ClipboardList, Play, RefreshCw, Search, Shield, Terminal, X, Zap } from 'lucide-react';
 import { compact, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -11,10 +11,12 @@ import { harnessApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import SessionAgentAccess from './SessionAgentAccess';
 import LiveWorkspace from './LiveWorkspace';
+import BoardView from './BoardView';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
-function savedView(): 'live' | 'history' {
-  try { return localStorage.getItem(VIEW_KEY) === 'history' ? 'history' : 'live'; } catch { return 'live'; }
+type View = 'live' | 'history' | 'board';
+function savedView(): View {
+  try { const v = localStorage.getItem(VIEW_KEY); return v === 'history' || v === 'board' ? v : 'live'; } catch { return 'live'; }
 }
 
 const empty: Snapshot = { sessions: [], errors: [], scannedFiles: 0, pendingFiles: 0, indexedAt: 0 };
@@ -26,8 +28,9 @@ function Metric({ label, value, hint }: { label: string; value: string; hint: st
 }
 export default function SessionWorkspace({ onClose, active = true }: { onClose: () => void; active?: boolean }) {
   const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [view, setViewState] = useState<'live' | 'history'>(savedView);
-  const setView = (v: 'live' | 'history') => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
+  const [view, setViewState] = useState<View>(savedView);
+  const [focus, setFocus] = useState<{ id: string; at: number }>();
+  const setView = (v: View) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
   const [data, setData] = useState<Snapshot>(empty);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [focusedEvidence, setFocusedEvidence] = useState<{ session: string; event: SessionEvent } | null>(null);
@@ -90,6 +93,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       <nav className="hs-view-switch" aria-label="Sessions view">
         <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
         <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><Search size={13}/> Search</button>
+        <button type="button" aria-current={view === 'board' ? 'page' : undefined} onClick={() => setView('board')} title="What sessions reported to you, and the notes they left for each other"><ClipboardList size={13}/> Board</button>
       </nav>
       <div className="sc-top-actions">
         {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button><button onClick={() => setUserMemories(true)}>User memories</button><button onClick={() => setAgentAccess(true)}>Agent access</button></>}
@@ -105,7 +109,8 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div>
       </details>}
     </header>
-    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined}/></div>
+    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
+    {view === 'board' && <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/>}
     {view === 'history' && <>
     {error && <div className="sc-banner" role="alert">{error}</div>}
     {!enabled ? <div className="sc-welcome"><div className="sc-logo"><Bot size={36}/></div><p className="sc-eyebrow">YOUR AGENTIC LANDSCAPE</p><h1>See the work.<br/>Follow every agent.</h1><p>Codex and Claude sessions, their agents, models, tokens, tools and linked work. One view across all recorded workspaces on this machine.</p>
