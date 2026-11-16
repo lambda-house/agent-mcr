@@ -4,6 +4,8 @@ Plan for full Windows support of Agent MCR (decision D13 in `AGENT_HARNESS_DESIG
 
 ## Gate for every task
 
+Scoped (operator decision, 2026-11-16): a frontend-only diff runs `npm run build` and `npm test`; a Rust-only diff runs `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo xwin clippy`; a diff touching both runs all. The full five-check gate runs at the final merge and the final check.
+
 On this Mac, all must pass:
 
 ```bash
@@ -52,12 +54,12 @@ Claude hook commands use `"<exe with forward slashes>" --harness-hook <Event>`, 
 
 ## Team and workflow (operator decision, 2026-11-16)
 
-- Executor A ("Windows port: executor", Antigravity): worktree `agent-mcr-windows`, branch `windows-port`. Track: W2–W7 and R1–R3, and the merges.
-- Executor B ("Windows port: executor B", Codex): worktree `agent-mcr-windows-b`, branch `windows-port-b` (from 9116835). Track: W8, W9, W10, W11, W12.
+- Executor A ("Windows port: executor", Antigravity): worktree `agent-mcr-windows`, branch `windows-port`. Track: W2–W6 and R1–R3, and the merges.
+- Executor B ("Windows port: executor B", Codex): worktree `agent-mcr-windows-b`, branch `windows-port-b` (from 9116835). Track: W8, W9, W7 (moved from A by the operator), W10, W11, W12. Before W7, B merges `windows-port` into `windows-port-b` once, because W7 needs `ipc::private_dir` (W3) and `peer.rs` (W2).
 - Pipeline: an executor starts its next task as soon as it reports a commit; review fixes come as follow-up commits. At most one unreviewed task per executor ahead of the reviewer.
-- Review: the executor runs the full gate. The reviewer re-runs only `cargo xwin clippy` (plus `cargo test` when the diff touches Rust tests) and reads the diff closely. The full gate runs on every merge and at the final check.
-- File ownership, to keep merges small: `harness.rs`, `runner.rs`, `peer.rs`, `ipc.rs`, `agents*`, `session_mcp.rs`, `session_analysis_commands.rs`, `Cargo.toml`/`Cargo.lock` belong to A. `agent.rs`, `sessions.rs`, `session_memory.rs`, `src/`, `tauri.conf.json`, `package.json`, `.github/`, `CLAUDE.md`, `README.md`, `docs/SESSION_ANALYSIS_MCP.md`, `docs/AGENT_HARNESS_DESIGN.md` belong to B. `main.rs` is shared: A owns `get_config_dir` and the `--runner`/`--harness`/`--mcp` branches (W3, W7); B may change only `session_folders` and the Access path checks (W8). `docs/WINDOWS_PORT.md`: the planner edits the plan; A writes only under "Wine findings". A needed change in a file the other owns goes to the planner, who hands it to the owner. B collects doc notes from A's commits for W12.
-- Merges: A merges `windows-port-b` into `windows-port` and runs the full gate, after the reviewer approves W9, after W11, and before the final check. B then merges `windows-port` back into `windows-port-b` before its next task.
+- Review: the executor runs the scoped gate. Before a task is released, the planner asks the reviewer what it will check and writes the answers into the task text, aiming at one review round per task. The reviewer re-runs only `cargo xwin clippy` (plus `cargo test` when the diff touches Rust tests) and reads the diff closely. The full gate runs on every merge and at the final check.
+- File ownership, to keep merges small: `harness.rs`, `runner.rs`, `peer.rs`, `ipc.rs`, `agents*`, `Cargo.toml`/`Cargo.lock` belong to A. `session_mcp.rs`, `session_analysis_commands.rs`, `agent.rs`, `sessions.rs`, `session_memory.rs`, `src/`, `tauri.conf.json`, `package.json`, `.github/`, `CLAUDE.md`, `README.md`, `docs/SESSION_ANALYSIS_MCP.md`, `docs/AGENT_HARNESS_DESIGN.md` belong to B. `main.rs` is shared: A owns `get_config_dir` and the `--runner`/`--harness` branches; B owns the `--mcp` branch (W7), `session_folders`, the Access path checks (W8) and the `tauri::Builder` run error path (W10). If W7 needs a dependency in `Cargo.toml`, B asks the planner. `docs/WINDOWS_PORT.md`: the planner edits the plan; A writes only under "Wine findings". A needed change in a file the other owns goes to the planner, who hands it to the owner. B collects doc notes from A's commits for W12.
+- Merges (operator decision): B merges `windows-port` into `windows-port-b` once before W7. At the end, A merges `windows-port-b` into `windows-port` once and runs the full gate. No other intermediate merges.
 
 ## Tasks
 
