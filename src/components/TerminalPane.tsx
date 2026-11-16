@@ -3,10 +3,16 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
-import { harnessApi, pastedImage, shellQuote } from '../utils/harness';
+import { harnessApi, pastedImage, SESSION_DRAG_TYPE, shellQuote } from '../utils/harness';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
 export const RESIZE_SETTLE_MS = 200;
+/**
+ * A session that ends this soon after a key press in its terminal was quit by
+ * the person (Ctrl-D twice, /exit): it leaves the list like a closed one. One
+ * that ends on its own stays, with its output, until it is removed.
+ */
+export const QUIT_WINDOW_MS = 10_000;
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 
@@ -31,7 +37,13 @@ function theme(element: HTMLElement) {
  * with no text is saved and its path typed. Ctrl-V reaches the agent as ^V
  * (Claude Code reads the clipboard image itself).
  */
-export default function TerminalPane({ id, active }: { id: string; active: boolean }) {
+export default function TerminalPane({ id, active, onQuit }: {
+  id: string; active: boolean;
+  /** The session ended right after the person pressed keys in it: they quit the agent themselves */
+  onQuit?: () => void;
+}) {
+  const quit = useRef(onQuit);
+  quit.current = onQuit;
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
@@ -79,8 +91,15 @@ export default function TerminalPane({ id, active }: { id: string; active: boole
       } finally { sending = false; }
     };
     resend.current = () => { void sendSize(t.cols, t.rows); };
+    // Key presses only: xterm's own replies to the agent's queries are not the person
+    let lastKey = 0;
+    const keyed = t.onKey(() => { lastKey = Date.now(); });
     harnessApi.attach(id, bytes => {
-      if (bytes.length === 0) { setEnded(true); return; }
+      if (bytes.length === 0) {
+        setEnded(true);
+        if (Date.now() - lastKey < QUIT_WINDOW_MS) quit.current?.();
+        return;
+      }
       t.write(bytes);
     }).then(handle => {
       if (disposed) { void harnessApi.detach(handle); return; }
@@ -103,6 +122,18 @@ export default function TerminalPane({ id, active }: { id: string; active: boole
     // Capture phase: before xterm's own textarea handler pastes nothing
     element.addEventListener('paste', onPaste, true);
 
+    // A session row dropped here: its reference is typed at the prompt, like a paste
+    const dragged = (e: DragEvent) => !!e.dataTransfer?.types.includes(SESSION_DRAG_TYPE);
+    const onDragOver = (e: DragEvent) => { if (dragged(e)) { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; } };
+    const onDrop = (e: DragEvent) => {
+      if (!dragged(e)) return;
+      e.preventDefault(); e.stopPropagation();
+      const reference = e.dataTransfer?.getData('text/plain');
+      if (reference) { t.paste(`${reference} `); t.focus(); }
+    };
+    element.addEventListener('dragover', onDragOver, true);
+    element.addEventListener('drop', onDrop, true);
+
     // Fit once the size has settled. Every new size reaches the agent as a
     // window change, and Claude Code and Codex repaint their whole transcript
     // for each one: fitting on every frame of a window drag floods the
@@ -118,7 +149,9 @@ export default function TerminalPane({ id, active }: { id: string; active: boole
       clearTimeout(settle);
       observer.disconnect();
       element.removeEventListener('paste', onPaste, true);
-      typed.dispose(); resized.dispose();
+      element.removeEventListener('dragover', onDragOver, true);
+      element.removeEventListener('drop', onDrop, true);
+      typed.dispose(); keyed.dispose(); resized.dispose();
       if (view !== null) void harnessApi.detach(view);
       t.dispose();
       term.current = null; fit.current = null; resend.current = () => {};

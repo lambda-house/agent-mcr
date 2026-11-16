@@ -10,6 +10,8 @@ export interface Attention { kind: 'permission' | 'assessment' | 'notification';
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';
   since: number; precise: boolean; agentSession: string | null; attention: Attention | null; lastMessage: string | null;
+  /** When its last turn ended with `lastMessage` */
+  lastMessageAt?: number;
   /** False when `name` is the title the agent gave the session, not a name someone chose */
   named?: boolean;
   /** What the agent says it is doing (its `set_status` tool) */
@@ -164,12 +166,17 @@ export function pastedImage(data: DataTransfer | null): File | null {
 /** A subagent that wrote to its transcript this recently counts as active. */
 export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;
 
-const KIND: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', shell: 'shell' };
 
-/** What to paste into another session so its agent can reach this one. */
+/** The drag type of a session row; its text/plain data is the session's reference. */
+export const SESSION_DRAG_TYPE = 'application/x-mcr-session';
+
+/**
+ * A pointer to a session, to paste or drop into another one: `mcr:<id>` is
+ * what the mcr tools take as `to` (hosted agents are told so, `PEER_NOTE`);
+ * the name after it is for the reader.
+ */
 export function sessionReference(h: Hosted): string {
-  const kind = KIND[h.harness?.profile || h.meta.profile || ''] ?? 'agent';
-  return `Agent MCR session "${hostedLabel(h)}" (${kind}, id ${h.id}, pid ${h.pid ?? 'unknown'}, folder ${h.cwd}). Reach it with the mcr tools: ask or send_message with to "${h.id}".`;
+  return `mcr:${h.id} "${hostedLabel(h).replace(/"/g, "'")}"`;
 }
 
 /** A session whose agent can be ended and started again on the same conversation. */
@@ -181,6 +188,35 @@ export function runningFor(started: number, now: number): string {
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** The first thing a message says, as one plain line: no Markdown marks, at most `max` characters. */
+export function gist(message: string, max = 220): string {
+  const line = message.split('\n').map(l => l.trim()).find(l => l && !/^(```|---|\|[-\s|:]+\|?$)/.test(l)) ?? '';
+  const plain = line.replace(/^(#{1,6}|[-*+]|\d+[.)]|>)\s+/, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/(\*\*|__|`)/g, '').trim();
+  return plain.length > max ? `${plain.slice(0, max - 1).trimEnd()}…` : plain;
+}
+
+/**
+ * What a live session is doing, or what it finished with, for its row.
+ * `lead` says since when; `text` is the agent's own status while it works,
+ * and when its turn has ended, how its last message begins (its status when
+ * it left no message). `full` is the whole of both, for a tooltip.
+ */
+export function sessionSummary(h: Hosted, now: number): { lead: string; text: string; full: string } | null {
+  const t = h.harness;
+  if (h.exit || !t) return null;
+  const status = t.status?.trim() ?? '';
+  const last = t.lastMessage?.trim() ?? '';
+  const full = [status && `Status: ${status}`, last && `Last message:\n${last}`].filter(Boolean).join('\n\n');
+  if (t.state === 'working') return { lead: `Working ${runningFor(t.since, now)}`, text: status, full };
+  if (t.state === 'idle' || t.state === 'waiting') {
+    const ended = t.lastMessageAt || t.since;
+    const text = gist(last) || status;
+    if (!text) return null;
+    return { lead: last ? `Done ${runningFor(ended, now)} ago` : `Idle ${runningFor(ended, now)}`, text, full };
+  }
+  return status ? { lead: '', text: status, full } : null;
 }
 
 /** A shell whose processor time has not moved for this long is shown as quiet. */

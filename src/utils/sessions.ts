@@ -1,7 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
 export interface Usage { input: number; cached: number; cacheWrite: number; output: number; reasoning: number }
 /** What a session's context holds; `toolBytes` is the size of tool output, not tokens. */
-export interface ContextStats { now: number; first: number; peak: number; window: number; compactions: number; toolBytes: Record<string, number>; skills: Record<string, number> }
+export interface ContextStats {
+  now: number; first: number; peak: number; window: number; compactions: number; toolBytes: Record<string, number>; skills: Record<string, number>;
+  /** Lifetime in seconds of the prompt cache last written (Claude: 300 or 3600); 0 or missing when unrecorded */
+  cacheTtl?: number;
+  /** When the cache was last refreshed (ms): the latest response of the main conversation */
+  cacheAt?: number;
+  /** Requests sent after the cache had expired, and their input not served from it */
+  coldWakeups?: number; coldTokens?: number;
+}
 export interface SessionEvent { seq: number; at: string; kind: string; text: string; tool: string | null }
 export interface Session {
   id: string; provider: 'codex' | 'claude'; parentId: string | null; forkedFrom?: string | null; origin?: 'human' | 'subagent' | 'automation' | 'unknown'; directories?: string[]; name: string; cwd: string;
@@ -49,6 +57,34 @@ export function family(sessions: Session[], selected: Session): Session[] {
   return sessions.filter(s => s.provider === selected.provider && ids.has(s.id));
 }
 export const compact = (n: number): string => Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(n);
+
+/**
+ * The context limit a session's size is measured against. Codex records it.
+ * Claude Code does not: its size is taken as 200K, or 1M once the session has
+ * held more than 200K (only the long-context window can), and marked `assumed`.
+ */
+export function contextWindow(s: Pick<Session, 'provider' | 'context'>): { size: number; assumed: boolean } | null {
+  const c = s.context;
+  if (!c) return null;
+  if (c.window > 0) return { size: c.window, assumed: false };
+  if (s.provider !== 'claude' || c.now <= 0) return null;
+  return { size: Math.max(c.peak, c.now) > 200_000 ? 1_000_000 : 200_000, assumed: true };
+}
+
+/** A warm cache with less than this share of its lifetime left is cooling. */
+export const COOLING_SHARE = 0.2;
+export interface CacheState { warm: boolean; cooling: boolean; ttl: number; until: number }
+/**
+ * Whether the session's prompt cache is still alive: a message to a warm
+ * session reads its context at the cached price, one to a cold session pays
+ * for writing all of it again. Null when the transcript records no cache lifetime.
+ */
+export function cacheState(s: Pick<Session, 'context'>, now: number): CacheState | null {
+  const c = s.context;
+  if (!c?.cacheTtl || !c.cacheAt) return null;
+  const until = c.cacheAt + c.cacheTtl * 1000;
+  return { warm: now < until, cooling: now < until && until - now < COOLING_SHARE * c.cacheTtl * 1000, ttl: c.cacheTtl, until };
+}
 export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
 export function origin(s: Session): string { return s.origin || (s.parentId ? 'subagent' : 'unknown'); }

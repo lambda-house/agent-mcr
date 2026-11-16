@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { compact, sessionApi, type Session } from '../utils/sessions';
-import type { Hosted } from '../utils/harness';
+import { cacheState, compact, contextWindow, sessionApi, type Session } from '../utils/sessions';
+import { runningFor, type Hosted } from '../utils/harness';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const size = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} B`;
@@ -51,18 +51,33 @@ export default function SessionStats({ session, active }: { session: Hosted; act
     const most = Math.max(1, ...tools.map(t => t.bytes));
     const skills = Object.entries(c.skills).sort((a, b) => b[1] - a[1]);
     const models = Object.entries(stats.models).filter(([name]) => name);
-    const scale = c.window || c.peak;
+    const limit = contextWindow(stats);
+    const scale = limit?.size || c.peak;
+    const now = Date.now();
+    const cache = cacheState(stats, now);
     return <>
       <section>
         <h4>Context</h4>
-        <p className="hs-stats-big">{compact(c.now)}<small>{c.window ? ` of ${compact(c.window)} · ${percent(c.now, c.window)}` : ' tokens now'}</small></p>
-        {scale > 0 && <div className="hs-stats-bar" role="img" aria-label={c.window ? `${percent(c.now, c.window)} of the context window` : `${percent(c.now, c.peak)} of this session's peak`}><span style={{ width: `${Math.min(100, 100 * c.now / scale)}%` }}/></div>}
+        <p className="hs-stats-big">{compact(c.now)}<small title={limit?.assumed ? 'Claude Code does not record the context limit: 200K is assumed, 1M once the session has held more than 200K' : undefined}>{limit ? ` of ${limit.assumed ? '~' : ''}${compact(limit.size)} · ${percent(c.now, limit.size)}` : ' tokens now'}</small></p>
+        {scale > 0 && <div className="hs-stats-bar" role="img" aria-label={limit ? `${percent(c.now, limit.size)} of the context window` : `${percent(c.now, c.peak)} of this session's peak`}><span style={{ width: `${Math.min(100, 100 * c.now / scale)}%` }}/></div>}
         <dl>
           <dt title="Input of the first reply: instructions, tool definitions and skill listings, before any work">At start</dt><dd>{compact(c.first)}</dd>
           <dt>Peak</dt><dd>{compact(c.peak)}</dd>
           <dt>Compactions</dt><dd>{c.compactions}</dd>
         </dl>
       </section>
+      {cache && <section className={cache.warm ? 'hs-cache-warm' : 'hs-cache-cold'}>
+        <h4 title="The prompt cache keeps the context ready between requests. Read from it, input costs about a tenth; once it has expired, the next request writes the whole context again (1.25× the input price for a 5-minute cache, 2× for a 1-hour one).">Cache</h4>
+        <p className="hs-stats-big">{cache.warm ? 'Warm' : 'Cold'}<small>{cache.warm ? ` · ${runningFor(now, cache.until)} left` : ` · for ${runningFor(cache.until, now)}`}</small></p>
+        <p className="hs-stats-note">{cache.warm
+          ? `A message before ${new Date(cache.until).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} reads the context from the cache.`
+          : `Waking it up writes about ${compact(c.now)} tokens to the cache again.`}</p>
+        <dl>
+          <dt>Lifetime</dt><dd>{cache.ttl >= 3600 ? `${cache.ttl / 3600} h` : `${cache.ttl / 60} min`}</dd>
+          <dt title="Requests sent after the cache had expired: a prompt after a long pause, or a tool that ran longer than the cache lives">Cold wakeups</dt><dd>{c.coldWakeups ?? 0}</dd>
+          {(c.coldWakeups ?? 0) > 0 && <><dt title="Input of those requests that was not read from the cache">read uncached</dt><dd>{compact(c.coldTokens ?? 0)}{u.input ? ` · ${percent(c.coldTokens ?? 0, u.input)}` : ''}</dd></>}
+        </dl>
+      </section>}
       <section>
         <h4>Tokens{stats.usageKnown ? '' : ' (not recorded)'}</h4>
         <dl>

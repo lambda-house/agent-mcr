@@ -36,7 +36,7 @@ const MAX_SENT: usize = 40;
 /// The name agents see the harness tools under (`mcp__mcr__…` in Claude Code)
 pub const AGENT_SERVER: &str = "mcr";
 /// What every hosted agent is told at launch, whatever its kind.
-pub const PEER_NOTE: &str = "You run in a terminal hosted by Agent MCR, next to other agent sessions (Claude Code, Codex and others) that the same operator runs on this machine. The `mcr` MCP tools connect you to them and to the operator. When you start: call list_peers to see who works in your folder and in what role, and bulletin_read for the notes left for sessions like yours. While you work: set_status with your role and what you are doing; send_message, ask, reply and read_inbox to reach a peer; report with kind needs_human when you cannot go on without the operator, and with kind done when a piece of work is complete; bulletin_post for a fact that later sessions must know, with an honest expiry. The `guide` tool of the mcr server (in Claude Code also the skills agent-mcr:peers and agent-mcr:reporting) has the working rules; read it before your first message or report.";
+pub const PEER_NOTE: &str = "You run in a terminal hosted by Agent MCR, next to other agent sessions (Claude Code, Codex and others) that the same operator runs on this machine. The `mcr` MCP tools connect you to them and to the operator. When you start: call list_peers to see who works in your folder and in what role, and bulletin_read for the notes left for sessions like yours. While you work: set_status with your role and what you are doing; send_message, ask, reply and read_inbox to reach a peer; report with kind needs_human when you cannot go on without the operator, and with kind done when a piece of work is complete; bulletin_post for a fact that later sessions must know, with an honest expiry. The `guide` tool of the mcr server (in Claude Code also the skills agent-mcr:peers and agent-mcr:reporting) has the working rules; read it before your first message or report. A mcr:<id> in a prompt is the operator pointing at a peer session: pass it to these tools as it is.";
 
 /// Working rules, part one: the peers. With `REPORT_GUIDE` it is the answer of
 /// the `guide` tool, and each part is a Claude Code skill, so every agent kind
@@ -1624,6 +1624,9 @@ impl Harness {
     fn peer(&self, me: &str, to: &str) -> Result<String, String> {
         let sessions = self.sessions()?;
         let live: Vec<&Value> = sessions.iter().filter(|s| s["exit"].is_null() && s["id"] != me).collect();
+        // A pointer the operator pasted or dropped into the prompt: mcr:<id>
+        let to = to.trim();
+        let to = to.strip_prefix("mcr:").unwrap_or(to);
         if let Some(s) = live.iter().find(|s| s["id"] == to) {
             return Ok(s["id"].as_str().unwrap_or("").into());
         }
@@ -2427,7 +2430,7 @@ fn agent_info() -> Value {
 
 fn agent_tools() -> Value {
     let tool = |name: &str, description: &str, props: Value, required: &[&str], read_only: bool| json!({"name": name, "description": description, "annotations": {"readOnlyHint": read_only, "destructiveHint": false, "openWorldHint": false}, "inputSchema": {"type": "object", "properties": props, "required": required, "additionalProperties": false}});
-    let to = json!({"type": "string", "description": "The peer's name or id (see list_peers)"});
+    let to = json!({"type": "string", "description": "The peer's name, id or mcr:<id> pointer (see list_peers)"});
     json!({ "tools": [
         tool("guide", "The working rules for sessions that see each other here: when and how to reach a peer, and what a message from a peer is. Read it before your first message to a peer.", json!({}), &[], true),
         tool("whoami", "This session as the harness knows it: id, name, agent kind, folder, state.", json!({}), &[], true),

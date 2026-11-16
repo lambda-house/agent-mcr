@@ -3,7 +3,7 @@ use crate::session_db::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-pub const PARSER_VERSION: u32 = 5;
+pub const PARSER_VERSION: u32 = 6;
 pub fn digest(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -113,8 +113,46 @@ pub struct Context {
     pub tool_bytes: BTreeMap<String, u64>,
     /// Explicit skill invocations
     pub skills: BTreeMap<String, u64>,
+    /// Lifetime in seconds of the prompt cache the agent last wrote (Claude
+    /// records 5 minutes or 1 hour per response); 0 when the transcript does not say
+    pub cache_ttl: u64,
+    /// When the latest response of the main conversation was recorded (ms):
+    /// every request refreshes the cache, so it lives until this plus the lifetime
+    pub cache_at: u64,
+    /// When the latest request of the main conversation was sent (ms): a prompt or a tool result
+    pub request_at: u64,
+    /// Requests sent after the cache had expired
+    pub cold_wakeups: u64,
+    /// Input of those requests that was not served from the cache
+    pub cold_tokens: u64,
+}
+/// An RFC3339 timestamp in milliseconds; 0 when it is missing or malformed.
+fn millis(at: &str) -> u64 {
+    chrono::DateTime::parse_from_rfc3339(at).map(|d| d.timestamp_millis().max(0) as u64).unwrap_or(0)
 }
 impl Context {
+    /// A response of the main conversation, recorded at `at`, whose request
+    /// wrote a cache living `ttl` seconds (0: none written), read `cached`
+    /// input tokens from the cache and `uncached` at more than the cached
+    /// price. A late request counts as a cold wakeup only when the response
+    /// confirms it: recorded times can be a little off, and a request just
+    /// past the lifetime is sometimes still served. Rows repeating a response
+    /// change nothing: their request is not newer than the response before.
+    fn cache_response(&mut self, at: u64, ttl: u64, cached: u64, uncached: u64) {
+        if at == 0 {
+            return;
+        }
+        let sent = if self.request_at > self.cache_at { self.request_at } else { at };
+        let late = self.cache_at > 0 && self.cache_ttl > 0 && sent.saturating_sub(self.cache_at) > self.cache_ttl * 1000;
+        if late && uncached > cached {
+            self.cold_wakeups += 1;
+            self.cold_tokens += uncached;
+        }
+        if ttl > 0 {
+            self.cache_ttl = ttl;
+        }
+        self.cache_at = self.cache_at.max(at);
+    }
     fn response(&mut self, input: u64) {
         if input == 0 {
             return;
@@ -578,6 +616,9 @@ impl Indexed {
                 self.session.event(at, "memory", strv(&r, "summary"), None);
             }
             let m = &r["message"];
+            if kind == "user" && r["isSidechain"] != true && millis(at) > 0 {
+                self.session.context.request_at = millis(at);
+            }
             if kind == "assistant" {
                 let model = strv(m, "model");
                 if model != "<synthetic>" && !model.is_empty() {
@@ -586,6 +627,15 @@ impl Indexed {
                         let usage = Usage::from(&m["usage"], true);
                         if r["isSidechain"] != true {
                             self.session.context.response(usage.input);
+                            let written = &m["usage"]["cache_creation"];
+                            let ttl = if written["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0) > 0 {
+                                3600
+                            } else if written["ephemeral_5m_input_tokens"].as_u64().unwrap_or(0) > 0 {
+                                300
+                            } else {
+                                0
+                            };
+                            self.session.context.cache_response(millis(at), ttl, usage.cached, usage.input.saturating_sub(usage.cached));
                         }
                         self.usage(strv(m, "id"), usage, model);
                     }
@@ -1455,6 +1505,34 @@ mod tests {
         let ctx = &x.session.context;
         assert_eq!((ctx.now, ctx.window, ctx.compactions), (40_000, 272_000, 1));
         assert_eq!(ctx.tool_bytes.get("shell"), Some(&4));
+    }
+    #[test]
+    fn a_request_after_the_cache_expired_is_a_cold_wakeup() {
+        let mut c = Indexed::new(Path::new("a.jsonl"), "claude");
+        let ask = |at: &str| json!({"type":"user","timestamp":at,"message":{"content":"go on"}});
+        let reply = |id: &str, at: &str, read: u64, written: u64, kind: &str| json!({"type":"assistant","timestamp":at,"message":{"id":id,"model":"opus",
+            "usage":{"input_tokens":10,"cache_read_input_tokens":read,"cache_creation_input_tokens":written,"output_tokens":1,"cache_creation":{kind:written}}}});
+        c.row(ask("2026-11-16T10:00:00Z"));
+        c.row(reply("m1", "2026-11-16T10:00:05Z", 0, 1_000, "ephemeral_5m_input_tokens"));
+        // Within five minutes: served from the cache
+        c.row(ask("2026-11-16T10:04:00Z"));
+        c.row(reply("m2", "2026-11-16T10:04:30Z", 1_000, 100, "ephemeral_5m_input_tokens"));
+        // Asked ten minutes later: everything is read again. The reply's repeated row counts once
+        c.row(ask("2026-11-16T10:14:30Z"));
+        c.row(reply("m3", "2026-11-16T10:20:00Z", 0, 1_200, "ephemeral_1h_input_tokens"));
+        c.row(reply("m3", "2026-11-16T10:20:01Z", 0, 1_200, "ephemeral_1h_input_tokens"));
+        // The cache now lives an hour: 40 minutes later it is still warm
+        c.row(ask("2026-11-16T11:00:00Z"));
+        c.row(reply("m4", "2026-11-16T11:00:10Z", 1_200, 0, "ephemeral_1h_input_tokens"));
+        // A slow answer is not a wakeup: the request went out in time
+        c.row(ask("2026-11-16T11:59:00Z"));
+        c.row(reply("m5", "2026-11-16T12:10:00Z", 1_200, 50, "ephemeral_1h_input_tokens"));
+        // Just past the hour by the recorded times, yet served from the cache: not counted
+        c.row(ask("2026-11-16T13:11:00Z"));
+        c.row(reply("m6", "2026-11-16T13:11:10Z", 1_250, 30, "ephemeral_1h_input_tokens"));
+        let ctx = &c.session.context;
+        assert_eq!((ctx.cold_wakeups, ctx.cold_tokens, ctx.cache_ttl), (1, 1_210, 3600));
+        assert_eq!(ctx.cache_at, millis("2026-11-16T13:11:10Z"));
     }
     #[test]
     fn codex_cumulative_and_records_not_added_together() {

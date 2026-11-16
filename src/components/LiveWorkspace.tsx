@@ -3,8 +3,8 @@ import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, Terminal, FolderO
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
-import SessionMetrics, { useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
+import { canRestart, directorySections, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
@@ -163,6 +163,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
   const names = new Map(hosted.map(h => [h.id, hostedLabel(h)]));
+  const supervisorSummary = supervisor ? sessionSummary(supervisor, Date.now()) : null;
   const row = (h: Hosted) => {
     const state = hostedState(h);
     const label = hostedLabel(h);
@@ -171,15 +172,18 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', referenced === h.id ? 'reference copied' : ''].filter(Boolean).join(' · ');
     const subs = (h.subagents ?? []).filter(a => !a.finished);
     const shells = h.exit ? [] : h.shells ?? [];
-    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : ''].filter(Boolean).join(' ')}>
-      <button className="hs-item" onClick={() => select(h.id)} title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}`}>
+    const summary = sessionSummary(h, Date.now());
+    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now())].filter(Boolean).join(' ')}>
+      <button className="hs-item" onClick={() => select(h.id)}
+        draggable={!h.exit} onDragStart={e => { e.dataTransfer.setData(SESSION_DRAG_TYPE, h.id); e.dataTransfer.setData('text/plain', sessionReference(h)); e.dataTransfer.effectAllowed = 'copy'; }}
+        title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}${h.exit ? '' : '\nDrag into a terminal to point its agent at this session'}`}>
         <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
         <span className="hs-item-text">
           <strong><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}</strong>
           <SessionMetrics hosted={h} data={metrics}/>
           {detail && <small>{detail}</small>}
           {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
-          {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
+          {summary && <small className="hs-status" title={summary.full || undefined}>{summary.lead && <span className="hs-lead">{summary.lead}</span>}{summary.text && <span>{summary.text}</span>}</small>}
         </span>
       </button>
       <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
@@ -222,7 +226,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
             {!supervisor && <small>Sees and directs all sessions</small>}
             {supervisor && referenced === supervisor.id && <small>reference copied</small>}
             {supervisor && needsYou(supervisor) && <small className="hs-needs">{supervisor.harness?.attention?.text}</small>}
-            {supervisor?.harness?.status && <small className="hs-status">{supervisor.harness.status}</small>}
+            {supervisorSummary && <small className="hs-status" title={supervisorSummary.full || undefined}>{supervisorSummary.lead && <span className="hs-lead">{supervisorSummary.lead}</span>}{supervisorSummary.text && <span>{supervisorSummary.text}</span>}</small>}
           </span>
         </button>
         {supervisor && <RowMenu label="Actions for the supervisor" actions={actions(supervisor)}/>}
@@ -284,7 +288,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>
         </header>
         <div className="hs-pane-body">
-          <TerminalPane id={h.id} active={active && h.id === selected}/>
+          <TerminalPane id={h.id} active={active && h.id === selected} onQuit={() => { closing.current.add(h.id); void refresh(); }}/>
           {stats && h.id === selected && <SessionStats session={h} active={active}/>}
         </div>
       </div>)}

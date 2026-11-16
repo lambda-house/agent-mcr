@@ -141,13 +141,39 @@
 .hs-outside input { margin: 0; }
 
 /* Session telemetry stays readable independently of the activity dot. */
-.hs-metrics { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 10px; margin: 4px 0 2px; color: var(--sc-muted); font-size: 10px; font-variant-numeric: tabular-nums; line-height: 1.5; }
+.hs-metrics { display: flex; align-items: center; gap: 7px; margin: 3px 0 1px; overflow: hidden; color: var(--sc-muted); font-size: 10px; font-variant-numeric: tabular-nums; line-height: 1.5; }
 .hs-metrics > span { white-space: nowrap; }
-.hs-metric-context { display: inline-flex; align-items: center; gap: 4px; }
+.hs-metrics > span + span::before { content: '·'; margin-right: 7px; opacity: .6; }
+.hs-metrics.old { opacity: .6; }
+.hs-metric-context { display: inline-flex; align-items: center; gap: 5px; }
 .hs-metric-context.high { color: #e0a23c; }
-.hs-metric-bar { width: 24px; height: 3px; border-radius: 2px; background: var(--sc-border); overflow: hidden; }
+.hs-metric-bar { width: 32px; height: 4px; border-radius: 2px; background: var(--sc-border); overflow: hidden; }
 .hs-metric-bar i { display: block; height: 100%; background: var(--sc-accent); }
 .hs-metric-context.high .hs-metric-bar i { background: #e0a23c; }
+.hs-metric-context b { font-weight: 600; color: var(--sc-text); }
+.hs-metric-context.high b { color: inherit; }
+.hs-metric-cache { display: inline-flex; align-items: center; gap: 2px; color: #f08a4b; }
+.hs-metric-cache.cold { color: inherit; font-style: italic; }
+
+/* What the session is doing or finished with: up to two lines, the timing first */
+.hs-item-text small.hs-status { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+.hs-lead { margin-right: 5px; font-weight: 600; color: color-mix(in srgb, var(--sc-text) 75%, var(--sc-muted)); }
+.hs-lead:not(:only-child)::after { content: ' ·'; font-weight: 400; }
+
+/* Prompt cache. Warm: the next message is cheap, the row glows like an ember
+   (fainter when the cache is about to expire). Cold: waking it up re-reads the
+   whole context, the row is burnt to ashes. */
+.hs-list li.cache-warm { --ember: #f08a4b; background-image: radial-gradient(130% 160% at 0% 50%, color-mix(in srgb, var(--ember) 20%, transparent), transparent 72%); box-shadow: inset 0 0 14px -6px var(--ember); animation: hs-ember 4.5s ease-in-out infinite; }
+.hs-list li.cache-warm.cache-cooling { background-image: radial-gradient(90% 130% at 0% 50%, color-mix(in srgb, var(--ember) 10%, transparent), transparent 60%); box-shadow: inset 0 0 10px -7px var(--ember); animation: none; }
+.hs-list li.cache-warm.needs-you { box-shadow: inset 2px 0 0 #e0a23c, inset 0 0 14px -6px var(--ember); animation: none; }
+.hs-list li.cache-warm.idle:not(.selected) > .hs-item { opacity: .9; }
+@keyframes hs-ember { 50% { box-shadow: inset 0 0 20px -6px var(--ember); } }
+@media (prefers-reduced-motion: reduce) { .hs-list li.cache-warm { animation: none; } }
+.hs-list li.cache-cold:not(.selected) > .hs-item { filter: grayscale(1); opacity: .5; }
+.hs-list li.cache-cold:not(.selected):hover > .hs-item { opacity: .8; }
+.hs-list li.cache-cold:not(.selected) { background-image: repeating-linear-gradient(135deg, color-mix(in srgb, var(--sc-muted) 7%, transparent) 0 2px, transparent 2px 6px); }
+.hs-cache-warm .hs-stats-big { color: #f08a4b; }
+.hs-cache-cold .hs-stats-big { color: var(--sc-muted); }
 
 /* Board: reports to the person, and the notes sessions left for each other */
 .hs-board { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 0; overflow: hidden; }

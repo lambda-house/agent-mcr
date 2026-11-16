@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hostedLabel, hostedState, pastedImage, shellQuote, type Hosted } from './harness';
+import { gist, hostedLabel, hostedState, pastedImage, sessionSummary, shellQuote, type Hosted } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -7,6 +7,30 @@ function transfer(items: { kind: string; type: string }[]): DataTransfer {
   const file = new File([new Uint8Array([1])], 'x.png', { type: 'image/png' });
   return { items: items.map(i => ({ ...i, getAsFile: () => (i.kind === 'file' ? file : null) })) } as unknown as DataTransfer;
 }
+
+describe('session summary', () => {
+  const tracked = (over: object) => hosted({ harness: { name: '', profile: 'claude', state: 'idle', since: 1_000, precise: true, agentSession: null, attention: null, lastMessage: null, ...over } as Hosted['harness'] });
+  const now = 1_000 + 12 * 60_000;
+  it('takes the first plain line of a message', () => {
+    expect(gist('\n## Done\n\nMore below')).toBe('Done');
+    expect(gist('```\ncode\n```')).toBe('code');
+    expect(gist('- **Fixed** the `parser` ([PR](https://x/1))')).toBe('Fixed the parser (PR)');
+    expect(gist('x'.repeat(300), 20)).toBe(`${'x'.repeat(19)}…`);
+  });
+  it('says what a working session does and what an idle one finished with', () => {
+    expect(sessionSummary(tracked({ state: 'working', status: 'running the regrade' }), now)).toMatchObject({ lead: 'Working 12m', text: 'running the regrade' });
+    // Still shown at work without a status: how long it has been at it
+    expect(sessionSummary(tracked({ state: 'working' }), now)).toMatchObject({ lead: 'Working 12m', text: '' });
+    // A finished turn: how its last message begins, timed from when it ended; the rest is in the tooltip
+    const done = sessionSummary(tracked({ status: 'reviewing', lastMessage: '**All 69 tests pass.**\n\nDetails…', lastMessageAt: now - 5 * 60_000 }), now);
+    expect(done).toMatchObject({ lead: 'Done 5m ago', text: 'All 69 tests pass.' });
+    expect(done?.full).toBe('Status: reviewing\n\nLast message:\n**All 69 tests pass.**\n\nDetails…');
+    // No message yet: its own status
+    expect(sessionSummary(tracked({ status: 'waiting for CI' }), now)).toMatchObject({ lead: 'Idle 12m', text: 'waiting for CI' });
+    expect(sessionSummary(tracked({}), now)).toBeNull();
+    expect(sessionSummary(hosted({ exit: { code: 0, signal: null, at: 1 } }), now)).toBeNull();
+  });
+});
 
 describe('harness helpers', () => {
   it('escapes pasted paths the way Terminal does for dropped files', () => {
