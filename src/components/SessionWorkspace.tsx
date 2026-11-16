@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronRight, Play, RefreshCw, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
+import { Bot, ChevronRight, History, Play, RefreshCw, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
 import { compact, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -100,7 +100,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
             {t.icon} {t.label}
           </button>
         ))}
-        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><Search size={13}/> Search</button>
+        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><History size={13}/> Journal</button>
       </nav>
       <div className="sc-top-actions">
         {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button></>}
