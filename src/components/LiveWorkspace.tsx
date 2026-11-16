@@ -57,8 +57,10 @@ function HiddenPaneSlot({ sessionId, registerSlot }: { sessionId: string; regist
  * Agent terminals hosted by the runner. They keep running when this view, the
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
  */
-export default function LiveWorkspace({ active, recentDirectories, titles = {}, onSearch }: {
+export default function LiveWorkspace({ active, recentDirectories, titles = {}, onSearch, focus }: {
   active: boolean; recentDirectories: string[];
+  /** A session to show, asked for from another view; `at` makes a repeated ask count */
+  focus?: { id: string; at: number };
   /** Display titles by conversation id, when the Sessions index has them */
   titles?: Record<string, string>;
   /** Open the search view narrowed to a folder */
@@ -287,6 +289,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
+  useEffect(() => { if (focus?.id) select(focus.id); }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
   // Rows keep their place: running ones in the order they were started, ended ones after them.

@@ -143,6 +143,7 @@ Two surfaces in one window (`App.tsx`).
 **Sessions** (`SessionWorkspace.tsx`):
 
 - **Live** (`LiveWorkspace.tsx`, `TerminalPane.tsx` with xterm.js): the hosted sessions by working folder, their state, subagents and running shells, and their terminals. Terminal bytes go from the runner to the webview over a raw channel and never pass through the harness service.
+- **Board** (`BoardView.tsx`): what sessions reported to the person, newest first, with the ones not yet acted on marked, and the live notes of the bulletin board. The person can take a note off the board; the text is shown and never acted on.
 - **Search**: past Claude and Codex sessions from the index, with activity, subagents, usage, memories and linked work. A past session can be resumed in Live.
 
 **Documents** (`AgentPanel.tsx`, `DocumentPanel.tsx`): the agents' Markdown and nothing else. Instructions, rules, memory, plans, skills, agents and commands, grouped by the folder sessions work in, then the agents' own folders. Changes since the person last read a document are marked. The reader has tabs, a table of contents, find, a source editor (CodeMirror 6) and export. A memory opened from Sessions gets its own reader window, which shares preferences read-only and nothing else.

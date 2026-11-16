@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronRight, History, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
+import { Bot, ChevronRight, ClipboardList, History, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
 import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { useStore } from '../store';
@@ -11,6 +11,7 @@ import SessionResults from './SessionResults';
 import { harnessApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import LiveWorkspace from './LiveWorkspace';
+import BoardView from './BoardView';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
 function savedView(): string {
@@ -30,6 +31,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const globalOverlays = pluginRegistry.getGlobalOverlays();
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [view, setViewState] = useState<string>(savedView);
+  const [focus, setFocus] = useState<{ id: string; at: number }>();
   const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
   const activePluginTab = topTabs.find(t => t.id === view);
   const [data, setData] = useState<Snapshot>(empty);
@@ -98,6 +100,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
           </button>
         ))}
         <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><History size={13}/> Journal</button>
+        <button type="button" aria-current={view === 'board' ? 'page' : undefined} onClick={() => setView('board')} title="What sessions reported to you, and the notes they left for each other"><ClipboardList size={13}/> Board</button>
       </nav>
       <div className="sc-top-actions">
         <button onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"><Settings size={14}/></button>
@@ -113,7 +116,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div>
       </details>}
     </header>
-    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined}/></div>
+    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
     {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
     {globalOverlays.map(o => o.render({
       enabled,
@@ -127,6 +130,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       onEnableAccess: async () => { try { setEnabled(await sessionApi.enable()); } catch (e) { setError(err(e)); } },
       topTabs,
     }))}
+    {view === 'board' && <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/>}
     {view === 'history' && <>
     {error && <div className="sc-banner" role="alert">{error}</div>}
     {!enabled ? <div className="sc-welcome"><div className="sc-logo"><Bot size={36}/></div><p className="sc-eyebrow">YOUR AGENTIC LANDSCAPE</p><h1>See the work.<br/>Follow every agent.</h1><p>Codex and Claude sessions, their agents, models, tokens, tools and linked work. One view across all recorded workspaces on this machine.</p>

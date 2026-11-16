@@ -115,6 +115,18 @@ pub async fn harness_resumable(access: State<'_, AccessState>) -> Result<Value, 
     blocking(|| service(json!({"op": "resumable", "days": 14}))).await
 }
 
+/// What sessions reported to the person, and the live notes of the bulletin board.
+#[tauri::command]
+pub async fn harness_board() -> Result<Value, String> {
+    blocking(|| service(json!({"op": "board"}))).await
+}
+
+#[tauri::command]
+pub async fn harness_note_remove(note: String) -> Result<(), String> {
+    valid_id(&note)?;
+    blocking(move || service(json!({"op": "note_remove", "note": note})).map(drop)).await
+}
+
 #[tauri::command]
 pub async fn harness_ack(id: String, since: Option<u64>) -> Result<(), String> {
     valid_id(&id)?;
@@ -168,7 +180,7 @@ pub async fn harness_restart(id: String) -> Result<Value, String> {
 
 fn valid_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-        return Err("Invalid session id".into());
+        return Err("Invalid id".into());
     }
     Ok(())
 }
