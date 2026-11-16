@@ -10,13 +10,9 @@ describe('plugin system', () => {
 
   it('auto-discovers built-in plugins', () => {
     const ids = pluginRegistry.listPlugins().map(p => p.id);
-    expect(ids).toContain('doc-pane');
     expect(ids).toContain('theme-overrides');
     expect(ids).toContain('teob-theme');
     expect(ids).toContain('command-panel');
-    expect(pluginRegistry.getPaneType('doc')).toBeDefined();
-    expect(pluginRegistry.getSidebarSections().some(s => s.id === 'documents')).toBe(true);
-    expect(pluginRegistry.getEmptyActions().some(a => a.id === 'open-file')).toBe(true);
     expect(pluginRegistry.getAppWrappers().some(w => w.id === 'teob-providers')).toBe(true);
     expect(pluginRegistry.getGlobalOverlays().some(o => o.id === 'command-panel')).toBe(true);
   });

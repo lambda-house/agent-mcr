@@ -5,7 +5,6 @@ import {
   createInitialLayout,
   findLeafByItem,
   listLeaves,
-  removeDocFromLayout,
   removeSessionFromLayout,
   replaceSessionInLayout,
   setLeafItem,
@@ -15,10 +14,10 @@ import {
 } from './paneLayout';
 
 const s = (id: string): PaneItem => ({ kind: 'session', id });
-const d = (path: string): PaneItem => ({ kind: 'doc', path });
+const d = (key: string): PaneItem => ({ kind: 'custom', type: 'note', key });
 
 describe('paneLayout', () => {
-  it('splits a leaf between sessions and documents, and collapses back cleanly on close', () => {
+  it('splits a leaf between sessions and custom panes, and collapses back cleanly on close', () => {
     let tree = setLeafItem(createInitialLayout(), 'p1', s('s1'));
     tree = splitLeaf(tree, 'p1', 'row', 'p2', 'sp1', d('/work/README.md'));
 
@@ -33,7 +32,7 @@ describe('paneLayout', () => {
     expect(listLeaves(collapsed)).toEqual([{ kind: 'leaf', id: 'p2', item: d('/work/README.md') }]);
   });
 
-  it('clamps split ratios and updates/removes sessions and docs', () => {
+  it('clamps split ratios and updates/removes sessions', () => {
     let tree = splitLeaf(setLeafItem(createInitialLayout(), 'p1', s('s1')), 'p1', 'col', 'p2', 'sp1', d('/a.md'));
     tree = setSplitRatio(tree, 'sp1', 0.99);
     expect(tree.kind === 'split' && tree.ratio).toBe(0.85);
@@ -46,8 +45,6 @@ describe('paneLayout', () => {
     tree = removeSessionFromLayout(tree, 's1-new');
     expect(findLeafByItem(tree, s('s1-new'))).toBeNull();
 
-    tree = removeDocFromLayout(tree, '/a.md');
-    expect(findLeafByItem(tree, d('/a.md'))).toBeNull();
   });
 
   it('builds 1, 2-col, and 2x2 presets', () => {

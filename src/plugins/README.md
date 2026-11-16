@@ -5,11 +5,9 @@
 These files and directories are isolated from upstream core files:
 
 - `src/plugins/` — Plugin SDK (`sdk.ts`, `usePlugins.ts`, `index.ts`) and plugins:
-  - `src/plugins/doc-pane/` — `doc` pane renderer, `Documents` sidebar section, `Open file` action
   - `src/plugins/theme-overrides/` — custom CSS tokens and visual overrides
-- `src/components/LiveDocPane.tsx`
 - `src/utils/paneLayout.ts` + `src/utils/paneLayout.test.ts`
-- `src/teob-ui/` + `src/styles/teob/` (with CSS imports in `src/styles/index.css` / `src/main.tsx`)
+- `@teob/ui` (npm dependency; tokens and the agent-mcr bridge CSS are loaded by `src/plugins/teob-theme/`)
 
 ## 2. Core integration points (small hooks in upstream files)
 
@@ -20,9 +18,7 @@ When pulling or moving to a newer version of `agent-mcr`, only these core files 
 2. **`src/components/LiveWorkspace.tsx`** (+ **`src/styles/harness.css`**)
    - Hosts the multi-pane split tree (`PaneNode` from `utils/paneLayout.ts`).
    - Calls `pluginRegistry.getSidebarSections()`, `getPaneType()`, `getEmptyActions()`, `getSessionEnrichers()`, `getOverride('live:*')`, and `emitEvent(...)`.
-3. **`src/components/DocumentPanel.tsx`**
-   - Exports `ErrorBoundary` and `MarkdownViewer` so `LiveDocPane` reuses the exact upstream renderer.
-4. **`src-tauri/src/agents.rs` & `src-tauri/src/harness.rs`** (optional Rust backend enrichment)
+3. **`src-tauri/src/agents.rs` & `src-tauri/src/harness.rs`** (optional Rust backend enrichment)
    - `transcript_summary` (`title`, `role`, `tags` on `Resumable`) and `antigravity` harness support.
 
 ## 3. Adding a new plugin

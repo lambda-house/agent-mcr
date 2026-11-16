@@ -1,6 +1,5 @@
 export type PaneItem =
   | { kind: 'session'; id: string }
-  | { kind: 'doc'; path: string }
   | { kind: 'custom'; type: string; key: string; payload?: unknown };
 
 export interface PaneLeaf {
@@ -26,7 +25,6 @@ export function samePaneItem(a: PaneItem | null | undefined, b: PaneItem | null 
   if (!a || !b) return a === b;
   if (a.kind !== b.kind) return false;
   if (a.kind === 'session' && b.kind === 'session') return a.id === b.id;
-  if (a.kind === 'doc' && b.kind === 'doc') return a.path === b.path;
   if (a.kind === 'custom' && b.kind === 'custom') return a.type === b.type && a.key === b.key;
   return false;
 }
@@ -101,15 +99,6 @@ export function removeSessionFromLayout(node: PaneNode, sessionId: string): Pane
   }
   const a = removeSessionFromLayout(node.a, sessionId);
   const b = removeSessionFromLayout(node.b, sessionId);
-  return a === node.a && b === node.b ? node : { ...node, a, b };
-}
-
-export function removeDocFromLayout(node: PaneNode, path: string): PaneNode {
-  if (node.kind === 'leaf') {
-    return node.item?.kind === 'doc' && node.item.path === path ? { ...node, item: null } : node;
-  }
-  const a = removeDocFromLayout(node.a, path);
-  const b = removeDocFromLayout(node.b, path);
   return a === node.a && b === node.b ? node : { ...node, a, b };
 }
 
