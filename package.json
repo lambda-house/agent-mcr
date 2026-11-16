@@ -23,7 +23,7 @@
     "@fontsource/jetbrains-mono": "^5.3.0",
     "@lezer/highlight": "^1.2.5",
     "@tauri-apps/api": "^2.12.2",
-    "@teob/ui": "github:teob-cc/teob-ui",
+    "@teob/ui": "git+https://github.com/teob-cc/teob-ui.git#0e05387c20acd71ded3ab9b6ff8be45eb7e2645a",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-webgl": "^0.19.0",
@@ -33,12 +33,9 @@
     "lucide-react": "^1.73.0",
     "markdown-it": "^14.0.0",
     "mermaid": "^11.17.2",
-    "motion": "^14.14.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "recharts": "^3.10.1",
     "shiki": "^1.0.0",
-    "torph": "^0.1.4",
     "zustand": "^4.5.0"
   },
   "devDependencies": {
