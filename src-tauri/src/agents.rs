@@ -272,6 +272,7 @@ pub trait Adapter: Sync {
     fn profile(&self) -> Profile;
     fn id(&self) -> &'static str { self.profile().id }
     /// The command run in the login shell; `base` is the profile's command (D7)
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String>;
     /// Files the launch reads, as paths under the config dir. Written before
     /// every launch, so a restart picks up what a new build wants in them.
@@ -296,6 +297,10 @@ pub trait Adapter: Sync {
     /// tells whether it is at its prompt (`at_prompt`)
     fn silent_until_first_turn(&self) -> bool {
         false
+    }
+    /// Whether `at_prompt` reliably detects the input box (for queued first-task delivery)
+    fn detects_prompt(&self) -> bool {
+        self.silent_until_first_turn()
     }
     /// The input box is on screen (the markers depend on the agent's version).
     /// False when unsure: text typed into a menu would answer it
@@ -333,6 +338,7 @@ impl Adapter for Claude {
     fn profile(&self) -> Profile {
         Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits", optional: false, can_supervise: true, task_tracking: true }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let mut cmd = format!("exec {base}");
         if !l.mcp.is_empty() {
@@ -402,6 +408,7 @@ impl Adapter for Codex {
     fn profile(&self) -> Profile {
         Profile { id: "codex", label: "Codex", command: "codex --sandbox workspace-write --ask-for-approval on-request", optional: false, can_supervise: true, task_tracking: true }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
         let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
@@ -474,6 +481,7 @@ impl Adapter for Shell {
     fn profile(&self) -> Profile {
         Profile { id: "shell", label: "Terminal", command: "", optional: false, can_supervise: false, task_tracking: false }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, _base: &str, l: &Launch) -> Result<String, String> {
         if l.resume.is_some() || l.task.is_some() {
             return Err("A shell has no session to resume and takes no task".into());
@@ -498,6 +506,7 @@ pub fn adapter(profile: &str) -> &'static dyn Adapter {
 }
 
 /// The command line run in the login shell (empty for a plain shell).
+#[cfg(any(unix, test))]
 pub fn command_line(l: &Launch) -> Result<String, String> {
     let agent = adapters().find(|a| a.id() == l.profile).ok_or_else(|| format!("Unknown profile {}", l.profile))?;
     if l.supervisor && !agent.profile().can_supervise {
@@ -519,12 +528,11 @@ pub fn toml_literal(s: &str) -> Result<String, String> {
     Ok(format!("'{s}'"))
 }
 
-/// Encode `args` for `cmd.exe /d /v:off /s /c "<command line>"`.
+/// Encode `args` for `cmd.exe /d /v:off /c %AMCR_LAUNCH%`.
 ///
 /// Refuses any argument containing `"`, `%`, CR, LF or NUL. Every argument
 /// (including the program name) is wrapped in double quotes, with trailing
-/// backslash runs doubled for CRT/`CommandLineToArgvW`, joined by one space,
-/// and the whole line wrapped once more in double quotes for `/s /c`.
+/// backslash runs doubled for CRT/`CommandLineToArgvW`, and joined by one space.
 #[cfg(any(windows, test))]
 pub fn cmd_line(args: &[String]) -> Result<String, String> {
     if args.is_empty() {
@@ -554,7 +562,7 @@ pub fn cmd_line(args: &[String]) -> Result<String, String> {
         }
         inner.push('"');
     }
-    Ok(format!("\"{inner}\""))
+    Ok(inner)
 }
 
 /// Raw argument vector for a Windows launch (without `exec` and without free-text tasks).
@@ -740,7 +748,7 @@ mod tests {
         let encoded = cmd_line(&args).unwrap();
         assert_eq!(
             encoded,
-            "\"\"C:\\Program Files\\agent-mcr\\agent-mcr.exe\" \"\" \"C:\\dir with space\\\\\" \"a & b | c < d > e ^ f (g) !h!\"\""
+            "\"C:\\Program Files\\agent-mcr\\agent-mcr.exe\" \"\" \"C:\\dir with space\\\\\" \"a & b | c < d > e ^ f (g) !h!\""
         );
 
         assert!(cmd_line(&[]).is_err());

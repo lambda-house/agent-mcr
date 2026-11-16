@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn walk_ancestry_distinguishes_found_outside_and_unknown() {
         // Reaches root pid 1 -> Outside
-        assert_eq!(walk_ancestry(10, &[99], |p| Ok(Some(if p == 10 { 1 } else { 1 }))), Ancestry::Outside);
+        assert_eq!(walk_ancestry(10, &[99], |_| Ok(Some(1))), Ancestry::Outside);
         // Clean OS root (Ok(None)) -> Outside
         assert_eq!(walk_ancestry(10, &[99], |_| Ok(None)), Ancestry::Outside);
         // Hits session root -> Found

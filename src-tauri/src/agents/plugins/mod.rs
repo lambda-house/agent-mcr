@@ -4,11 +4,14 @@ mod antigravity;
 mod pi;
 mod opencode;
 
-use super::{sh, Adapter, Launch, PEER_NOTE};
+use super::{Adapter, Launch};
+#[cfg(any(unix, test))]
+use super::{sh, PEER_NOTE};
 
 pub const PLUGINS: &[&dyn Adapter] = &[&antigravity::Antigravity, &pi::Pi, &opencode::OpenCode];
 
 /// CLI access preserves the service's process-ancestry authorization, without changing user MCP config.
+#[cfg(any(unix, test))]
 fn cli_note(l: &Launch) -> String {
     let exe = sh(l.exe);
     let mut note = format!("{PEER_NOTE}\nUse the shell to call Agent MCR tools: {exe} --harness-tool <name> '<JSON object>'. Read {exe} --harness-tool guide and {exe} --harness-tool tools_list for instructions and schemas.");
@@ -18,6 +21,7 @@ fn cli_note(l: &Launch) -> String {
     note
 }
 
+#[cfg(any(unix, test))]
 fn cli_prompt(l: &Launch) -> Option<String> {
     match (l.note, l.task) {
         (true, task) => Some(format!("{}\n{}", cli_note(l), task.unwrap_or("Read the harness guide, then wait for the operator's task."))),

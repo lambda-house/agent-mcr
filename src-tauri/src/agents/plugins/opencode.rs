@@ -1,5 +1,8 @@
+#[cfg(any(unix, test))]
 use super::cli_prompt;
-use super::super::{sh, Adapter, Launch, Profile};
+#[cfg(any(unix, test))]
+use super::super::sh;
+use super::super::{Adapter, Launch, Profile};
 
 pub struct OpenCode;
 
@@ -9,6 +12,7 @@ impl Adapter for OpenCode {
     fn profile(&self) -> Profile {
         Profile { id: "opencode", label: "OpenCode", command: "opencode", optional: true, can_supervise: true, task_tracking: false }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         // A private server keeps CLI-tool process ancestry inside this hosted session.
         let mut cmd = format!("exec {base} --standalone");

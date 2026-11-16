@@ -6,9 +6,11 @@
 //! State comes from the agents' own hooks (`--harness-hook`), passed per
 //! launch; nothing is written into the user's agent config files.
 
+#[cfg(any(unix, test))]
+pub use crate::agents::command_line;
 #[cfg(any(windows, test))]
 pub use crate::agents::{cmd_line, windows_args};
-pub use crate::agents::{command_line, Launch};
+pub use crate::agents::Launch;
 use crate::ipc::{self, Listener, Stream};
 use crate::peer;
 use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, adapters, profiles};
@@ -135,6 +137,7 @@ pub const SUPERVISOR_SERVER: &str = "supervisor";
 /// The user's login shell from the account database: GUI apps and launchd
 /// jobs don't reliably have `$SHELL`.
 #[cfg(unix)]
+#[cfg(unix)]
 pub fn login_shell() -> String {
     // SAFETY: getpwuid returns a pointer into static storage or null; we copy
     // the string out immediately and don't call it concurrently from here.
@@ -153,6 +156,7 @@ pub fn login_shell() -> String {
 }
 
 #[cfg(not(unix))]
+#[cfg(unix)]
 pub fn login_shell() -> String {
     String::new()
 }
@@ -163,21 +167,36 @@ fn new_uuid() -> String {
     format!("{}-{}-4{}-a{}-{}", &hex[..8], &hex[8..12], &hex[13..16], &hex[17..20], &hex[20..32])
 }
 
-/// Windows launch argv: `powershell.exe -NoLogo` for shell, `cmd.exe /d /v:off /s /c "<line>"` for agents.
+/// Windows launch argv + env: `powershell.exe -NoLogo` for shell,
+/// `cmd.exe /d /v:off /c %AMCR_LAUNCH%` with `AMCR_LAUNCH` for agents.
 #[cfg(any(windows, test))]
-pub fn windows_argv_for(l: &Launch) -> Result<Vec<String>, String> {
+pub fn windows_launch_for(l: &Launch) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
     let args = windows_args(l)?;
     if l.profile == "shell" {
-        return Ok(args);
+        return Ok((args, BTreeMap::new()));
     }
-    Ok(vec![
-        "cmd.exe".into(),
-        "/d".into(),
-        "/v:off".into(),
-        "/s".into(),
-        "/c".into(),
-        cmd_line(&args)?,
-    ])
+    let mut env = BTreeMap::new();
+    env.insert("AMCR_LAUNCH".into(), cmd_line(&args)?);
+    Ok((
+        vec![
+            "cmd.exe".into(),
+            "/d".into(),
+            "/v:off".into(),
+            "/c".into(),
+            "%AMCR_LAUNCH%".into(),
+        ],
+        env,
+    ))
+}
+
+#[cfg(unix)]
+fn launch_for(l: &Launch) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+    Ok((argv_for(l)?, BTreeMap::new()))
+}
+
+#[cfg(windows)]
+fn launch_for(l: &Launch) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+    windows_launch_for(l)
 }
 
 /// Every profile runs in a login shell on Unix, so agents see the PATH, keys and
@@ -192,12 +211,6 @@ pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
         shell = if Path::new("/bin/zsh").is_file() { "/bin/zsh" } else { "/bin/sh" }.into();
     }
     Ok(if cmd.is_empty() { vec![shell, "-l".into()] } else { vec![shell, "-l".into(), "-i".into(), "-c".into(), cmd] })
-}
-
-/// Windows launch argv: `cmd.exe /d /v:off /s /c "<command line>"` (or `powershell.exe -NoLogo`).
-#[cfg(windows)]
-pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
-    windows_argv_for(l)
 }
 
 /// Claude hook command string for the current platform.
@@ -809,7 +822,10 @@ impl Store {
     /// reports nothing, so it takes one only when its terminal shows the
     /// prompt (`at_prompt`): text typed into a start-up question would answer it.
     fn next(&mut self, session: &str, at_prompt: bool) -> Option<Task> {
-        let ready = self.sessions.get(session).is_some_and(|t| t.state == "idle" || (t.state == "unknown" && (!adapter(&t.profile).silent_until_first_turn() || at_prompt)));
+        let ready = self.sessions.get(session).is_some_and(|t| {
+            t.state == "idle"
+                || (t.state == "unknown" && adapter(&t.profile).detects_prompt() && at_prompt)
+        });
         if !ready || self.tasks.values().any(|t| t.session == session && t.state == "working") {
             return None;
         }
@@ -1460,12 +1476,21 @@ impl Harness {
         let mcp = self.dir.join(if supervisor { "claude-supervisor-mcp.json" } else { "claude-mcp.json" });
         let plugin = self.dir.join("claude-plugin");
         let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
-        if cfg!(windows) && agent.is_agent() {
+        if cfg!(windows) {
             if let Some(text) = task {
-                plain_prompt(text)?;
+                if !agent.reports_from_start() && !agent.detects_prompt() {
+                    return Err(if profile == "shell" {
+                        "A shell has no session to resume and takes no task"
+                    } else {
+                        "This harness cannot accept a first task on Windows until its prompt is detected"
+                    }.into());
+                }
+                if agent.is_agent() {
+                    plain_prompt(text)?;
+                }
             }
         }
-        let argv = argv_for(&Launch {
+        let (argv, mut spawn_env) = launch_for(&Launch {
             supervisor,
             plugin: &plugin.display().to_string(),
             note: agent.takes_note(&home),
@@ -1478,7 +1503,10 @@ impl Harness {
             // Free text never goes in Windows argv; it is queued and typed when ready.
             task: if cfg!(windows) { None } else { task },
         })?;
+        spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
         let id = runner::random_id()[..12].to_string();
+        spawn_env.insert("AGENT_MCR_SESSION".into(), id.clone());
+        spawn_env.insert("AGENT_MCR_HARNESS".into(), socket(&self.dir).display().to_string());
         let name: String = req["name"].as_str().unwrap_or("").trim().chars().take(80).collect();
         let mut meta = json!({ "profile": profile, "label": label });
         if !name.is_empty() {
@@ -1495,11 +1523,7 @@ impl Harness {
             "id": id,
             "argv": argv,
             "cwd": dir.display().to_string(),
-            "env": {
-                "AGENT_MCR_PROFILE": profile,
-                "AGENT_MCR_SESSION": id,
-                "AGENT_MCR_HARNESS": socket(&self.dir).display().to_string(),
-            },
+            "env": spawn_env,
             "meta": meta,
             "cols": req["cols"].as_u64().unwrap_or(120),
             "rows": req["rows"].as_u64().unwrap_or(32),
@@ -1592,7 +1616,7 @@ impl Harness {
         let (queued, unsure) = {
             let store = lock(&self.store);
             let queued = store.tasks.values().filter(|t| t.session == session && t.state == "queued").map(|t| t.created).min();
-            (queued, store.sessions.get(session).is_some_and(|t| adapter(&t.profile).silent_until_first_turn() && t.state == "unknown"))
+            (queued, store.sessions.get(session).is_some_and(|t| adapter(&t.profile).detects_prompt() && t.state == "unknown"))
         };
         let Some(queued) = queued else { return };
         let at_prompt = unsure && self.at_prompt(session);
@@ -2907,11 +2931,13 @@ mod tests {
     #[test]
     fn windows_argv_and_claude_hooks_match_spec() {
         let id = "11111111-2222-3333-4444-555555555555";
-        let shell = windows_argv_for(&Launch { profile: "shell", ..Launch::default() }).unwrap();
+        let (shell, shell_env) = windows_launch_for(&Launch { profile: "shell", ..Launch::default() }).unwrap();
         assert_eq!(shell, vec!["powershell.exe", "-NoLogo"]);
+        assert!(shell_env.is_empty());
+        assert!(windows_launch_for(&Launch { profile: "shell", task: Some("hi"), ..Launch::default() }).is_err());
 
         for profile in ["claude", "codex", "antigravity"] {
-            let argv = windows_argv_for(&Launch {
+            let (argv, env) = windows_launch_for(&Launch {
                 profile,
                 exe: "C:\\Program Files\\Agent MCR\\agent-mcr.exe",
                 settings: "C:\\cfg\\claude-hooks.json",
@@ -2923,19 +2949,41 @@ mod tests {
                 task: Some("ignored on windows"),
                 ..Launch::default()
             }).unwrap();
-            assert_eq!(&argv[..5], &["cmd.exe", "/d", "/v:off", "/s", "/c"]);
-            assert!(argv[5].starts_with("\"\"") && argv[5].ends_with("\"\""));
-            assert!(!argv[5].contains("ignored on windows"));
+            assert_eq!(argv, vec!["cmd.exe", "/d", "/v:off", "/c", "%AMCR_LAUNCH%"]);
+            let line = env.get("AMCR_LAUNCH").expect("AMCR_LAUNCH env");
+            assert!(!line.contains("ignored on windows"));
+            assert!(!line.starts_with("\"\"") && !line.ends_with("\"\""));
         }
 
         let hook = claude_hook_command("C:\\Program Files\\Agent MCR\\agent-mcr.exe", "Stop", true);
         assert_eq!(hook, "\"C:/Program Files/Agent MCR/agent-mcr.exe\" --harness-hook Stop");
     }
 
+    #[test]
+    fn windows_first_task_gating_waits_for_prompt_not_startup_menu() {
+        let mut store = Store::default();
+        store.sessions.insert(
+            "agy1".into(),
+            Tracked { profile: "antigravity".into(), state: "unknown".into(), ..Tracked::default() },
+        );
+        store.tasks.insert(
+            "t1".into(),
+            Task { id: "t1".into(), session: "agy1".into(), text: "do work".into(), state: "queued".into(), created: 1, started: 0, finished: 0, result: None },
+        );
+        // Folder-trust / permission menu on screen -> at_prompt is false -> must NOT deliver
+        let menu_screen = "Trust this folder? enter Confirm";
+        assert!(!adapter("antigravity").at_prompt(menu_screen));
+        assert!(store.next("agy1", adapter("antigravity").at_prompt(menu_screen)).is_none());
+        // Input box ready -> at_prompt is true -> delivers once
+        let ready_screen = "? for shortcuts";
+        assert!(adapter("antigravity").at_prompt(ready_screen));
+        assert_eq!(store.next("agy1", adapter("antigravity").at_prompt(ready_screen)).unwrap().id, "t1");
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_cmd_line_preserves_argv_through_cmd_and_npm_shim() {
-        use std::os::windows::process::CommandExt;
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         let exe = std::env::current_exe().unwrap();
         let probe = exe
             .parent()
@@ -2963,6 +3011,7 @@ mod tests {
         let payload = vec![
             "".to_string(),
             "hello world".to_string(),
+            "héllo 世界".to_string(),
             "C:\\dir with space\\".to_string(),
             "a & b | c < d > e ^ f (g) !h!".to_string(),
         ];
@@ -2971,13 +3020,27 @@ mod tests {
             let mut full = vec![prog.display().to_string()];
             full.extend(payload.iter().cloned());
             let line = cmd_line(&full).unwrap();
-            let out = std::process::Command::new("cmd.exe")
-                .raw_arg("/d /v:off /s /c ")
-                .raw_arg(&line)
-                .output()
+            let pair = native_pty_system()
+                .openpty(PtySize { rows: 24, cols: 512, pixel_width: 0, pixel_height: 0 })
                 .unwrap();
-            assert!(out.status.success(), "cmd failed for {}: {}", prog.display(), String::from_utf8_lossy(&out.stderr));
-            let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+            let mut cmd = CommandBuilder::new("cmd.exe");
+            cmd.args(["/d", "/v:off", "/c", "%AMCR_LAUNCH%"]);
+            cmd.env("AMCR_LAUNCH", &line);
+            let mut child = pair.slave.spawn_command(cmd).unwrap();
+            drop(pair.slave);
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let status = child.wait().unwrap();
+            drop(pair.master);
+            assert!(status.success(), "cmd failed for {}", prog.display());
+            let mut raw = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut reader, &mut raw);
+            let text = String::from_utf8_lossy(&raw);
+            let json_line = text
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with('[') && l.ends_with(']'))
+                .unwrap_or_else(|| panic!("no JSON argv line in ConPTY output for {}: {text:?}", prog.display()));
+            let got: Vec<String> = serde_json::from_str(json_line).unwrap();
             assert_eq!(got, payload, "argv mismatch via {}", prog.display());
         }
         let _ = std::fs::remove_dir_all(&dir);
