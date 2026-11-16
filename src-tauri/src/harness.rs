@@ -2550,7 +2550,7 @@ pub fn serve(dir: &Path) -> Result<(), String> {
         if Stream::connect(&path).is_ok() {
             return Err("A harness service is already listening".into());
         }
-        if !ipc::is_socket(&meta) {
+        if !ipc::is_socket(&path, &meta) {
             return Err("Refusing to replace a non-socket file".into());
         }
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;

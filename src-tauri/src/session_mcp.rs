@@ -243,7 +243,7 @@ impl Service {
             if Stream::connect(path).is_ok() {
                 return Err("Another Agent MCR analysis service is already listening".into());
             }
-            if !is_socket(&std::fs::symlink_metadata(path).map_err(|e| e.to_string())?) {
+            if !is_socket(path, &std::fs::symlink_metadata(path).map_err(|e| e.to_string())?) {
                 return Err("Refusing to replace a non-socket file".into());
             }
             std::fs::remove_file(path).map_err(|e| e.to_string())?;

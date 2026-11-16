@@ -562,7 +562,7 @@ pub fn serve(socket: &Path) -> Result<(), String> {
         if Stream::connect(socket).is_ok() {
             return Err("A runner is already listening".into());
         }
-        if !ipc::is_socket(&meta) {
+        if !ipc::is_socket(socket, &meta) {
             return Err("Refusing to replace a non-socket file".into());
         }
         std::fs::remove_file(socket).map_err(|e| e.to_string())?;
