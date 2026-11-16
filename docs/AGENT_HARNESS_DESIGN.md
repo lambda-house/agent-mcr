@@ -11,7 +11,7 @@
 | D1 | Agents survive quitting or updating the app. The part that runs agents is separate from the view and controls | 2026-11-13 |
 | D2 | Asynchronous work between agents and supervisors uses MCP's async mechanism: the Tasks extension of revision 2026-07-28 | 2026-11-13 |
 | D3 | Atlassian, TEOB memory and other infrastructure tools are MCP servers behind a local gateway (agentgateway). Every hosted agent gets all of them | 2026-11-13 |
-| D4 | macOS only for now | 2026-11-13 |
+| D4 | macOS only for now. Superseded by D13 | 2026-11-13 |
 | D5 | A local supervisor gets root access: every internal of the harness, with no separate grant or limits. It's all local | 2026-11-13 |
 | D5a | Amends D5 after the security review of 2026-11-15. Root stays, with three limits: an outside agent has the supervisor tools only while the operator's "outside agents" setting is on (default off, native confirmation); `terminal_write` is not pre-approved for the hosted Supervisor, so the operator is asked each time; tasks are refused for shell sessions. The runner takes requests only from this program outside any hosted session, the service's control requests likewise, and a hook is attributed by its process, not by the id it sends | 2026-11-15 |
 | D3a | Revision for 1.0 (MCR-24, 2026-11-15): the gateway of D3 and its prerequisite D11 are not built and are not part of 1.0. The app holds no third-party credentials: the Connections dialog (Jira, TEOB memory) is removed, ticket keys found in transcripts are shown as text. Memory and infrastructure tools come back as a later layer (MCR-3) | 2026-11-15 |
@@ -22,6 +22,7 @@
 | D10 | The harness is built in a separate repository: `lambda-house/agent-mcr` (private), with mdviewer-mj's history and mdviewer-mj as `upstream`. MDViewer itself stays a Markdown viewer | 2026-11-13 |
 | D11 | agentgateway is a prerequisite installed with Homebrew, found on `PATH` or configured, with a version check | 2026-11-13 |
 | D12 | Local builds are the gate: `npm run build`, `npm test`, `cargo clippy --all-targets` and `cargo test` on the Mac. GitHub CI stays Linux-only and checks what compiles there; macOS-only modules are behind `cfg(target_os = "macos")` | 2026-11-13 |
+| D13 | Supersedes D4 (operator, 2026-11-16): full Windows support (Windows 10 1903+ and 11, x86_64), with the same features and the same identity checks as macOS (D5a): local IPC restricted to the user, caller identity from the kernel, failing closed. Plan and design choices in `WINDOWS_PORT.md`. The local gate adds `cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets`; CI gets a Windows job | 2026-11-16 |
 
 ### What is built (revision 5)
 
