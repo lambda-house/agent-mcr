@@ -60,8 +60,9 @@ jobs:
 
       - name: Test Rust backend
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         working-directory: src-tauri
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1 --nocapture
 
   windows:
     runs-on: windows-latest
@@ -101,5 +102,6 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test Rust backend
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         working-directory: src-tauri
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1 --nocapture
