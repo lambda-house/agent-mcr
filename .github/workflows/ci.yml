@@ -35,9 +35,16 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Authenticate private dependencies
+        shell: bash
         env:
-          TEOB_UI_TOKEN: ${{ secrets.TEOB_UI_TOKEN }}
-        run: git config --global url."https://x-access-token:${TEOB_UI_TOKEN}@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
+          TEOB_UI_SSH_KEY: ${{ secrets.TEOB_UI_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$TEOB_UI_SSH_KEY" > ~/.ssh/teob_ui
+          chmod 600 ~/.ssh/teob_ui
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global core.sshCommand "ssh -i ~/.ssh/teob_ui -o IdentitiesOnly=yes"
+          git config --global url."ssh://git@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
 
       - run: npm ci
 
@@ -76,8 +83,14 @@ jobs:
       - name: Authenticate private dependencies
         shell: bash
         env:
-          TEOB_UI_TOKEN: ${{ secrets.TEOB_UI_TOKEN }}
-        run: git config --global url."https://x-access-token:${TEOB_UI_TOKEN}@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
+          TEOB_UI_SSH_KEY: ${{ secrets.TEOB_UI_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$TEOB_UI_SSH_KEY" > ~/.ssh/teob_ui
+          chmod 600 ~/.ssh/teob_ui
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global core.sshCommand "ssh -i ~/.ssh/teob_ui -o IdentitiesOnly=yes"
+          git config --global url."ssh://git@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
 
       - run: npm ci
       - run: npm run build
