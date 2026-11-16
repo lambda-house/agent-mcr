@@ -206,29 +206,33 @@ impl Drop for WinJob {
 }
 
 #[cfg(windows)]
-fn assign_job(pid: Option<u32>) -> Option<WinJob> {
+fn assign_job(pid: Option<u32>) -> Result<WinJob, String> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
-    let pid = pid?;
+    let pid = pid.ok_or("Child process id unknown")?;
     // SAFETY: creating an anonymous job object.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
-        return None;
+        return Err(format!("Cannot create job object: {}", std::io::Error::last_os_error()));
     }
     let job = WinJob(job);
     // SAFETY: opening child process to assign to job.
     let proc = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
     if proc.is_null() {
-        return None;
+        return Err(format!("Cannot open child process {pid}: {}", std::io::Error::last_os_error()));
     }
     // SAFETY: both handles are valid.
     let ok = unsafe { AssignProcessToJobObject(job.0, proc) } != 0;
+    let err = std::io::Error::last_os_error();
     // SAFETY: closing temporary process handle.
     unsafe { CloseHandle(proc) };
-    ok.then_some(job)
+    if !ok {
+        return Err(format!("Cannot assign process {pid} to job object: {err}"));
+    }
+    Ok(job)
 }
 
 #[derive(Default)]
@@ -308,7 +312,13 @@ impl Runner {
         #[cfg(windows)]
         let killer = child.clone_killer();
         #[cfg(windows)]
-        let job = assign_job(child.process_id());
+        let job = match assign_job(child.process_id()) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e);
+            }
+        };
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let info = Info {
@@ -460,17 +470,27 @@ impl Runner {
                 writer.write_all(&[0x03]).and_then(|_| writer.flush()).map_err(|e| e.to_string())
             }
             "TERM" | "HUP" | "KILL" => {
-                // Terminate the entire job tree first, then kill the direct child and close ConPTY handles.
-                if let Some(job) = lock(&session.job).take() {
-                    // SAFETY: `job.0` is a valid job object handle.
-                    unsafe {
-                        windows_sys::Win32::System::JobObjects::TerminateJobObject(job.0, 1);
+                // Close ConPTY handles and terminate the entire job tree; fail if TerminateJobObject fails.
+                let job_res = match lock(&session.job).take() {
+                    Some(job) => {
+                        // SAFETY: `job.0` is a valid job object handle.
+                        if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job.0, 1) } == 0 {
+                            Err(std::io::Error::last_os_error().to_string())
+                        } else {
+                            Ok(())
+                        }
                     }
-                }
-                let res = lock(&session.killer).kill().map_err(|e| e.to_string());
+                    None => Err("Job object unavailable for process-tree termination".into()),
+                };
+                let kill_res = lock(&session.killer).kill().map_err(|e| e.to_string());
                 lock(&session.writer).take();
                 lock(&session.master).take();
-                res
+                // TerminateJobObject kills the child too, so killer.kill() may see an already-exited process.
+                if job_res.is_ok() {
+                    Ok(())
+                } else {
+                    job_res.and(kill_res)
+                }
             }
             _ => Err(format!("Unknown signal {name}")),
         }
@@ -1103,8 +1123,14 @@ mod tests {
         control.call(json!({"op": "write", "id": "cmd", "data": "echo typed by the service\r\n"})).unwrap();
         read_until(&mut out, "typed by the service");
         control.call(json!({"op": "resize", "id": "cmd", "cols": 120, "rows": 40})).unwrap();
-        // Spawn a descendant process inside the ConPTY session so TERM verifies full-tree termination.
-        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"Start-Sleep 30\"\r\n"})).unwrap();
+        // Spawn a descendant process inside the job and verify TERM terminates it too.
+        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden powershell '-NoProfile -Command Start-Sleep 30'; Write-Output ('DESC_PID=' + $p.Id + ':END')\"\r\n"})).unwrap();
+        let output = read_until(&mut out, ":END");
+        let desc_pid: u32 = output
+            .rsplit_once("DESC_PID=")
+            .and_then(|(_, rest)| rest.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("descendant pid in output");
         assert!(control.call(json!({"op": "forget", "id": "cmd"})).is_err(), "a running session can't be forgotten");
         control.call(json!({"op": "signal", "id": "cmd", "signal": "TERM"})).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1117,6 +1143,19 @@ mod tests {
             }
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(50));
+        }
+        // Verify the descendant process actually exited.
+        unsafe {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, WaitForSingleObject, SYNCHRONIZE,
+            };
+            let proc = OpenProcess(SYNCHRONIZE, 0, desc_pid);
+            if !proc.is_null() {
+                let waited = WaitForSingleObject(proc, 5000);
+                CloseHandle(proc);
+                assert_eq!(waited, WAIT_OBJECT_0, "descendant process {desc_pid} survived TERM");
+            }
         }
         assert!(control.call(json!({"op": "spawn", "argv": [], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
         assert!(control.call(json!({"op": "spawn", "id": "../x", "argv": ["cmd.exe", "/c", "exit 0"], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
