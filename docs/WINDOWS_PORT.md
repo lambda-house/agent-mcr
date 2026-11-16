@@ -79,6 +79,12 @@ Claude hook commands use `"<exe with forward slashes>" --harness-hook <Event>`, 
 | W11 | CI: a `windows-latest` job running `npm ci`, `npm run build`, `npm test`, `cargo clippy --locked --all-targets`, `cargo test --locked` | `.github/workflows/ci.yml` | YAML reviewed; the job mirrors the Linux job. Its first green run is on the manual list |
 | W12 | Docs: CLAUDE.md (platform notes, transport, launch, gate), `SESSION_ANALYSIS_MCP.md`, `AGENT_HARNESS_DESIGN.md` (D12 amended for the Windows gate, "What differs" row for D4), README build steps for Windows | docs | Reviewer reads them against the code |
 
+### Review checklists (from the reviewer, written into the tasks)
+
+- **W5**: exact argv through an `.exe` and through a real npm-style `.cmd` shim: empty arguments, spaces, Unicode, trailing backslashes, shell metacharacters; refusals for `"`, `%`, CR, LF, NUL; no command injection on any path. The first prompt arrives verbatim, once, when the agent is ready, for launch, resume and the supervisor. Hook commands run under Git Bash and under cmd.exe. Program lookup through `PATH`/`PATHEXT`. macOS command lines unchanged (existing tests untouched).
+- **W6**: pid and parent mapping; CPU time and start time units (match what the Unix `ps` path produces); processes missing or exited mid-scan; shell paths with spaces, quotes and mixed case; option variants (`-c`, `-Command`, `-command`, `/c`, `/C`, `-EncodedCommand` not shown as text); descendants only, filtering of MCP servers and the bridge as on macOS; `serve`/`tool_cli`/`bridge` stay non-blocking with reconnect after a service restart; macOS unchanged.
+- **W7**: same-user admission and caller handling on every connection; private dir, stale socket replacement and refusal of a non-socket or reparse point at the socket path; frame size bounds; parallel readers and writers; grant and revoke racing active requests; revocation closes every active stream; restart and reconnect; Windows paths. Tests on Windows (`cfg(windows)`) and Unix.
+
 ## Runtime tests under Wine (Rum)
 
 Real Windows is not available here. The app is run under Rum 2.0.0-beta.1 (`/Applications/Rum.app`, a Wine wrapper). CLI: `/Applications/Rum.app/Contents/Resources/RumCmd` (not on `PATH`): `list`, `create <name>`, `run <bottle> <path.exe> [args]`, `shellenv <bottle>` (env exports to run `wine` directly, e.g. with `WINEDEBUG`). Use a dedicated bottle `agent-mcr-test`; leave `Default` alone.
