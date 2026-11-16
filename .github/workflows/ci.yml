@@ -42,8 +42,8 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$TEOB_UI_SSH_KEY" > ~/.ssh/teob_ui
           chmod 600 ~/.ssh/teob_ui
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-          git config --global core.sshCommand "ssh -i ~/.ssh/teob_ui -o IdentitiesOnly=yes"
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+          git config --global core.sshCommand "ssh -i ~/.ssh/teob_ui -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
           git config --global url."ssh://git@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
 
       - run: npm ci
@@ -88,8 +88,8 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$TEOB_UI_SSH_KEY" > ~/.ssh/teob_ui
           chmod 600 ~/.ssh/teob_ui
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-          git config --global core.sshCommand "ssh -i ~/.ssh/teob_ui -o IdentitiesOnly=yes"
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+          git config --global core.sshCommand "ssh -i ~/.ssh/teob_ui -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
           git config --global url."ssh://git@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
 
       - run: npm ci
