@@ -181,6 +181,8 @@ struct Session {
     info: Mutex<Info>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
+    #[cfg(windows)]
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     output: Mutex<Output>,
 }
 
@@ -258,6 +260,8 @@ impl Runner {
         }
         let mut child = pair.slave.spawn_command(cmd).map_err(|e| format!("Cannot start {}: {e}", req.argv[0]))?;
         drop(pair.slave);
+        #[cfg(windows)]
+        let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let info = Info {
@@ -277,6 +281,8 @@ impl Runner {
             info: Mutex::new(info.clone()),
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
+            #[cfg(windows)]
+            killer: Mutex::new(killer),
             output: Mutex::new(Output {
                 ring: VecDeque::new(),
                 views: Vec::new(),
@@ -387,10 +393,20 @@ impl Runner {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn signal(&self, id: &str, name: &str) -> Result<(), String> {
-        let _ = (self.get(id)?, name);
-        Err("Signals are not yet implemented on this platform".into())
+        let session = self.get(id)?;
+        if lock(&session.info).exit.is_some() {
+            return Err("The session has ended".into());
+        }
+        match name {
+            "INT" => {
+                let mut writer = lock(&session.writer);
+                writer.write_all(&[0x03]).and_then(|_| writer.flush()).map_err(|e| e.to_string())
+            }
+            "TERM" | "HUP" | "KILL" => lock(&session.killer).kill().map_err(|e| e.to_string()),
+            _ => Err(format!("Unknown signal {name}")),
+        }
     }
 
     fn control(self: &Arc<Self>, req: &Value) -> Result<Value, String> {
@@ -779,19 +795,54 @@ fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
         .map_err(|e| format!("Cannot start the {}: {e}", unit.name))
 }
 
-#[cfg(not(unix))]
-fn start(_socket: &Path, unit: &Unit) -> Result<(), String> {
-    let _ = (unit.label, unit.flag);
-    Err(format!("Cannot start the {}: not yet implemented on this platform", unit.name))
+#[cfg(windows)]
+fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+    };
+    let _ = unit.label;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if let Some(dir) = socket.parent() {
+        ipc::private_dir(dir)?;
+    }
+    let log_path = socket.with_extension("log");
+    let open_log = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| e.to_string())
+    };
+    let spawn_with = |flags: u32| -> Result<(), String> {
+        let log = open_log()?;
+        Command::new(&exe)
+            .arg(unit.flag)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log)
+            .creation_flags(flags)
+            .spawn()
+            .map(drop)
+            .map_err(|e| format!("Cannot start the {}: {e}", unit.name))
+    };
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    spawn_with(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn_with(base))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_socket(name: &str) -> std::path::PathBuf {
         // Socket paths are limited to ~100 bytes; keep them short
-        let dir = std::path::PathBuf::from(format!("/tmp/amcr-{}-{name}", std::process::id()));
+        let root = if cfg!(unix) {
+            std::path::PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!("amcr-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("r.sock")
     }
@@ -840,6 +891,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawn_attach_type_replay_and_exit() {
         let socket = temp_socket("attach");
@@ -882,6 +934,54 @@ mod tests {
         assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn spawn_attach_type_replay_and_exit() {
+        let socket = temp_socket("attach");
+        serve_in_background(&socket);
+        let mut control = Client::connect(&socket).unwrap();
+        assert_eq!(control.call(json!({"op": "hello"})).unwrap()["protocol"], PROTOCOL);
+        let cwd = std::env::temp_dir().display().to_string();
+
+        let info = control
+            .call(json!({
+                "op": "spawn",
+                "id": "t1",
+                "argv": ["cmd.exe", "/c", "echo ready& set /p line=& echo got %line%& exit /b 3"],
+                "cwd": cwd,
+                "cols": 80,
+                "rows": 24
+            }))
+            .unwrap();
+        assert_eq!(info["id"], "t1");
+        assert!(info["pid"].as_u64().is_some());
+        assert!(control.call(json!({"op": "spawn", "id": "t1", "argv": ["cmd.exe", "/c", "exit 0"], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
+
+        let (mut out, mut input) = open_stream(&socket, json!({"op": "attach", "id": "t1"})).unwrap();
+        read_until(&mut out, "ready");
+        input.write_all(b"hello runner\r\n").unwrap();
+        read_until(&mut out, "got hello runner");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let list = control.call(json!({"op": "list"})).unwrap();
+            if !list["sessions"][0]["exit"].is_null() {
+                assert_eq!(list["sessions"][0]["exit"]["code"], 3);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let (mut late, _w) = open_stream(&socket, json!({"op": "attach", "id": "t1"})).unwrap();
+        let replay = read_until(&mut late, "got hello runner");
+        assert!(replay.contains("ready"));
+
+        control.call(json!({"op": "forget", "id": "t1"})).unwrap();
+        assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn control_writes_resizes_and_signals() {
         let socket = temp_socket("control");
@@ -912,16 +1012,53 @@ mod tests {
         assert!(control.call(json!({"op": "nope"})).is_err());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn control_writes_resizes_and_signals() {
+        let socket = temp_socket("control");
+        serve_in_background(&socket);
+        let mut control = Client::connect(&socket).unwrap();
+        let cwd = std::env::temp_dir().display().to_string();
+        control
+            .call(json!({"op": "spawn", "id": "cmd", "argv": ["cmd.exe", "/k"], "cwd": cwd, "cols": 80, "rows": 24}))
+            .unwrap();
+        let (mut out, _w) = open_stream(&socket, json!({"op": "attach", "id": "cmd"})).unwrap();
+        control.call(json!({"op": "write", "id": "cmd", "data": "echo typed by the service\r\n"})).unwrap();
+        read_until(&mut out, "typed by the service");
+        control.call(json!({"op": "resize", "id": "cmd", "cols": 120, "rows": 40})).unwrap();
+        assert!(control.call(json!({"op": "forget", "id": "cmd"})).is_err(), "a running session can't be forgotten");
+        control.call(json!({"op": "signal", "id": "cmd", "signal": "TERM"})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let list = control.call(json!({"op": "list"})).unwrap();
+            let s = &list["sessions"][0];
+            if !s["exit"].is_null() {
+                assert_eq!(s["cols"], 120);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(control.call(json!({"op": "spawn", "argv": [], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
+        assert!(control.call(json!({"op": "spawn", "id": "../x", "argv": ["cmd.exe", "/c", "exit 0"], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
+        assert!(control.call(json!({"op": "nope"})).is_err());
+    }
+
     #[test]
     fn a_second_runner_refuses_the_socket_and_plist_escapes_paths() {
         let socket = temp_socket("twice");
         serve_in_background(&socket);
         assert!(serve(&socket).unwrap_err().contains("already listening"));
-        let plist = launch_agent_plist(&RUNNER, Path::new("/A & B/Agent MCR.app/Contents/MacOS/agent-mcr"), Path::new("/tmp/r.log"));
-        assert!(plist.contains("<string>/A &amp; B/Agent MCR.app/Contents/MacOS/agent-mcr</string>"));
-        assert!(plist.contains("<string>--runner</string>"));
+        #[cfg(target_os = "macos")]
+        {
+            let plist = launch_agent_plist(&RUNNER, Path::new("/A & B/Agent MCR.app/Contents/MacOS/agent-mcr"), Path::new("/tmp/r.log"));
+            assert!(plist.contains("<string>/A &amp; B/Agent MCR.app/Contents/MacOS/agent-mcr</string>"));
+            assert!(plist.contains("<string>--runner</string>"));
+        }
     }
     /// Any other program of the same user is told the version and nothing else.
+    /// Unix-only: uses `/usr/bin/nc -U` to connect as a foreign process.
+    #[cfg(unix)]
     #[test]
     fn another_program_gets_hello_only() {
         if !Path::new("/usr/bin/nc").is_file() {
