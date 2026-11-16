@@ -1207,7 +1207,7 @@ fn main() {
         _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
-        let path = std::env::args().nth(2).map(PathBuf::from).or_else(||get_config_dir().ok().map(|p|p.join("analysis/mcp.sock")));
+        let path = std::env::args().nth(2).map(PathBuf::from).or_else(|| get_config_dir().ok().map(|p| p.join("analysis").join("mcp.sock")));
         let result = path.ok_or_else(||"Configuration directory unavailable".to_string()).and_then(|p|session_mcp::bridge(&p));
         if let Err(e) = result {eprintln!("{e}");std::process::exit(1);}
         return;
