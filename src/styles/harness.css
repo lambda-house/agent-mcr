@@ -150,10 +150,12 @@
 .hs-dot { flex: 0 0 auto; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: var(--text-faint); }
 .hs-dot.running, .hs-dot.idle { background: var(--accent); }
 .hs-dot.starting { background: transparent; border: 2px solid var(--text-muted); }
-.hs-dot.working { background: var(--accent); animation: hs-pulse 1.2s ease-in-out infinite; }
+.hs-dot.working { position: relative; background: var(--accent); }
+/* Working: a ring spreads from the dot; idle stays still */
+.hs-dot.working::after { content: ''; position: absolute; inset: 0; border-radius: 50%; background: var(--accent); animation: hs-ripple 1.6s cubic-bezier(.2, .6, .4, 1) infinite; pointer-events: none; }
 .hs-dot.waiting { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 26%, transparent); }
-@keyframes hs-pulse { 50% { opacity: .35; } }
-@media (prefers-reduced-motion: reduce) { .hs-dot.working { animation: none; } }
+@keyframes hs-ripple { from { transform: scale(1); opacity: .55; } to { transform: scale(2.8); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .hs-dot.working::after { animation: none; opacity: 0; } .hs-dot.working { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); } }
 .hs-attention { margin: 4px 4px 0; padding: 6px 8px; border-radius: 8px; background: var(--warn-soft); border: 1px solid var(--warn-line); display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 500; color: var(--warn); }
 .hs-list li.needs-you { box-shadow: inset 2px 0 0 var(--warn); }
 .hs-item-text small.hs-needs { color: var(--warn); white-space: normal; overflow-wrap: anywhere; }
