@@ -1,3 +1,5 @@
+import { basename } from './paths';
+export { tildePath } from './paths';
 import { Channel, invoke } from '@tauri-apps/api/core';
 
 /** A launch profile held by the backend; the webview can only pick one by id. */
@@ -145,7 +147,7 @@ const HARNESS_NAME = /^(claude code|claude|codex|antigravity|antigravity cli|agy
 /** The name in a terminal title: without the agent's status glyph and Codex's folder suffix. */
 function titleName(h: Hosted): string {
   const text = h.title.replace(/^[^\p{L}\p{N}]+/u, '').split(' | ')[0].trim();
-  const folder = h.cwd.split('/').filter(Boolean).pop() ?? '';
+  const folder = basename(h.cwd);
   return !text || text === folder || HARNESS_NAME.test(text) ? '' : text;
 }
 
@@ -268,9 +270,7 @@ export function directorySections(sessions: Hosted[], resumable: Resumable[], pi
 
 /** A path for a section heading: the last two folders, since the start is the same everywhere. */
 export function shortPath(path: string): string {
-  const parts = path.split('/');
-  return parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : path;
+  const parts = path.split(/[\\/]/);
+  const separator = path.includes('\\') ? '\\' : '/';
+  return parts.length > 3 ? `…${separator}${parts.slice(-2).join(separator)}` : path;
 }
-
-/** A path with the home folder written as ~. */
-export const tildePath = (path: string, home: string) => home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;

@@ -1,3 +1,4 @@
+import { basename } from './paths';
 import { invoke } from '@tauri-apps/api/core';
 export interface Usage { input: number; cached: number; cacheWrite: number; output: number; reasoning: number }
 /** What a session's context holds; `toolBytes` is the size of tool output, not tokens. */
@@ -53,8 +54,8 @@ export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
 
 export function origin(s: Session): string { return s.origin || (s.parentId ? 'subagent' : 'unknown'); }
 export function within(path: string, directory: string): boolean {
-  const root = directory.replace(/\/+$/, '');
-  return !root || path === root || path.startsWith(root + '/');
+  const root = directory.replace(/[\\/]+$/, '');
+  return !root || path === root || (path.startsWith(root) && /^[\\/]/.test(path.slice(root.length)));
 }
 export function sessionDirectories(s: Session): string[] { return [...new Set([s.cwd, ...(s.directories || [])].filter(Boolean))]; }
 export interface ActivityWindow { activeSince?: number; inactiveSince?: number; activeMinutes?: number; inactiveMinutes?: number; now?: number }
@@ -99,9 +100,12 @@ export function directoryTree(sessions: Session[]): DirectoryNode {
   const root: DirectoryNode = { path: '/', name: 'All recorded locations', sessions: new Set(), children: new Map() };
   for (const s of sessions) for (const path of sessionDirectories(s)) {
     let node=root; node.sessions.add(sessionKey(s));
-    for (const part of path.split('/').filter(Boolean)) {
+    for (const match of path.matchAll(/[^\\/]+/g)) {
+      const part = match[0];
       let child=node.children.get(part);
-      if (!child) {child={path:(node.path === '/' ? '' : node.path)+'/'+part,name:part,sessions:new Set(),children:new Map()};node.children.set(part,child);}
+      const end = match.index + part.length;
+      const prefix = /^[A-Za-z]:$/.test(part) && end === 2 ? path.slice(0, end + 1) : path.slice(0, end);
+      if (!child) {child={path:prefix,name:part,sessions:new Set(),children:new Map()};node.children.set(part,child);}
       child.sessions.add(sessionKey(s));node=child;
     }
   }
@@ -113,9 +117,7 @@ const SYSTEM_TITLE_RE =
 
 function projectFromCwd(cwd: string): string {
   if (!cwd) return '';
-  const clean = cwd.replace(/\/+$/, '');
-  const parts = clean.split('/').filter(Boolean);
-  return parts[parts.length - 1] || clean;
+  return basename(cwd);
 }
 
 export function formatSessionTitle(s: Session): string {

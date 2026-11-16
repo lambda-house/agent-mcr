@@ -1,3 +1,4 @@
+import { homePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, ChevronRight, ClipboardList, History, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
 import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
@@ -151,7 +152,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
           </div>
         </details>
         {(directory || filtersOn > 0 || query) && <div className="ss-active">
-          {directory && <span className="ss-chip" title={directory}>in {directory.replace(/^\/(Users|home)\/[^/]+/, '~')}<button aria-label="Search all folders" title="Search all folders" onClick={() => setDirectory('')}><X size={10}/></button></span>}
+          {directory && <span className="ss-chip" title={directory}>in {homePath(directory)}<button aria-label="Search all folders" title="Search all folders" onClick={() => setDirectory('')}><X size={10}/></button></span>}
           <button className="sc-clear-filters" onClick={clearFilters}><X size={12}/> Clear</button>
         </div>}
         <SessionResults all={data.sessions} matches={filtered} selected={selected} select={setSelected} directory={directory} narrow={setDirectory}/>

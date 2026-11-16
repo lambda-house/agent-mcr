@@ -1,3 +1,4 @@
+import { homePath } from '../utils/paths';
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
@@ -126,7 +127,7 @@ export default function SessionCommandPanel({
       for (const s of matchingSessions) {
         const key = sessionKey(s);
         const title = formatSessionTitle(s);
-        const folder = s.cwd ? s.cwd.replace(/^\/(Users|home)\/[^/]+/, '~') : '';
+        const folder = s.cwd ? homePath(s.cwd) : '';
         const age = s.modified ? formatAge(s.modified) : '';
         const metaParts = [folder, s.model, age].filter(Boolean);
         next.push({
@@ -377,7 +378,7 @@ export default function SessionCommandPanel({
                 </div>
                 {directory && (
                   <span className="cmd-dir-badge" title={directory}>
-                    <span>in {directory.replace(/^\/(Users|home)\/[^/]+/, '~')}</span>
+                    <span>in {homePath(directory)}</span>
                     <button type="button" aria-label="Search all folders" onClick={onClearDirectory}>
                       <X size={11} />
                     </button>
@@ -488,7 +489,7 @@ export default function SessionCommandPanel({
                           {
                             label: 'Workspace',
                             value: activeItem.session.cwd
-                              ? activeItem.session.cwd.replace(/^\/(Users|home)\/[^/]+/, '~')
+                              ? homePath(activeItem.session.cwd)
                               : 'Unknown',
                             mono: true,
                           },

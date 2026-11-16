@@ -1,3 +1,4 @@
+import { basename as base, isAbsolutePath, tildePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, Folder, FolderOpen, History, MoreHorizontal, Play, Plus, Radar, RotateCw, Search, Terminal, X } from 'lucide-react';
@@ -13,7 +14,6 @@ import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '..
 import '../styles/harness.css';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
-const base = (path: string) => path.split('/').filter(Boolean).pop() || path;
 const PINNED_KEY = 'hs-dirs';
 /** Folders with only history shown before "more" is asked for. */
 const HISTORY_FOLDERS = 6;
@@ -356,14 +356,15 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   ];
   const names = new Map(hosted.map(h => [h.id, sessionLabel(h)]));
   const addFolder = (raw: string) => {
-    const path = raw.trim().replace(/\/+$/, '') || '/';
+    const input = raw.trim();
+    const path = /^[A-Za-z]:[\\/]$/.test(input) ? input : input.replace(/[\\/]+$/, '') || '/';
     if (!path) return;
     if (!pinned.includes(path)) pin([...pinned, path]);
     setCwd('');
   };
   const home = status?.home ?? '';
-  const shortPath = (p: string) => home && p.startsWith(`${home}/`) ? `~/${p.slice(home.length + 1)}` : p === home ? '~' : p;
-  const sections = useMemo(() => directorySections(sorted.filter(h => !h.exit), resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
+  const shortPath = (p: string) => tildePath(p, home);
+  const sections = useMemo(() => directorySections(sorted.filter(h => !h.exit), resumable.filter(r => !/[\\/]agent-mcr[\\/]supervisor$/.test(r.cwd)), pinned), [sorted, resumable, pinned]);
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
 
@@ -461,7 +462,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               const q = projectFilter.trim();
               const first = suggestions.find(d => d.toLowerCase().includes(q.toLowerCase()));
               if (first) selectProjectCwd(first);
-              else if (q.startsWith('/')) selectProjectCwd(q);
+              else if (isAbsolutePath(q)) selectProjectCwd(q);
             }
           }} placeholder="Filter projects or paste a folder path…" aria-label="Filter projects"/>
           <button type="button" className="hs-palette-browse" onClick={async () => { try { const dir = await pickDirectory(); if (dir) { selectProjectCwd(dir); setProjectFilter(''); } } catch (e) { setError(err(e)); } }}><FolderOpen size={13}/> Browse…</button>
@@ -470,7 +471,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           <div className="hs-split-col">
             <div className="hs-modal-label">Projects</div>
             <div className="hs-folder-list">
-              {projectFilter.trim().startsWith('/') && !suggestions.includes(projectFilter.trim()) && (
+              {isAbsolutePath(projectFilter.trim()) && !suggestions.includes(projectFilter.trim()) && (
                 <button type="button" className={`hs-folder-opt${cwd === projectFilter.trim() ? ' active' : ''}`} onClick={() => selectProjectCwd(projectFilter.trim())}>
                   <Folder size={14}/>
                   <span className="hs-folder-opt-name">Custom path</span>
@@ -558,7 +559,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         actions={waiting.map(h => ({ label: `${isSupervisor(h) ? 'Supervisor' : sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
       <ul className="hs-dirs">
         {shown.map(d => {
-          const name = d.path.split('/').filter(Boolean).pop() ?? d.path;
+          const name = base(d.path);
           const open = earlierOpen.has(d.path);
           return <li key={d.path} className={`hs-dir${d.sessions.length ? ' live' : ''}`}>
             <header className="hs-dir-head">
