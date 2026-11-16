@@ -5,6 +5,7 @@ pub struct Pi;
 
 impl Adapter for Pi {
     // shortcut: task tracking stays off until this adapter reports turn-end hooks.
+    // at_prompt keeps the default (false): its menus are not known yet, so no inbox notice is typed.
     fn profile(&self) -> Profile {
         Profile { id: "pi", label: "Pi", command: "pi", optional: true, can_supervise: true, task_tracking: false }
     }

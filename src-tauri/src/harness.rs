@@ -1479,16 +1479,21 @@ impl Harness {
         Ok(created)
     }
 
-    /// Type a prompt into the session, then Enter. As a bracketed paste when
-    /// the program asked for it, so a multi-line text arrives whole; a program
-    /// that didn't (a plain shell) would see the markers as text.
+    /// Type a prompt into the session, then Enter (`submit`).
     fn deliver(&self, session: &str, text: &str) -> Result<(), String> {
-        let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
-        // Agents always turn it on, and their old output may have left the scrollback
         let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
         if agent {
-            plain_prompt(&clean)?;
+            plain_prompt(text)?;
         }
+        self.submit(session, text)
+    }
+
+    /// Type text into the session, then Enter as a write of its own 250 ms
+    /// later (`submit_writes`). Shared by tasks, inbox notices and
+    /// `terminal_write` with `submit`.
+    fn submit(&self, session: &str, text: &str) -> Result<(), String> {
+        // Agents always turn it on, and their old output may have left the scrollback
+        let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
         // The prompt that follows is the harness's own, not the operator's answer
         self.update(|s| {
             if let Some(t) = s.sessions.get_mut(session) {
@@ -1496,10 +1501,13 @@ impl Harness {
             }
         });
         let bracketed = agent || runner::snapshot(&runner_socket(&self.dir), session).is_ok_and(|bytes| wants_bracketed_paste(&bytes));
-        let data = if bracketed { format!("\x1b[200~{clean}\x1b[201~") } else { clean };
-        self.runner(json!({"op": "write", "id": session, "data": data}))?;
-        std::thread::sleep(Duration::from_millis(250));
-        self.runner(json!({"op": "write", "id": session, "data": "\r"}))?;
+        let writes = submit_writes(text, bracketed);
+        for (i, data) in writes.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            self.runner(json!({"op": "write", "id": session, "data": data}))?;
+        }
         Ok(())
     }
 
@@ -1558,21 +1566,21 @@ impl Harness {
     /// on a prompt (D6) or into a shell, where it would run as a command.
     fn nudge(&self, session: &str) {
         let pending = |s: &Store| s.messages.values().any(|m| m.to == session && m.read == 0 && !m.notified);
-        let unsure = {
+        let (untracked, unsure) = {
             let store = lock(&self.store);
             if !pending(&store) {
                 return;
             }
             let Some(t) = store.sessions.get(session) else { return };
-            if !adapter(&t.profile).is_agent() {
-                return;
-            }
-            adapter(&t.profile).silent_until_first_turn() && t.state == "unknown"
+            // An agent without state tracking (no turn-end hooks) is only seen
+            // through its screen; a shell has no input box (`at_prompt` is false)
+            let agent = adapter(&t.profile);
+            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown")
         };
-        let at_prompt = unsure && self.at_prompt(session);
+        let at_prompt = (untracked || unsure) && self.at_prompt(session);
         let from = self.update(|s| {
             let t = s.sessions.get(session)?;
-            if !(t.state == "idle" || (unsure && at_prompt && t.state == "unknown")) {
+            if !notice_ready(untracked, unsure, at_prompt, &t.state) {
                 return None;
             }
             let mut from: Vec<String> = Vec::new();
@@ -1583,7 +1591,10 @@ impl Harness {
                 }
             }
             let tools = t.tools;
-            s.set_state(session, "working");
+            // Nothing would set an untracked session back to idle
+            if !untracked {
+                s.set_state(session, "working");
+            }
             Some((from, tools))
         });
         let Some((from, tools)) = from else { return };
@@ -1609,7 +1620,9 @@ impl Harness {
                 for m in s.messages.values_mut().filter(|m| m.to == session && m.read == 0) {
                     m.notified = false;
                 }
-                s.set_state(session, "idle");
+                if !untracked {
+                    s.set_state(session, "idle");
+                }
             });
         }
     }
@@ -2212,7 +2225,12 @@ impl Harness {
             "terminal_write" => {
                 let id = text("session")?;
                 refuse_if_waiting(id)?;
-                self.runner(json!({"op": "write", "id": id, "data": text("input")?}))?;
+                match terminal_input(text("input")?, args["submit"] == true) {
+                    (input, true) => self.submit(id, &input)?,
+                    (input, false) => {
+                        self.runner(json!({"op": "write", "id": id, "data": input}))?;
+                    }
+                }
                 Ok(json!({ "written": true }))
             }
             "session_interrupt" => {
@@ -2373,6 +2391,44 @@ impl Harness {
 /// A prompt an agent reads as a request. An agent's input box treats a first
 /// `!` as a shell command, `#` as a note to keep and `/` as a command of its
 /// own or of the folder's: none of them passes its permission prompts.
+/// Whether an inbox notice may be typed now. A session with state tracking
+/// takes it when idle (or, before its first report, at its input box); one
+/// without (Antigravity, OpenCode, Pi) only when `at_prompt` sees the input box.
+fn notice_ready(untracked: bool, unsure: bool, at_prompt: bool, state: &str) -> bool {
+    if untracked {
+        at_prompt
+    } else {
+        state == "idle" || (unsure && at_prompt && state == "unknown")
+    }
+}
+
+/// The writes that type `text` and then press Enter: the text without ESC (as
+/// a bracketed paste when the program asked for one, so a multi-line text
+/// arrives whole; a plain shell would see the markers as text), then CR alone.
+/// LF is a soft line break in agy's input box, and a CR in the same burst as
+/// the text can be taken as part of a paste.
+fn submit_writes(text: &str, bracketed: bool) -> Vec<String> {
+    let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
+    let mut writes = Vec::new();
+    if !clean.is_empty() {
+        writes.push(if bracketed { format!("\x1b[200~{clean}\x1b[201~") } else { clean });
+    }
+    writes.push("\r".into());
+    writes
+}
+
+/// `terminal_write`'s input and whether to submit it. A model can't always
+/// produce a CR byte through tool arguments: a trailing `\r` or `\n` written
+/// out as two characters, or a trailing newline, means Enter.
+fn terminal_input(input: &str, submit: bool) -> (String, bool) {
+    for end in ["\\r", "\\n", "\n"] {
+        if let Some(text) = input.strip_suffix(end) {
+            return (text.to_string(), true);
+        }
+    }
+    (input.to_string(), submit)
+}
+
 fn plain_prompt(text: &str) -> Result<(), String> {
     match text.trim_start().chars().next() {
         Some(c @ ('!' | '#' | '/')) => Err(format!("Refused: a task can't start with {c:?}. In an agent's input that runs a command instead of asking the agent; write the request in words, or let the operator type it.")),
@@ -2419,7 +2475,7 @@ fn supervisor_tools() -> Value {
         tool("task_status", "A task's state: queued, working, completed (with the agent's last message as result), delivered (the session reports no turn end) or failed.", json!({"task": {"type": "string"}}), &["task"]),
         tool("task_wait", "Wait until a task ends or the time is up, then return it.", json!({"task": {"type": "string"}, "timeout_seconds": wait}), &["task"]),
         tool("terminal_read", "The session's terminal as text (last lines).", json!({"session": session, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"]),
-        tool("terminal_write", "Type raw input into a session's terminal (use \\r for Enter). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}}), &["session", "input"]),
+        tool("terminal_write", "Type raw input into a session's terminal. Escape sequences in input are not interpreted: to press Enter, set submit to true (a trailing \\r or \\n written out as two characters counts as submit too). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}, "submit": {"type": "boolean", "description": "Press Enter after the text, as a separate key 250 ms later; the text goes in as a paste when the program asked for that"}}), &["session", "input"]),
         tool("session_interrupt", "Stop the current turn (Esc for Claude, Ctrl-C otherwise).", json!({"session": session}), &["session"]),
         tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}}), &["session"]),
         tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
@@ -3117,8 +3173,43 @@ mod tests {
         assert_eq!(screen_text(&bytes, 10, 40, 2), "line 25\nred prompt>");
         assert_eq!(screen_text(b"one\r\ntwo", 10, 40, 60), "one\ntwo");
         assert!(!wants_bracketed_paste(b"bash-3.2$ "));
+        // Enter is a write of its own after the text, never glued to it
+        assert_eq!(submit_writes("hi", true), ["\x1b[200~hi\x1b[201~", "\r"]);
+        assert_eq!(submit_writes("ls\x1b", false), ["ls", "\r"]);
+        assert_eq!(submit_writes("", true), ["\r"]);
         assert!(wants_bracketed_paste(b"\x1b[?2004h> "));
         assert!(!wants_bracketed_paste(b"\x1b[?2004h> \x1b[?2004l"));
+    }
+
+    #[test]
+    fn terminal_write_submits_escaped_enter() {
+        // What a model sends through tool arguments when asked for "\r"
+        assert_eq!(terminal_input("hi\\r", false), ("hi".to_string(), true));
+        assert_eq!(terminal_input("hi\\n", false), ("hi".to_string(), true));
+        assert_eq!(terminal_input("hi\n", false), ("hi".to_string(), true));
+        assert_eq!(terminal_input("hi", true), ("hi".to_string(), true));
+        assert_eq!(terminal_input("a\\rb", false), ("a\\rb".to_string(), false));
+        assert_eq!(terminal_input("\x03", false), ("\x03".to_string(), false));
+    }
+
+    #[test]
+    fn untracked_agents_get_notices_only_at_their_input_box() {
+        // Screens of Antigravity CLI 1.5.9
+        let prompt = "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\n? for shortcuts  accept-edits · Gemini";
+        let trust = "Do you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit\n  ↑/↓ Navigate · enter Confirm";
+        let busy = "> \nesc to cancel  plan · Gemini";
+        let agy = adapter("antigravity");
+        assert!(agy.at_prompt(prompt) && !agy.at_prompt(trust) && !agy.at_prompt(busy));
+        for profile in ["opencode", "pi", "shell"] {
+            assert!(!adapter(profile).at_prompt(prompt), "{profile} must not take a notice while unsure");
+        }
+        // Untracked: the screen decides, whatever the (never updated) state
+        assert!(notice_ready(true, false, true, "unknown"));
+        assert!(!notice_ready(true, false, false, "idle"));
+        // Tracked: unchanged
+        assert!(notice_ready(false, false, false, "idle"));
+        assert!(!notice_ready(false, false, true, "working"));
+        assert!(notice_ready(false, true, true, "unknown"));
     }
 
     #[test]

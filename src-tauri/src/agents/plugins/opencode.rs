@@ -5,6 +5,7 @@ pub struct OpenCode;
 
 impl Adapter for OpenCode {
     // shortcut: task tracking stays off until this adapter reports turn-end hooks.
+    // at_prompt keeps the default (false): its menus are not known yet, so no inbox notice is typed.
     fn profile(&self) -> Profile {
         Profile { id: "opencode", label: "OpenCode", command: "opencode", optional: true, can_supervise: true, task_tracking: false }
     }
