@@ -59,6 +59,7 @@ jobs:
         run: cargo clippy --locked --all-targets
 
       - name: Test Rust backend
+        if: ${{ !cancelled() }}
         working-directory: src-tauri
         run: cargo test --locked
 
@@ -99,5 +100,6 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test Rust backend
+        if: ${{ !cancelled() }}
         working-directory: src-tauri
         run: cargo test --locked
