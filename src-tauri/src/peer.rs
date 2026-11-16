@@ -179,8 +179,8 @@ mod win {
         if (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
             return None;
         }
-        // SAFETY: `buf` holds a valid `TOKEN_USER` structure.
-        let user = unsafe { &*(buf.as_ptr().cast::<TOKEN_USER>()) };
+        // SAFETY: `buf` holds a `TOKEN_USER` structure (read_unaligned avoids Vec<u8> alignment assumption).
+        let user = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_USER>()) };
         let sid = user.User.Sid;
         // SAFETY: checking SID validity and length before copying its bytes.
         if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
@@ -195,13 +195,7 @@ mod win {
         Some(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec())
     }
 
-    pub fn same_user(stream: &Stream) -> bool {
-        let Some(peer_pid) = pid(stream).and_then(|p| u32::try_from(p).ok()) else {
-            return false;
-        };
-        let Some(peer_proc) = Handle::open_process(peer_pid) else {
-            return false;
-        };
+    fn same_user_handle(peer_proc: &Handle) -> bool {
         let Some(mut theirs) = process_user_sid(peer_proc.0) else {
             return false;
         };
@@ -214,6 +208,33 @@ mod win {
             IsValidSid(mine.as_mut_ptr().cast()) != 0
                 && IsValidSid(theirs.as_mut_ptr().cast()) != 0
                 && EqualSid(mine.as_mut_ptr().cast(), theirs.as_mut_ptr().cast()) != 0
+        }
+    }
+
+    pub fn same_user(stream: &Stream) -> bool {
+        let Some(peer_pid) = pid(stream).and_then(|p| u32::try_from(p).ok()) else {
+            return false;
+        };
+        let Some(peer_proc) = Handle::open_process(peer_pid) else {
+            return false;
+        };
+        same_user_handle(&peer_proc)
+    }
+
+    pub fn is_this_program(stream: &Stream) -> bool {
+        let Some(peer_pid) = pid(stream).and_then(|p| u32::try_from(p).ok()) else {
+            return false;
+        };
+        // Open the process handle once so SID and image path are read from the same kernel process object.
+        let Some(peer_proc) = Handle::open_process(peer_pid) else {
+            return false;
+        };
+        if !same_user_handle(&peer_proc) {
+            return false;
+        }
+        match (program_handle(&peer_proc), std::env::current_exe()) {
+            (Some(theirs), Ok(ours)) => super::real(&theirs) == super::real(&ours),
+            _ => false,
         }
     }
 
@@ -272,9 +293,7 @@ mod win {
         i32::try_from(ppid).ok().filter(|&p| p > 0)
     }
 
-    pub fn program(pid: i32) -> Option<PathBuf> {
-        let pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
-        let handle = Handle::open_process(pid)?;
+    fn program_handle(handle: &Handle) -> Option<PathBuf> {
         let mut cap = 512usize;
         loop {
             let mut buf = vec![0u16; cap];
@@ -291,6 +310,13 @@ mod win {
             }
             return None;
         }
+    }
+
+    #[cfg(test)]
+    pub fn program(pid: i32) -> Option<PathBuf> {
+        let pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
+        let handle = Handle::open_process(pid)?;
+        program_handle(&handle)
     }
 }
 
@@ -309,7 +335,7 @@ pub fn parent(pid: i32) -> Option<i32> {
     win::parent(pid)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub fn program(pid: i32) -> Option<PathBuf> {
     win::program(pid)
 }
@@ -320,15 +346,24 @@ fn real(path: &Path) -> PathBuf {
 
 /// The connection comes from this very program (the app, the harness service
 /// or one of its bridges), run by the same user.
+#[cfg(unix)]
 pub fn is_this_program(stream: &Stream) -> bool {
-    let Some(pid) = pid(stream) else { return false };
-    if !same_user(stream) {
+    let Some((uid, pid)) = credentials(stream) else { return false };
+    // SAFETY: plain syscall.
+    if uid != unsafe { libc::getuid() } {
         return false;
     }
     match (program(pid), std::env::current_exe()) {
         (Some(theirs), Ok(ours)) => real(&theirs) == real(&ours),
         _ => false,
     }
+}
+
+/// The connection comes from this very program (the app, the harness service
+/// or one of its bridges), run by the same user.
+#[cfg(windows)]
+pub fn is_this_program(stream: &Stream) -> bool {
+    win::is_this_program(stream)
 }
 
 /// The first of `roots` that `pid` is, or descends from.
@@ -372,6 +407,7 @@ mod tests {
         assert_eq!(pid(&a), Some(std::process::id() as i32));
         assert!(is_this_program(&a));
         let me = std::process::id() as i32;
+        assert_eq!(program(me).map(|p| real(&p)), std::env::current_exe().ok().map(|p| real(&p)));
         assert_eq!(ancestor_among(me, &[me]), Some(me));
         let up = parent(me).unwrap();
         assert_eq!(ancestor_among(me, &[up]), Some(up));
