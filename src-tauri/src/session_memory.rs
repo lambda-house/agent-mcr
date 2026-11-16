@@ -49,7 +49,7 @@ fn add_file(
     scope: &str,
     description: &str,
 ) {
-    if !regular(path, root) || out.len() >= 1000 || !path.extension().is_some_and(|e| e == "md") {
+    if !regular(path, root) || out.len() >= 1000 || path.extension().is_none_or(|e| e != "md") {
         return;
     }
     let modified = path

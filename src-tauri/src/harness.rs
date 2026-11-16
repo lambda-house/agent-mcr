@@ -7,6 +7,7 @@
 //! launch; nothing is written into the user's agent config files.
 
 pub use crate::agents::{command_line, Launch};
+use crate::ipc::{self, Listener, Stream};
 use crate::peer;
 use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, adapters, profiles};
 use crate::runner::{self, lock, now_ms, Client, Unit};
@@ -15,8 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -133,6 +132,7 @@ pub const SUPERVISOR_SERVER: &str = "supervisor";
 
 /// The user's login shell from the account database: GUI apps and launchd
 /// jobs don't reliably have `$SHELL`.
+#[cfg(unix)]
 pub fn login_shell() -> String {
     // SAFETY: getpwuid returns a pointer into static storage or null; we copy
     // the string out immediately and don't call it concurrently from here.
@@ -148,6 +148,11 @@ pub fn login_shell() -> String {
         .filter(|s| Path::new(s).is_file())
         .or_else(|| std::env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/zsh".into())
+}
+
+#[cfg(not(unix))]
+pub fn login_shell() -> String {
+    String::new()
 }
 
 fn new_uuid() -> String {
@@ -288,11 +293,13 @@ pub struct Process {
 }
 
 /// `[[dd-]hh:]mm:ss[.cc]` as `ps` prints elapsed and processor time.
+#[cfg(any(unix, test))]
 fn clock_seconds(text: &str) -> f64 {
     let (days, rest) = text.split_once('-').map_or((0.0, text), |(d, r)| (d.parse().unwrap_or(0.0), r));
     rest.split(':').fold(0.0, |total, part| total * 60.0 + part.parse::<f64>().unwrap_or(0.0)) + days * 86_400.0
 }
 
+#[cfg(unix)]
 pub fn process_table() -> Vec<Process> {
     let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,etime=,time=,state=,command="]).output() else { return Vec::new() };
     String::from_utf8_lossy(&out.stdout)
@@ -309,6 +316,11 @@ pub fn process_table() -> Vec<Process> {
             })
         })
         .collect()
+}
+
+#[cfg(not(unix))]
+pub fn process_table() -> Vec<Process> {
+    Vec::new()
 }
 
 fn is_command_shell(command: &str) -> bool {
@@ -1115,8 +1127,14 @@ impl Harness {
         store.version += 1;
         if let Ok(bytes) = serde_json::to_vec(&*store) {
             let tmp = self.dir.join("harness-state.json.tmp");
-            use std::os::unix::fs::OpenOptionsExt;
-            let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(&bytes));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let written = opts.open(&tmp).and_then(|mut f| f.write_all(&bytes));
             if written.is_ok() {
                 let _ = std::fs::rename(&tmp, self.dir.join("harness-state.json"));
             }
@@ -1829,7 +1847,7 @@ impl Harness {
 
     /// The hosted session a connection comes from: its process descends from
     /// one of the runner's children. Nothing the caller says is trusted.
-    fn caller(&self, stream: &UnixStream) -> Result<String, String> {
+    fn caller(&self, stream: &Stream) -> Result<String, String> {
         match self.who(stream) {
             Caller::Session { id, .. } => Ok(id),
             Caller::Outside => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
@@ -1838,7 +1856,7 @@ impl Harness {
     }
 
     /// Where a connection comes from, by the caller's process alone.
-    fn who(&self, stream: &UnixStream) -> Caller {
+    fn who(&self, stream: &Stream) -> Caller {
         let Some(pid) = peer::pid(stream) else { return Caller::Unknown };
         let Ok(list) = self.runner(json!({"op": "list"})) else { return Caller::Unknown };
         let live: Vec<(i32, &Value)> = list["sessions"]
@@ -1852,7 +1870,7 @@ impl Harness {
         }
     }
 
-    fn agent(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream, mcp_client: bool) -> std::io::Result<()> {
+    fn agent(&self, mut reader: BufReader<Stream>, mut writer: Stream, mcp_client: bool) -> std::io::Result<()> {
         // Refused callers still get a working MCP server whose tools say why
         let me = self.caller(&writer);
         // The session has the tools for as long as a bridge of its is connected
@@ -2295,7 +2313,7 @@ impl Harness {
         }
     }
 
-    fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
+    fn supervise(&self, mut reader: BufReader<Stream>, mut writer: Stream) -> std::io::Result<()> {
         // Only the Supervisor session has these tools. An agent outside the
         // harness gets them when the operator allowed that, and not otherwise:
         // a worker's process that left its session looks like an outside one.
@@ -2325,7 +2343,7 @@ impl Harness {
         }
     }
 
-    fn handle(&self, stream: UnixStream) -> std::io::Result<()> {
+    fn handle(&self, stream: Stream) -> std::io::Result<()> {
         if !peer::same_user(&stream) {
             return Ok(());
         }
@@ -2471,22 +2489,23 @@ const AGENT: Server = Server { info: agent_info, tools: agent_tools };
 /// Serve until idle. Refuses to start if another service answers on the socket.
 pub fn serve(dir: &Path) -> Result<(), String> {
     let path = socket(dir);
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    ipc::private_dir(dir)?;
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        if UnixStream::connect(&path).is_ok() {
+        if Stream::connect(&path).is_ok() {
             return Err("A harness service is already listening".into());
         }
-        if !meta.file_type().is_socket() {
+        if !ipc::is_socket(&meta) {
             return Err("Refusing to replace a non-socket file".into());
         }
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
-    let listener = UnixListener::bind(&path).map_err(|e| format!("Cannot listen on {}: {e}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    let listener = Listener::bind(&path).map_err(|e| format!("Cannot listen on {}: {e}", path.display()))?;
+    ipc::private_file(&path)?;
     // State and logs hold session names, messages and folders: the user's alone,
     // also when the folder's own mode is changed later
+    #[cfg(unix)]
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        use std::os::unix::fs::PermissionsExt;
         if entry.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 != 0) {
             let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
         }
@@ -2549,7 +2568,7 @@ const BRIDGE_RETRY: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 struct BridgeState {
-    stream: Option<UnixStream>,
+    stream: Option<Stream>,
     /// The client's `initialize` and `notifications/initialized`, replayed to a restarted service
     initialize: Option<Vec<u8>>,
     initialized: Option<Vec<u8>>,
@@ -2561,7 +2580,7 @@ struct BridgeState {
 /// An agent's stdio ⇄ the service, kept across a service restart: the bridge
 /// reconnects, replays the MCP handshake and fails the calls that were in
 /// flight, so the agent keeps its tools instead of losing the server.
-fn bridge<R: Read + Send + 'static, W: Write + Send + 'static>(input: R, output: W, retry: Duration, connect: impl Fn() -> Result<UnixStream, String>) -> Result<(), String> {
+fn bridge<R: Read + Send + 'static, W: Write + Send + 'static>(input: R, output: W, retry: Duration, connect: impl Fn() -> Result<Stream, String>) -> Result<(), String> {
     let state = Arc::new((Mutex::new(BridgeState::default()), Condvar::new()));
     let output = Arc::new(Mutex::new(output));
     let emit = |output: &Mutex<W>, line: &[u8]| {
@@ -2674,9 +2693,9 @@ fn bridge<R: Read + Send + 'static, W: Write + Send + 'static>(input: R, output:
     }
 }
 
-fn bridge_to(path: PathBuf, op: &'static str) -> impl Fn() -> Result<UnixStream, String> {
+fn bridge_to(path: PathBuf, op: &'static str) -> impl Fn() -> Result<Stream, String> {
     move || {
-        let mut stream = UnixStream::connect(&path).map_err(|e| format!("Harness service unavailable: {e}"))?;
+        let mut stream = Stream::connect(&path).map_err(|e| format!("Harness service unavailable: {e}"))?;
         writeln!(stream, "{}", json!({ "op": op })).map_err(|e| e.to_string())?;
         Ok(stream)
     }
@@ -2710,7 +2729,7 @@ pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>, supervisor: b
         return Err("The arguments must be a JSON object".into());
     }
     let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
-    let stream = UnixStream::connect(path).map_err(|e| format!("Harness service unavailable: {e}"))?;
+    let stream = Stream::connect(path).map_err(|e| format!("Harness service unavailable: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(MAX_WAIT + 30)));
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream);
@@ -2759,7 +2778,7 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
         obj.remove("tool_input");
         obj.remove("tool_response");
     }
-    let Ok(mut stream) = UnixStream::connect(path) else { return };
+    let Ok(mut stream) = Stream::connect(path) else { return };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     if writeln!(stream, "{}", json!({"op": "hook", "session": session, "event": event, "payload": payload})).is_ok() {
@@ -3148,17 +3167,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bridge_survives_a_service_restart() {
         let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let (mut agent, input) = UnixStream::pair().unwrap();
-        let (output, from_bridge) = UnixStream::pair().unwrap();
+        let listener = Listener::bind(&path).unwrap();
+        let (mut agent, input) = Stream::pair().unwrap();
+        let (output, from_bridge) = Stream::pair().unwrap();
         let mut from_bridge = BufReader::new(from_bridge);
         std::thread::spawn(move || bridge(input, output, Duration::from_secs(10), bridge_to(path, "agent")));
-        let line = |r: &mut BufReader<UnixStream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
+        let line = |r: &mut BufReader<Stream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
 
         // First service: handshake, then it dies with a call in flight
         let (first, _) = listener.accept().unwrap();

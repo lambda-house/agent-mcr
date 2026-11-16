@@ -18,13 +18,12 @@
 //! Anyone who can reach the socket is the user (same OS user, 0700 directory);
 //! the runner does no authorization of its own.
 
+use crate::ipc::{self, Listener, Stream};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -356,6 +355,7 @@ impl Runner {
         out.views.clear();
     }
 
+    #[cfg(unix)]
     fn signal(&self, id: &str, name: &str) -> Result<(), String> {
         let session = self.get(id)?;
         let pid = {
@@ -385,6 +385,12 @@ impl Runner {
             return Err(std::io::Error::last_os_error().to_string());
         }
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn signal(&self, id: &str, name: &str) -> Result<(), String> {
+        let _ = (self.get(id)?, name);
+        Err("Signals are not yet implemented on this platform".into())
     }
 
     fn control(self: &Arc<Self>, req: &Value) -> Result<Value, String> {
@@ -439,7 +445,7 @@ impl Runner {
         }
     }
 
-    fn attach(&self, id: &str, mut stream: UnixStream) -> std::io::Result<()> {
+    fn attach(&self, id: &str, mut stream: Stream) -> std::io::Result<()> {
         let session = match self.get(id) {
             Ok(s) => s,
             Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
@@ -479,7 +485,7 @@ impl Runner {
     }
 
     /// The scrollback as it is now: a length line, then that many raw bytes.
-    fn snapshot(&self, id: &str, mut stream: UnixStream) -> std::io::Result<()> {
+    fn snapshot(&self, id: &str, mut stream: Stream) -> std::io::Result<()> {
         let session = match self.get(id) {
             Ok(s) => s,
             Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
@@ -490,7 +496,7 @@ impl Runner {
         stream.shutdown(std::net::Shutdown::Both)
     }
 
-    fn watch(&self, mut stream: UnixStream) -> std::io::Result<()> {
+    fn watch(&self, mut stream: Stream) -> std::io::Result<()> {
         let (tx, rx) = sync_channel::<Value>(1024);
         lock(&self.watchers).push(tx);
         writeln!(stream, "{}", json!({"ok": true}))?;
@@ -504,7 +510,7 @@ impl Runner {
     /// service. A hosted session, or any other program, gets nothing but
     /// `hello`: typing into a terminal answers its prompts, and `spawn` runs
     /// a command outside every agent's sandbox.
-    fn trusts(&self, stream: &UnixStream) -> bool {
+    fn trusts(&self, stream: &Stream) -> bool {
         if !crate::peer::is_this_program(stream) {
             return false;
         }
@@ -512,7 +518,7 @@ impl Runner {
         crate::peer::pid(stream).is_some_and(|pid| crate::peer::ancestor_among(pid, &children).is_none())
     }
 
-    fn handle(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
+    fn handle(self: &Arc<Self>, stream: Stream) -> std::io::Result<()> {
         if !crate::peer::same_user(&stream) {
             return Ok(());
         }
@@ -551,19 +557,18 @@ impl Runner {
 /// Serve until idle. Refuses to start if another runner answers on `socket`.
 pub fn serve(socket: &Path) -> Result<(), String> {
     let dir = socket.parent().ok_or("Invalid socket path")?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    ipc::private_dir(dir)?;
     if let Ok(meta) = std::fs::symlink_metadata(socket) {
-        if UnixStream::connect(socket).is_ok() {
+        if Stream::connect(socket).is_ok() {
             return Err("A runner is already listening".into());
         }
-        if !meta.file_type().is_socket() {
+        if !ipc::is_socket(&meta) {
             return Err("Refusing to replace a non-socket file".into());
         }
         std::fs::remove_file(socket).map_err(|e| e.to_string())?;
     }
-    let listener = UnixListener::bind(socket).map_err(|e| format!("Cannot listen on {}: {e}", socket.display()))?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    let listener = Listener::bind(socket).map_err(|e| format!("Cannot listen on {}: {e}", socket.display()))?;
+    ipc::private_file(socket)?;
     let runner = Arc::new(Runner::default());
 
     let idle = runner.clone();
@@ -598,13 +603,13 @@ pub fn serve(socket: &Path) -> Result<(), String> {
 
 /// A control connection.
 pub struct Client {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Stream>,
+    writer: Stream,
 }
 
 impl Client {
     pub fn connect(socket: &Path) -> Result<Self, String> {
-        let stream = UnixStream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
+        let stream = Stream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
         stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
         Ok(Self { reader: BufReader::new(stream.try_clone().map_err(|e| e.to_string())?), writer: stream })
@@ -627,8 +632,8 @@ impl Client {
 
 /// Open a stream connection (`attach` or `watch`). Returns the reader, which
 /// may already hold stream bytes past the handshake, and a writer.
-pub fn open_stream(socket: &Path, req: Value) -> Result<(BufReader<UnixStream>, UnixStream), String> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
+pub fn open_stream(socket: &Path, req: Value) -> Result<(BufReader<Stream>, Stream), String> {
+    let mut stream = Stream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
     writeln!(stream, "{req}").map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut line = Vec::new();
@@ -690,12 +695,14 @@ fn check_protocol(hello: Value, unit: &Unit, protocol: u32) -> Result<Value, Str
 
 pub const LAUNCH_LABEL: &str = "cc.lambdahouse.agent-mcr.runner";
 
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// The LaunchAgent that runs the runner outside the app's process tree, so
 /// quitting or updating the app leaves agents running.
+#[cfg(target_os = "macos")]
 pub fn launch_agent_plist(unit: &Unit, exe: &Path, log: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -749,7 +756,7 @@ fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -772,7 +779,13 @@ fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
         .map_err(|e| format!("Cannot start the {}: {e}", unit.name))
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+fn start(_socket: &Path, unit: &Unit) -> Result<(), String> {
+    let _ = (unit.label, unit.flag);
+    Err(format!("Cannot start the {}: not yet implemented on this platform", unit.name))
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -787,7 +800,7 @@ mod tests {
         let path = socket.to_path_buf();
         std::thread::spawn(move || serve(&path).unwrap());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while UnixStream::connect(socket).is_err() {
+        while Stream::connect(socket).is_err() {
             assert!(Instant::now() < deadline, "runner did not listen");
             std::thread::sleep(Duration::from_millis(20));
         }

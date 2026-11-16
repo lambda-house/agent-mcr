@@ -18,16 +18,12 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 
 mod agent;
-#[cfg(unix)]
+mod ipc;
 mod peer;
-#[cfg(unix)]
 mod runner;
-#[cfg(unix)]
 mod agents;
 mod harness;
-#[cfg(unix)]
 mod harness_preferences;
-#[cfg(unix)]
 mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
@@ -822,7 +818,7 @@ fn session_folders(access: &AccessState, sessions: &session_commands::SessionSta
     let mut found: Vec<(u64, PathBuf)> = Vec::new();
     if let Ok(dir) = get_config_dir() {
         // Only a service that already runs: listing documents must not start one
-        let hosted = std::os::unix::net::UnixStream::connect(harness::socket(&dir)).is_ok()
+        let hosted = ipc::Stream::connect(harness::socket(&dir)).is_ok()
             .then(|| harness::call(&dir, serde_json::json!({"op": "sessions"})).ok())
             .flatten();
         for s in hosted.iter().flat_map(|h| h["sessions"].as_array().into_iter().flatten()) {
@@ -1159,7 +1155,6 @@ fn apply_linux_rendering_workarounds() {
 fn main() {
     // The runner owns agent terminals and outlives the app (started by launchd).
     // Like the MCP bridge, it must branch before any AppKit/Tauri initialization.
-    #[cfg(unix)]
     if std::env::args().nth(1).as_deref() == Some("--runner") {
         let result = get_config_dir()
             .map_err(|e| e.message)
@@ -1171,7 +1166,6 @@ fn main() {
         return;
     }
     // The harness service, the supervisor's MCP bridge and the agents' hook reporter
-    #[cfg(unix)]
     match std::env::args().nth(1).as_deref() {
         Some(flag @ ("--harness" | "--supervise" | "--harness-mcp")) => {
             let result = get_config_dir().map_err(|e| e.message).and_then(|dir| match flag {

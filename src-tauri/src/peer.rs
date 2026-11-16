@@ -7,13 +7,15 @@
 //! only source of a caller's identity: nothing a caller says about itself is
 //! believed.
 
+use crate::ipc::Stream;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 /// The user and process that opened the connection.
 #[cfg(target_os = "macos")]
-fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
+fn credentials(stream: &Stream) -> Option<(u32, i32)> {
     let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
     // SAFETY: both pointers are valid for writes.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
@@ -26,8 +28,8 @@ fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
     (ok && pid > 0).then_some((uid, pid))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
+#[cfg(all(unix, not(target_os = "macos")))]
+fn credentials(stream: &Stream) -> Option<(u32, i32)> {
     // SAFETY: zeroed is a valid ucred, and `len` is its size.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -35,13 +37,25 @@ fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
     (ok && cred.pid > 0).then_some((cred.uid, cred.pid))
 }
 
+#[cfg(not(unix))]
+fn credentials(_stream: &Stream) -> Option<(u32, i32)> {
+    None
+}
+
 /// The connection comes from a process of the user this process runs as.
-pub fn same_user(stream: &UnixStream) -> bool {
+#[cfg(unix)]
+pub fn same_user(stream: &Stream) -> bool {
     // SAFETY: plain syscall.
     credentials(stream).is_some_and(|(uid, _)| uid == unsafe { libc::getuid() })
 }
 
-pub fn pid(stream: &UnixStream) -> Option<i32> {
+/// The connection comes from a process of the user this process runs as.
+#[cfg(not(unix))]
+pub fn same_user(_stream: &Stream) -> bool {
+    false
+}
+
+pub fn pid(stream: &Stream) -> Option<i32> {
     credentials(stream).map(|(_, pid)| pid)
 }
 
@@ -54,11 +68,16 @@ pub fn parent(pid: i32) -> Option<i32> {
     (got == size).then_some(info.pbi_ppid as i32)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn parent(pid: i32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // "pid (comm) state ppid …": the command may hold spaces and brackets
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(not(unix))]
+pub fn parent(_pid: i32) -> Option<i32> {
+    None
 }
 
 /// The program a process runs.
@@ -70,7 +89,7 @@ pub fn program(pid: i32) -> Option<PathBuf> {
     (n > 0).then(|| PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).into_owned()))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn program(pid: i32) -> Option<PathBuf> {
     let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     // A program replaced on disk while it runs
@@ -78,13 +97,15 @@ pub fn program(pid: i32) -> Option<PathBuf> {
     Some(PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text)))
 }
 
+#[cfg(unix)]
 fn real(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The connection comes from this very program (the app, the harness service
 /// or one of its bridges), run by the same user.
-pub fn is_this_program(stream: &UnixStream) -> bool {
+#[cfg(unix)]
+pub fn is_this_program(stream: &Stream) -> bool {
     let Some((uid, pid)) = credentials(stream) else { return false };
     // SAFETY: plain syscall.
     if uid != unsafe { libc::getuid() } {
@@ -94,6 +115,13 @@ pub fn is_this_program(stream: &UnixStream) -> bool {
         (Some(theirs), Ok(ours)) => real(&theirs) == real(&ours),
         _ => false,
     }
+}
+
+/// The connection comes from this very program (the app, the harness service
+/// or one of its bridges), run by the same user.
+#[cfg(not(unix))]
+pub fn is_this_program(_stream: &Stream) -> bool {
+    false
 }
 
 /// The first of `roots` that `pid` is, or descends from.
@@ -110,13 +138,13 @@ pub fn ancestor_among(mut pid: i32, roots: &[i32]) -> Option<i32> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
     fn a_connection_from_this_process_is_recognised() {
-        let (a, _b) = UnixStream::pair().unwrap();
+        let (a, _b) = Stream::pair().unwrap();
         assert!(same_user(&a));
         assert_eq!(pid(&a), Some(std::process::id() as i32));
         assert!(is_this_program(&a));

@@ -5,13 +5,13 @@
 //! (docs/AGENT_HARNESS_DESIGN.md, 05 · Trust).
 
 use crate::harness;
+use crate::ipc::Stream;
 use crate::runner::{self, Client};
 use crate::session_commands::SessionState;
 use crate::AccessState;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -24,7 +24,7 @@ const MAX_PASTED_IMAGE: usize = 30 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct HarnessState {
-    views: Mutex<BTreeMap<u64, (UnixStream, String)>>,
+    views: Mutex<BTreeMap<u64, (Stream, String)>>,
     next_view: AtomicU64,
 }
 
@@ -295,8 +295,11 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Screenshots can show anything: the user's alone, and not kept for good
     if let Some(root) = dir.parent() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+        }
         let old = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PASTED_IMAGE_KEPT));
         for session in std::fs::read_dir(root).into_iter().flatten().flatten() {
             for file in std::fs::read_dir(session.path()).into_iter().flatten().flatten().filter(|f| old(&f.path())) {
