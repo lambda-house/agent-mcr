@@ -511,6 +511,11 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     <aside className="hs-list" aria-label="Hosted sessions">
       {waiting.length > 0 && <p className="hs-attention" role="status"><BellRing size={12}/> {waiting.length === 1 ? '1 session is waiting for you' : `${waiting.length} sessions are waiting for you`}</p>}
       {error && <div className="hs-error" role="alert">{error}</div>}
+      {pluginRegistry.getSidebarSections().map(section => (
+        <div key={section.id} className="hs-plugin-sidebar-section">
+          {section.render(controller)}
+        </div>
+      ))}
       <div className={`hs-supervisor${supervisor ? ' running' : ''}${supervisor && supervisor.id === selected ? ' selected' : ''}${supervisor && needsYou(supervisor) ? ' needs-you' : ''}`}>
         <button type="button" className="hs-supervisor-open" disabled={!status || starting} onClick={() => void openSupervisor()}
           title="A Claude session wired to this harness: it sees and directs all the other sessions. It cannot answer their permission prompts; only you can.">
@@ -561,11 +566,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       </ul>
       {sections.length > shown.length && <button type="button" className="hs-more-folders" onClick={() => setAllHistory(true)}>{sections.length - shown.length} more folders with history</button>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
-      {pluginRegistry.getSidebarSections().map(section => (
-        <div key={section.id} className="hs-plugin-sidebar-section">
-          {section.render(controller)}
-        </div>
-      ))}
       <footer className="hs-footer">
         <span>{status ? `Runner pid ${status.runner.pid} · ${running} running` : 'Connecting to the runner…'}</span>
         {status?.supervisorCommand && <button title={`Copy the command that gives an outside Claude Code the supervisor tools:\n${status.supervisorCommand}`} aria-label="Copy supervisor setup command" onClick={() => { void navigator.clipboard.writeText(status.supervisorCommand ?? '').then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }).catch(e => setError(err(e))); }}><Copy size={12}/> {copied ? 'Copied' : 'Supervisor'}</button>}
