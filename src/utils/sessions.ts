@@ -54,6 +54,10 @@ export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
 
 export function origin(s: Session): string { return s.origin || (s.parentId ? 'subagent' : 'unknown'); }
 export function within(path: string, directory: string): boolean {
+  if (/^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(directory)) {
+    path = path.replace(/\\/g, '/').toLowerCase();
+    directory = directory.replace(/\\/g, '/').toLowerCase();
+  }
   const root = directory.replace(/[\\/]+$/, '');
   return !root || path === root || (path.startsWith(root) && /^[\\/]/.test(path.slice(root.length)));
 }

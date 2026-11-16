@@ -18,6 +18,10 @@ describe('Windows paths', () => {
     const path = 'C:\\Users\\me\\repo';
     expect(within(path, 'C:\\Users\\me')).toBe(true);
     expect(within(path, 'C:\\Users\\m')).toBe(false);
+    expect(within(path, 'c:/users/ME')).toBe(true);
+    expect(within(path, 'c:/users/m')).toBe(false);
+    expect(within('\\\\Server\\Share\\Repo', '\\\\server\\share')).toBe(true);
+    expect(within('/Work/repo', '/work')).toBe(false);
     const tree = directoryTree([{ cwd: path, id: '1', provider: 'codex' } as Session]);
     expect(tree.children.get('C:')?.path).toBe('C:\\');
     expect(tree.children.get('C:')?.children.get('Users')?.children.get('me')?.children.get('repo')?.path).toBe(path);
