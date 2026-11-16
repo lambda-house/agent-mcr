@@ -42,8 +42,6 @@ fn clean_title(raw: &str) -> Option<String> {
         || t.starts_with('<')
         || t.starts_with("[SYSTEM")
         || t.starts_with('#')
-        || t.starts_with("Another Claude session")
-        || t.starts_with("The coordinator sent")
     {
         return None;
     }
@@ -219,6 +217,10 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
 
     let summary = TranscriptSummary { title: custom.or(first_user), role, tags };
     if let Ok(mut guard) = cache.lock() {
+        // chisle: drop all at the cap; an LRU only if rescans show up in profiles
+        if guard.len() >= 4096 {
+            guard.clear();
+        }
         guard.insert(path.to_path_buf(), (mtime, summary.clone()));
     }
     summary
@@ -470,6 +472,12 @@ impl Adapter for Antigravity {
     fn takes_note(&self, _home: &Path) -> bool {
         false
     }
+    /// No hooks report its turns yet, so the harness can't tell when it is idle:
+    /// a task would never be typed and a prompt would never raise attention.
+    /// Until it has a turn-end signal it is a terminal, like a shell.
+    fn is_agent(&self) -> bool {
+        false
+    }
 }
 
 impl Adapter for Shell {
@@ -509,12 +517,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transcript_summary_takes_title_role_and_tags_from_the_head() {
+        let dir = std::env::temp_dir().join(format!("mcr-summary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = dir.join("c.jsonl");
+        std::fs::write(&claude, concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"<command-name>x</command-name>\"}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Fix   the login bug\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\",\"input\":{\"file_path\":\"src/a.rs\"}}]}}\n",
+        )).unwrap();
+        let s = transcript_summary(&claude, true);
+        assert_eq!(s.title.as_deref(), Some("Fix the login bug"), "markup is skipped, spaces collapse");
+        assert_eq!(s.role.as_deref(), Some("Backend"));
+        assert_eq!(s.tags, vec!["Rust".to_string()]);
+        let codex = dir.join("x.jsonl");
+        std::fs::write(&codex, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Write the docs\"}}\n").unwrap();
+        let s = transcript_summary(&codex, false);
+        assert_eq!((s.title.as_deref(), s.role, s.tags.len()), (Some("Write the docs"), None, 0));
+        assert!(transcript_summary(&dir.join("missing.jsonl"), true).title.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn each_profile_has_an_adapter_and_only_agents_take_prompts() {
         for p in PROFILES {
             assert_eq!(adapter(p.id).id(), p.id);
         }
         assert_eq!(adapter("something new").id(), "shell", "an unknown profile is never typed into as an agent");
-        assert!(adapter("claude").is_agent() && adapter("codex").is_agent() && adapter("antigravity").is_agent() && !adapter("shell").is_agent());
+        assert!(adapter("claude").is_agent() && adapter("codex").is_agent() && !adapter("antigravity").is_agent() && !adapter("shell").is_agent());
         // Claude reports through hooks from the start; Codex only once a turn has ended
         assert!(adapter("claude").reports_from_start() && !adapter("claude").silent_until_first_turn());
         assert!(adapter("codex").silent_until_first_turn() && !adapter("codex").reports_from_start());

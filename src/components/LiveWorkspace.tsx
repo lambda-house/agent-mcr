@@ -475,7 +475,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                 return <button key={r.id} type="button" className={`hs-session-pick${resume === r.id ? ' active' : ''}`} onClick={() => setResume(r.id)} title={info.title}>
                   <AgentMark profile={r.agent} size={14}/>
                   <span className="hs-session-pick-text">
-                    {info.role && <span className="hs-role-pill">{info.role}</span>}
+                    {info.role && <span className="hs-role-pill" title="Guessed from the tools the session used, not reported by the agent">{info.role}</span>}
                     <strong>{info.title}</strong>
                     <small>{info.meta}</small>
                     {info.chips.length > 0 && <span className="hs-session-chips">{info.chips.map(c => <span key={c}>{c}</span>)}</span>}

@@ -2121,6 +2121,10 @@ impl Harness {
             "session_create" if args["profile"] == "shell" && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
                 Err("Refused: a task for a shell is a command, and commands need the operator. Start the shell without one; terminal_write asks the operator.".into())
             }
+            // No turn-end signal: the task would stay open for good
+            "session_create" if !adapter(args["profile"].as_str().unwrap_or("")).is_agent() && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+                Err("Refused: the harness can't tell when this agent finishes a turn, so it takes no task. Start it without one and work in its terminal.".into())
+            }
             "session_create" if args["task"].as_str().is_some_and(|t| plain_prompt(t).is_err()) => plain_prompt(args["task"].as_str().unwrap_or("")).map(|_| json!({})),
             "session_create" => self.create(args).map(|s| {
                 let mut out = Self::brief(&s);
