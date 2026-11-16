@@ -11,7 +11,6 @@ import WorkspaceSwitch from './WorkspaceSwitch';
 import SessionResults from './SessionResults';
 import { harnessApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
-import SessionAgentAccess from './SessionAgentAccess';
 import LiveWorkspace from './LiveWorkspace';
 import SessionCommandPanel from './SessionCommandPanel';
 
@@ -45,8 +44,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const [selected, setSelected] = useState(''); const [query, setQuery] = useState('');
   const [provider, setProvider] = useState('all'); const [directory, setDirectory] = useState('');
   const [role, setRole] = useState('all'); const [activeSince, setActiveSince] = useState(''); const [inactiveSince, setInactiveSince] = useState(''); const [inactiveMinutes, setInactiveMinutes] = useState(''); const [activeMinutes, setActiveMinutes] = useState('');
-  const [agentAccess, setAgentAccess] = useState(false);
-  const [userMemories, setUserMemories] = useState(false); const [filter, setFilter] = useState('all');
+  const [filter, setFilter] = useState('all');
   const [tab, setTab] = useState('activity'); const [eventFilter, setEventFilter] = useState('all');
   const inflight = useRef(false); const mounted = useRef(true); const contextVersion = useRef(0);
   const refresh = useCallback(async () => {
@@ -105,7 +103,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><Search size={13}/> Search</button>
       </nav>
       <div className="sc-top-actions">
-        {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button><button onClick={() => setUserMemories(true)}>User memories</button><button onClick={() => setAgentAccess(true)}>Agent access</button></>}
+        {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button></>}
         <button onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"><Settings size={14}/></button>
       </div>
       {enabled && <details className="sc-summary">
@@ -184,5 +182,5 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div></> : <div className="sc-empty"><Bot size={32}/><h2>Select a session</h2><p>Inspect its activity, agents and linked work.</p></div>}</main></div>
       <footer className="sc-footer"><span title={data.cachePath || 'No persistent cache'}><i className="sc-local-dot"/> {data.cachePath ? 'SQLite index' : 'In-memory index'} · {data.restoredFiles || 0} restored · {data.pendingFiles ? `${data.pendingFiles} files still indexing · totals partial` : 'history indexed'} · {compact(data.bytesRead || 0)} bytes read this scan · {data.errors.length} warnings</span><button onClick={async () => { try { await sessionApi.disable(); setEnabled(false); setData(empty); } catch(e) {setError(err(e));} }}>Revoke session access</button></footer>
       {data.errors.length > 0 && <details className="sc-errors"><summary>Index warnings</summary>{data.errors.map((e,i) => <p key={i}>{e}</p>)}</details>}
-    </>}</>}{agentAccess && <SessionAgentAccess close={() => setAgentAccess(false)} directory={directory} selected={chosen} inspect={(key,event)=>{setSelected(key);setTab('activity');setEventFilter('all');setAgentAccess(false);setFocusedEvidence({session:key,event});}}/>}{userMemories && <div className="sc-dialog-backdrop"><section className="sc-dialog sc-memory-dialog" role="dialog" aria-modal="true" aria-label="User memories"><header><h2>User memories</h2><button onClick={()=>setUserMemories(false)} aria-label="Close user memories"><X size={18}/></button></header><SessionMemoryBrowser/></section></div>}</section>;
+    </>}</>}</section>;
 }
