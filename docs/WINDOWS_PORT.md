@@ -114,6 +114,27 @@ Wine differs from Windows (ConPTY, AF_UNIX and its `SIO_AF_UNIX_GETPEERPID`, pro
 
 Cross-clippy and Mac tests prove that Windows code compiles and that the pure functions are right; they do not prove Windows behaviour. A task whose acceptance includes a `cfg(windows)` test (W2, W3, W5, W7) is approved for the Mac gate only and stays marked "Windows-unverified" until that test has run green on Windows (the CI job of W11, which needs a push the operator decides on, or a real Windows machine). Wine runs (R1–R3) are supporting evidence, not proof. The final report lists each task's status.
 
+### Status (planner's record)
+
+| Task | Commits | Review | Windows runtime |
+|---|---|---|---|
+| W1 | 38aa0df (code part), 2e12eed | Approved | n/a (compile) |
+| M1 | 9116835 | Approved | n/a |
+| W2 | d351047, da8f787, 9139a7a, b902636, 27974b9 (clippy) | Code reviewed; pid race accepted by the operator (221f392) | Unverified (CI) |
+| W3 | 1bc76ce, c6a8a7e | Approved, Mac gate | Unverified (CI): DACL tests |
+| W4 | 4df92a9, 4618a56, 59eb453, 898dc3d, b902636 | Failure handling accepted; pre-assignment race documented as a known limit | Unverified (CI): descendant test |
+| W5 | dc1d3f8, 27974b9 (+ test gating in 60fea4c) | Mac gate passed at 60fea4c; code conditionally accepted | Unverified (CI): ConPTY argv_probe and shim |
+| W6 | 60fea4c | Approved | Unverified |
+| W7 | 2bc9013 + follow-up pending | Not approved: Unix symlink regression, Windows test setup | Unverified |
+| W8 | 5f8e778 | Approved | Unverified (CI) |
+| W9 | a6d5d0d, 06fe06a | Approved | Unverified (UI on Windows) |
+| W10 | 44ebe8f | Approved | Unverified: installer, error dialog |
+| W11 | 07ca075 (= 315dc73 on windows-port) | Approved | First runs failed at `npm ci` (no credentials); SSH deploy-key fix pending |
+| W12 | pending | | |
+| R1 | b9c9239, 476a395 | Inconclusive (Wine shows an empty window) | |
+| R2 | | Dropped (no AF_UNIX in Wine) | |
+| R3 | pending (after the final merge) | | |
+
 ## Manual test list (needs a real Windows 10 1903+ / 11 machine)
 
 1. Install with the NSIS installer as a normal user; app starts; WebView2 present; no SmartScreen bypass needed beyond "Run anyway".
