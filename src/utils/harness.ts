@@ -103,6 +103,8 @@ export const harnessApi = {
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
   /** What sessions reported to the person, and the live notes of the bulletin board */
   board: () => invoke<Board>('harness_board'),
+  /** A note from the person; without a folder it is for every session */
+  postNote: (text: string, hours: number, folder?: string) => invoke<void>('harness_note_post', { text, hours, folder: folder || null }),
   removeNote: (note: string) => invoke<void>('harness_note_remove', { note }),
   /** The person looked at a session's notification */
   ack: (id: string) => invoke<void>('harness_ack', { id }),

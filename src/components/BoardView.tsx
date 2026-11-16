@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { X } from 'lucide-react';
+import { ArrowRight, X } from 'lucide-react';
 import { formatUntil, harnessApi, openReports, shortPath, tildePath, type Board, type Hosted } from '../utils/harness';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -8,6 +8,8 @@ import '../styles/harness.css';
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const KIND = { needs_human: 'Needs you', done: 'Done' } as const;
 type Filter = 'all' | keyof typeof KIND;
+/** How long a note of the person can stay: label and hours */
+const LASTS: [string, number][] = [['1 hour', 1], ['8 hours', 8], ['1 day', 24], ['3 days', 72], ['1 week', 168], ['2 weeks', 336]];
 
 /**
  * What sessions reported to the person (their `report` tool), and the notes
@@ -22,6 +24,10 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
   const [filter, setFilter] = useState<Filter>('all');
   // A note is removed on the second click
   const [removing, setRemoving] = useState('');
+  const [draft, setDraft] = useState('');
+  const [scope, setScope] = useState('');
+  const [hours, setHours] = useState(24);
+  const [posting, setPosting] = useState(false);
   const mounted = useRef(true);
 
   const refresh = useCallback(async () => {
@@ -49,6 +55,16 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
   const reports = useMemo(() => [...board?.reports ?? []].reverse().filter(r => filter === 'all' || r.kind === filter), [board, filter]);
   const notes = useMemo(() => [...board?.notes ?? []].reverse(), [board]);
   const folder = (path: string) => shortPath(tildePath(path, home));
+  // A note can be for one of the folders sessions run in, or for all
+  const folders = useMemo(() => [...new Set(hosted.filter(h => !h.exit && h.cwd).map(h => h.cwd))].sort(), [hosted]);
+  const post = () => {
+    if (!draft.trim() || posting) return;
+    setPosting(true);
+    harnessApi.postNote(draft, hours, folders.includes(scope) ? scope : undefined)
+      .then(() => { if (mounted.current) setDraft(''); return refresh(); })
+      .catch(e => { if (mounted.current) setError(err(e)); })
+      .finally(() => { if (mounted.current) setPosting(false); });
+  };
   const remove = (id: string) => {
     if (removing !== id) { setRemoving(id); setTimeout(() => setRemoving(r => r === id ? '' : r), 3000); return; }
     setRemoving('');
@@ -60,11 +76,12 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
     <section aria-label="Reports">
       <header className="hs-board-head">
         <h2>Reports</h2>
-        <small>What sessions told you with their report tool</small>
+        <small>What sessions told you. Click one to open its session</small>
         <span className="hs-board-filter" role="group" aria-label="Kind of report">
           {(['all', 'needs_human', 'done'] as Filter[]).map(f => <button key={f} type="button" aria-pressed={filter === f} onClick={() => setFilter(f)}>{f === 'all' ? 'All' : KIND[f]}</button>)}
         </span>
       </header>
+      <p className="hs-board-help">A <b>Needs you</b> report waits until you type into its session; a <b>Done</b> one until you open the session.</p>
       {board && !reports.length && <p className="hs-empty">{board.reports.length ? 'No reports of this kind.' : 'No reports yet. A session reports when it cannot go on without you, or when a piece of work is complete.'}</p>}
       <ul>
         {reports.map(r => {
@@ -76,6 +93,7 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
               <span className="hs-board-text">{r.text}</span>
               <small>{KIND[r.kind] ?? r.kind} · <span title={r.cwd}>{folder(r.cwd)}</span> · {formatAge(r.created)}{live ? '' : ' · session ended'}</small>
             </span>
+            {live && <span className="hs-board-go">{r.kind === 'needs_human' && open.has(r.id) ? 'Answer' : 'Open'}<ArrowRight size={11}/></span>}
           </>;
           return <li key={r.id} className={open.has(r.id) ? 'open' : ''}>
             {live ? <button type="button" className="hs-board-row" title="Show this session in Live" onClick={() => onOpen(r.session)}>{body}</button> : <div className="hs-board-row">{body}</div>}
@@ -86,9 +104,24 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
     <section aria-label="Bulletin board">
       <header className="hs-board-head">
         <h2>Bulletin board</h2>
-        <small>Notes sessions left for each other, until they expire</small>
+        <small>Notes sessions read when they start, until the notes expire</small>
       </header>
-      {board && !notes.length && <p className="hs-empty">No notes. Sessions post here what the others in a folder should know: a file being edited, a step nobody should run.</p>}
+      <form className="hs-board-post" aria-label="Leave a note" onSubmit={e => { e.preventDefault(); post(); }}>
+        <textarea value={draft} rows={2} maxLength={2000} aria-label="Note" placeholder="Leave a note for the sessions: a rule, a file not to touch, a step nobody should run"
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); post(); } }}/>
+        <div>
+          <select value={folders.includes(scope) ? scope : ''} aria-label="Who reads it" onChange={e => setScope(e.target.value)}>
+            <option value="">All sessions</option>
+            {folders.map(f => <option key={f} value={f}>{folder(f)}</option>)}
+          </select>
+          <select value={hours} aria-label="How long it stays" onChange={e => setHours(Number(e.target.value))}>
+            {LASTS.map(([label, h]) => <option key={h} value={h}>for {label}</option>)}
+          </select>
+          <button type="submit" disabled={!draft.trim() || posting}>Post</button>
+        </div>
+      </form>
+      {board && !notes.length && <p className="hs-empty">No notes. Sessions, and you, post here what the others in a folder should know: a file being edited, a step nobody should run.</p>}
       <ul>
         {notes.map(n => <li key={n.id}>
           <div className="hs-board-row">

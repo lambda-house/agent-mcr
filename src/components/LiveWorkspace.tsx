@@ -11,6 +11,13 @@ import '../styles/harness.css';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 
+const LIST_WIDTH_KEY = 'hs-list-width';
+/** The session list is never narrower than this, and leaves the terminal at least as much. */
+export const LIST_MIN_WIDTH = 200;
+const storedWidth = (): number | null => {
+  try { const v = Number(localStorage.getItem(LIST_WIDTH_KEY)); return v >= LIST_MIN_WIDTH ? v : null; } catch { return null; }
+};
+
 interface Action { label: string; icon: React.ReactNode; run: () => void }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
@@ -55,6 +62,15 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   onSearch?: (directory: string) => void;
 }) {
   const metrics = useSessionMetrics(active);
+  // Null: the default width, a share of the window
+  const [listWidth, setListWidth] = useState<number | null>(storedWidth);
+  const resizeList = (x: number | null, handle?: HTMLElement) => {
+    const live = handle?.closest<HTMLElement>('.hs-live')?.getBoundingClientRect();
+    const width = x === null || !live ? null
+      : Math.round(Math.max(LIST_MIN_WIDTH, Math.min(x - live.left, live.width - LIST_MIN_WIDTH)));
+    setListWidth(width);
+    try { if (width) localStorage.setItem(LIST_WIDTH_KEY, String(width)); else localStorage.removeItem(LIST_WIDTH_KEY); } catch { /* not kept */ }
+  };
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
   const [error, setError] = useState('');
@@ -214,8 +230,13 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     </li>;
   };
 
-  return <div className="hs-live">
+  return <div className="hs-live" style={listWidth ? { gridTemplateColumns: `${listWidth}px minmax(0, 1fr)` } : undefined}>
     <aside className="hs-list" aria-label="Hosted sessions">
+      <div className="hs-list-resizer" role="separator" aria-orientation="vertical" aria-label="Session list width"
+        title="Drag to resize the list, double-click for the default width"
+        onPointerDown={e => { if (e.button === 0) { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); } }}
+        onPointerMove={e => { if (e.currentTarget.hasPointerCapture(e.pointerId)) resizeList(e.clientX, e.currentTarget); }}
+        onDoubleClick={() => resizeList(null)}/>
       <div className={`hs-supervisor${supervisor ? ' running' : ''}${supervisor && supervisor.id === selected ? ' selected' : ''}${supervisor && needsYou(supervisor) ? ' needs-you' : ''}`}>
         <button type="button" className="hs-supervisor-open" disabled={!status || starting} onClick={() => void openSupervisor()}
           title="A Claude session wired to this harness: it sees and directs all the other sessions. It cannot answer their permission prompts; only you can.">

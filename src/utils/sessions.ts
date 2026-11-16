@@ -73,17 +73,30 @@ export function contextWindow(s: Pick<Session, 'provider' | 'context'>): { size:
 
 /** A warm cache with less than this share of its lifetime left is cooling. */
 export const COOLING_SHARE = 0.2;
-export interface CacheState { warm: boolean; cooling: boolean; ttl: number; until: number }
+/**
+ * Codex records no cache lifetime and its provider promises none. In local
+ * transcripts about nine in ten requests sent within an hour of the one
+ * before were still served from the cache, so that long it is taken for warm.
+ */
+export const CODEX_CACHE_S = 3600;
+export interface CacheState {
+  warm: boolean; cooling: boolean; ttl: number; until: number;
+  /** The lifetime is not recorded (Codex): warm is likely, and past it the state is unknown, not cold */
+  assumed: boolean;
+}
 /**
  * Whether the session's prompt cache is still alive: a message to a warm
  * session reads its context at the cached price, one to a cold session pays
- * for writing all of it again. Null when the transcript records no cache lifetime.
+ * for all of it again. Null when the transcript has no response to go by.
  */
-export function cacheState(s: Pick<Session, 'context'>, now: number): CacheState | null {
+export function cacheState(s: Pick<Session, 'context'> & { provider?: string }, now: number): CacheState | null {
   const c = s.context;
-  if (!c?.cacheTtl || !c.cacheAt) return null;
-  const until = c.cacheAt + c.cacheTtl * 1000;
-  return { warm: now < until, cooling: now < until && until - now < COOLING_SHARE * c.cacheTtl * 1000, ttl: c.cacheTtl, until };
+  if (!c?.cacheAt) return null;
+  const assumed = !c.cacheTtl;
+  if (assumed && s.provider !== 'codex') return null;
+  const ttl = c.cacheTtl || CODEX_CACHE_S;
+  const until = c.cacheAt + ttl * 1000;
+  return { warm: now < until, cooling: now < until && until - now < COOLING_SHARE * ttl * 1000, ttl, until, assumed };
 }
 export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 

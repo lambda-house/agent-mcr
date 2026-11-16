@@ -1246,6 +1246,7 @@ fn main() {
             harness_commands::harness_resumable,
             harness_commands::harness_ack,
             harness_commands::harness_board,
+            harness_commands::harness_note_post,
             harness_commands::harness_note_remove,
             harness_commands::harness_signal,
             harness_commands::harness_forget,

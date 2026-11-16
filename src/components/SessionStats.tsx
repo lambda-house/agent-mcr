@@ -66,15 +66,19 @@ export default function SessionStats({ session, active }: { session: Hosted; act
           <dt>Compactions</dt><dd>{c.compactions}</dd>
         </dl>
       </section>
-      {cache && <section className={cache.warm ? 'hs-cache-warm' : 'hs-cache-cold'}>
+      {cache && <section className={cache.warm ? 'hs-cache-warm' : cache.assumed ? undefined : 'hs-cache-cold'}>
         <h4 title="The prompt cache keeps the context ready between requests. Read from it, input costs about a tenth; once it has expired, the next request writes the whole context again (1.25× the input price for a 5-minute cache, 2× for a 1-hour one).">Cache</h4>
-        <p className="hs-stats-big">{cache.warm ? 'Warm' : 'Cold'}<small>{cache.warm ? ` · ${runningFor(now, cache.until)} left` : ` · for ${runningFor(cache.until, now)}`}</small></p>
-        <p className="hs-stats-note">{cache.warm
-          ? `A message before ${new Date(cache.until).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} reads the context from the cache.`
-          : `Waking it up writes about ${compact(c.now)} tokens to the cache again.`}</p>
+        <p className="hs-stats-big">{cache.warm ? (cache.assumed ? 'Probably warm' : 'Warm') : cache.assumed ? 'Unknown' : 'Cold'}<small>{cache.warm ? ` · ${cache.assumed ? '~' : ''}${runningFor(now, cache.until)} left` : cache.assumed ? ` · last request ${runningFor(c.cacheAt ?? cache.until, now)} ago` : ` · for ${runningFor(cache.until, now)}`}</small></p>
+        <p className="hs-stats-note">{cache.assumed
+          ? 'Codex records no cache lifetime. A request within an hour of the last one is usually still served from the cache; after hours of pause it is often gone.'
+          : cache.warm
+            ? `A message before ${new Date(cache.until).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} reads the context from the cache.`
+            : `Waking it up writes about ${compact(c.now)} tokens to the cache again.`}</p>
         <dl>
-          <dt>Lifetime</dt><dd>{cache.ttl >= 3600 ? `${cache.ttl / 3600} h` : `${cache.ttl / 60} min`}</dd>
-          <dt title="Requests sent after the cache had expired: a prompt after a long pause, or a tool that ran longer than the cache lives">Cold wakeups</dt><dd>{c.coldWakeups ?? 0}</dd>
+          <dt>Lifetime</dt><dd>{cache.assumed ? '~' : ''}{cache.ttl >= 3600 ? `${cache.ttl / 3600} h` : `${cache.ttl / 60} min`}{cache.assumed ? ', assumed' : ''}</dd>
+          <dt title={cache.assumed
+            ? 'Responses that came over 5 minutes after the one before and were mostly not served from the cache'
+            : 'Requests sent after the cache had expired: a prompt after a long pause, or a tool that ran longer than the cache lives'}>Cold wakeups</dt><dd>{c.coldWakeups ?? 0}</dd>
           {(c.coldWakeups ?? 0) > 0 && <><dt title="Input of those requests that was not read from the cache">read uncached</dt><dd>{compact(c.coldTokens ?? 0)}{u.input ? ` · ${percent(c.coldTokens ?? 0, u.input)}` : ''}</dd></>}
         </dl>
       </section>}

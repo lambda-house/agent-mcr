@@ -114,6 +114,12 @@ pub async fn harness_board() -> Result<Value, String> {
     blocking(|| service(json!({"op": "board"}))).await
 }
 
+/// A note from the person on the bulletin board: `folder` empty means every session.
+#[tauri::command]
+pub async fn harness_note_post(text: String, hours: u64, folder: Option<String>) -> Result<(), String> {
+    blocking(move || service(json!({"op": "note_post", "text": text, "hours": hours, "folder": folder.unwrap_or_default()})).map(drop)).await
+}
+
 #[tauri::command]
 pub async fn harness_note_remove(note: String) -> Result<(), String> {
     valid_id(&note)?;

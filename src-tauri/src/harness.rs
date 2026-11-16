@@ -889,7 +889,7 @@ impl Store {
         }
         note.id = format!("n{}", &runner::random_id()[..10]);
         note.created = now;
-        note.from_name = self.sessions.get(&note.from).map(label).unwrap_or_else(|| "Supervisor".into());
+        note.from_name = self.sessions.get(&note.from).map(label).unwrap_or_else(|| if note.from_name.is_empty() { "Supervisor".into() } else { note.from_name.clone() });
         note.seen.insert(note.from.clone());
         self.notes.insert(note.id.clone(), note.clone());
         Ok(note)
@@ -2076,6 +2076,21 @@ impl Harness {
             }
             // What the app shows of the reports and the bulletin board
             "board" => Ok(lock(&self.store).board()),
+            // The human left a note for the sessions: for one folder, or for all
+            "note_post" => {
+                let said: String = req["text"].as_str().unwrap_or("").trim().chars().filter(|c| !c.is_control() || *c == '\n').take(MAX_NOTE_TEXT).collect();
+                if said.is_empty() {
+                    return Err("The note is empty".into());
+                }
+                let hours = req["hours"].as_u64().filter(|h| (1..=MAX_NOTE_HOURS).contains(h)).ok_or_else(|| format!("hours is required: 1 to {MAX_NOTE_HOURS}"))?;
+                let cwd = match req["folder"].as_str().filter(|c| !c.is_empty()) {
+                    Some(cwd) => dunce::canonicalize(cwd).map_err(|e| format!("{cwd}: {e}"))?.display().to_string(),
+                    None => String::new(),
+                };
+                let scope = if cwd.is_empty() { "all" } else { "folder" };
+                let note = self.update(|s| s.pin(Note { cwd, scope: scope.into(), text: said, from_name: "Operator".into(), expires: now_ms() + hours * 3_600_000, ..Note::default() }))?;
+                Ok(json!({ "note": note.id }))
+            }
             // The human took a note off the board
             "note_remove" => {
                 let note = req["note"].as_str().ok_or("Missing note")?;

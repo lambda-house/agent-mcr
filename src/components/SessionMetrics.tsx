@@ -42,7 +42,8 @@ export function cacheClass(hosted: Hosted, data: Record<string, Session>, now: n
   if (!cache) return '';
   // A session at work refreshes its cache with every request, whatever the index last saw
   if (cache.warm || hosted.harness?.state === 'working') return cache.cooling ? 'cache-warm cache-cooling' : 'cache-warm';
-  return 'cache-cold';
+  // Past an assumed lifetime the cache may still be there: neither glow nor ashes
+  return cache.assumed ? '' : 'cache-cold';
 }
 
 /** Every figure of the row, spelled out: the row itself shows bare numbers. */
@@ -60,7 +61,10 @@ export function metricsTooltip(s: Session, cost: number | null, now: number): st
   const cache = cacheState(s, now);
   if (cache) {
     const life = cache.ttl >= 3600 ? `${cache.ttl / 3600} h` : `${cache.ttl / 60} min`;
-    lines.push(cache.warm
+    if (cache.assumed) lines.push(cache.warm
+      ? `Cache: probably warm for another ${runningFor(now, cache.until)}. Codex records no cache lifetime; a request within ${life} of the last one is usually still served from the cache`
+      : `Cache: unknown. Codex records no cache lifetime, and the last request was over ${life} ago; after hours of pause the cache is often gone`);
+    else lines.push(cache.warm
       ? `Cache: warm for another ${runningFor(now, cache.until)} (${life} cache, refreshed by every request)`
       : `Cache: cold for ${runningFor(cache.until, now)}. Waking the session up writes about ${compact(c?.now ?? 0)} tokens to the cache again`);
     if (c?.coldWakeups) lines.push(`Cold wakeups so far: ${c.coldWakeups} · ${compact(c.coldTokens ?? 0)} tokens read uncached`);
@@ -95,8 +99,8 @@ export default function SessionMetrics({ hosted, data }: { hosted: Hosted; data:
     </span>}
     {!!c?.compactions && <span>↻ {c.compactions}</span>}
     {cache && (cache.warm
-      ? <span className="hs-metric-cache"><Flame size={10} aria-label="cache warm for"/>{runningFor(now, cache.until)}</span>
-      : <span className="hs-metric-cache cold">cold</span>)}
+      ? <span className="hs-metric-cache"><Flame size={10} aria-label={cache.assumed ? 'cache probably warm for' : 'cache warm for'}/>{cache.assumed ? '~' : ''}{runningFor(now, cache.until)}</span>
+      : !cache.assumed && <span className="hs-metric-cache cold">cold</span>)}
     {cost !== null && <span>${cost.toFixed(2)}</span>}
   </span>;
 }

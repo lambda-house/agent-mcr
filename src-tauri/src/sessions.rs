@@ -3,7 +3,7 @@ use crate::session_db::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-pub const PARSER_VERSION: u32 = 6;
+pub const PARSER_VERSION: u32 = 8;
 pub fn digest(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -125,7 +125,14 @@ pub struct Context {
     pub cold_wakeups: u64,
     /// Input of those requests that was not served from the cache
     pub cold_tokens: u64,
+    /// A compaction came after the latest response: the next request has a
+    /// new prompt, so the cache not serving it says nothing about a pause
+    pub after_compaction: bool,
 }
+/// Codex records no cache lifetime: a response this long after the one before
+/// that the cache did not serve is taken for a cold wakeup. Shorter gaps are
+/// not, a miss there has other causes.
+const CODEX_PAUSE_MS: u64 = 5 * 60 * 1000;
 /// An RFC3339 timestamp in milliseconds; 0 when it is missing or malformed.
 fn millis(at: &str) -> u64 {
     chrono::DateTime::parse_from_rfc3339(at).map(|d| d.timestamp_millis().max(0) as u64).unwrap_or(0)
@@ -151,6 +158,21 @@ impl Context {
         if ttl > 0 {
             self.cache_ttl = ttl;
         }
+        self.cache_at = self.cache_at.max(at);
+    }
+    /// A Codex response recorded at `at`: the transcript has no cache lifetime
+    /// and no request time, so a cold wakeup is a response after a pause (or a
+    /// long tool run) whose input mostly missed the cache.
+    fn paused_response(&mut self, at: u64, cached: u64, uncached: u64) {
+        if at == 0 {
+            return;
+        }
+        let late = self.cache_at > 0 && at.saturating_sub(self.cache_at) > CODEX_PAUSE_MS;
+        if late && uncached > cached && !self.after_compaction {
+            self.cold_wakeups += 1;
+            self.cold_tokens += uncached;
+        }
+        self.after_compaction = false;
         self.cache_at = self.cache_at.max(at);
     }
     fn response(&mut self, input: u64) {
@@ -453,7 +475,13 @@ impl Indexed {
                 if let Some(window) = info["model_context_window"].as_u64() {
                     self.session.context.window = window;
                 }
-                self.session.context.response(info["last_token_usage"]["input_tokens"].as_u64().unwrap_or(0));
+                let last = &info["last_token_usage"];
+                let input = last["input_tokens"].as_u64().unwrap_or(0);
+                self.session.context.response(input);
+                if input > 0 {
+                    let cached = last["cached_input_tokens"].as_u64().unwrap_or(0);
+                    self.session.context.paused_response(millis(at), cached, input.saturating_sub(cached));
+                }
             }
             match kind {
                 "session_meta" => {
@@ -490,6 +518,7 @@ impl Indexed {
                 }
                 "compacted" => {
                     self.session.context.compactions += 1;
+                    self.session.context.after_compaction = true;
                     self.session.event(at, "memory", strv(p, "message"), None)
                 }
                 "turn_context" => {
@@ -647,8 +676,17 @@ impl Indexed {
                 }
                 .into();
             }
+            // No response follows a compaction until the next prompt, so the
+            // context it left is taken from the boundary: the recorded size,
+            // else an estimate from the summary's length (4 characters a token).
+            if r["subtype"] == "compact_boundary" && r["isSidechain"] != true {
+                self.session.context.now = r["compactMetadata"]["postTokens"].as_u64().unwrap_or(0);
+            }
             if r["isCompactSummary"] == true {
                 self.session.context.compactions += 1;
+                if self.session.context.now == 0 {
+                    self.session.context.now = value_text(&m["content"]).len() as u64 / 4;
+                }
             }
             if kind == "user" || kind == "assistant" {
                 if let Some(text) = m["content"].as_str() {
@@ -1480,6 +1518,29 @@ mod tests {
         assert_eq!(i.session.usage.output, 9);
     }
     #[test]
+    fn a_codex_response_the_cache_missed_after_a_pause_is_a_cold_wakeup() {
+        let mut x = Indexed::new(Path::new("x.jsonl"), "codex");
+        let reply = |at: &str, input: u64, cached: u64| json!({"timestamp":at,"type":"event_msg","payload":{"type":"token_count",
+            "info":{"last_token_usage":{"input_tokens":input,"cached_input_tokens":cached}}}});
+        x.row(reply("2026-01-01T10:00:00Z", 50_000, 0));
+        x.row(reply("2026-01-01T10:01:00Z", 60_000, 50_000));
+        // A miss without a pause has another cause
+        x.row(reply("2026-01-01T10:02:00Z", 60_000, 1_000));
+        // A pause the cache survived
+        x.row(reply("2026-01-01T11:30:00Z", 61_000, 60_000));
+        assert_eq!(x.session.context.cold_wakeups, 0);
+        x.row(reply("2026-01-01T19:30:00Z", 62_000, 2_000));
+        // The same response reported again
+        x.row(reply("2026-01-01T19:30:01Z", 62_000, 2_000));
+        let ctx = &x.session.context;
+        assert_eq!((ctx.cold_wakeups, ctx.cold_tokens, ctx.cache_ttl), (1, 60_000, 0));
+        assert_eq!(ctx.cache_at, millis("2026-01-01T19:30:01Z"));
+        // After a compaction the prompt is new: the miss is not the pause's
+        x.row(json!({"timestamp":"2026-01-02T09:00:00Z","type":"compacted","payload":{"message":"compacted"}}));
+        x.row(reply("2026-01-02T09:00:30Z", 9_000, 0));
+        assert_eq!(x.session.context.cold_wakeups, 1);
+    }
+    #[test]
     fn context_size_tool_output_and_skills_come_from_the_records() {
         let mut c = Indexed::new(Path::new("a.jsonl"), "claude");
         let turn = |id: &str, read: u64, side: bool| json!({"type":"assistant","isSidechain":side,"message":{"id":id,"model":"opus","usage":{"input_tokens":10,"cache_read_input_tokens":read,"output_tokens":1},
@@ -1489,11 +1550,17 @@ mod tests {
         c.row(json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-m1","content":"0123456789"}]}}));
         c.row(turn("m2", 9_000, false));
         c.row(json!({"type":"user","isCompactSummary":true,"message":{"content":"summary of the work so far"}}));
+        assert_eq!(c.session.context.now, 9_010, "a summary alone leaves the last measured size");
+        c.row(json!({"type":"system","subtype":"compact_boundary","compactMetadata":{"preTokens":9_010,"postTokens":700}}));
+        assert_eq!(c.session.context.now, 700, "the size after a compaction is the one the boundary records");
+        c.row(json!({"type":"system","subtype":"compact_boundary","compactMetadata":{"preTokens":9_010}}));
+        c.row(json!({"type":"user","isCompactSummary":true,"message":{"content":"x".repeat(400)}}));
+        assert_eq!(c.session.context.now, 100, "without a recorded size it is estimated from the summary");
         c.row(turn("m3", 50_000, true));
         c.row(turn("m4", 3_000, false));
         let ctx = &c.session.context;
         // A subagent's turn inside the file is not this session's context
-        assert_eq!((ctx.first, ctx.peak, ctx.now, ctx.compactions), (1_010, 9_010, 3_010, 1));
+        assert_eq!((ctx.first, ctx.peak, ctx.now, ctx.compactions), (1_010, 9_010, 3_010, 2));
         assert_eq!(ctx.tool_bytes.get("Read"), Some(&10));
         assert_eq!(ctx.skills.get("deploy"), Some(&1), "a skill is counted when invoked, not when a file mentions it");
 
