@@ -91,7 +91,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const [pinned, setPinned] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem(PINNED_KEY) || '[]') as string[]; } catch { return []; } });
   const pin = (next: string[]) => { setPinned(next); try { localStorage.setItem(PINNED_KEY, JSON.stringify(next)); } catch { /* not kept */ } };
   const [allHistory, setAllHistory] = useState(false);
-  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
   const [earlierOpen, setEarlierOpen] = useState(() => new Set<string>());
   // The usage pane beside the terminal: open or closed is this viewer's preference
   const [stats, setStats] = useState(() => { try { return localStorage.getItem('hs-stats') === '1'; } catch { return false; } });
@@ -359,6 +358,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     if (!pinned.includes(path)) pin([...pinned, path]);
     setCwd('');
   };
+  const home = status?.home ?? '';
+  const shortPath = (p: string) => home && p.startsWith(`${home}/`) ? `~/${p.slice(home.length + 1)}` : p === home ? '~' : p;
   const sections = useMemo(() => directorySections(sorted.filter(h => !h.exit), resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
@@ -558,15 +559,15 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           const open = earlierOpen.has(d.path);
           return <li key={d.path} className={`hs-dir${d.sessions.length ? ' live' : ''}`}>
             <header className="hs-dir-head">
-              <button type="button" className="hs-dir-path" title={d.path} aria-expanded={!collapsedProjects.has(d.path)} onClick={() => setCollapsedProjects(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>{collapsedProjects.has(d.path) ? <ChevronRight size={12}/> : <ChevronDown size={12}/>} {name}</button>
+              <span className="hs-dir-path" title={d.path}>{shortPath(d.path)}</span>
               <span className="hs-dir-rule"/>
               <RowMenu className="hs-dir-tools" label={`Start a session in ${d.path}`} title={`Start a session in ${name}`} icon={<Plus size={13}/>} disabled={!status?.profiles.length || starting}
                 actions={(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) }))}/>
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
             </header>
-            {!collapsedProjects.has(d.path) && d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{d.sessions.map(row)}</ul>}
-            {!collapsedProjects.has(d.path) && d.earlier.length > 0 && <div className="hs-earlier">
+            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{d.sessions.map(row)}</ul>}
+            {d.earlier.length > 0 && <div className="hs-earlier">
               <button type="button" className="hs-earlier-toggle" aria-expanded={open} onClick={() => setEarlierOpen(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>
                 {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<History size={11}/> Earlier · {d.earlier.length} · last {formatAge(d.earlier[0].modified)}
               </button>

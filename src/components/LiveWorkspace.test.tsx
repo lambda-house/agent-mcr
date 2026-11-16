@@ -75,7 +75,7 @@ describe('Live workspace', () => {
   it('lists sessions under their folder, with the state on the dot', async () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={['/work/repo']}/>)); await flush();
     // One section per folder, headed by its path (home as ~)
-    expect(folders().map(f => [f.querySelector('.hs-dir-path')?.textContent, f.querySelector('.hs-dir-path')?.getAttribute('title')])).toEqual([[' repo', '/work/repo']]);
+    expect(folders().map(f => [f.querySelector('.hs-dir-path')?.textContent, f.querySelector('.hs-dir-path')?.getAttribute('title')])).toEqual([['/work/repo', '/work/repo']]);
     expect(folders()[0].className).toContain('live');
     const items = [...host.querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim());
     // An unnamed session goes by the title its agent gave it; the agent kind is a mark; the folder is the section
@@ -87,18 +87,6 @@ describe('Live workspace', () => {
     expect(host.textContent).not.toContain('exited with 0');
     expect(host.textContent).not.toContain('Runner pid');
     expect(host.textContent).not.toContain('Completed');
-  });
-
-  it('collapses and expands a project without losing its sessions', async () => {
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    const toggle = host.querySelector('.hs-dir-path') as HTMLButtonElement;
-    expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    await act(async () => toggle.click());
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(folders()[0].querySelector('.hs-item')).toBeNull();
-    await act(async () => toggle.click());
-    expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    expect(folders()[0].querySelector('.hs-item')?.textContent).toContain('Fixing tests');
   });
 
   it('hides ended sessions and their empty folders without deleting them', async () => {
@@ -118,7 +106,7 @@ describe('Live workspace', () => {
     vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(host.querySelectorAll('.hs-dir .hs-actions button')).toHaveLength(2);
-    expect(host.querySelectorAll('.hs-dir-head button')).toHaveLength(2);
+    expect(host.querySelectorAll('.hs-dir-head button')).toHaveLength(1);
     expect(host.querySelector('[role="menu"]')).toBeNull();
     const item = (text: string) => [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes(text)) as HTMLButtonElement;
     await act(async () => button('Actions for Fixing tests').click());
@@ -159,7 +147,7 @@ describe('Live workspace', () => {
     ]);
     vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'old-1', cwd: '/Users/me/legacy', modified: 5 }, { agent: 'claude', id: 'old-2', cwd: '/Users/me/api', modified: 4 }]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    expect(folders().map(f => `${f.querySelector('.hs-dir-path')?.textContent}${f.className.includes('live') ? ' (live)' : ''}`)).toEqual([' api (live)', ' web (live)', ' legacy', ' notes']);
+    expect(folders().map(f => `${f.querySelector('.hs-dir-path')?.textContent}${f.className.includes('live') ? ' (live)' : ''}`)).toEqual(['~/api (live)', '~/web (live)', '~/legacy', '~/notes']);
     expect([...folders()[0].querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim())).toEqual(['two job', 'one job']);
     // Who a session talks to is in its tooltip, wherever the peer runs
     expect(folders()[0].querySelectorAll('.hs-item')[0].getAttribute('title')).toContain('In contact with: ask job');
@@ -180,7 +168,7 @@ describe('Live workspace', () => {
     expect(host.textContent).toContain('Add a project above');
     vi.mocked(pickDirectory).mockResolvedValue('/Users/me/new/');
     await act(async () => button('Add project').click()); await flush();
-    expect(folders().map(f => f.querySelector('.hs-dir-path')?.textContent)).toEqual([' new']);
+    expect(folders().map(f => f.querySelector('.hs-dir-path')?.textContent)).toEqual(['~/new']);
     vi.mocked(harnessApi.list).mockResolvedValue([{ ...running, cwd: '/Users/me/new' }]);
     // One "+" per folder: offer every launch profile supplied by the backend
     await act(async () => button('Start a session in /Users/me/new').click());
