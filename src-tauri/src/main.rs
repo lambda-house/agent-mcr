@@ -1406,6 +1406,17 @@ mod tests {
         assert!(!access.can_open(Path::new("/work/app/CLAUDE.md")));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_folder_access_is_scoped() {
+        let access = Access { agent_workspace: true, session_folders: vec![PathBuf::from(r"C:\Users\me\app")], ..Access::default() };
+        assert!(access.can_open(Path::new(r"C:\Users\me\app\.claude\rules\api.md")));
+        assert!(!access.can_open(Path::new(r"C:\Users\me\application\CLAUDE.md")));
+        assert!(!access.can_open(Path::new(r"C:\Users\me\app\README.md")));
+        assert!(Path::new(r"C:\Users\me").starts_with(Path::new(r"C:\Users")));
+        assert!(!Path::new(r"C:\Users\me").starts_with(Path::new(r"C:\Users\me\app")));
+    }
+
     #[test]
     fn atomic_write_replaces_content_and_keeps_permissions() {
         let dir = temp_dir("atomic");

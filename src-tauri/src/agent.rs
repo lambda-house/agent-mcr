@@ -395,6 +395,18 @@ fn make_entry(path: &Path, kind: Kind, group: String, scope: &'static str) -> Ag
 /// it after the project's path with every character other than a letter or
 /// digit replaced by `-`, which can't be reversed by string replacement alone:
 /// walk the file system and match each folder's encoded name instead.
+fn project_root(name: &str, windows: bool) -> Option<(String, &str)> {
+    if windows {
+        let (drive, rest) = name.split_once("--")?;
+        if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+            return None;
+        }
+        Some((format!("{drive}:\\"), rest))
+    } else {
+        Some(("/".into(), name.strip_prefix('-')?))
+    }
+}
+
 fn decode_project_dir(name: &str) -> Option<PathBuf> {
     fn encode(s: &str) -> String {
         s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
@@ -430,13 +442,8 @@ fn decode_project_dir(name: &str) -> Option<PathBuf> {
         None
     }
     let mut budget = 200;
-    if cfg!(windows) {
-        // `C--Users-me-work` is `C:\Users\me\work`
-        let (drive, rest) = name.split_once("--")?;
-        walk(Path::new(&format!("{}:\\", drive)), rest, &mut budget)
-    } else {
-        walk(Path::new("/"), name.strip_prefix('-')?, &mut budget)
-    }
+    let (root, rest) = project_root(name, cfg!(windows))?;
+    walk(Path::new(&root), rest, &mut budget)
 }
 
 /// Agent files under a folder the user opened: `CLAUDE.md`, `AGENTS.md`,
@@ -862,11 +869,20 @@ mod tests {
     }
 
     #[test]
+    fn project_roots_decode_windows_drives() {
+        assert_eq!(project_root("C--Users-me-my-app", true), Some(("C:\\".into(), "Users-me-my-app")));
+        assert_eq!(project_root("C--", true), Some(("C:\\".into(), "")));
+        assert_eq!(project_root("XX--Users", true), None);
+        assert_eq!(project_root("-Users-me", false), Some(("/".into(), "Users-me")));
+    }
+
+    #[test]
     fn agent_folders_expose_only_their_documents() {
         let claude = |p: &str| classify_rel(Tool::Claude, &parts(p));
         assert_eq!(claude("CLAUDE.md"), Some(Kind::Instructions));
         assert_eq!(claude("projects/-Users-me-work/memory/MEMORY.md"), Some(Kind::Memory));
         assert_eq!(claude("projects/-Users-me-work/memory/sub/note.md"), Some(Kind::Memory));
+        assert_eq!(classify_rel(Tool::Claude, &r"projects\C--Users-me-work\memory\MEMORY.md".split('\\').map(String::from).collect::<Vec<_>>()), Some(Kind::Memory));
         assert_eq!(claude("skills/review/SKILL.md"), Some(Kind::Skill));
         assert_eq!(claude("skills/review/references/api.md"), Some(Kind::Skill));
         assert_eq!(claude("plans/quick-plan.md"), Some(Kind::Plan));
@@ -888,6 +904,16 @@ mod tests {
         assert_eq!(classify_in(&homes, Path::new("/home/me/.claude/skills/a/run.sh")), None);
         assert_eq!(classify_in(&homes, Path::new("/home/me/.claude/projects/p/memory/x.json")), None);
         assert_eq!(classify_in(&homes, Path::new("/home/me/other/CLAUDE.md")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_agent_paths_are_classified() {
+        let homes = vec![(Tool::Claude, PathBuf::from(r"C:\Users\me\.claude"))];
+        assert_eq!(classify_in(&homes, Path::new(r"C:\Users\me\.claude\projects\C--Users-me-repo\memory\MEMORY.md")), Some(Kind::Memory));
+        assert_eq!(classify_in(&homes, Path::new(r"C:\Users\me\.claude\projects\C--Users-me-repo\session.md")), None);
+        assert!(is_project_agent_file(Path::new(r".claude\rules\api.md")));
+        assert!(!is_project_agent_file(Path::new(r"node_modules\x\CLAUDE.md")));
     }
 
     #[test]

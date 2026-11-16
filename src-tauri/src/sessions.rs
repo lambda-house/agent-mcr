@@ -1421,6 +1421,15 @@ mod tests {
         assert_eq!(i.session.directories.len(), 2);
     }
     #[test]
+    fn windows_transcript_directories_are_preserved() {
+        let mut i = Indexed::new(Path::new("windows.jsonl"), "codex");
+        i.row(json!({"type":"session_meta","payload":{"id":"s","cwd":r"C:\Users\me\repo"}}));
+        i.row(json!({"type":"turn_context","payload":{"cwd":r"C:\Users\me\repo\worktree"}}));
+        assert_eq!(i.session.cwd, r"C:\Users\me\repo\worktree");
+        assert!(i.session.directories.contains(r"C:\Users\me\repo"));
+        assert!(i.session.directories.contains(r"C:\Users\me\repo\worktree"));
+    }
+    #[test]
     fn claude_counts_messages_not_fragments() {
         let mut i = Indexed::new(Path::new("a.jsonl"), "claude");
         for output in [4, 4, 9, 4, 9] {
