@@ -11,7 +11,6 @@ export type PluginEventMap = {
   'pane:closed': { leafId: string };
   'doc:opened': { path: string };
   'doc:saved': { path: string };
-  'command-panel:open': Record<string, never>;
 };
 
 export type PluginEventName = keyof PluginEventMap;

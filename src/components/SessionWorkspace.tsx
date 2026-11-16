@@ -13,6 +13,7 @@ import { harnessApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import SessionAgentAccess from './SessionAgentAccess';
 import LiveWorkspace from './LiveWorkspace';
+import SessionCommandPanel from './SessionCommandPanel';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
 function savedView(): string {
@@ -34,6 +35,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const [view, setViewState] = useState<string>(savedView);
   const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
   const activePluginTab = topTabs.find(t => t.id === view);
+  const [commandsOpen, setCommandsOpen] = useState(false);
   const [data, setData] = useState<Snapshot>(empty);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [focusedEvidence, setFocusedEvidence] = useState<{ session: string; event: SessionEvent } | null>(null);
@@ -119,6 +121,18 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     </header>
     <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined}/></div>
     {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
+    <SessionCommandPanel hideTrigger open={commandsOpen} onOpenChange={setCommandsOpen}
+      enabled={enabled}
+      sessions={data.sessions}
+      directory={directory}
+      onClearDirectory={() => setDirectory('')}
+      onSelectSession={key => { setSelected(key); setView('history'); }}
+      onNavigateView={viewId => setView(viewId)}
+      onOpenSettings={() => useStore.getState().setSettingsOpen(true)}
+      onRefresh={() => void refresh()}
+      onEnableAccess={async () => { try { setEnabled(await sessionApi.enable()); } catch (e) { setError(err(e)); } }}
+      topTabs={topTabs}
+    />
     {globalOverlays.map(o => o.render({
       enabled,
       sessions: data.sessions,
