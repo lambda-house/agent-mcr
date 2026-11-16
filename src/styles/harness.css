@@ -31,7 +31,7 @@
 .session-cockpit .hs-new-agent-btn svg { color: var(--text-muted); flex-shrink: 0; }
 
 /* The supervisor: calm utility row */
-.hs-plugin-sidebar-section { margin-bottom: 6px; }
+.hs-plugin-sidebar-section { margin-bottom: 0; }
 .hs-plugin-sidebar-section .cmd-trigger-btn { display: flex; width: 100%; height: 34px; }
 .hs-plugin-sidebar-section .cmd-trigger-btn__label { flex: 1; text-align: left; }
 .hs-supervisor { display: flex; align-items: center; border-radius: 8px; border: 1px solid transparent; transition: background .15s ease, border-color .15s ease; }
@@ -342,3 +342,16 @@
 .hs-metric-bar { width: 24px; height: 3px; border-radius: 2px; background: var(--sc-border); overflow: hidden; }
 .hs-metric-bar i { display: block; height: 100%; background: var(--sc-accent); }
 .hs-metric-context.high .hs-metric-bar i { background: #e0a23c; }
+
+/* Sidebar actions share one visual hierarchy. */
+.session-cockpit .hs-add { justify-content: stretch; padding: 0; margin: 0; }
+.session-cockpit .hs-add button, .session-cockpit .hs-notifications, .session-cockpit .hs-supervisor-open, .session-cockpit .cmd-trigger-btn { width: 100%; min-height: 36px; justify-content: flex-start; gap: 8px; padding: 6px 8px; font-size: 12px; }
+.session-cockpit .hs-supervisor-open { min-height: 34px; }
+.session-cockpit .hs-supervisor-open .hs-item-text strong { font-size: 12px; }
+.hs-list :is(.hs-add button, .hs-notifications, .hs-supervisor-open, .cmd-trigger-btn) > svg { width: 16px; height: 16px; flex: 0 0 16px; }
+.session-cockpit .hs-notifications { display: flex; align-items: center; border: 1px solid transparent; background: transparent; text-align: left; }
+.session-cockpit .hs-list .hs-dir-head button, .hs-list .hs-dir-tools { background: var(--canvas); }
+.hs-notifications-wrap { display: block; }
+.hs-notifications-wrap .hs-menu { max-width: min(420px, calc(100vw - 24px)); max-height: 50vh; overflow: auto; }
+.hs-notifications-wrap .hs-menu button { white-space: normal; overflow-wrap: anywhere; }
+.hs-notifications-wrap .hs-menu svg { flex: 0 0 14px; }

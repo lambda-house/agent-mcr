@@ -19,7 +19,7 @@ describe('Sessions workspace', () => {
   it('opens on the Live view until Journal is chosen, and remembers the choice', async () => {
     localStorage.removeItem('agent-mcr.sessions.view');
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
-    expect(host.textContent).toContain('Connecting to the runner');
+    expect(host.textContent).toContain('Open supervisor');
     expect(host.textContent).not.toContain('Fix CORE-123');
     await act(async () => button('journal').click()); await flush();
     expect(host.textContent).toContain('Fix CORE-123');

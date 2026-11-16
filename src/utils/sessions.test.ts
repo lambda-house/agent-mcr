@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { family, origin, within, matchesActivity, sessionTree, directoryTree, matchesSession, sumUsage, totalTokens, type Session } from './sessions';
+import { family, formatSessionTitle, origin, within, matchesActivity, sessionTree, directoryTree, matchesSession, sumUsage, totalTokens, type Session } from './sessions';
 const s = (id: string, parentId: string | null = null, provider: 'codex' | 'claude' = 'codex') => ({ id, parentId, provider, cwd: '/work/it\'s repo', title: 'Fix CORE-123', name: '', model: 'model-a', tickets: ['CORE-123'], tools: { shell: 1 }, usage: { input: 100, cached: 70, cacheWrite: 5, output: 20, reasoning: 6 } } as unknown as Session);
 describe('session landscape', () => {
+  it('names sessions from cleaned titles, user requests, tickets and projects', () => {
+    const session = { ...s('1'), cwd: '/work/api', name: 'root', title: '<INSTRUCTIONS>Setup</INSTRUCTIONS>\n Fix   login', events: [] };
+    expect(formatSessionTitle(session)).toBe('Fix login');
+    const instructions = { ...session, title: '# AGENTS.md instructions', events: [{ seq: 1, at: '', kind: 'user', text: '<environment_context>Setup</environment_context>', tool: null }, { seq: 2, at: '', kind: 'user', text: 'Repair\n the cache', tool: null }] };
+    expect(formatSessionTitle(instructions)).toBe('Repair the cache');
+    expect(formatSessionTitle({ ...instructions, events: [] })).toBe('CORE-123 · api');
+    expect(formatSessionTitle({ ...instructions, events: [], tickets: [] })).toBe('api session');
+  });
   it('does not add cached and reasoning tokens twice', () => { expect(totalTokens(sumUsage([s('1'),s('2')]))).toBe(240); });
   it('finds descendants regardless of ordering, provider, or cycles', () => {
     const root = s('root');

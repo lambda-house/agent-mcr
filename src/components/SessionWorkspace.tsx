@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronRight, History, Play, RefreshCw, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
-import { compact, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
+import { Bot, ChevronRight, History, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
+import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
-import { formatAge } from '../utils/agent';
 import { useStore } from '../store';
 import { pluginRegistry, usePluginVersion } from '../plugins';
 import '../styles/sessions.css';
@@ -78,8 +77,8 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const usage = sumUsage(filtered); const working = filtered.filter(s => s.status === 'working').length;
   const events = focusedEvidence?.session === selected ? [focusedEvidence.event] : olderEvents ?? chosen?.events ?? [];
   const descendants = chosen ? family(data.sessions,chosen) : [];
-  // Titles for the Live view's earlier sessions, which only know ids
-  const titles = useMemo(() => Object.fromEntries(data.sessions.filter(s => !s.parentId && s.title).map(s => [s.id, s.title])), [data.sessions]);
+  // The same cleaned names in Live and the command panel, joined by conversation id
+  const titles = useMemo(() => Object.fromEntries(data.sessions.filter(s => !s.parentId).map(s => [s.id, formatSessionTitle(s)])), [data.sessions]);
   const searchFolder = (path: string) => { setDirectory(path); setView('history'); };
   const filtersOn = [provider !== 'all', role !== 'all', filter !== 'all', !!(activeSince || inactiveSince || activeMinutes || inactiveMinutes)].filter(Boolean).length;
   const clearFilters = () => { setActiveSince(''); setInactiveSince(''); setInactiveMinutes(''); setActiveMinutes(''); setDirectory(''); setRole('all'); setProvider('all'); setFilter('all'); setQuery(''); };
@@ -101,7 +100,6 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><History size={13}/> Journal</button>
       </nav>
       <div className="sc-top-actions">
-        {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button></>}
         <button onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"><Settings size={14}/></button>
       </div>
       {enabled && <details className="sc-summary">

@@ -5,8 +5,7 @@ import { Button, Dialog } from '@teob/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
-import SessionMetrics, { useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -16,14 +15,13 @@ import '../styles/harness.css';
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const base = (path: string) => path.split('/').filter(Boolean).pop() || path;
 const PINNED_KEY = 'hs-dirs';
-const START: [string, string][] = [['claude', 'Claude Code'], ['codex', 'Codex']];
 /** Folders with only history shown before "more" is asked for. */
 const HISTORY_FOLDERS = 6;
 
 interface Action { label: string; icon: React.ReactNode; run: () => void }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
-function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', disabled = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; disabled?: boolean }) {
+function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean }) {
   const [at, setAt] = useState<{ top: number; right: number } | null>(null);
   const wrap = useRef<HTMLSpanElement>(null);
   useEffect(() => {
@@ -34,12 +32,12 @@ function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-acti
     return () => { document.removeEventListener('mousedown', outside); document.removeEventListener('keydown', key); };
   }, [at]);
   return <span className={className} ref={wrap}>
-    <button type="button" aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={e => {
+    <button type="button" className={buttonClassName} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={e => {
       // Fixed position: the list scrolls and would clip a menu placed inside it
       const box = e.currentTarget.getBoundingClientRect();
       setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
     }}>{icon ?? <MoreHorizontal size={14}/>}</button>
-    {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }}>
+    {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }} onKeyDown={e => { if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return; e.preventDefault(); const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('button')); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); buttons[(index + (e.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus(); }}>
       {actions.map(a => <button key={a.label} type="button" role="menuitem" onClick={() => { setAt(null); a.run(); }}>{a.icon} {a.label}</button>)}
     </div>}
   </span>;
@@ -61,12 +59,12 @@ function HiddenPaneSlot({ sessionId, registerSlot }: { sessionId: string; regist
  */
 export default function LiveWorkspace({ active, recentDirectories, titles = {}, onSearch }: {
   active: boolean; recentDirectories: string[];
-  /** Titles of earlier sessions by conversation id, when the Sessions index has them */
+  /** Display titles by conversation id, when the Sessions index has them */
   titles?: Record<string, string>;
   /** Open the search view narrowed to a folder */
   onSearch?: (directory: string) => void;
 }) {
-  const metrics = useSessionMetrics(active);
+  const sessionLabel = (h: Hosted) => hostedLabel(h, titles);
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
   const [error, setError] = useState('');
@@ -83,7 +81,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const [profile, setProfile] = useState('claude');
   const [cwd, setCwd] = useState('');
   const [starting, setStarting] = useState(false);
-  const [resumable, setResumable] = useState<Resumable[]>([]);
+  const [pastSessions, setResumable] = useState<Resumable[]>([]);
+  const resumable = useMemo(() => pastSessions.filter(r => status?.profiles.some(p => p.id === r.agent)), [pastSessions, status]);
   const [resume, setResume] = useState('');
   const [copied, setCopied] = useState(false);
   const [referenced, setReferenced] = useState('');
@@ -92,6 +91,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const [pinned, setPinned] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem(PINNED_KEY) || '[]') as string[]; } catch { return []; } });
   const pin = (next: string[]) => { setPinned(next); try { localStorage.setItem(PINNED_KEY, JSON.stringify(next)); } catch { /* not kept */ } };
   const [allHistory, setAllHistory] = useState(false);
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
   const [earlierOpen, setEarlierOpen] = useState(() => new Set<string>());
   // The usage pane beside the terminal: open or closed is this viewer's preference
   const [stats, setStats] = useState(() => { try { return localStorage.getItem('hs-stats') === '1'; } catch { return false; } });
@@ -108,8 +108,16 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   useEffect(() => {
     mounted.current = true;
     if (!isTauri()) { setError('Open the desktop app to host agent terminals.'); return; }
-    harnessApi.status().then(s => { if (mounted.current) { setStatus(s); setCwd(c => c || s.home); } }).catch(e => setError(err(e)));
-    return () => { mounted.current = false; };
+    const updateStatus = () => {
+      harnessApi.status().then(s => {
+        if (!Array.isArray(s.profiles)) throw new Error('An older harness service returned no launch profiles. Update the app and restart the harness service.');
+        if (mounted.current) { setStatus(s); setCwd(c => c || s.home); setProfile(p => s.profiles.some(next => next.id === p) ? p : s.profiles[0]?.id ?? ''); }
+      }).catch(e => { if (mounted.current) setError(err(e)); });
+    };
+    updateStatus();
+    window.addEventListener(HARNESS_PREFERENCES_CHANGED, updateStatus);
+    window.addEventListener('focus', updateStatus);
+    return () => { mounted.current = false; window.removeEventListener(HARNESS_PREFERENCES_CHANGED, updateStatus); window.removeEventListener('focus', updateStatus); };
   }, []);
   useEffect(() => {
     if (!active || !status) return;
@@ -180,8 +188,21 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
 
   const select = (id: string) => {
     openItem({ kind: 'session', id });
-    if (hosted.find(h => h.id === id)?.harness?.attention?.kind === 'notification') void harnessApi.ack(id).then(refresh).catch(() => {});
   };
+  const acknowledging = useRef(new Map<string, number>());
+  useEffect(() => {
+    const acknowledge = () => {
+      if (!active || document.hidden || !document.hasFocus()) return;
+      const attention = hosted.find(h => h.id === selected)?.harness?.attention;
+      if (attention?.kind !== 'notification' || acknowledging.current.get(selected) === attention.since) return;
+      acknowledging.current.set(selected, attention.since);
+      void harnessApi.ack(selected, attention.since).then(refresh).catch(e => setError(err(e))).finally(() => acknowledging.current.delete(selected));
+    };
+    acknowledge();
+    window.addEventListener('focus', acknowledge);
+    document.addEventListener('visibilitychange', acknowledge);
+    return () => { window.removeEventListener('focus', acknowledge); document.removeEventListener('visibilitychange', acknowledge); };
+  }, [active, hosted, selected, refresh]);
   const focusPane = (leafId: string, item: PaneItem | null) => {
     setFocusedPane(leafId);
     if (item?.kind === 'session' && item.id) {
@@ -273,7 +294,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // One that needs the person is marked, not moved. The supervisor has its own tile above the list
   const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
   const sorted = useMemo(() => hosted.filter(h => h.exit || !isSupervisor(h)).sort((a, b) => Number(!!a.exit) - Number(!!b.exit) || a.started - b.started || a.id.localeCompare(b.id)), [hosted]);
-  const running = hosted.filter(h => !h.exit).length;
 
   const start = async (overrideProfile?: string, overrideCwd?: string, overrideResume?: string) => {
     const p = overrideProfile ?? profile;
@@ -314,7 +334,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   };
   useEffect(() => { hosted.filter(h => h.exit && closing.current.has(h.id)).forEach(h => forget(h.id)); }, [hosted]); // eslint-disable-line react-hooks/exhaustive-deps
   const copyReference = (h: Hosted) => {
-    navigator.clipboard.writeText(sessionReference(h)).then(() => { setReferenced(h.id); setTimeout(() => setReferenced(r => r === h.id ? '' : r), 1500); }).catch(e => setError(err(e)));
+    navigator.clipboard.writeText(sessionReference(h, titles)).then(() => { setReferenced(h.id); setTimeout(() => setReferenced(r => r === h.id ? '' : r), 1500); }).catch(e => setError(err(e)));
   };
   /** The agent is ended and continues its conversation in a new process, with today's settings and tools. */
   const restart = (h: Hosted) => {
@@ -324,7 +344,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       setOpened(o => o.filter(x => x !== h.id));
       setLayout(l => replaceSessionInLayout(l, h.id, fresh.id));
       if (selected === h.id) select(fresh.id);
-      if (!fresh.resumed) setError(`${hostedLabel(h)} had no saved conversation to continue: it started fresh in the same folder.`);
+      if (!fresh.resumed) setError(`${sessionLabel(h)} had no saved conversation to continue: it started fresh in the same folder.`);
     }).catch(e => { setError(err(e)); void refresh(); });
   };
   const actions = (h: Hosted): Action[] => [
@@ -332,16 +352,14 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     ...(canRestart(h) ? [{ label: 'Restart (reload settings)', icon: <RotateCw size={13}/>, run: () => restart(h) }] : []),
     { label: h.exit ? 'Remove from the list' : 'Close session', icon: <X size={13}/>, run: () => close(h) },
   ];
-  const names = new Map(hosted.map(h => [h.id, hostedLabel(h)]));
+  const names = new Map(hosted.map(h => [h.id, sessionLabel(h)]));
   const addFolder = (raw: string) => {
     const path = raw.trim().replace(/\/+$/, '') || '/';
     if (!path) return;
     if (!pinned.includes(path)) pin([...pinned, path]);
     setCwd('');
   };
-  const home = status?.home ?? '';
-  const shortPath = (p: string) => home && p.startsWith(`${home}/`) ? `~/${p.slice(home.length + 1)}` : p === home ? '~' : p;
-  const sections = useMemo(() => directorySections(sorted, resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
+  const sections = useMemo(() => directorySections(sorted.filter(h => !h.exit), resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
 
@@ -369,7 +387,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   };
   const row = (h: Hosted) => {
     const state = hostedState(h);
-    const label = hostedLabel(h);
+    const label = sessionLabel(h);
     const detail = h.exit
       ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
       : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', referenced === h.id ? 'reference copied' : ''].filter(Boolean).join(' · ');
@@ -379,8 +397,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       <button className="hs-item" onClick={() => select(h.id)} title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}`}>
         <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
         <span className="hs-item-text">
-          <strong><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}</strong>
-          <SessionMetrics hosted={h} data={metrics}/>
+          <strong title={label}><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}</strong>
           {detail && <small>{detail}</small>}
           {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
           {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
@@ -427,7 +444,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const defaultNewAgent = () => (
     <Dialog open={newAgentOpen} onClose={closeNewAgent} title="New agent" footer={<>
       <Button variant="ghost" size="sm" onClick={closeNewAgent}>Cancel</Button>
-      <button type="button" className="hs-start hs-start--solid" disabled={!status || (!cwd && !selectedResume) || starting} onClick={() => void start(profile, cwd, selectedResume?.id ?? '')}>
+      <button type="button" className="hs-start hs-start--solid" disabled={!status || (!selectedResume && !status.profiles.some(p => p.id === profile)) || (!cwd && !selectedResume) || starting} onClick={() => void start(profile, cwd, selectedResume?.id ?? '')}>
         <Play size={12}/> {starting ? 'Starting…' : selectedResume ? `Resume ${selectedResume.agent === 'claude' ? 'Claude' : 'Codex'}` : `Start ${(status?.profiles ?? []).find(p => p.id === profile)?.label ?? profile}`}
       </button>
     </>}>
@@ -494,6 +511,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         {!selectedResume && <div className="hs-modal-sec">
           <div className="hs-modal-label">Harness</div>
           <div className="hs-pills" role="radiogroup" aria-label="Launch profile">
+            {status?.profiles.length === 0 && <p>Enable a harness in Settings → Harnesses.</p>}
             {(status?.profiles ?? []).map(p => (
               <button key={p.id} type="button" role="radio" aria-checked={profile === p.id} className={`hs-pill${profile === p.id ? ' active' : ''}`} onClick={() => setProfile(p.id)} title={p.command}>
                 <AgentMark profile={p.id} size={13}/>
@@ -509,7 +527,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
 
   const defaultSidebar = () => (
     <aside className="hs-list" aria-label="Hosted sessions">
-      {waiting.length > 0 && <p className="hs-attention" role="status"><BellRing size={12}/> {waiting.length === 1 ? '1 session is waiting for you' : `${waiting.length} sessions are waiting for you`}</p>}
       {error && <div className="hs-error" role="alert">{error}</div>}
       {pluginRegistry.getSidebarSections().map(section => (
         <div key={section.id} className="hs-plugin-sidebar-section">
@@ -517,12 +534,11 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         </div>
       ))}
       <div className={`hs-supervisor${supervisor ? ' running' : ''}${supervisor && supervisor.id === selected ? ' selected' : ''}${supervisor && needsYou(supervisor) ? ' needs-you' : ''}`}>
-        <button type="button" className="hs-supervisor-open" disabled={!status || starting} onClick={() => void openSupervisor()}
-          title="A Claude session wired to this harness: it sees and directs all the other sessions. It cannot answer their permission prompts; only you can.">
+        <button type="button" className="hs-supervisor-open" disabled={!status || starting || (!supervisor && status.supervisorProfile === null)} onClick={() => void openSupervisor()}
+          title={`Supervisor harness: ${supervisor?.meta.profile ?? status?.supervisorProfile ?? 'none'}. It sees and directs the other sessions. Only you can answer their permission prompts. Choose its harness in Settings → Harnesses.`}>
           <Radar size={15}/>
           <span className="hs-item-text">
             <strong>{supervisor ? 'Supervisor' : 'Open supervisor'}{supervisor && <span className={`hs-dot ${hostedState(supervisor)}`} aria-label={STATE_LABEL[hostedState(supervisor)]}/>}</strong>
-            {supervisor && <SessionMetrics hosted={supervisor} data={metrics}/>}
             {supervisor && referenced === supervisor.id && <small>reference copied</small>}
             {supervisor && needsYou(supervisor) && <small className="hs-needs">{supervisor.harness?.attention?.text}</small>}
             {supervisor?.harness?.status && <small className="hs-status">{supervisor.harness.status}</small>}
@@ -533,21 +549,24 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       <div className="hs-add">
         <Button variant="ghost" size="sm" title="Choose a folder to work in" aria-label="Add project" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}><Plus size={14}/> Add project</Button>
       </div>
+      <RowMenu className="hs-notifications-wrap" buttonClassName="hs-notifications" label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
+        icon={<><BellRing size={14}/> Notifications{waiting.length > 0 && ` · ${waiting.length}`}</>}
+        actions={waiting.map(h => ({ label: `${isSupervisor(h) ? 'Supervisor' : sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
       <ul className="hs-dirs">
         {shown.map(d => {
           const name = d.path.split('/').filter(Boolean).pop() ?? d.path;
           const open = earlierOpen.has(d.path);
           return <li key={d.path} className={`hs-dir${d.sessions.length ? ' live' : ''}`}>
             <header className="hs-dir-head">
-              <span className="hs-dir-path" title={d.path}>{shortPath(d.path)}</span>
+              <button type="button" className="hs-dir-path" title={d.path} aria-expanded={!collapsedProjects.has(d.path)} onClick={() => setCollapsedProjects(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>{collapsedProjects.has(d.path) ? <ChevronRight size={12}/> : <ChevronDown size={12}/>} {name}</button>
               <span className="hs-dir-rule"/>
-              <RowMenu className="hs-dir-tools" label={`Start a session in ${d.path}`} title={`Start a session in ${name}`} icon={<Plus size={13}/>} disabled={!status || starting}
-                actions={START.map(([p, what]) => ({ label: what, icon: <AgentMark profile={p} size={13}/>, run: () => void start(p, d.path) }))}/>
+              <RowMenu className="hs-dir-tools" label={`Start a session in ${d.path}`} title={`Start a session in ${name}`} icon={<Plus size={13}/>} disabled={!status?.profiles.length || starting}
+                actions={(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) }))}/>
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
             </header>
-            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{d.sessions.map(row)}</ul>}
-            {d.earlier.length > 0 && <div className="hs-earlier">
+            {!collapsedProjects.has(d.path) && d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{d.sessions.map(row)}</ul>}
+            {!collapsedProjects.has(d.path) && d.earlier.length > 0 && <div className="hs-earlier">
               <button type="button" className="hs-earlier-toggle" aria-expanded={open} onClick={() => setEarlierOpen(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>
                 {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<History size={11}/> Earlier · {d.earlier.length} · last {formatAge(d.earlier[0].modified)}
               </button>
@@ -566,11 +585,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       </ul>
       {sections.length > shown.length && <button type="button" className="hs-more-folders" onClick={() => setAllHistory(true)}>{sections.length - shown.length} more folders with history</button>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
-      <footer className="hs-footer">
-        <span>{status ? `Runner pid ${status.runner.pid} · ${running} running` : 'Connecting to the runner…'}</span>
-        {status?.supervisorCommand && <button title={`Copy the command that gives an outside Claude Code the supervisor tools:\n${status.supervisorCommand}`} aria-label="Copy supervisor setup command" onClick={() => { void navigator.clipboard.writeText(status.supervisorCommand ?? '').then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }).catch(e => setError(err(e))); }}><Copy size={12}/> {copied ? 'Copied' : 'Supervisor'}</button>}
-        {status && <label className="hs-outside" title="Off: only the Supervisor session here has the supervisor tools. On: an agent you run outside Agent MCR and connected with the supervisor command has them too."><input type="checkbox" checked={!!status.outsideSupervisors} onChange={e => { void harnessApi.outsideSupervisors(e.target.checked).then(on => setStatus(s => s && { ...s, outsideSupervisors: on })).catch(x => setError(err(x))); }}/> outside agents</label>}
-      </footer>
+
     </aside>
   );
 
@@ -716,7 +731,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                                     profile={cand.harness?.profile || cand.meta.profile || ''}
                                     size={13}
                                   />
-                                  <strong>{isSupervisor(cand) ? 'Supervisor' : hostedLabel(cand)}</strong>
+                                  <strong>{isSupervisor(cand) ? 'Supervisor' : sessionLabel(cand)}</strong>
                                   <small className={`hs-pick-state hs-pick-state--${state}`}>
                                     {STATE_LABEL[state]}
                                   </small>
@@ -742,7 +757,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                   <header className="hs-pane-title">
                     <span className={`hs-dot ${hostedState(h)}`} aria-label={STATE_LABEL[hostedState(h)]}/>
                     <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/>
-                    <strong>{isSupervisor(h) ? 'Supervisor' : hostedLabel(h)}</strong>
+                    <strong>{isSupervisor(h) ? 'Supervisor' : sessionLabel(h)}</strong>
                     <span title={h.cwd}>{h.cwd}</span>
                     <div className="hs-pane-tools">
                       <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>

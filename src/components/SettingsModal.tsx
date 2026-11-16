@@ -7,6 +7,7 @@ import {
   Puzzle,
   FileText,
   Palette,
+  Terminal,
 } from 'lucide-react';
 import { Badge, Button, Kbd, Notice, SettingRow } from '@teob/ui';
 import { useStore } from '../store';
@@ -14,6 +15,7 @@ import { getAppVersion } from '../utils/tauri';
 import { pluginRegistry, usePluginVersion } from '../plugins';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import SessionAgentAccess from './SessionAgentAccess';
+import HarnessSettingsSection from './HarnessSettingsSection';
 import '../styles/settings-modal.css';
 
 type SettingsCategory =
@@ -179,6 +181,9 @@ const SettingsModal: React.FC = () => {
             </button>
 
             <div className="settings-nav-group">Workspace &amp; Agent</div>
+            <button type="button" className={`settings-nav-item ${activeCategory === 'harnesses' ? 'active' : ''}`} onClick={() => setActiveCategory('harnesses')}>
+              <Terminal size={15}/><span>Harnesses</span>
+            </button>
             <button
               type="button"
               className={`settings-nav-item ${activeCategory === 'memories' ? 'active' : ''}`}
@@ -242,6 +247,7 @@ const SettingsModal: React.FC = () => {
             )}
 
             {activeCategory === 'plugins' && <PluginsSettingsSection />}
+            {activeCategory === 'harnesses' && <HarnessSettingsSection />}
 
             {activeCategory === 'memories' && (
               <div className="settings-section">

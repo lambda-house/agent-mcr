@@ -2,7 +2,7 @@ import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type R
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
 import { Badge, DescList, Kbd, ScrollArea, StatusDot, cx } from '@teob/ui';
-import { compact, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
+import { compact, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
 import type { TopTabPlugin } from '../plugins/sdk';
 import AgentMark from './AgentMark';
@@ -37,45 +37,6 @@ interface CommandEntry {
   session?: Session;
   kind: 'session' | 'nav' | 'action';
   onRun: () => void;
-}
-
-const SYSTEM_TITLE_RE =
-  /^(?:#\s*AGENTS\.md\s+instructions|<(?:INSTRUCTIONS|environment_context|user_instructions|system)>|<!--)/i;
-
-function projectFromCwd(cwd: string): string {
-  if (!cwd) return '';
-  const clean = cwd.replace(/\/+$/, '');
-  const parts = clean.split('/').filter(Boolean);
-  return parts[parts.length - 1] || clean;
-}
-
-export function formatSessionTitle(s: Session): string {
-  const raw = (s.title || '').trim();
-  const afterTag = raw
-    .replace(/^[\s\S]*?<\/(?:INSTRUCTIONS|environment_context|user_instructions)>\s*/i, '')
-    .trim();
-  const candidate = SYSTEM_TITLE_RE.test(raw) ? afterTag : raw;
-
-  if (candidate && !SYSTEM_TITLE_RE.test(candidate)) {
-    return candidate.replace(/\s+/g, ' ');
-  }
-
-  const userEvent = s.events?.find(
-    (e) => e.kind === 'user' && e.text.trim() && !SYSTEM_TITLE_RE.test(e.text.trim()),
-  );
-  if (userEvent) {
-    return userEvent.text.trim().replace(/\s+/g, ' ');
-  }
-
-  const project = projectFromCwd(s.cwd);
-  const ticket = s.tickets?.[0];
-  const meaningfulName =
-    s.name && s.name !== 'root' && !/^[0-9a-f-]{8,}$/i.test(s.name) ? s.name : '';
-
-  if (ticket && project) return `${ticket} · ${project}`;
-  if (meaningfulName && project) return `${project} · ${meaningfulName}`;
-  if (project) return `${project} session`;
-  return s.name || s.id;
 }
 
 function statusClass(status?: string): string {

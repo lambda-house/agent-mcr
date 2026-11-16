@@ -8,7 +8,7 @@
 
 pub use crate::agents::{command_line, Launch};
 use crate::peer;
-use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, ADAPTERS};
+use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, adapters, profiles};
 use crate::runner::{self, lock, now_ms, Client, Unit};
 use crate::session_mcp::{read_frame, Protocol, Server};
 use serde::{Deserialize, Serialize};
@@ -131,24 +131,6 @@ pub fn claude_plugin() -> [(&'static str, String); 3] {
 /// The name the hosted supervisor session sees the supervisor tools under
 pub const SUPERVISOR_SERVER: &str = "supervisor";
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Profile {
-    pub id: &'static str,
-    pub label: &'static str,
-    /// What runs inside the user's login shell
-    pub command: &'static str,
-}
-
-/// D7: agents start in their own permission modes that keep prompts to shell
-/// commands and network access.
-pub const PROFILES: &[Profile] = &[
-    Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits" },
-    Profile { id: "codex", label: "Codex", command: "codex --sandbox workspace-write --ask-for-approval on-request" },
-    Profile { id: "antigravity", label: "Antigravity", command: "agy --mode accept-edits" },
-    Profile { id: "shell", label: "Shell", command: "" },
-];
-
 /// The user's login shell from the account database: GUI apps and launchd
 /// jobs don't reliably have `$SHELL`.
 pub fn login_shell() -> String {
@@ -249,7 +231,7 @@ fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// and times only; no transcript content.
 pub fn resumable(home: &Path, since: u64, limit: usize) -> Vec<Resumable> {
     let mut out = Vec::new();
-    for agent in ADAPTERS {
+    for agent in adapters() {
         let Some((folder, depth)) = agent.transcripts() else { continue };
         let mut files = Vec::new();
         jsonl_files(&home.join(folder), depth, &mut files);
@@ -266,7 +248,7 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
         return None;
     }
     let suffix = format!("{id}.jsonl");
-    ADAPTERS.iter().find_map(|agent| {
+    adapters().find_map(|agent| {
         let (folder, depth) = agent.transcripts()?;
         let mut files = Vec::new();
         jsonl_files(&home.join(folder), depth, &mut files);
@@ -380,7 +362,7 @@ pub fn top_level_thread(home: &Path, id: &str) -> Option<bool> {
         return None;
     }
     let suffix = format!("{id}.jsonl");
-    ADAPTERS.iter().find_map(|agent| {
+    adapters().find_map(|agent| {
         let (folder, depth) = agent.transcripts()?;
         let mut files = Vec::new();
         jsonl_files(&home.join(folder), depth, &mut files);
@@ -607,7 +589,7 @@ pub struct Tracked {
 pub fn title_name(title: &str, cwd: &str) -> String {
     let text = title.trim_start_matches(|c: char| !c.is_alphanumeric()).split(" | ").next().unwrap_or("").trim();
     let folder = cwd.rsplit('/').find(|p| !p.is_empty()).unwrap_or("");
-    if text.is_empty() || text == folder || PROFILES.iter().any(|p| p.label.eq_ignore_ascii_case(text)) || text.eq_ignore_ascii_case("claude") {
+    if text.is_empty() || text == folder || profiles().iter().any(|p| p.label.eq_ignore_ascii_case(text)) || text.eq_ignore_ascii_case("claude") {
         return String::new();
     }
     text.chars().filter(|c| !c.is_control() && *c != '"').take(80).collect()
@@ -1249,14 +1231,16 @@ impl Harness {
     }
 
     /// The hosted supervisor session: the one already running, or a new one.
-    /// A Claude session in its own folder with the supervisor tools wired in.
+    /// The selected harness in its own folder with the supervisor tools wired in.
     fn supervisor(&self, req: &Value) -> Result<Value, String> {
         if let Some(live) = self.sessions()?.into_iter().find(|s| s["exit"].is_null() && s["meta"]["role"] == "supervisor") {
             return Ok(live);
         }
         let folder = self.dir.join("supervisor");
+        let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
+        let profile = prefs.supervisor_profile.ok_or("Choose a supervisor in Settings → Harnesses")?;
         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-        self.create_as(&json!({"profile": "claude", "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true)
+        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true)
     }
 
     fn create(&self, req: &Value) -> Result<Value, String> {
@@ -1272,6 +1256,7 @@ impl Harness {
     fn restart(&self, id: &str, force: bool) -> Result<Value, String> {
         let old = self.session(id)?;
         let profile = old["harness"]["profile"].as_str().unwrap_or("").to_string();
+        crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
         if !adapter(&profile).is_agent() {
             return Err("Only an agent session can be restarted; a shell has no conversation to continue".into());
         }
@@ -1365,7 +1350,8 @@ impl Harness {
             Some(r) => r.agent.to_string(),
             None => req["profile"].as_str().unwrap_or("").to_string(),
         };
-        let label = PROFILES.iter().find(|p| p.id == profile).ok_or_else(|| format!("Unknown profile {profile:?}"))?.label;
+        let label = profiles().iter().find(|p| p.id == profile).ok_or_else(|| format!("Unknown profile {profile:?}"))?.label;
+        crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
         let cwd = match (req["cwd"].as_str().filter(|s| !s.is_empty()), &found) {
             (Some(cwd), _) => cwd.to_string(),
             (None, Some(r)) => r.cwd.clone(),
@@ -1402,6 +1388,7 @@ impl Harness {
         let plugin = self.dir.join("claude-plugin");
         let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
         let argv = argv_for(&Launch {
+            supervisor,
             plugin: &plugin.display().to_string(),
             note: agent.takes_note(&home),
             profile: &profile,
@@ -2056,13 +2043,35 @@ impl Harness {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
                 }
-                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors }))
+                let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
+                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
             }
-            // The human looked at it
+            "harness_preferences" => {
+                let _store = lock(&self.store);
+                if !req["preferences"].is_null() {
+                    let prefs: crate::harness_preferences::HarnessPreferences = serde_json::from_value(req["preferences"].clone()).map_err(|e| e.to_string())?;
+                    prefs.save(&self.dir)?;
+                }
+                let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
+                Ok(json!({"profiles": profiles(), "enabledProfiles": prefs.enabled_profiles, "supervisorProfile": prefs.supervisor_profile}))
+            }
+            "operator_input" => {
+                let id = id()?;
+                self.update(|s| {
+                    if let Some(t) = s.sessions.get_mut(id) {
+                        t.injected = 0;
+                        if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
+                            t.attention = None;
+                        }
+                    }
+                });
+                Ok(json!({}))
+            }
+            // The human looked at this version of the notice; a newer one must survive.
             "ack" => {
                 let id = id()?;
                 self.update(|s| {
-                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| a.kind == "notification")) {
+                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| a.kind == "notification" && req["since"].as_u64().is_none_or(|since| since == a.since))) {
                         t.attention = None;
                     }
                 });
@@ -2073,8 +2082,9 @@ impl Harness {
                 let days = req["days"].as_u64().unwrap_or(3).clamp(1, 90);
                 let running: BTreeSet<String> =
                     self.sessions()?.iter().filter(|s| s["exit"].is_null()).filter_map(|s| s["harness"]["agentSession"].as_str().map(str::to_owned)).collect();
+                let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
                 let list: Vec<Resumable> =
-                    resumable(&home, now_ms().saturating_sub(days * 86_400_000), 200).into_iter().filter(|r| !running.contains(&r.id)).collect();
+                    resumable(&home, now_ms().saturating_sub(days * 86_400_000), 200).into_iter().filter(|r| !running.contains(&r.id) && prefs.require_enabled(r.agent).is_ok()).collect();
                 Ok(json!({ "sessions": list }))
             }
             other => Err(format!("Unknown request {other:?}")),
@@ -2108,7 +2118,7 @@ impl Harness {
             }
         };
         match name {
-            "profiles_list" => Ok(json!({ "profiles": PROFILES })),
+            "profiles_list" => Ok(json!({ "profiles": crate::harness_preferences::HarnessPreferences::load(&self.dir)?.profiles() })),
             "session_list" => Ok(json!({ "sessions": self.sessions()?.iter().map(Self::brief).collect::<Vec<_>>() })),
             "session_status" => {
                 let s = self.session(text("session")?)?;
@@ -2369,7 +2379,7 @@ fn supervisor_tools() -> Value {
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
         tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
-            "profile": {"type": "string", "description": "claude, codex or shell (see profiles_list)"},
+            "profile": {"type": "string", "description": "Enabled harness id (see profiles_list)"},
             "role": {"type": "string", "description": "The part it plays (reviewer, implementer of X): its peers see it in list_peers"},
             "cwd": {"type": "string", "description": "Working folder (absolute path)"},
             "name": {"type": "string", "description": "A short name shown to the operator"},
@@ -2659,13 +2669,19 @@ pub fn agent_bridge(dir: &Path) -> Result<(), String> {
 }
 
 /// `--harness-tool <name> [json]`: one harness tool call from a shell, for a
-/// hosted agent that has no `mcr` MCP server loaded. Same identity check and
-/// same tools; prints the result as JSON.
-pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>) -> Result<String, String> {
+/// hosted agent that has no `mcr` MCP server loaded. `--supervisor-tool` uses
+/// supervisor authorization. Raw terminal input still needs an approving client.
+pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>, supervisor: bool) -> Result<String, String> {
+    if supervisor && name == "terminal_write" {
+        return Err("Raw terminal input needs the operator's approval. Use the app's terminal or an MCP client that asks for approval.".into());
+    }
     let arguments: Value = match arguments.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
         Some(raw) => serde_json::from_str(raw).map_err(|e| format!("The arguments must be a JSON object: {e}"))?,
         None => json!({}),
     };
+    if !arguments.is_object() {
+        return Err("The arguments must be a JSON object".into());
+    }
     let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
     let stream = UnixStream::connect(path).map_err(|e| format!("Harness service unavailable: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(MAX_WAIT + 30)));
@@ -2677,16 +2693,23 @@ pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>) -> Result<Str
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
         serde_json::from_str(&line).map_err(|_| "The harness service closed the connection".to_string())
     };
-    send(json!({"op": "agent", "cli": true}))?;
+    send(json!({"op": if supervisor { "supervise" } else { "agent" }, "cli": true}))?;
     send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "agent-mcr-cli"}, "capabilities": {}}}))?;
     receive()?;
     send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
-    send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}}))?;
+    send(if name == "tools_list" {
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    } else {
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+    })?;
     let reply = receive()?;
     if let Some(message) = reply["error"]["message"].as_str() {
         return Err(message.to_string());
     }
     let result = &reply["result"];
+    if name == "tools_list" {
+        return serde_json::to_string_pretty(result).map_err(|e| e.to_string());
+    }
     if result["isError"] == true {
         return Err(result["content"][0]["text"].as_str().unwrap_or("The tool failed").to_string());
     }
@@ -2720,6 +2743,22 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_profiles_are_refused_before_launch_and_cli_never_bypasses_approval() {
+        let dir = Path::new("/tmp").join(format!("mcr-disabled-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Harness::open(&dir);
+        assert!(harness.create(&json!({"profile": "pi", "cwd": "/tmp"})).unwrap_err().contains("disabled"));
+        assert!(!harness.tool("profiles_list", &json!({})).unwrap()["profiles"].as_array().unwrap().iter().any(|p| p["id"] == "pi"));
+        let saved = harness.control(&json!({"op": "harness_preferences", "preferences": {"enabledProfiles": ["pi"], "supervisorProfile": "pi"}})).unwrap();
+        assert_eq!(saved["supervisorProfile"], "pi");
+        assert_eq!(harness.tool("profiles_list", &json!({})).unwrap()["profiles"][0]["id"], "pi");
+        assert!(harness.create(&json!({"profile": "claude", "cwd": "/tmp"})).unwrap_err().contains("disabled"));
+        assert!(tool_cli(&dir, "terminal_write", None, true).unwrap_err().contains("approval"));
+        assert!(tool_cli(&dir, "session_list", Some("[]".into()), true).unwrap_err().contains("JSON object"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn launch<'a>(profile: &'a str) -> Launch<'a> {
         Launch { profile, exe: "/Apps/Agent MCR.app/agent-mcr", settings: "/cfg dir/claude-hooks.json", ..Launch::default() }

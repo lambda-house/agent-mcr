@@ -26,6 +26,8 @@ mod runner;
 mod agents;
 mod harness;
 #[cfg(unix)]
+mod harness_preferences;
+#[cfg(unix)]
 mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
@@ -1183,10 +1185,10 @@ fn main() {
             }
             return;
         }
-        Some("--harness-tool") => {
+        Some(flag @ ("--harness-tool" | "--supervisor-tool")) => {
             let result = get_config_dir()
                 .map_err(|e| e.message)
-                .and_then(|dir| harness::tool_cli(&dir, &std::env::args().nth(2).unwrap_or_default(), std::env::args().nth(3)));
+                .and_then(|dir| harness::tool_cli(&dir, &std::env::args().nth(2).unwrap_or_default(), std::env::args().nth(3), flag == "--supervisor-tool"));
             match result {
                 Ok(out) => println!("{out}"),
                 Err(e) => {
@@ -1240,6 +1242,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             harness_commands::harness_status,
+            harness_commands::harness_preferences,
             harness_commands::harness_list,
             harness_commands::harness_spawn,
             harness_commands::harness_supervisor,

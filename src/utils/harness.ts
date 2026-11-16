@@ -1,7 +1,9 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 
 /** A launch profile held by the backend; the webview can only pick one by id. */
-export interface Profile { id: string; label: string; command: string }
+export interface Profile { id: string; label: string; command: string; optional: boolean; canSupervise: boolean; taskTracking: boolean }
+export interface HarnessPreferences { profiles: Profile[]; enabledProfiles: string[]; supervisorProfile: string | null }
+export const HARNESS_PREFERENCES_CHANGED = 'harness-preferences-changed';
 export interface HostedExit { code: number; signal: string | null; at: number }
 /** Why a session needs the person: a prompt only they may answer, or a notification. */
 /** `assessment` and `report` come from the agent's own `report` tool: it needs the person, or finished a piece of work. */
@@ -56,6 +58,7 @@ export interface Resumable {
 }
 export interface HarnessStatus {
   runner: { protocol: number; pid: number; version: string; exe: string }; profiles: Profile[]; home: string;
+  supervisorProfile?: string | null;
   /** Run once in a terminal to give an outside agent the supervisor tools */
   supervisorCommand?: string;
   /** The operator lets agents outside the harness use the supervisor tools */
@@ -64,6 +67,12 @@ export interface HarnessStatus {
 
 export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
+  preferences: () => invoke<HarnessPreferences>('harness_preferences'),
+  savePreferences: async (preferences: Omit<HarnessPreferences, 'profiles'>) => {
+    const result = await invoke<HarnessPreferences>('harness_preferences', { preferences });
+    window.dispatchEvent(new Event(HARNESS_PREFERENCES_CHANGED));
+    return result;
+  },
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume }),
   /** The hosted supervisor session: the running one, or a new one */
@@ -74,7 +83,7 @@ export const harnessApi = {
   restart: (id: string) => invoke<Hosted & { replaced: string; resumed: boolean }>('harness_restart', { id }),
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
   /** The person looked at a session's notification */
-  ack: (id: string) => invoke<void>('harness_ack', { id }),
+  ack: (id: string, since?: number) => invoke<void>('harness_ack', { id, since }),
   signal: (id: string, signal: 'INT' | 'TERM' | 'HUP' | 'KILL') => invoke<void>('harness_signal', { id, signal }),
   forget: (id: string) => invoke<void>('harness_forget', { id }),
   resize: (id: string, cols: number, rows: number) => invoke<void>('terminal_resize', { id, cols, rows }),
@@ -94,17 +103,22 @@ export function shellQuote(path: string): string {
   return path.replace(/([^A-Za-z0-9_\-.,:/@+=%^~])/g, '\\$1');
 }
 
+const HARNESS_NAME = /^(claude code|claude|codex|antigravity|antigravity cli|agy|pi|opencode|shell|terminal|root)$/i;
+
 /** The name in a terminal title: without the agent's status glyph and Codex's folder suffix. */
 function titleName(h: Hosted): string {
   const text = h.title.replace(/^[^\p{L}\p{N}]+/u, '').split(' | ')[0].trim();
   const folder = h.cwd.split('/').filter(Boolean).pop() ?? '';
-  return !text || text === folder || /^(claude code|claude|codex|antigravity|agy|shell)$/i.test(text) ? '' : text;
+  return !text || text === folder || HARNESS_NAME.test(text) ? '' : text;
 }
 
 export const isSupervisor = (h: Hosted) => h.meta.role === 'supervisor';
 
-export function hostedLabel(h: Hosted): string {
-  return h.harness?.name || h.meta.name || titleName(h) || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;
+export function hostedLabel(h: Hosted, titles: Record<string, string> = {}): string {
+  const name = h.harness?.name?.trim() ?? '';
+  const named = h.harness?.named ? name : '';
+  const meaningfulName = HARNESS_NAME.test(name) || /^[0-9a-f-]{8,}$/i.test(name) ? '' : name;
+  return named || h.meta.name || meaningfulName || h.harness?.role?.trim() || titles[h.harness?.agentSession ?? ''] || titleName(h) || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;
 }
 
 export type HostedState = 'running' | 'starting' | 'working' | 'idle' | 'waiting' | 'exited' | 'failed';
@@ -164,9 +178,9 @@ export function groupSessions(list: Hosted[]): Hosted[][] {
 const KIND: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', antigravity: 'Antigravity', shell: 'shell' };
 
 /** What to paste into another session so its agent can reach this one. */
-export function sessionReference(h: Hosted): string {
+export function sessionReference(h: Hosted, titles: Record<string, string> = {}): string {
   const kind = KIND[h.harness?.profile || h.meta.profile || ''] ?? 'agent';
-  return `Agent MCR session "${hostedLabel(h)}" (${kind}, id ${h.id}, pid ${h.pid ?? 'unknown'}, folder ${h.cwd}). Reach it with the mcr tools: ask or send_message with to "${h.id}".`;
+  return `Agent MCR session "${hostedLabel(h, titles)}" (${kind}, id ${h.id}, pid ${h.pid ?? 'unknown'}, folder ${h.cwd}). Reach it with the mcr tools: ask or send_message with to "${h.id}".`;
 }
 
 /** A session whose agent can be ended and started again on the same conversation. */

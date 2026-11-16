@@ -9,6 +9,15 @@ function transfer(items: { kind: string; type: string }[]): DataTransfer {
 }
 
 describe('harness helpers', () => {
+  it('replaces generic agent names with indexed conversation titles while keeping assigned names', () => {
+    const session = hosted({ title: 'Codex | /work/api', meta: { profile: 'codex', label: 'Codex' }, harness: { name: 'Codex', named: false, profile: 'codex', since: 0, precise: true, agentSession: 'conversation', attention: null, lastMessage: null, state: 'idle' } });
+    const titles = { conversation: 'Fix authentication retries' };
+    expect(hostedLabel(session, titles)).toBe('Fix authentication retries');
+    expect(hostedLabel({ ...session, meta: { ...session.meta, name: 'Reviewer' } }, titles)).toBe('Reviewer');
+    expect(hostedLabel({ ...session, harness: { ...session.harness!, named: true } }, titles)).toBe('Codex');
+    expect(hostedLabel({ ...session, harness: { ...session.harness!, name: 'API maintainer' } }, titles)).toBe('API maintainer');
+    expect(hostedLabel(session)).toBe('Codex');
+  });
   it('escapes pasted paths the way Terminal does for dropped files', () => {
     expect(shellQuote('/Users/me/Library/Caches/agent-mcr/a.png')).toBe('/Users/me/Library/Caches/agent-mcr/a.png');
     expect(shellQuote("/tmp/my shot (1)'s.png")).toBe("/tmp/my\\ shot\\ \\(1\\)\\'s.png");

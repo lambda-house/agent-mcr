@@ -23,5 +23,5 @@ export default function AgentMark({ profile, size = 14 }: { profile: string; siz
       <path d="M8 1.8 13.4 13.5 8 10.6 2.6 13.5Z"/>
     </svg>;
   }
-  return <Terminal className="hs-mark" size={size} aria-label="Shell"/>;
+  return <Terminal className="hs-mark" size={size} aria-label={profile === 'pi' ? 'Pi' : profile === 'opencode' ? 'OpenCode' : 'Shell'}/>;
 }

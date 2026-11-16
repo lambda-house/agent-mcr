@@ -4,10 +4,24 @@
 //! and how it reports. The harness service asks the adapter and never names
 //! an agent itself, so another agent is another adapter.
 
-use crate::harness::{claude_mcp, claude_plugin, claude_settings, Resumable, Subagent, AGENT_SERVER, PEER_NOTE, PROFILES};
+use crate::harness::{claude_mcp, claude_plugin, claude_settings, Resumable, Subagent, AGENT_SERVER, PEER_NOTE};
+use serde::Serialize;
 use serde_json::json;
 use std::io::Read;
 use std::path::Path;
+
+mod plugins;
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub command: &'static str,
+    pub optional: bool,
+    pub can_supervise: bool,
+    pub task_tracking: bool,
+}
 
 pub fn sh(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -230,6 +244,7 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
 #[derive(Default)]
 pub struct Launch<'a> {
     pub profile: &'a str,
+    pub supervisor: bool,
     pub exe: &'a str,
     /// Claude settings file carrying the hooks
     pub settings: &'a str,
@@ -254,8 +269,8 @@ pub enum Interrupt {
 }
 
 pub trait Adapter: Sync {
-    /// The profile id (`PROFILES`)
-    fn id(&self) -> &'static str;
+    fn profile(&self) -> Profile;
+    fn id(&self) -> &'static str { self.profile().id }
     /// The command run in the login shell; `base` is the profile's command (D7)
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String>;
     /// Files the launch reads, as paths under the config dir. Written before
@@ -265,7 +280,7 @@ pub trait Adapter: Sync {
     }
     /// Takes prompts and ends turns (a shell does neither)
     fn is_agent(&self) -> bool {
-        true
+        self.profile().task_tracking
     }
     /// The harness chooses the conversation id at launch; otherwise the agent reports it
     fn names_conversation(&self) -> bool {
@@ -311,12 +326,11 @@ pub trait Adapter: Sync {
 
 pub struct Claude;
 pub struct Codex;
-pub struct Antigravity;
 pub struct Shell;
 
 impl Adapter for Claude {
-    fn id(&self) -> &'static str {
-        "claude"
+    fn profile(&self) -> Profile {
+        Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits", optional: false, can_supervise: true, task_tracking: true }
     }
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let mut cmd = format!("exec {base}");
@@ -384,8 +398,8 @@ impl Adapter for Claude {
 }
 
 impl Adapter for Codex {
-    fn id(&self) -> &'static str {
-        "codex"
+    fn profile(&self) -> Profile {
+        Profile { id: "codex", label: "Codex", command: "codex --sandbox workspace-write --ask-for-approval on-request", optional: false, can_supervise: true, task_tracking: true }
     }
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
@@ -401,6 +415,9 @@ impl Adapter for Codex {
             cmd += " resume";
         }
         cmd += &format!(" {flags} -c {} -c tui.notifications=true {tools}", sh(&notify));
+        if l.supervisor {
+            cmd += &format!(" -c {} -c {}", sh(&format!("mcp_servers.supervisor.command={}", json!(l.exe))), sh("mcp_servers.supervisor.args=[\"--supervise\"]"));
+        }
         if l.note {
             cmd += &format!(" -c {}", sh(&format!("developer_instructions={}", json!(PEER_NOTE))));
         }
@@ -452,37 +469,9 @@ impl Adapter for Codex {
     }
 }
 
-impl Adapter for Antigravity {
-    fn id(&self) -> &'static str {
-        "antigravity"
-    }
-    fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
-        let mut cmd = format!("exec {base}");
-        if let Some(id) = l.resume {
-            cmd += &format!(" --conversation {id}");
-        }
-        if let Some(t) = l.task {
-            cmd += &format!(" --prompt-interactive {}", sh(t));
-        }
-        Ok(cmd)
-    }
-    fn interrupt(&self) -> Interrupt {
-        Interrupt::Key("\x1b")
-    }
-    fn takes_note(&self, _home: &Path) -> bool {
-        false
-    }
-    /// No hooks report its turns yet, so the harness can't tell when it is idle:
-    /// a task would never be typed and a prompt would never raise attention.
-    /// Until it has a turn-end signal it is a terminal, like a shell.
-    fn is_agent(&self) -> bool {
-        false
-    }
-}
-
 impl Adapter for Shell {
-    fn id(&self) -> &'static str {
-        "shell"
+    fn profile(&self) -> Profile {
+        Profile { id: "shell", label: "Terminal", command: "", optional: false, can_supervise: false, task_tracking: false }
     }
     fn command_line(&self, _base: &str, l: &Launch) -> Result<String, String> {
         if l.resume.is_some() || l.task.is_some() {
@@ -490,26 +479,34 @@ impl Adapter for Shell {
         }
         Ok(String::new())
     }
-    fn is_agent(&self) -> bool {
-        false
-    }
 }
 
-pub const ADAPTERS: &[&dyn Adapter] = &[&Claude, &Codex, &Antigravity, &Shell];
+const BUILT_INS: &[&dyn Adapter] = &[&Claude, &Codex, &Shell];
+
+pub fn adapters() -> impl Iterator<Item = &'static dyn Adapter> {
+    BUILT_INS.iter().chain(plugins::PLUGINS.iter()).copied()
+}
+
+pub fn profiles() -> Vec<Profile> {
+    adapters().map(|a| a.profile()).collect()
+}
 
 /// The adapter of a profile; anything unknown is treated as a plain shell.
 pub fn adapter(profile: &str) -> &'static dyn Adapter {
-    ADAPTERS.iter().copied().find(|a| a.id() == profile).unwrap_or(&Shell)
+    adapters().find(|a| a.id() == profile).unwrap_or(&Shell)
 }
 
 /// The command line run in the login shell (empty for a plain shell).
 pub fn command_line(l: &Launch) -> Result<String, String> {
-    let p = PROFILES.iter().find(|p| p.id == l.profile).ok_or_else(|| format!("Unknown profile {}", l.profile))?;
+    let agent = adapters().find(|a| a.id() == l.profile).ok_or_else(|| format!("Unknown profile {}", l.profile))?;
+    if l.supervisor && !agent.profile().can_supervise {
+        return Err("This harness cannot supervise agents".into());
+    }
     if l.resume.is_some_and(|id| !is_uuid(id)) {
         return Err("Invalid session id to resume".into());
     }
     let task = l.task.map(str::trim).filter(|t| !t.is_empty());
-    adapter(p.id).command_line(p.command, &Launch { task, ..*l })
+    agent.command_line(agent.profile().command, &Launch { task, ..*l })
 }
 
 #[cfg(test)]
@@ -540,7 +537,7 @@ mod tests {
 
     #[test]
     fn each_profile_has_an_adapter_and_only_agents_take_prompts() {
-        for p in PROFILES {
+        for p in profiles() {
             assert_eq!(adapter(p.id).id(), p.id);
         }
         assert_eq!(adapter("something new").id(), "shell", "an unknown profile is never typed into as an agent");
@@ -558,11 +555,45 @@ mod tests {
     }
 
     #[test]
+    fn registry_describes_built_ins_and_optional_plugins() {
+        let all = profiles();
+        let ids: std::collections::BTreeSet<_> = all.iter().map(|p| p.id).collect();
+        assert_eq!(ids.len(), all.len(), "each adapter is registered once");
+        assert_eq!(all.iter().filter(|p| !p.optional).map(|p| p.id).collect::<Vec<_>>(), ["claude", "codex", "shell"]);
+        assert_eq!(all.iter().filter(|p| p.optional).map(|p| p.id).collect::<Vec<_>>(), ["antigravity", "pi", "opencode"]);
+        for p in all {
+            assert_eq!(p.task_tracking, adapter(p.id).is_agent());
+            let serialized = serde_json::to_value(&p).unwrap();
+            assert_eq!(serialized["canSupervise"], p.can_supervise);
+            assert_eq!(serialized["taskTracking"], p.task_tracking);
+        }
+        assert!(command_line(&Launch { profile: "shell", supervisor: true, ..Default::default() }).is_err());
+    }
+
+    #[test]
     fn claude_launch_files_are_written_under_the_config_dir() {
         let names: Vec<String> = Claude.files("/x/agent-mcr", false).into_iter().map(|(name, _)| name).collect();
         assert!(names.starts_with(&["claude-hooks.json".to_string(), "claude-mcp.json".to_string()]));
         assert!(names.iter().skip(2).all(|n| n.starts_with("claude-plugin/")));
         assert!(Claude.files("/x/agent-mcr", true)[0].0.contains("supervisor"));
         assert!(Codex.files("/x/agent-mcr", false).is_empty() && Shell.files("/x", false).is_empty());
+    }
+
+    #[test]
+    fn every_agent_harness_can_receive_supervisor_tools() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        for profile in ["pi", "opencode", "antigravity"] {
+            let launch = Launch { profile, exe: "/Apps/Agent MCR's.app/mcr", note: true, supervisor: true, task: Some("fix 'quoted' input"), resume: Some(id), ..Default::default() };
+            let cmd = command_line(&launch).unwrap();
+            assert!(cmd.contains("--supervisor-tool tools_list") && cmd.contains("--harness-tool guide"), "{cmd}");
+            assert!(cmd.contains(id) && cmd.contains("fix '\\''quoted'\\'' input"), "{cmd}");
+            assert!(!adapter(profile).is_agent(), "no task queue without turn-end hooks");
+            let worker = command_line(&Launch { supervisor: false, ..launch }).unwrap();
+            assert!(!worker.contains("--supervisor-tool"));
+        }
+        let supervisor = command_line(&Launch { profile: "codex", exe: "/x/mcr", supervisor: true, ..Default::default() }).unwrap();
+        assert!(supervisor.contains("mcp_servers.supervisor.command=\"/x/mcr\"") && supervisor.contains("--supervise"));
+        let worker = command_line(&Launch { profile: "codex", exe: "/x/mcr", ..Default::default() }).unwrap();
+        assert!(!worker.contains("mcp_servers.supervisor"));
     }
 }
