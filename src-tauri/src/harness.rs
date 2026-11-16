@@ -104,6 +104,7 @@ pub struct Profile {
 pub const PROFILES: &[Profile] = &[
     Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits" },
     Profile { id: "codex", label: "Codex", command: "codex --sandbox workspace-write --ask-for-approval on-request" },
+    Profile { id: "antigravity", label: "Antigravity", command: "agy --mode accept-edits" },
     Profile { id: "shell", label: "Shell", command: "" },
 ];
 
@@ -182,6 +183,12 @@ pub struct Resumable {
     pub id: String,
     pub cwd: String,
     pub modified: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {

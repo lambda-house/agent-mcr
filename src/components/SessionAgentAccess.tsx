@@ -11,7 +11,7 @@ export const analysisApi = {
   query: (name: string, args: Record<string, unknown>) => invoke<Record<string, unknown>>('run_session_analysis', { name, arguments: args }),
 };
 const message = (e: unknown) => e instanceof Error ? e.message : String(e);
-export default function SessionAgentAccess({ close, directory, selected, inspect }: { close: () => void; directory: string; selected?: Session; inspect: (session: string, event: SessionEvent) => void }) {
+export default function SessionAgentAccess({ close, directory, selected, inspect, embedded = false }: { close?: () => void; directory: string; selected?: Session; inspect: (session: string, event: SessionEvent) => void; embedded?: boolean }) {
   const [status, setStatus] = useState<Status | null>(null);
   const [scope, setScope] = useState(selected ? 'session' : directory ? 'directory' : 'all');
   const [excerpts, setExcerpts] = useState(false);
@@ -24,8 +24,7 @@ export default function SessionAgentAccess({ close, directory, selected, inspect
   const command = status ? `${shellQuote(status.executable)} --mcp` : '';
   const cohort = selected ? { session: sessionKey(selected) } : directory ? { directory } : {};
   const evidenceRows = ((result?.data as { evidence?: { id: string; session: string; event: SessionEvent }[] } | undefined)?.evidence ?? []).filter(row => row.event);
-  return <div className="sc-dialog-backdrop"><section className="sc-dialog sc-analysis-dialog" role="dialog" aria-modal="true" aria-label="Agent access">
-    <header><h2><Shield size={18}/> Agent access</h2><button aria-label="Close agent access" onClick={close}><X size={18}/></button></header>
+  const body = <>
     <p>Let local agents query this app’s SQLite index through MCP. Access ends when you revoke it or close Agent MCR.</p>
     <div className="sc-analysis-state"><strong>{status?.grant.enabled ? 'Sharing enabled' : 'Sharing disabled'}</strong><span>{status?.clients.length ?? 0} connected clients</span></div>
     {status?.grant.enabled ? <><p className="sc-note">Shared: {status.grant.session || status.grant.directory || 'All sessions'} · excerpts {status.grant.excerpts ? 'enabled' : 'disabled'}</p><button disabled={busy} onClick={() => void action(async () => { await analysisApi.revoke(); setResult(null); })}>Revoke agent access</button></> : <>
@@ -49,5 +48,10 @@ export default function SessionAgentAccess({ close, directory, selected, inspect
     {result && <pre className="sc-analysis-result">{JSON.stringify(result, null, 2)}</pre>}
     <h3>Connected clients</h3><p>{status?.clients.join(', ') || 'None'}</p>
     <h3>Recent queries</h3><div className="sc-analysis-audit">{status?.recentQueries.slice().reverse().map((q,i) => <div key={`${q.at}-${i}`}><time>{new Date(q.at).toLocaleTimeString()}</time><strong>{q.tool}</strong><span>{q.client || 'Unknown client'} · {q.ok ? 'OK' : 'Failed'} · {q.elapsedMs} ms</span><small>{q.session || JSON.stringify(q.cohort || {})}</small></div>)}</div>
+  </>;
+  if (embedded) return <div className="session-cockpit sc-embedded-settings" style={{ height: 'auto', background: 'transparent', overflow: 'visible' }}>{body}</div>;
+  return <div className="sc-dialog-backdrop"><section className="sc-dialog sc-analysis-dialog" role="dialog" aria-modal="true" aria-label="Agent access">
+    <header><h2><Shield size={18}/> Agent access</h2><button aria-label="Close agent access" onClick={close}><X size={18}/></button></header>
+    {body}
   </section></div>;
 }

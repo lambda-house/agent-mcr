@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, Bot, ChevronRight, Copy, Play, RefreshCw, Search, Shield, Square, Terminal, X, Zap } from 'lucide-react';
+import { Activity, Bot, ChevronRight, Copy, Play, RefreshCw, Search, Settings, Shield, Square, Terminal, X, Zap } from 'lucide-react';
 import { compact, family, origin, within, sessionDirectories, matchesActivity, matchesSession, resumeCommand, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
+import { useStore } from '../store';
+import { pluginRegistry, usePluginVersion } from '../plugins';
 import '../styles/sessions.css';
 import SessionTree from './SessionTree';
 import WorkspaceSwitch from './WorkspaceSwitch';
@@ -13,8 +15,8 @@ import SessionAgentAccess from './SessionAgentAccess';
 import LiveWorkspace from './LiveWorkspace';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
-function savedView(): 'live' | 'history' {
-  try { return localStorage.getItem(VIEW_KEY) === 'history' ? 'history' : 'live'; } catch { return 'live'; }
+function savedView(): string {
+  try { return localStorage.getItem(VIEW_KEY) || 'live'; } catch { return 'live'; }
 }
 
 const empty: Snapshot = { sessions: [], errors: [], scannedFiles: 0, pendingFiles: 0, indexedAt: 0 };
@@ -25,9 +27,13 @@ function Metric({ label, value, hint }: { label: string; value: string; hint: st
   return <div className="sc-metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>;
 }
 export default function SessionWorkspace({ onClose, active = true }: { onClose: () => void; active?: boolean }) {
+  usePluginVersion();
+  const topTabs = pluginRegistry.getTopTabs();
+  const globalOverlays = pluginRegistry.getGlobalOverlays();
   const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [view, setViewState] = useState<'live' | 'history'>(savedView);
-  const setView = (v: 'live' | 'history') => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
+  const [view, setViewState] = useState<string>(savedView);
+  const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
+  const activePluginTab = topTabs.find(t => t.id === view);
   const [data, setData] = useState<Snapshot>(empty);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [focusedEvidence, setFocusedEvidence] = useState<{ session: string; event: SessionEvent } | null>(null);
@@ -95,10 +101,16 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       <WorkspaceSwitch active="sessions" onChange={workspace => { if (workspace === 'documents') onClose(); }}/>
       <nav className="hs-view-switch" aria-label="Sessions view">
         <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
+        {topTabs.map(t => (
+          <button key={t.id} type="button" aria-current={view === t.id ? 'page' : undefined} title={t.title} onClick={() => setView(t.id)}>
+            {t.icon} {t.label}
+          </button>
+        ))}
         <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><Search size={13}/> Search</button>
       </nav>
       <div className="sc-top-actions">
         {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button><button onClick={() => setUserMemories(true)}>User memories</button><button onClick={() => setAgentAccess(true)}>Agent access</button></>}
+        <button onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"><Settings size={14}/></button>
       </div>
       {enabled && <details className="sc-summary">
         <summary><span className="sc-summary-working">{working} working</span><span> · {filtered.length.toLocaleString()} sessions</span><ChevronRight size={12}/></summary>
@@ -112,6 +124,19 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       </details>}
     </header>
     <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined}/></div>
+    {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
+    {globalOverlays.map(o => o.render({
+      enabled,
+      sessions: data.sessions,
+      directory,
+      onClearDirectory: () => setDirectory(''),
+      onSelectSession: (key) => { setSelected(key); setView('history'); },
+      onNavigateView: (viewId) => setView(viewId),
+      onOpenSettings: () => useStore.getState().setSettingsOpen(true),
+      onRefresh: () => void refresh(),
+      onEnableAccess: async () => { try { setEnabled(await sessionApi.enable()); } catch (e) { setError(err(e)); } },
+      topTabs,
+    }))}
     {view === 'history' && <>
     {error && <div className="sc-banner" role="alert">{error}</div>}
     {!enabled ? <div className="sc-welcome"><div className="sc-logo"><Bot size={36}/></div><p className="sc-eyebrow">YOUR AGENTIC LANDSCAPE</p><h1>See the work.<br/>Follow every agent.</h1><p>Codex and Claude sessions, their agents, models, tokens, tools and linked work. One view across all recorded workspaces on this machine.</p>

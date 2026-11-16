@@ -42,7 +42,7 @@ interface ErrorBoundaryProps {
   onReset?: () => void;
 }
 
-class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
   constructor(props: ErrorBoundaryProps) {
     super(props);
     this.state = { hasError: false, error: null };
@@ -115,7 +115,7 @@ function debounce<T extends (...args: unknown[]) => void>(
  * them survive a restart as well.
  */
 function useDocumentScroll(
-  scrollRef: React.RefObject<HTMLDivElement>,
+  scrollRef: React.RefObject<HTMLDivElement | null>,
   path: string | null,
   ready: boolean
 ): void {
@@ -263,7 +263,7 @@ interface MarkdownViewerProps {
   onHeadingsExtracted?: (headings: RenderResult['headings']) => void;
 }
 
-const MarkdownViewer: React.FC<MarkdownViewerProps> = ({
+export const MarkdownViewer: React.FC<MarkdownViewerProps> = ({
   content,
   documentPath,
   onHeadingsExtracted,

@@ -18,5 +18,10 @@ export default function AgentMark({ profile, size = 14 }: { profile: string; siz
       <path d="m6.1 6.3-1.9 1.7 1.9 1.7M8.6 9.9h3"/>
     </svg>;
   }
+  if (profile === 'antigravity') {
+    return <svg className="hs-mark antigravity" width={size} height={size} viewBox="0 0 16 16" role="img" aria-label="Antigravity" fill="none" stroke="#60a5fa" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round">
+      <path d="M8 1.8 13.4 13.5 8 10.6 2.6 13.5Z"/>
+    </svg>;
+  }
   return <Terminal className="hs-mark" size={size} aria-label="Shell"/>;
 }

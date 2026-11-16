@@ -1,0 +1,540 @@
+/* Agent Handoff relay view (AffectUI-inspired, using teob-ui surface tokens) */
+.ho-wrap {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--canvas);
+  overflow: auto;
+  padding: 18px 24px 28px;
+  gap: 18px;
+}
+
+.ho-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ho-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ho-title-group h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.ho-title-group p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.ho-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ho-seg {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--layer-1);
+  border: 1px solid var(--line);
+  gap: 2px;
+}
+
+.session-cockpit .ho-seg button {
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.session-cockpit .ho-seg button[aria-pressed='true'] {
+  background: var(--layer-3);
+  color: var(--text);
+}
+
+.session-cockpit .ho-replay-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--layer-1);
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.session-cockpit .ho-replay-btn:hover {
+  background: var(--layer-2);
+  color: var(--text);
+}
+
+.ho-board {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 720px;
+  max-width: 1060px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 24px 24px 28px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--surface-1);
+}
+
+.ho-agents {
+  display: grid;
+  grid-template-columns: repeat(var(--ho-cols, 3), minmax(0, 1fr));
+  gap: 16px;
+}
+
+.ho-agent {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 14px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--layer-1);
+  transition: border-color .16s ease, box-shadow .16s ease, opacity .16s ease, transform .16s ease;
+}
+
+.ho-agent.is-target {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+  transform: translateY(-2px);
+}
+
+.ho-agent.is-dimmed {
+  opacity: 0.45;
+}
+
+.ho-agent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ho-agent-id {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.ho-agent-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--layer-2);
+  border: 1px solid var(--line);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ho-agent-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ho-agent-name strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ho-agent-name small {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.ho-agent-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.ho-cost {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ho-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  background: var(--layer-2);
+  color: var(--text-muted);
+}
+
+.ho-status-pill.working {
+  border-color: var(--accent-line, var(--accent));
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.ho-status-pill.waiting {
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.ho-agent-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-soft);
+  min-height: 34px;
+}
+
+.ho-agent-slot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.ho-agent-slot strong {
+  color: var(--text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ho-port {
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 8px;
+  height: 8px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: var(--surface-1);
+  border: 2px solid var(--accent);
+}
+
+/* Curved SVG relay connectors */
+.ho-wires {
+  width: 100%;
+  height: 48px;
+  display: block;
+  overflow: visible;
+}
+
+.ho-wire-base {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.ho-wire-pulse {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-dasharray: 28 180;
+  vector-effect: non-scaling-stroke;
+  animation: ho-flow 2.8s linear infinite;
+}
+
+@keyframes ho-flow {
+  from { stroke-dashoffset: 186; }
+  to { stroke-dashoffset: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ho-wire-pulse { animation: none; stroke-dasharray: none; opacity: 0.45; }
+}
+
+/* Handoff lanes centered under the gaps between agent cards */
+.ho-lanes {
+  display: grid;
+  grid-template-columns: repeat(var(--ho-lanes, 2), minmax(0, 1fr));
+  gap: 16px;
+  width: calc(100% * var(--ho-lanes, 2) / var(--ho-cols, 3));
+  margin: 0 auto;
+}
+
+.ho-lane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--layer-1);
+  min-width: 0;
+}
+
+.ho-lane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 6px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-soft);
+}
+
+.ho-lane-route {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ho-lane-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--layer-2);
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ho-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ho-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface-1);
+  cursor: grab;
+  transition: border-color .14s ease, background .14s ease;
+}
+
+.ho-card:hover {
+  border-color: var(--line-strong);
+  background: var(--layer-2);
+}
+
+.ho-card.expanded {
+  border-color: var(--accent-line, var(--line-strong));
+}
+
+.ho-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.ho-card-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.35;
+}
+
+.ho-card-summary {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ho-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.ho-pill-warn,
+.ho-pill-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+
+.ho-pill-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-line);
+}
+
+.ho-pill-ok {
+  color: var(--ok, #4ade80);
+  background: color-mix(in srgb, #4ade80 12%, transparent);
+  border: 1px solid color-mix(in srgb, #4ade80 28%, transparent);
+}
+
+.session-cockpit .ho-forward-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  background: var(--layer-2);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .14s ease, color .14s ease;
+}
+
+.ho-card:hover .ho-forward-btn,
+.ho-forward-btn:focus-visible {
+  opacity: 1;
+}
+
+.session-cockpit .ho-forward-btn:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.ho-items {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 7px;
+  margin-top: 2px;
+  border-top: 1px solid var(--line);
+}
+
+.ho-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: var(--layer-1);
+}
+
+.ho-item.lost {
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  border: 1px dashed var(--warn-line);
+}
+
+.ho-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ho-item-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ho-item.lost .ho-item-label span:first-of-type {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+.ho-item-kind {
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.ho-item-why {
+  font-size: 10.5px;
+  color: var(--warn);
+}
+
+.session-cockpit .ho-restore-btn {
+  flex-shrink: 0;
+  border: 1px solid var(--accent-line, var(--accent));
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.session-cockpit .ho-restore-btn:hover {
+  filter: brightness(1.1);
+}
+
+.ho-empty-lane {
+  margin: 6px 0;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+@media (max-width: 820px) {
+  .ho-board { min-width: 0; }
+  .ho-agents { grid-template-columns: 1fr; }
+  .ho-wires { display: none; }
+  .ho-lanes { grid-template-columns: 1fr; padding: 0; }
+}

@@ -815,8 +815,6 @@ const App: React.FC = () => {
       </div>
 
       <StatusBar />
-      <SettingsModal />
-      <SaveAllDialog />
 
       {isDropTarget && (
         <div className="drop-overlay" aria-hidden="true">
@@ -830,6 +828,8 @@ const App: React.FC = () => {
         </div>
       )}
       </div>}
+      <SettingsModal />
+      <SaveAllDialog />
     </div>
   );
 };

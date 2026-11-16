@@ -36,6 +36,194 @@ pub fn head_value(path: &Path, key: &str, limit: u64) -> Option<String> {
     serde_json::Deserializer::from_slice(&head[at..]).into_iter::<String>().next()?.ok()
 }
 
+fn clean_title(raw: &str) -> Option<String> {
+    let t = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.len() < 4
+        || t.starts_with('<')
+        || t.starts_with("[SYSTEM")
+        || t.starts_with('#')
+        || t.starts_with("Another Claude session")
+        || t.starts_with("The coordinator sent")
+    {
+        return None;
+    }
+    Some(t.chars().take(120).collect())
+}
+
+fn extract_text(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return clean_title(s);
+    }
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(s) = item.get("text").and_then(|t| t.as_str()).and_then(clean_title) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Default)]
+struct TranscriptSummary {
+    title: Option<String>,
+    role: Option<String>,
+    tags: Vec<String>,
+}
+
+fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
+    use std::collections::HashMap;
+    use std::io::BufRead;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (u64, TranscriptSummary)>>> = OnceLock::new();
+    let mtime = modified_ms(path);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_mtime, summary)) = guard.get(path) {
+            if *cached_mtime == mtime {
+                return summary.clone();
+            }
+        }
+    }
+
+    let Ok(file) = std::fs::File::open(path) else { return TranscriptSummary::default() };
+    let mut reader = std::io::BufReader::new(file.take(192 * 1024));
+    let mut line = String::new();
+    let mut custom = None;
+    let mut first_user = None;
+
+    let mut reads = 0usize;
+    let mut edits = 0usize;
+    let mut shell = 0usize;
+    let mut tests = 0usize;
+    let mut subagents = 0usize;
+    let mut ui_hits = 0usize;
+    let mut rust_hits = 0usize;
+    let mut py_hits = 0usize;
+    let mut docs_hits = 0usize;
+    let mut data_hits = 0usize;
+    let mut test_file_hits = 0usize;
+
+    for _ in 0..120 {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        if line.len() <= 32 * 1024 {
+            if is_claude {
+                if line.contains("\"custom-title\"") || line.contains("\"customTitle\"") || line.contains("\"summary\"") {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        for k in ["customTitle", "summary", "title"] {
+                            if let Some(t) = v.get(k).and_then(|x| x.as_str()).and_then(clean_title) {
+                                custom = Some(t);
+                            }
+                        }
+                    }
+                } else if first_user.is_none() && line.contains("\"type\":\"user\"") {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if v.get("type").and_then(|t| t.as_str()) == Some("user") {
+                            first_user = v.get("message").and_then(|m| m.get("content")).and_then(extract_text);
+                        }
+                    }
+                }
+            } else if line.contains("\"thread_name\"") || line.contains("\"user_message\"") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(t) = v.get("payload").and_then(|p| p.get("thread_name")).and_then(|x| x.as_str()).and_then(clean_title) {
+                        custom = Some(t);
+                    } else if first_user.is_none() && v.get("payload").and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("user_message") {
+                        first_user = v.get("payload").and_then(|p| p.get("message")).and_then(|x| x.as_str()).and_then(clean_title);
+                    }
+                }
+            }
+        }
+
+        // Activity & scope fingerprinting from tool calls (0 LLM tokens)
+        if line.contains("\"tool_use\"") || line.contains("\"function_call\"") || line.contains("\"apply_patch\"") {
+            if ["\"Read\"", "\"Grep\"", "\"Glob\"", "\"WebSearch\"", "\"WebFetch\"", "\"read_file\"", "\"grep_search\""]
+                .iter().any(|k| line.contains(k))
+            {
+                reads += 1;
+            }
+            if ["\"Edit\"", "\"Write\"", "\"MultiEdit\"", "\"apply_patch\""].iter().any(|k| line.contains(k)) {
+                edits += 1;
+            }
+            if line.contains("\"Bash\"") || line.contains("\"exec_command\"") {
+                shell += 1;
+                if ["cargo test", "vitest", "jest", "pytest", "npm test", "playwright"].iter().any(|k| line.contains(k)) {
+                    tests += 1;
+                }
+            }
+            if line.contains("\"Agent\"") || line.contains("\"Task\"") || line.contains("\"subagent_type\"") {
+                subagents += 1;
+            }
+            if [".css", ".scss", ".tsx", ".jsx"].iter().any(|ext| line.contains(ext)) {
+                ui_hits += 1;
+            }
+            if line.contains(".rs") {
+                rust_hits += 1;
+            }
+            if line.contains(".py") {
+                py_hits += 1;
+            }
+            if line.contains(".md") {
+                docs_hits += 1;
+            }
+            if line.contains(".sql") || line.contains(".prisma") {
+                data_hits += 1;
+            }
+            if line.contains(".test.") || line.contains(".spec.") || line.contains("/tests/") {
+                test_file_hits += 1;
+            }
+        }
+    }
+
+    let role = if subagents > 0 && edits == 0 {
+        Some("Orchestrator")
+    } else if tests > 0 && edits == 0 {
+        Some("Tester")
+    } else if tests > 0 && edits > 0 {
+        Some("Builder · Tests")
+    } else if edits == 0 && reads >= 3 {
+        Some("Researcher")
+    } else if edits > 0 && ui_hits > rust_hits + py_hits + data_hits {
+        Some("UI Builder")
+    } else if edits > 0 && rust_hits + py_hits + data_hits > ui_hits {
+        Some("Backend")
+    } else if edits > 0 {
+        Some("Builder")
+    } else if shell > 0 {
+        Some("Runner")
+    } else {
+        None
+    }.map(str::to_string);
+
+    let mut scope_counts = [
+        (ui_hits, "UI"),
+        (rust_hits, "Rust"),
+        (test_file_hits + tests, "Tests"),
+        (py_hits, "Python"),
+        (docs_hits, "Docs"),
+        (data_hits, "Data"),
+    ];
+    scope_counts.sort_by(|a, b| b.0.cmp(&a.0));
+    let tags = scope_counts
+        .into_iter()
+        .filter(|(c, _)| *c > 0)
+        .take(2)
+        .map(|(_, label)| label.to_string())
+        .collect();
+
+    let summary = TranscriptSummary { title: custom.or(first_user), role, tags };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), (mtime, summary.clone()));
+    }
+    summary
+}
+
 /// What a launch needs besides the profile.
 #[derive(Default)]
 pub struct Launch<'a> {
@@ -121,6 +309,7 @@ pub trait Adapter: Sync {
 
 pub struct Claude;
 pub struct Codex;
+pub struct Antigravity;
 pub struct Shell;
 
 impl Adapter for Claude {
@@ -176,7 +365,16 @@ impl Adapter for Claude {
             return None;
         }
         let cwd = head_value(path, "cwd", 1024 * 1024)?;
-        Some(Resumable { agent: self.id(), id, cwd, modified: modified_ms(path) })
+        let summary = transcript_summary(path, true);
+        Some(Resumable {
+            agent: self.id(),
+            id,
+            cwd,
+            modified: modified_ms(path),
+            title: summary.title,
+            role: summary.role,
+            tags: summary.tags,
+        })
     }
     fn subagents(&self, home: &Path, transcript: Option<&str>, _conversation: Option<&str>, since: u64) -> Vec<Subagent> {
         transcript.map(|t| crate::harness::subagents(home, t, since)).unwrap_or_default()
@@ -236,10 +434,41 @@ impl Adapter for Codex {
             return None;
         }
         let cwd = head_value(path, "cwd", 8192)?;
-        Some(Resumable { agent: self.id(), id, cwd, modified: modified_ms(path) })
+        let summary = transcript_summary(path, false);
+        Some(Resumable {
+            agent: self.id(),
+            id,
+            cwd,
+            modified: modified_ms(path),
+            title: summary.title,
+            role: summary.role,
+            tags: summary.tags,
+        })
     }
     fn subagents(&self, home: &Path, _transcript: Option<&str>, conversation: Option<&str>, since: u64) -> Vec<Subagent> {
         conversation.map(|c| crate::harness::codex_subagents(home, c, since)).unwrap_or_default()
+    }
+}
+
+impl Adapter for Antigravity {
+    fn id(&self) -> &'static str {
+        "antigravity"
+    }
+    fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
+        let mut cmd = format!("exec {base}");
+        if let Some(id) = l.resume {
+            cmd += &format!(" --conversation {id}");
+        }
+        if let Some(t) = l.task {
+            cmd += &format!(" --prompt-interactive {}", sh(t));
+        }
+        Ok(cmd)
+    }
+    fn interrupt(&self) -> Interrupt {
+        Interrupt::Key("\x1b")
+    }
+    fn takes_note(&self, _home: &Path) -> bool {
+        false
     }
 }
 
@@ -258,7 +487,7 @@ impl Adapter for Shell {
     }
 }
 
-pub const ADAPTERS: &[&dyn Adapter] = &[&Claude, &Codex, &Shell];
+pub const ADAPTERS: &[&dyn Adapter] = &[&Claude, &Codex, &Antigravity, &Shell];
 
 /// The adapter of a profile; anything unknown is treated as a plain shell.
 pub fn adapter(profile: &str) -> &'static dyn Adapter {
@@ -285,7 +514,7 @@ mod tests {
             assert_eq!(adapter(p.id).id(), p.id);
         }
         assert_eq!(adapter("something new").id(), "shell", "an unknown profile is never typed into as an agent");
-        assert!(adapter("claude").is_agent() && adapter("codex").is_agent() && !adapter("shell").is_agent());
+        assert!(adapter("claude").is_agent() && adapter("codex").is_agent() && adapter("antigravity").is_agent() && !adapter("shell").is_agent());
         // Claude reports through hooks from the start; Codex only once a turn has ended
         assert!(adapter("claude").reports_from_start() && !adapter("claude").silent_until_first_turn());
         assert!(adapter("codex").silent_until_first_turn() && !adapter("codex").reports_from_start());
@@ -293,6 +522,9 @@ mod tests {
         assert!(!adapter("codex").at_prompt("Do you trust the files in this folder?"));
         assert!(matches!(adapter("claude").interrupt(), Interrupt::Key("\x1b")));
         assert!(matches!(adapter("codex").interrupt(), Interrupt::Signal("INT")));
+        assert!(matches!(adapter("antigravity").interrupt(), Interrupt::Key("\x1b")));
+        let agy_cmd = command_line(&Launch { profile: "antigravity", task: Some("hi"), ..Default::default() }).unwrap();
+        assert!(agy_cmd.starts_with("exec agy ") && agy_cmd.contains("--prompt-interactive 'hi'"));
     }
 
     #[test]

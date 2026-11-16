@@ -1,3 +1,5 @@
+@layer base, teob-ui;
+
 /* ============================================================
    MDViewer - Main Stylesheet
    IntelliJ IDEA Dark Theme
@@ -155,6 +157,7 @@
   --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.15);
 }
 
+@layer base {
 /* Reset & Base */
 *, *::before, *::after {
   box-sizing: border-box;
@@ -253,6 +256,7 @@ a {
 
 a:hover {
   text-decoration: underline;
+}
 }
 
 /* ============================================================

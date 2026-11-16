@@ -42,7 +42,15 @@ export interface Hosted {
   subagents?: Subagent[];
 }
 /** An earlier Claude or Codex session that can continue in the harness. */
-export interface Resumable { agent: 'claude' | 'codex'; id: string; cwd: string; modified: number }
+export interface Resumable {
+  agent: 'claude' | 'codex';
+  id: string;
+  cwd: string;
+  modified: number;
+  title?: string;
+  role?: string;
+  tags?: string[];
+}
 export interface HarnessStatus {
   runner: { protocol: number; pid: number; version: string; exe: string }; profiles: Profile[]; home: string;
   /** Run once in a terminal to give an outside agent the supervisor tools */
@@ -87,7 +95,7 @@ export function shellQuote(path: string): string {
 function titleName(h: Hosted): string {
   const text = h.title.replace(/^[^\p{L}\p{N}]+/u, '').split(' | ')[0].trim();
   const folder = h.cwd.split('/').filter(Boolean).pop() ?? '';
-  return !text || text === folder || /^(claude code|claude|codex|shell)$/i.test(text) ? '' : text;
+  return !text || text === folder || /^(claude code|claude|codex|antigravity|agy|shell)$/i.test(text) ? '' : text;
 }
 
 export const isSupervisor = (h: Hosted) => h.meta.role === 'supervisor';
@@ -124,7 +132,33 @@ export function pastedImage(data: DataTransfer | null): File | null {
 /** A subagent that wrote to its transcript this recently counts as active. */
 export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;
 
-const KIND: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', shell: 'shell' };
+/**
+ * The list in groups: sessions that exchanged messages or run in the same
+ * folder stand together, in the place of the first of them. A session with
+ * neither is a group of one.
+ */
+export function groupSessions(list: Hosted[]): Hosted[][] {
+  const live = new Map(list.filter(h => !h.exit).map(h => [h.id, h]));
+  const seen = new Set<string>();
+  const groups: Hosted[][] = [];
+  for (const h of list) {
+    if (seen.has(h.id)) continue;
+    const members = new Set<string>([h.id]);
+    const queue = h.exit ? [] : [h];
+    for (let next = queue.shift(); next; next = queue.shift()) {
+      const linked = [...(next.peers ?? []), ...[...live.values()].filter(x => x.cwd === next.cwd).map(x => x.id)];
+      for (const id of linked) {
+        const peer = live.get(id);
+        if (peer && !members.has(id)) { members.add(id); queue.push(peer); }
+      }
+    }
+    members.forEach(id => seen.add(id));
+    groups.push(list.filter(x => members.has(x.id)));
+  }
+  return groups;
+}
+
+const KIND: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', antigravity: 'Antigravity', shell: 'shell' };
 
 /** What to paste into another session so its agent can reach this one. */
 export function sessionReference(h: Hosted): string {
