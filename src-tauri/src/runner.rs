@@ -631,7 +631,7 @@ impl Runner {
             return false;
         }
         let children: Vec<i32> = lock(&self.sessions).values().filter_map(|s| { let info = lock(&s.info); info.pid.filter(|_| info.exit.is_none()).map(|p| p as i32) }).collect();
-        peer.ancestor_among(&children).is_none()
+        matches!(peer.ancestor_among(&children), crate::peer::Ancestry::Outside)
     }
 
     fn handle(self: &Arc<Self>, stream: Stream, accepted_at: u64) -> std::io::Result<()> {
@@ -1130,14 +1130,28 @@ mod tests {
         control.call(json!({"op": "write", "id": "cmd", "data": "echo typed by the service\r\n"})).unwrap();
         read_until(&mut out, "typed by the service");
         control.call(json!({"op": "resize", "id": "cmd", "cols": 120, "rows": 40})).unwrap();
-        // Spawn a descendant process inside the job; split 'DESC' + '=' so cmd echo cannot match.
-        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden powershell '-NoProfile -Command Start-Sleep 30'; Write-Output ('DESC' + '=' + $p.Id + ':OK')\"\r\n"})).unwrap();
-        let output = read_until(&mut out, ":OK");
-        let desc_pid: u32 = output
-            .rsplit_once("DESC=")
-            .and_then(|(_, rest)| rest.split(":OK").next())
-            .and_then(|s| s.trim().parse().ok())
-            .expect("descendant pid in output");
+        // Spawn a descendant process inside the job; wait for a complete PID=<digits> line so cmd echo cannot match.
+        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden powershell '-NoProfile -Command Start-Sleep 30'; Write-Output ('PID' + '=' + $p.Id)\"\r\n"})).unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let desc_pid: u32 = loop {
+            if let Some(pid) = String::from_utf8_lossy(&seen).lines().find_map(|line| {
+                let rest = line.trim().strip_prefix("PID=")?;
+                (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| rest.parse().ok())
+                    .flatten()
+            }) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for PID= line; got {:?}", String::from_utf8_lossy(&seen));
+            match out.read(&mut buf) {
+                Ok(0) => panic!("EOF waiting for PID= line; got {:?}", String::from_utf8_lossy(&seen)),
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("{e}"),
+            }
+        };
         // Open the descendant handle before TERM so an OpenProcess failure cannot be mistaken for exit.
         let desc_proc = unsafe {
             use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;

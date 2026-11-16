@@ -12,6 +12,34 @@ use crate::ipc::Stream;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
+/// Result of walking a peer's process ancestry against live session roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    Found(i32),
+    Outside,
+    Unknown,
+}
+
+/// Pure ancestry walk: `step(pid)` returns `Ok(Some(ppid))`, `Ok(None)` at a
+/// clean OS root, or `Err(())` when a link cannot be opened or fails checks.
+fn walk_ancestry(
+    mut pid: i32,
+    roots: &[i32],
+    mut step: impl FnMut(i32) -> Result<Option<i32>, ()>,
+) -> Ancestry {
+    for _ in 0..32 {
+        if roots.contains(&pid) {
+            return Ancestry::Found(pid);
+        }
+        match step(pid) {
+            Ok(Some(up)) if up > 1 => pid = up,
+            Ok(_) => return Ancestry::Outside,
+            Err(()) => return Ancestry::Unknown,
+        }
+    }
+    Ancestry::Unknown
+}
+
 /// Whether `created` is strictly earlier than `bound` (guards against PID reuse).
 #[cfg(any(windows, test))]
 pub fn created_before(created: u64, bound: u64) -> bool {
@@ -253,22 +281,17 @@ mod win {
             }
         }
 
-        pub fn ancestor_among(&self, roots: &[i32]) -> Option<i32> {
-            let mut cur_pid = self.pid;
+        pub fn ancestor_among(&self, roots: &[i32]) -> super::Ancestry {
             let mut cur_created = self.created;
-            for _ in 0..32 {
-                if roots.contains(&cur_pid) {
-                    return Some(cur_pid);
+            super::walk_ancestry(self.pid, roots, |cur_pid| {
+                if cur_pid <= 4 {
+                    return Ok(None);
                 }
-                let (up_pid, up_handle, up_created) = parent_with_handle(cur_pid, cur_created)?;
-                if up_pid <= 1 {
-                    return None;
-                }
-                cur_pid = up_pid;
+                let (up_pid, _up_handle, up_created) =
+                    parent_with_handle(cur_pid, cur_created).ok_or(())?;
                 cur_created = up_created;
-                let _ = up_handle;
-            }
-            None
+                Ok(Some(up_pid))
+            })
         }
     }
 
@@ -403,8 +426,8 @@ impl Peer {
         self.is_this_program
     }
 
-    pub fn ancestor_among(&self, roots: &[i32]) -> Option<i32> {
-        ancestor_among(self.pid, roots)
+    pub fn ancestor_among(&self, roots: &[i32]) -> Ancestry {
+        walk_ancestry(self.pid, roots, |p| parent(p).ok_or(()).map(Some))
     }
 }
 
@@ -425,7 +448,7 @@ impl Peer {
         self.0.is_this_program()
     }
 
-    pub fn ancestor_among(&self, roots: &[i32]) -> Option<i32> {
+    pub fn ancestor_among(&self, roots: &[i32]) -> Ancestry {
         self.0.ancestor_among(roots)
     }
 }
@@ -477,18 +500,9 @@ pub fn is_this_program(stream: &Stream) -> bool {
 }
 
 /// The first of `roots` that `pid` is, or descends from.
-#[cfg(any(unix, test))]
-pub fn ancestor_among(mut pid: i32, roots: &[i32]) -> Option<i32> {
-    for _ in 0..32 {
-        if roots.contains(&pid) {
-            return Some(pid);
-        }
-        match parent(pid) {
-            Some(up) if up > 1 => pid = up,
-            _ => return None,
-        }
-    }
-    None
+#[cfg(test)]
+pub fn ancestor_among(pid: i32, roots: &[i32]) -> Ancestry {
+    walk_ancestry(pid, roots, |p| parent(p).ok_or(()).map(Some))
 }
 
 #[cfg(test)]
@@ -519,6 +533,20 @@ mod tests {
     }
 
     #[test]
+    fn walk_ancestry_distinguishes_found_outside_and_unknown() {
+        // Reaches root pid 1 -> Outside
+        assert_eq!(walk_ancestry(10, &[99], |p| Ok(Some(if p == 10 { 1 } else { 1 }))), Ancestry::Outside);
+        // Clean OS root (Ok(None)) -> Outside
+        assert_eq!(walk_ancestry(10, &[99], |_| Ok(None)), Ancestry::Outside);
+        // Hits session root -> Found
+        assert_eq!(walk_ancestry(10, &[5], |p| Ok(Some(p - 5))), Ancestry::Found(5));
+        // Unreadable or failed creation-time check -> Unknown (never Outside)
+        assert_eq!(walk_ancestry(10, &[99], |_| Err(())), Ancestry::Unknown);
+        // Exceeds 32-step depth limit -> Unknown
+        assert_eq!(walk_ancestry(100, &[999], |p| Ok(Some(p + 1))), Ancestry::Unknown);
+    }
+
+    #[test]
     fn a_connection_from_this_process_is_recognised() {
         let accepted_at = accept_time();
         let (a, _b) = stream_pair();
@@ -529,12 +557,12 @@ mod tests {
         assert!(peer.same_user());
         assert!(peer.is_this_program());
         let me = std::process::id() as i32;
-        assert_eq!(peer.ancestor_among(&[me]), Some(me));
+        assert_eq!(peer.ancestor_among(&[me]), Ancestry::Found(me));
         assert_eq!(program(me).map(|p| real(&p)), std::env::current_exe().ok().map(|p| real(&p)));
-        assert_eq!(ancestor_among(me, &[me]), Some(me));
+        assert_eq!(ancestor_among(me, &[me]), Ancestry::Found(me));
         let up = parent(me).unwrap();
-        assert_eq!(ancestor_among(me, &[up]), Some(up));
-        assert_eq!(peer.ancestor_among(&[up]), Some(up));
-        assert_eq!(ancestor_among(me, &[]), None);
+        assert_eq!(ancestor_among(me, &[up]), Ancestry::Found(up));
+        assert_eq!(peer.ancestor_among(&[up]), Ancestry::Found(up));
+        assert_eq!(ancestor_among(me, &[]), Ancestry::Outside);
     }
 }

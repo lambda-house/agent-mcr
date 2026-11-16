@@ -1927,9 +1927,13 @@ impl Harness {
             .map(|all| all.iter().filter(|s| s["exit"].is_null()).filter_map(|s| Some((s["pid"].as_i64()? as i32, s))).collect())
             .unwrap_or_default();
         let roots: Vec<i32> = live.iter().map(|(pid, _)| *pid).collect();
-        match peer.ancestor_among(&roots).and_then(|root| live.iter().find(|(pid, _)| *pid == root)) {
-            Some((_, s)) => Caller::Session { id: s["id"].as_str().unwrap_or("").into(), supervisor: s["meta"]["role"] == "supervisor" },
-            None => Caller::Outside,
+        match peer.ancestor_among(&roots) {
+            peer::Ancestry::Found(root) => match live.iter().find(|(pid, _)| *pid == root) {
+                Some((_, s)) => Caller::Session { id: s["id"].as_str().unwrap_or("").into(), supervisor: s["meta"]["role"] == "supervisor" },
+                None => Caller::Unknown,
+            },
+            peer::Ancestry::Outside => Caller::Outside,
+            peer::Ancestry::Unknown => Caller::Unknown,
         }
     }
 
