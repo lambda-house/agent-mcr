@@ -1130,14 +1130,21 @@ mod tests {
         control.call(json!({"op": "write", "id": "cmd", "data": "echo typed by the service\r\n"})).unwrap();
         read_until(&mut out, "typed by the service");
         control.call(json!({"op": "resize", "id": "cmd", "cols": 120, "rows": 40})).unwrap();
-        // Spawn a descendant process inside the job and verify TERM terminates it too.
-        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden powershell '-NoProfile -Command Start-Sleep 30'; Write-Output ('DESC_PID=' + $p.Id + ':END')\"\r\n"})).unwrap();
-        let output = read_until(&mut out, ":END");
+        // Spawn a descendant process inside the job; split 'DESC' + '=' so cmd echo cannot match.
+        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden powershell '-NoProfile -Command Start-Sleep 30'; Write-Output ('DESC' + '=' + $p.Id + ':OK')\"\r\n"})).unwrap();
+        let output = read_until(&mut out, ":OK");
         let desc_pid: u32 = output
-            .rsplit_once("DESC_PID=")
-            .and_then(|(_, rest)| rest.split(':').next())
+            .rsplit_once("DESC=")
+            .and_then(|(_, rest)| rest.split(":OK").next())
             .and_then(|s| s.trim().parse().ok())
             .expect("descendant pid in output");
+        // Open the descendant handle before TERM so an OpenProcess failure cannot be mistaken for exit.
+        let desc_proc = unsafe {
+            use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+            use windows_sys::Win32::System::Threading::OpenProcess;
+            OpenProcess(SYNCHRONIZE, 0, desc_pid)
+        };
+        assert!(!desc_proc.is_null(), "could not open descendant process {desc_pid}");
         assert!(control.call(json!({"op": "forget", "id": "cmd"})).is_err(), "a running session can't be forgotten");
         control.call(json!({"op": "signal", "id": "cmd", "signal": "TERM"})).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1151,17 +1158,12 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Verify the descendant process actually exited.
         unsafe {
             use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-            use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-            use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
-            let proc = OpenProcess(SYNCHRONIZE, 0, desc_pid);
-            if !proc.is_null() {
-                let waited = WaitForSingleObject(proc, 5000);
-                CloseHandle(proc);
-                assert_eq!(waited, WAIT_OBJECT_0, "descendant process {desc_pid} survived TERM");
-            }
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            let waited = WaitForSingleObject(desc_proc, 5000);
+            CloseHandle(desc_proc);
+            assert_eq!(waited, WAIT_OBJECT_0, "descendant process {desc_pid} survived TERM");
         }
         assert!(control.call(json!({"op": "spawn", "argv": [], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
         assert!(control.call(json!({"op": "spawn", "id": "../x", "argv": ["cmd.exe", "/c", "exit 0"], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
