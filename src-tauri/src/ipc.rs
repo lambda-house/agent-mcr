@@ -269,9 +269,10 @@ mod win {
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
         // SAFETY: `sd` is valid from GetNamedSecurityInfoW.
-        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0
-            || (control & SE_DACL_PROTECTED) == 0
-        {
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+            return Err(format!("{}: cannot read security descriptor control", path.display()));
+        }
+        if is_dir && (control & SE_DACL_PROTECTED) == 0 {
             return Err(format!("{}: DACL is not protected", path.display()));
         }
 
@@ -295,6 +296,8 @@ mod win {
         {
             return Err(format!("{}: cannot inspect DACL", path.display()));
         }
+        let inherit_both = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        let mut has_inherit_ace = false;
         for i in 0..info.AceCount {
             let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             // SAFETY: `i < info.AceCount`.
@@ -315,6 +318,12 @@ mod win {
             {
                 return Err(format!("{}: DACL grants access to another principal", path.display()));
             }
+            if (header.AceFlags & inherit_both) == inherit_both {
+                has_inherit_ace = true;
+            }
+        }
+        if is_dir && !has_inherit_ace {
+            return Err(format!("{}: directory DACL missing OI|CI inheritance flags", path.display()));
         }
         Ok(())
     }
@@ -422,6 +431,41 @@ mod win {
                 0
             );
             let mut user_sid = current_user_sid().unwrap();
+            let no_inherit = temp_root("no-inherit");
+            private_dir(&no_inherit).unwrap();
+            let ea_no_inherit = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: FILE_ALL_ACCESS,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: 0,
+                Trustee: TRUSTEE_W {
+                    pMultipleTrustee: std::ptr::null_mut(),
+                    MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_USER,
+                    ptstrName: user_sid.as_mut_ptr().cast(),
+                },
+            };
+            let mut no_inherit_acl: *mut ACL = std::ptr::null_mut();
+            assert_eq!(unsafe { SetEntriesInAclW(1, &ea_no_inherit, std::ptr::null(), &mut no_inherit_acl) }, ERROR_SUCCESS);
+            let _no_inherit_guard = LocalMem(no_inherit_acl.cast());
+            let mut no_inherit_wide = to_wide(&no_inherit);
+            assert_eq!(
+                unsafe {
+                    SetNamedSecurityInfoW(
+                        no_inherit_wide.as_mut_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        no_inherit_acl,
+                        std::ptr::null_mut(),
+                    )
+                },
+                ERROR_SUCCESS
+            );
+            assert!(private_dir(&no_inherit).is_err());
+            let _ = std::fs::remove_dir_all(&no_inherit);
+
             let eas = [
                 EXPLICIT_ACCESS_W {
                     grfAccessPermissions: FILE_ALL_ACCESS,
