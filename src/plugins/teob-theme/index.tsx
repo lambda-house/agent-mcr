@@ -2,18 +2,19 @@ import { createPlugin } from '../sdk';
 import { MotionProvider, ToastProvider } from '@teob/ui';
 import tokensCss from '@teob/ui/tokens.css?inline';
 import bridgeCss from '@teob/ui/bridges/agent-mcr.css?inline';
+import overridesCss from './overrides.css?inline';
 
 export const plugin = createPlugin({
   id: 'teob-theme',
   name: 'TEOB UI Theme',
   version: '1.0.0',
-  description: 'Surface Model design tokens, theme bridge, MotionProvider, and ToastProvider.',
+  description: 'Surface Model design tokens, theme bridge and local overrides, MotionProvider, and ToastProvider.',
   setup(api) {
     let styleEl: HTMLStyleElement | null = null;
     if (typeof document !== 'undefined') {
       styleEl = document.createElement('style');
       styleEl.dataset.plugin = 'teob-theme';
-      styleEl.textContent = `${tokensCss}\n${bridgeCss}`;
+      styleEl.textContent = `${tokensCss}\n${bridgeCss}\n${overridesCss}`;
       document.head.appendChild(styleEl);
       document.documentElement.dataset.teobTheme = 'on';
     }

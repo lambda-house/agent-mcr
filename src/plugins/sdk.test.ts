@@ -10,7 +10,6 @@ describe('plugin system', () => {
 
   it('auto-discovers built-in plugins', () => {
     const ids = pluginRegistry.listPlugins().map(p => p.id);
-    expect(ids).toContain('theme-overrides');
     expect(ids).toContain('teob-theme');
     expect(ids).toContain('command-panel');
     expect(pluginRegistry.getGlobalOverlays().some(o => o.id === 'command-panel')).toBe(true);

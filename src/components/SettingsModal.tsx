@@ -25,7 +25,7 @@ type SettingsCategory =
 
 function pluginIcon(id: string) {
   if (id === 'doc-pane') return <FileText size={16} />;
-  if (id === 'theme-overrides' || id === 'teob-theme') return <Palette size={16} />;
+  if (id === 'teob-theme') return <Palette size={16} />;
   return <Puzzle size={16} />;
 }
 
