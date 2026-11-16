@@ -1,6 +1,6 @@
 # Local session analysis through MCP
 
-MDViewer exposes seven read-only analysis tools from its running desktop process. The stdio bridge connects to the app’s private Unix socket; it never opens SQLite, scans transcripts or launches a second app. macOS and Linux are supported. Windows local transport is not implemented.
+Agent MCR exposes seven read-only analysis tools from its running desktop process. The stdio bridge connects to the app’s private local socket; it never opens SQLite, scans transcripts or launches a second app. The transport uses Unix-domain sockets on macOS, Linux and Windows.
 
 ## Connect
 
@@ -23,9 +23,11 @@ For clients using the common JSON server configuration, substitute the exact exe
 
 Clients with a different configuration format need the same command and argument. The bridge implements MCP initialization, tool discovery, structured results with text compatibility, ping and stdio shutdown. It supports protocol versions 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25. See the MCP [lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) and [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) specifications.
 
-Keep MDViewer open. Access lasts only for this app process. Revoking agent access closes client sockets; revoking session access also clears the index. Closing a bridge does not close the app. All programs running as the same OS user can reach an enabled socket; this is a local-user trust boundary, not individual-client authentication.
+On Windows use the executable path copied from the app, for example `C:\\Users\\name\\AppData\\Local\\Programs\\Agent MCR\\agent-mcr.exe` in JSON; backslashes in JSON must be doubled.
 
-The socket directory is private (0700), with a 0600 socket. Scope is enforced on every tool call. Directory sharing admits only sessions whose entire recorded directory history is inside that directory. This avoids exposing the rest of a session that moved elsewhere. Hierarchy queries cannot expand beyond the shared scope.
+Keep Agent MCR open. Access lasts only for this app process. Revoking agent access closes client sockets; revoking session access also clears the index. Closing a bridge does not close the app. All programs running as the same OS user can reach an enabled socket; this is a local-user trust boundary, not individual-client authentication.
+
+On Unix the socket directory is private (0700), with a 0600 socket. On Windows the config directory has a protected user-only DACL; an unsafe existing directory is refused rather than silently repaired. Scope is enforced on every tool call. Directory sharing admits only sessions whose entire recorded directory history is inside that directory. This avoids exposing the rest of a session that moved elsewhere. Hierarchy queries cannot expand beyond the shared scope.
 
 ## Tools and examples
 

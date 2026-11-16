@@ -21,7 +21,7 @@
 | D9 | Sessions belong to named groups (for example a supervisor's task force). `list_peers` and messaging cover the group by default, and the whole machine only with a flag. The graph collapses by group | 2026-11-13 |
 | D10 | The harness is built in a separate repository: `lambda-house/agent-mcr` (private), with mdviewer-mj's history and mdviewer-mj as `upstream`. MDViewer itself stays a Markdown viewer | 2026-11-13 |
 | D11 | agentgateway is a prerequisite installed with Homebrew, found on `PATH` or configured, with a version check | 2026-11-13 |
-| D12 | Local builds are the gate: `npm run build`, `npm test`, `cargo clippy --all-targets` and `cargo test` on the Mac. GitHub CI stays Linux-only and checks what compiles there; macOS-only modules are behind `cfg(target_os = "macos")` | 2026-11-13 |
+| D12 | The local gate runs `npm run build` and `npm test` for frontend changes; Rust changes run Mac `cargo clippy --all-targets -- -D warnings`, `cargo test` and Windows cross-clippy with `cargo xwin`. Merges and final validation run both. CI runs Linux and Windows checks; platform-specific tests still need execution on their target OS | 2026-11-13 |
 | D13 | Supersedes D4 (operator, 2026-11-16): full Windows support (Windows 10 1903+ and 11, x86_64), with the same features and the same identity checks as macOS (D5a): local IPC restricted to the user, caller identity from the kernel, failing closed. Accepted residual risk (operator, 2026-11-16): Windows AF_UNIX gives only the peer pid, so a connection waiting in the listen backlog whose connector exits and whose pid is reused by a trusted-looking process before `accept` returns passes; as D5a says, same-user programs are not walled off, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` already allows parent spoofing, and macOS has the same pid race. A per-session secret is a possible later hardening. Plan and design choices in `WINDOWS_PORT.md`. The local gate adds `cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets`; CI gets a Windows job | 2026-11-16 |
 
 ### What is built (revision 5)
@@ -68,7 +68,7 @@ Three findings from the live runs changed the design. None of them is reported b
 | D1 signed, and "separate running from view" | One daemon is enough | Runtime units, failure ladder, coupling | Data classes, clipboard, adapters |
 | D2: MCP Tasks | A notice inside the next tool result is the main wake-up signal | Delivery, harness tools | Message store (still receipt-acknowledged) |
 | D3: agentgateway | The app holds Atlassian/TEOB credentials | Connections, trust, runtime units | The Sessions view's ticket links |
-| D4: macOS | Windows and Linux transports | Process identity now uses macOS kernel peer credentials | — |
+| D4: macOS only | Windows support added by D13 | Unix-domain transport, Windows peer identity and private ACLs | Linux remains separately gated |
 | New client: super-supervisor | — | New surface, trust, ladder rows, map rows R12–R15 | Everything else |
 
 ### Facts the revision depends on (checked 2026-11-13)
