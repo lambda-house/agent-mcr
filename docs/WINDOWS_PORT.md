@@ -54,7 +54,7 @@ Claude hook commands use `"<exe with forward slashes>" --harness-hook <Event>`, 
 
 ## Team and workflow (operator decision, 2026-11-16)
 
-Update: Codex usage ran out; the Codex reviewer and executor B ended after B's track was complete (branches converged at fe6f81b). Review continues with "Windows port: reviewer 2" (Antigravity); executor A takes any remaining follow-ups, CI fixes and R3.
+Update: Codex usage ran out; the Codex reviewer and executor B ended after B's track was complete (branches converged at fe6f81b). Review continues with "Windows port: reviewer 2" (Antigravity); executor A takes any remaining follow-ups, CI fixes and R3. From a74f2db on, A pushes `windows-port` to the `ci` remote itself (never `origin`), watches the runs with `gh` and reports results to the planner; the Supervisor only observes.
 
 - Executor A ("Windows port: executor", Antigravity): worktree `agent-mcr-windows`, branch `windows-port`. Track: W2–W7 (W7 moved back from B by the operator once A was free) and R1–R3, and the final merge.
 - Executor B ("Windows port: executor B", Codex): worktree `agent-mcr-windows-b`, branch `windows-port-b` (from 9116835). Track: W8, W9, W10, W11 (moved forward by the operator), W12.
