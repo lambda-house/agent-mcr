@@ -65,6 +65,24 @@ Claude hook commands use `"<exe with forward slashes>" --harness-hook <Event>`, 
 | W11 | CI: a `windows-latest` job running `npm ci`, `npm run build`, `npm test`, `cargo clippy --locked --all-targets`, `cargo test --locked` | `.github/workflows/ci.yml` | YAML reviewed; the job mirrors the Linux job. Its first green run is on the manual list |
 | W12 | Docs: CLAUDE.md (platform notes, transport, launch, gate), `SESSION_ANALYSIS_MCP.md`, `AGENT_HARNESS_DESIGN.md` (D12 amended for the Windows gate, "What differs" row for D4), README build steps for Windows | docs | Reviewer reads them against the code |
 
+## Runtime tests under Wine (Rum)
+
+Real Windows is not available here. The app is run under Rum 2.0.0-beta.1 (`/Applications/Rum.app`, a Wine wrapper). CLI: `/Applications/Rum.app/Contents/Resources/RumCmd` (not on `PATH`): `list`, `create <name>`, `run <bottle> <path.exe> [args]`, `shellenv <bottle>` (env exports to run `wine` directly, e.g. with `WINEDEBUG`). Use a dedicated bottle `agent-mcr-test`; leave `Default` alone.
+
+Build with `cargo xwin build --target x86_64-pc-windows-msvc` (x86_64 only: Wine on Apple Silicon runs x64 through Rosetta). Tauri needs WebView2 in the bottle; try the Evergreen standalone or the fixed-version runtime.
+
+Wine differs from Windows (ConPTY, AF_UNIX and its `SIO_AF_UNIX_GETPEERPID`, process tokens, WebView2). A failure under Wine is not proof of a code bug: record each one with the exact console/log output in "Wine findings" below, decide whether it is ours, and if not, keep the case on the real-Windows list. Fail-closed identity checks refusing under Wine are expected if Wine lacks the ioctl; they must not be loosened for Wine.
+
+| Id | After | Goal | Acceptance |
+|---|---|---|---|
+| R1 | W1 | Smoke run: bottle `agent-mcr-test`, WebView2 installed, debug build started with `RumCmd run`, console captured | The window opens and the Documents view renders, or the exact errors are in Wine findings with a verdict (ours / Wine / WebView2) |
+| R2 | W7 | Harness under Wine: runner and service start detached, a shell and a Claude or Codex session in Live (if the CLIs install in the bottle), `--harness-tool list_peers` from outside refused, session MCP connects | Each step's result and output in Wine findings |
+| R3 | W10 | The NSIS installer installs and the installed app starts in a clean bottle | Result in Wine findings |
+
+### Wine findings
+
+None yet.
+
 ## Manual test list (needs a real Windows 10 1903+ / 11 machine)
 
 1. Install with the NSIS installer as a normal user; app starts; WebView2 present; no SmartScreen bypass needed beyond "Run anyway".
