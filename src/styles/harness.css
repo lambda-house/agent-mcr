@@ -302,7 +302,7 @@
 .hs-shells li.quiet .hs-item-text strong, .hs-shells li.stopped .hs-item-text strong { color: var(--sc-muted); }
 
 /* Add a folder: one line above the sections */
-.hs-add { display: flex; gap: 5px; padding: 8px 8px 6px; }
+.hs-add { display: flex; justify-content: flex-end; padding: 8px 8px 0; margin-bottom: -6px; }
 .session-cockpit .hs-add button { color: var(--sc-muted); }
 /* A folder: a bracket on the left and a line on top, with the folder's path set into the line */
 .hs-list li.hs-dir, .ss-dir { display: block; margin: 14px 0 6px 2px; padding: 0 0 2px 3px; border-left: 2px solid var(--sc-border); border-top: 1px solid var(--sc-border); border-radius: 6px 0 0 6px; min-width: 0; max-width: none; }
