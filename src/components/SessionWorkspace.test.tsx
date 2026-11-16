@@ -35,8 +35,4 @@ describe('Sessions workspace', () => {
     vi.mocked(sessionApi.access).mockResolvedValue(false);
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>));await flush();expect(host.textContent).toContain('Enable session access');expect(sessionApi.snapshot).not.toHaveBeenCalled();
   });
-  it('shows control failures without claiming delivery', async () => {
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>));await flush();await act(async () => button('direct').click());vi.mocked(sessionApi.control).mockRejectedValue('Daemon unavailable');
-    await act(async () => button('inspect live').click());expect(host.textContent).toContain('Daemon unavailable');expect(host.textContent).not.toContain('Instruction accepted');
-  });
 });

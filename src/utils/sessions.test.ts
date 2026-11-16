@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { family, origin, within, matchesActivity, sessionTree, directoryTree, matchesSession, resumeCommand, sumUsage, totalTokens, type Session } from './sessions';
+import { family, origin, within, matchesActivity, sessionTree, directoryTree, matchesSession, sumUsage, totalTokens, type Session } from './sessions';
 const s = (id: string, parentId: string | null = null, provider: 'codex' | 'claude' = 'codex') => ({ id, parentId, provider, cwd: '/work/it\'s repo', title: 'Fix CORE-123', name: '', model: 'model-a', tickets: ['CORE-123'], tools: { shell: 1 }, usage: { input: 100, cached: 70, cacheWrite: 5, output: 20, reasoning: 6 } } as unknown as Session);
 describe('session landscape', () => {
   it('does not add cached and reasoning tokens twice', () => { expect(totalTokens(sumUsage([s('1'),s('2')]))).toBe(240); });
@@ -9,10 +9,6 @@ describe('session landscape', () => {
     expect(family([s('a','b'),s('b','a')],s('a','b'))).toHaveLength(2);
   });
   it('searches tickets, tools and models', () => { expect(matchesSession(s('1'),'core-123')).toBe(true); expect(matchesSession(s('1'),'shell')).toBe(true); expect(matchesSession(s('1'),'other')).toBe(false); });
-  it('quotes resume commands and resumes the parent for Claude subagents', () => {
-    expect(resumeCommand(s('id'))).toBe("cd '/work/it'\\''s repo' && codex resume 'id'");
-    expect(resumeCommand(s('child','parent','claude'))).toContain("claude --resume 'parent'");
-  });
 });
 
 describe('hierarchy, location and activity', () => {

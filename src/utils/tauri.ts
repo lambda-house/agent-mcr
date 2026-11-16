@@ -1,29 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useStore, type FileNode } from '../store';
 
 /**
  * Check if running inside Tauri environment
  * Tauri 2.0 uses __TAURI_INTERNALS__ instead of __TAURI__
  */
 export const isTauri = (): boolean => '__TAURI_INTERNALS__' in window;
-
-/**
- * The backend only serves folders and files the user opened (folder picker,
- * drag & drop, "Open with"). A session saved by a version without that list
- * is carried over once, before the first file access.
- */
-let sessionAccess: Promise<void> | null = null;
-
-function adoptSessionAccess(): Promise<void> {
-  if (!sessionAccess) {
-    const { directories, tabs, workspaces } = useStore.getState();
-    sessionAccess = invoke<void>('adopt_session_access', {
-      directories: [...directories, ...workspaces.flatMap((w) => w.directories)],
-      files: [...tabs.map((t) => t.path), ...workspaces.flatMap((w) => w.tabs)],
-    }).catch((error) => console.error('Failed to carry over session access:', error));
-  }
-  return sessionAccess;
-}
 
 /**
  * Open native directory picker dialog. The backend adds the chosen folder to
@@ -40,46 +21,6 @@ export async function pickDirectory(): Promise<string | null> {
 }
 
 /**
- * Open the native file picker for documents (several can be chosen). The
- * backend adds the chosen files to the files the app may read.
- * @returns Selected file paths, empty if cancelled
- */
-export async function pickFiles(): Promise<string[]> {
-  if (!isTauri()) {
-    console.warn('pickFiles called outside Tauri environment');
-    return [];
-  }
-
-  return invoke<string[]>('pick_files');
-}
-
-/**
- * Scan directories for files using Tauri backend. Lists markdown files, plus
- * other text files when the "show text files" setting is on.
- * @param paths Array of directory paths to scan
- * @returns Array of FileNode trees
- */
-export async function scanDirectories(paths: string[]): Promise<FileNode[]> {
-  if (!isTauri()) {
-    console.warn('scanDirectories called outside Tauri environment');
-    return [];
-  }
-
-  await adoptSessionAccess();
-  return invoke<FileNode[]>('scan_directories', {
-    paths,
-    includeTextFiles: useStore.getState().showTextFiles,
-  });
-}
-
-/** List agent documents inside folders the user opened, without enabling global agent access. */
-export async function scanProjectAgentFiles(paths: string[]): Promise<AgentEntry[]> {
-  if (!isTauri() || paths.length === 0) return [];
-  await adoptSessionAccess();
-  return invoke<AgentEntry[]>('scan_project_agent_files', { paths });
-}
-
-/**
  * Read file contents using Tauri backend
  * @param path File path to read
  * @returns File contents as string
@@ -90,7 +31,6 @@ export async function readFile(path: string): Promise<string> {
     return `# File Not Available\n\nFile reading requires the Tauri desktop app.`;
   }
 
-  await adoptSessionAccess();
   return invoke<string>('read_file', { path });
 }
 
@@ -229,84 +169,6 @@ export async function openExternal(url: string): Promise<void> {
 }
 
 /**
- * Start watching directories for changes
- * @param paths Array of directory paths to watch
- */
-export async function startWatching(paths: string[]): Promise<void> {
-  if (!isTauri()) {
-    console.warn('startWatching called outside Tauri environment');
-    return;
-  }
-
-  await adoptSessionAccess();
-  return invoke('start_watching', { paths });
-}
-
-/**
- * Stop watching directories
- */
-export async function stopWatching(): Promise<void> {
-  if (!isTauri()) {
-    console.warn('stopWatching called outside Tauri environment');
-    return;
-  }
-
-  return invoke('stop_watching');
-}
-
-/**
- * Get the path to the history file
- * @returns Path to history.md
- */
-export async function getHistoryPath(): Promise<string> {
-  if (!isTauri()) {
-    console.warn('getHistoryPath called outside Tauri environment');
-    return '';
-  }
-
-  return invoke<string>('get_history_path');
-}
-
-/**
- * Read history file contents
- * @returns History markdown content
- */
-export async function readHistory(): Promise<string> {
-  if (!isTauri()) {
-    console.warn('readHistory called outside Tauri environment');
-    return '# History\n\nHistory requires the Tauri desktop app.';
-  }
-
-  return invoke<string>('read_history');
-}
-
-/**
- * Append an entry to the history file
- * @param filePath Full path to the file
- * @param fileName Display name of the file
- */
-export async function appendToHistory(filePath: string, fileName: string): Promise<void> {
-  if (!isTauri()) {
-    console.warn('appendToHistory called outside Tauri environment');
-    return;
-  }
-
-  return invoke('append_to_history', { filePath, fileName });
-}
-
-/**
- * Clear the history file
- */
-export async function clearHistory(): Promise<void> {
-  if (!isTauri()) {
-    console.warn('clearHistory called outside Tauri environment');
-    return;
-  }
-
-  return invoke('clear_history');
-}
-
-/**
  * File/directory metadata for a path
  */
 export interface PathInfo {
@@ -325,67 +187,11 @@ export async function getFileInfo(path: string): Promise<PathInfo> {
     throw new Error('getFileInfo requires the Tauri desktop app');
   }
 
-  await adoptSessionAccess();
   return invoke<PathInfo>('get_file_info', { path });
 }
 
 /** Payload of a native drag & drop event. */
 export type DropHandler = (paths: string[]) => void;
-
-/**
- * Listen for files/folders dropped onto the window.
- *
- * Uses Tauri's native drag & drop events rather than the HTML5 API, because
- * only the native event carries real file system paths.
- *
- * @returns unlisten function (no-op outside Tauri)
- */
-export async function onFileDrop(handlers: {
-  onDrop: DropHandler;
-  onEnter?: () => void;
-  onLeave?: () => void;
-}): Promise<() => void> {
-  if (!isTauri()) {
-    return () => {};
-  }
-
-  const { getCurrentWebview } = await import('@tauri-apps/api/webview');
-
-  return getCurrentWebview().onDragDropEvent((event) => {
-    const payload = event.payload;
-    if (payload.type === 'enter' || payload.type === 'over') {
-      handlers.onEnter?.();
-    } else if (payload.type === 'leave') {
-      handlers.onLeave?.();
-    } else if (payload.type === 'drop') {
-      handlers.onLeave?.();
-      handlers.onDrop(payload.paths);
-    }
-  });
-}
-
-/**
- * Files/folders the app was launched with ("Open with", `mdviewer file.md`).
- * Returns them once - later calls get an empty list.
- */
-export async function takeLaunchPaths(): Promise<string[]> {
-  if (!isTauri()) return [];
-
-  return invoke<string[]>('take_launch_paths');
-}
-
-/**
- * Listen for paths forwarded by a second launch while this instance is running.
- * @returns unlisten function (no-op outside Tauri)
- */
-export async function onOpenPaths(handler: (paths: string[]) => void): Promise<() => void> {
-  if (!isTauri()) {
-    return () => {};
-  }
-
-  const { listen } = await import('@tauri-apps/api/event');
-  return listen<string[]>('open-paths', (event) => handler(event.payload));
-}
 
 /** Receive a command selected from the native application menu. */
 export async function onMenuCommand(handler: (id: string) => void): Promise<() => void> {
@@ -426,6 +232,8 @@ export interface AgentEntry {
   /** What it belongs to: an agent ("Claude Code"), a project folder or a plugin. */
   group: string;
   scope: 'user' | 'project' | 'plugin';
+  /** The session folder it belongs to; null for the agents' own files. */
+  folder: string | null;
   /** Last change, ms since the epoch. */
   modified: number;
   /** Changed since the user last read it. */
@@ -437,6 +245,8 @@ export interface AgentEntry {
 export interface AgentWorkspace {
   enabled: boolean;
   entries: AgentEntry[];
+  /** The session folders that were looked through, most recent first. */
+  folders: string[];
   /** Changes arrive as `agent-files-changed` events; otherwise poll. */
   watching: boolean;
 }
@@ -449,7 +259,7 @@ export interface ReadSnapshot {
 }
 
 export async function getAgentWorkspace(): Promise<AgentWorkspace> {
-  if (!isTauri()) return { enabled: false, entries: [], watching: false };
+  if (!isTauri()) return { enabled: false, entries: [], folders: [], watching: false };
   return invoke('agent_workspace');
 }
 

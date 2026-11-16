@@ -1,19 +1,8 @@
-import React, { useEffect, useCallback, useMemo, useState, useRef } from 'react';
-import { Upload } from 'lucide-react';
+import React, { useEffect, useCallback, useMemo, useState } from 'react';
 import { useStore, PANEL_MIN_WIDTH, TOC_MIN_WIDTH, type Heading, type RestoredDocument } from './store';
 import {
-  scanDirectories,
   isTauri,
   readFile,
-  startWatching,
-  stopWatching,
-  pickDirectory,
-  pickFiles,
-  appendToHistory,
-  getFileInfo,
-  onFileDrop,
-  takeLaunchPaths,
-  onOpenPaths,
   onMenuCommand,
   openExternal,
   followLocalLink,
@@ -21,17 +10,15 @@ import {
   onAgentFilesChanged,
 } from './utils/tauri';
 import { buildMenu, menuCommands, commandForKey } from './utils/commands';
-import { isViewableFile, getFileName, normalizeDirPath, findFirstMarkdown, resolveLinkPath } from './utils/files';
+import { getFileName, resolveLinkPath } from './utils/files';
 import Toolbar from './components/Toolbar';
-import FilePanel from './components/FilePanel';
+import AgentPanel from './components/AgentPanel';
 import DocumentPanel from './components/DocumentPanel';
 import TocSidebar from './components/TocSidebar';
 import Resizer from './components/Resizer';
 import StatusBar from './components/StatusBar';
 import SettingsModal from './components/SettingsModal';
 import SaveAllDialog from './components/SaveAllDialog';
-import HistoryPanel from './components/HistoryPanel';
-import SearchPanel from './components/SearchPanel';
 import { agentFilesWatched, refreshAgentWorkspace } from './utils/agent';
 import UpdateBanner from './components/UpdateBanner';
 import SessionWorkspace from './components/SessionWorkspace';
@@ -41,8 +28,11 @@ import { documentWindowPath } from './utils/documentWindow';
 // Main App Component
 // ============================================================
 
-/** Quiet time after the last file change event before the tree is rescanned. */
-const RESCAN_DEBOUNCE = 300;
+// The window has two surfaces: Sessions (Live and Search), and Documents,
+// which shows the agents' Markdown: instructions, rules, memory, plans and
+// skills, by the folder their sessions work in. A memory reader window
+// (`documentWindowPath`) is the Documents surface with one document.
+
 /** Quiet time after the last agent file change before agent files are rescanned. */
 const AGENT_CHANGE_DEBOUNCE = 500;
 /** How often agent files are rescanned when they can't be watched (ms). */
@@ -83,17 +73,11 @@ const App: React.FC = () => {
   const panelWidth = useStore((s) => s.panelWidth);
   const tocWidth = useStore((s) => s.tocWidth);
   const tocVisible = useStore((s) => s.tocVisible);
-  const historyVisible = useStore((s) => s.historyVisible);
-  const agentVisible = useStore((s) => s.agentVisible);
-  const toggleAgentVisible = useStore((s) => s.toggleAgentVisible);
   const hasAgentTabs = useStore((s) => s.tabs.some((t) => s.agentEntries.some((e) => e.path === t.path)));
-  const openedDirectories = useStore((s) => s.directories);
 
   const setPanelWidth = useStore((s) => s.setPanelWidth);
   const setTocWidth = useStore((s) => s.setTocWidth);
   const toggleTocVisible = useStore((s) => s.toggleTocVisible);
-  const toggleHistoryVisible = useStore((s) => s.toggleHistoryVisible);
-  const setFiles = useStore((s) => s.setFiles);
   const activateTabByIndex = useStore((s) => s.activateTabByIndex);
   const navigateBack = useStore((s) => s.navigateBack);
   const navigateForward = useStore((s) => s.navigateForward);
@@ -102,37 +86,15 @@ const App: React.FC = () => {
   const zoomPanel = useStore((s) => s.zoomPanel);
   const reopenClosedTab = useStore((s) => s.reopenClosedTab);
   const openDocument = useStore((s) => s.openDocument);
-  const addDirectory = useStore((s) => s.addDirectory);
   const restoreSession = useStore((s) => s.restoreSession);
   const sessionRestored = useStore((s) => s.sessionRestored);
-  
+
   const [headings, setHeadings] = useState<Heading[]>([]);
-  const filePanelVisible = useStore((s) => s.filePanelVisible);
+  // A memory reader window shows its one document and no list
+  const filePanelVisible = useStore((s) => s.filePanelVisible) && !documentWindowPath;
   const setFilePanelVisible = useStore((s) => s.setFilePanelVisible);
-  const setHistoryVisible = useStore((s) => s.setHistoryVisible);
   const setTocVisible = useStore((s) => s.setTocVisible);
-  const searchVisible = useStore((s) => s.searchVisible);
-  const setSearchVisible = useStore((s) => s.setSearchVisible);
-  const openSearch = useStore((s) => s.openSearch);
-  const revealPath = useStore((s) => s.revealPath);
-  const showTextFiles = useStore((s) => s.showTextFiles);
-  const [isDropTarget, setIsDropTarget] = useState(false);
-  
-  // Load persisted directories on startup
-  useEffect(() => {
-    const loadDirectories = async () => {
-      const { directories } = useStore.getState();
-      if (directories.length > 0 && isTauri()) {
-        try {
-          const files = await scanDirectories(directories);
-          setFiles(files);
-        } catch (error) {
-          console.error('Failed to scan directories:', error);
-        }
-      }
-    };
-    loadDirectories();
-  }, [setFiles]);
+  const documentsShown = !sessionsVisible;
 
   // Restore the previous session: the persisted tabs only carry paths, so the
   // documents behind them have to be re-read before the tabs become usable.
@@ -168,141 +130,12 @@ const App: React.FC = () => {
     };
   }, [restoreSession]);
 
-  // Auto-refresh: Start/stop file watching based on settings
-  const watcherCleanup = useRef<(() => void) | null>(null);
-
-  useEffect(() => {
-    // The main window owns the process-wide directory watcher.
-    if (documentWindowPath) return;
-    const setupWatcher = async () => {
-      const { directories, autoRefresh } = useStore.getState();
-
-      if (!isTauri() || directories.length === 0) return;
-
-      if (autoRefresh) {
-        try {
-          // Start watching directories
-          await startWatching(directories);
-
-          // Listen for file change events from Tauri
-          const { listen } = await import('@tauri-apps/api/event');
-          // Events come one per file (a checkout or build sends hundreds):
-          // rescan once they have been quiet for a moment, and never run two
-          // scans at the same time
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          let scanning = false;
-          let rescanAgain = false;
-          // Names of the files changed since the last scan
-          const changedNames = new Set<string>();
-
-          const rescan = async () => {
-            if (scanning) {
-              rescanAgain = true;
-              return;
-            }
-            const { directories: currentDirs } = useStore.getState();
-            if (currentDirs.length === 0) return;
-
-            scanning = true;
-            const names = [...changedNames];
-            changedNames.clear();
-            try {
-              setFiles(await scanDirectories(currentDirs));
-              await reloadChangedDocuments(names);
-            } catch (error) {
-              console.error('Failed to refresh after file change:', error);
-            } finally {
-              scanning = false;
-              if (rescanAgain) {
-                rescanAgain = false;
-                scheduleRescan();
-              }
-            }
-          };
-
-          const scheduleRescan = () => {
-            clearTimeout(timer);
-            timer = setTimeout(rescan, RESCAN_DEBOUNCE);
-          };
-
-          const unlisten = await listen<{ path: string }>('files-changed', (event) => {
-            changedNames.add(getFileName(event.payload.path));
-            scheduleRescan();
-          });
-
-          watcherCleanup.current = () => {
-            clearTimeout(timer);
-            unlisten();
-            stopWatching().catch(console.error);
-          };
-        } catch (error) {
-          console.error('Failed to start file watcher:', error);
-        }
-      } else {
-        // Stop watching if auto-refresh is disabled
-        if (watcherCleanup.current) {
-          watcherCleanup.current();
-          watcherCleanup.current = null;
-        }
-        await stopWatching().catch(console.error);
-      }
-    };
-
-    setupWatcher();
-
-    // Subscribe to store changes for autoRefresh and directories
-    const unsubscribe = useStore.subscribe(
-      (state, prevState) => {
-        if (state.autoRefresh !== prevState.autoRefresh ||
-            state.directories !== prevState.directories) {
-          setupWatcher();
-        }
-      }
-    );
-
-    return () => {
-      unsubscribe();
-      if (watcherCleanup.current) {
-        watcherCleanup.current();
-      }
-    };
-  }, [setFiles]);
-  
-  // Rescan every configured directory and refresh the tree
-  const refreshFileTree = useCallback(async () => {
-    const { directories } = useStore.getState();
-    if (!isTauri() || directories.length === 0) return;
-    try {
-      const files = await scanDirectories(directories);
-      setFiles(files);
-    } catch (error) {
-      console.error('Failed to scan directories:', error);
-    }
-  }, [setFiles]);
-  
-  // Search and history temporarily replace the Files panel. Global agent files
-  // are a root inside Files and keep their own visibility when the panel hides.
-  const leftPanelVisible = searchVisible || historyVisible || filePanelVisible;
-  const setLeftPanelVisible = useCallback((visible: boolean) => {
-    if (visible) {
-      if (!historyVisible && !searchVisible) setFilePanelVisible(true);
-    } else {
-      setSearchVisible(false);
-      setHistoryVisible(false);
-      setFilePanelVisible(false);
-    }
-  }, [historyVisible, searchVisible, setFilePanelVisible, setHistoryVisible, setSearchVisible]);
-
-  // Agent files change while agents work: rescan while the global root or an
-  // agent file is open, when the backend reports a change and when the window
-  // gets focus. Each scan also makes the backend watch newly opened folders.
+  // Agent files change while agents work: rescan while their list or one of
+  // them is on screen, when the backend reports a change and when the window
+  // gets focus. Each scan also makes the backend look for new session folders.
   useEffect(() => {
     if (!isTauri() || documentWindowPath) return;
-    if (!agentVisible && !hasAgentTabs) {
-      // Still learn which documents are agent files (for "what changed")
-      refreshAgentWorkspace().catch(() => {});
-      return;
-    }
+    if (!documentsShown || (!filePanelVisible && !hasAgentTabs)) return;
     const refresh = () => {
       if (document.visibilityState === 'visible') {
         refreshAgentWorkspace().catch((error) => console.error('Failed to refresh agent files:', error));
@@ -327,18 +160,9 @@ const App: React.FC = () => {
       unlisten.then((fn) => fn()).catch(() => {});
       window.removeEventListener('focus', refresh);
     };
-  }, [agentVisible, hasAgentTabs, openedDirectories]);
-  
-  // Rescan when the "show text files" setting changes (not on startup - the
-  // directories are scanned once above)
-  const showTextFilesRef = useRef(showTextFiles);
-  useEffect(() => {
-    if (showTextFilesRef.current === showTextFiles) return;
-    showTextFilesRef.current = showTextFiles;
-    refreshFileTree();
-  }, [showTextFiles, refreshFileTree]);
+  }, [documentsShown, filePanelVisible, hasAgentTabs]);
 
-  // Open a file by path (shared by the file tree, history and drops)
+  // Open a document by path (links, reopened tabs, the memory reader window)
   const openPath = useCallback(async (path: string, options?: { preview?: boolean }) => {
     const content = await readFile(path);
     const result = openDocument(path, content, options);
@@ -346,12 +170,8 @@ const App: React.FC = () => {
     if (!result.success) {
       throw new Error(result.error || 'Failed to open document');
     }
-
-    appendToHistory(path, getFileName(path)).catch((err) => {
-      console.error('Failed to log to history:', err);
-    });
   }, [openDocument]);
-  
+
   // A native memory window opens only its requested document, independently of
   // the main window's launch queue and saved tabs.
   useEffect(() => {
@@ -425,168 +245,20 @@ const App: React.FC = () => {
     return () => document.removeEventListener('click', handleClick);
   }, [openPath]);
 
-  /**
-   * Add directories to the tree (merging overlaps, see `addDirectory`), then
-   * rescan. A newly added directory is expanded down to its first markdown
-   * file, which opens in the preview tab.
-   */
-  const addDirectories = useCallback(async (dirs: string[]) => {
-    const added = dirs
-      .map((dir) => ({ dir, result: addDirectory(dir) }))
-      .filter(({ result }) => !result.containedIn)
-      .map(({ dir }) => normalizeDirPath(dir));
-    // A folder can already be open, and another panel may be covering Files.
-    // Always bring the requested folder into view after the picker closes.
-    setSearchVisible(false);
-    setHistoryVisible(false);
-    setFilePanelVisible(true);
-    useStore.getState().setFilterQuery('');
-    revealPath(normalizeDirPath(dirs[dirs.length - 1]));
-    if (added.length === 0) return;
-
-    const files = await scanDirectories(useStore.getState().directories);
-    setFiles(files);
-
-    const root = useStore.getState().files.find((node) => node.path === added[added.length - 1]);
-    const first = root && findFirstMarkdown(root);
-    if (!first) return;
-
-    revealPath(first.file.path);
-    try {
-      await openPath(first.file.path, { preview: true });
-    } catch (error) {
-      console.error('Failed to open first markdown file:', error);
-    }
-  }, [addDirectory, setFiles, setSearchVisible, setHistoryVisible, setFilePanelVisible, revealPath, openPath]);
-
-  // Handle add directory - opens native picker
-  const handleAddDirectory = useCallback(async () => {
-    try {
-      const dir = await pickDirectory();
-      if (dir) await addDirectories([dir]);
-    } catch (error) {
-      console.error('Failed to open folder:', error);
-      alert(`Could not open folder:\n${errorText(error)}`);
-    }
-  }, [addDirectories]);
-  
-  // ============================================================
-  // Drag & Drop (native Tauri event - carries real file paths)
-  // ============================================================
-  
-  const handleDroppedPaths = useCallback(async (paths: string[]) => {
-    const errors: string[] = [];
-    const dirs: string[] = [];
-
-    for (const path of paths) {
-      try {
-        const info = await getFileInfo(path);
-        if (info.isDirectory) {
-          dirs.push(path);
-        } else if (isViewableFile(path)) {
-          await openPath(path);
-        } else {
-          errors.push(`${getFileName(path)} is not a markdown or text file`);
-        }
-      } catch (error) {
-        console.error('Failed to handle dropped path:', path, error);
-        errors.push(`${getFileName(path)}: ${errorText(error)}`);
-      }
-    }
-
-    if (dirs.length > 0) {
-      try {
-        await addDirectories(dirs);
-      } catch (error) {
-        errors.push(`Folders: ${errorText(error)}`);
-      }
-    }
-
-    if (errors.length > 0) {
-      alert(`Could not open:\n${errors.join('\n')}`);
-    }
-  }, [openPath, addDirectories]);
-
-  // Handle open file - opens native picker; the chosen files open like dropped ones
-  const handleOpenFile = useCallback(async () => {
-    try {
-      const paths = await pickFiles();
-      if (paths.length > 0) {
-        await handleDroppedPaths(paths);
-      }
-    } catch (error) {
-      console.error('Failed to pick files:', error);
-      alert(`Could not open the file dialog:\n${errorText(error)}`);
-    }
-  }, [handleDroppedPaths]);
-  
-  useEffect(() => {
-    if (!isTauri()) return;
-
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-
-    onFileDrop({
-      onEnter: () => setIsDropTarget(true),
-      onLeave: () => setIsDropTarget(false),
-      onDrop: handleDroppedPaths,
-    })
-      .then((fn) => {
-        if (disposed) fn();
-        else unlisten = fn;
-      })
-      .catch((error) => console.error('Failed to listen for file drops:', error));
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [handleDroppedPaths]);
-
-  // Listen before draining startup paths so Finder / a second instance cannot
-  // deliver a file between the two steps and lose its event.
-  useEffect(() => {
-    if (!sessionRestored || documentWindowPath) return;
-
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-
-    onOpenPaths(handleDroppedPaths)
-      .then(async (fn) => {
-        if (disposed) { fn(); return; }
-        unlisten = fn;
-        const paths = await takeLaunchPaths();
-        if (!disposed && paths.length > 0) await handleDroppedPaths(paths);
-      })
-      .catch((error) => console.error('Failed to listen for opened paths:', error));
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [sessionRestored, handleDroppedPaths]);
-  
   // Handle headings change from document
   const handleHeadingsChange = useCallback((newHeadings: Heading[]) => {
     setHeadings(newHeadings);
   }, []);
-  
+
   // Handle TOC toggle
   const handleToggleToc = useCallback(() => {
     toggleTocVisible();
   }, [toggleTocVisible]);
-  
-  // Toggle file panel
+
   const handleToggleFilePanel = useCallback(() => {
-    const state = useStore.getState();
-    setFilePanelVisible(state.searchVisible || state.historyVisible || !state.filePanelVisible);
+    setFilePanelVisible(!useStore.getState().filePanelVisible);
   }, [setFilePanelVisible]);
 
-  // Toggle history panel
-  const handleToggleHistory = useCallback(() => {
-    toggleHistoryVisible();
-  }, [toggleHistoryVisible]);
-  
   // Reopen closed tab
   const handleReopenClosedTab = useCallback(async () => {
     const closedTab = reopenClosedTab();
@@ -605,14 +277,7 @@ const App: React.FC = () => {
   
   // The commands, with their shortcuts, are defined in utils/commands.ts;
   // the toolbar's menu shows the same list
-  const menu = useMemo(
-    () => buildMenu({
-      openFile: handleOpenFile,
-      openFolder: handleAddDirectory,
-      reopenClosedTab: handleReopenClosedTab,
-    }),
-    [handleOpenFile, handleAddDirectory, handleReopenClosedTab]
-  );
+  const menu = useMemo(() => buildMenu({ reopenClosedTab: handleReopenClosedTab }), [handleReopenClosedTab]);
 
   // The system menu uses the same commands as the toolbar menu.
   useEffect(() => {
@@ -642,8 +307,8 @@ const App: React.FC = () => {
       
       // Prevent default for our shortcuts
       const shouldPrevent = (
-        (isMod && ['w', 'b', 'e', 's', 'f', 'p', 'h', '0', '=', '-'].includes(e.key.toLowerCase())) ||
-        (isMod && isShift && ['o', 'f', 't', 'w'].includes(e.key.toLowerCase())) ||
+        (isMod && ['w', 'b', 'e', 's', 'f', '0', '=', '-'].includes(e.key.toLowerCase())) ||
+        (isMod && isShift && ['o', 't', 'w'].includes(e.key.toLowerCase())) ||
         (isMod && e.key === 'Tab') ||
         (isMod && /^[1-9]$/.test(e.key))
       );
@@ -745,8 +410,6 @@ const App: React.FC = () => {
     window.addEventListener('wheel', handleWheel, { passive: false });
     return () => window.removeEventListener('wheel', handleWheel);
   }, [zoomIn, zoomOut, zoomPanel]);
-  
-
 
   return (
     <div className="app-container">
@@ -757,40 +420,24 @@ const App: React.FC = () => {
       <Toolbar
         menu={menu}
         onOpenSessions={documentWindowPath ? undefined : () => { setSessionsMounted(true); setSessionsVisible(true); }}
-        onAddDirectory={handleAddDirectory}
-        filePanelVisible={filePanelVisible && !searchVisible && !historyVisible}
-        onToggleFilePanel={handleToggleFilePanel}
-        historyVisible={historyVisible}
-        onToggleHistory={handleToggleHistory}
-        agentVisible={agentVisible}
-        onToggleAgent={toggleAgentVisible}
-        searchVisible={searchVisible}
-        onToggleSearch={() => (searchVisible ? setSearchVisible(false) : openSearch())}
+        filePanelVisible={filePanelVisible}
+        onToggleFilePanel={documentWindowPath ? undefined : handleToggleFilePanel}
       />
 
       <UpdateBanner />
 
       <div className="main-content">
-        {searchVisible && <SearchPanel width={panelWidth} />}
+        {filePanelVisible && <AgentPanel width={panelWidth} />}
 
-        {historyVisible && !searchVisible && <HistoryPanel width={panelWidth} />}
-
-        {filePanelVisible && !historyVisible && !searchVisible && (
-          <FilePanel
-            width={panelWidth}
-            onAddDirectory={handleAddDirectory}
-          />
-        )}
-
-        <Resizer
+        {!documentWindowPath && <Resizer
           side="left"
           width={panelWidth}
           minWidth={PANEL_MIN_WIDTH}
-          visible={leftPanelVisible}
+          visible={filePanelVisible}
           onWidthChange={setPanelWidth}
-          onVisibleChange={setLeftPanelVisible}
-          label={searchVisible ? 'search panel' : historyVisible ? 'history panel' : 'file panel'}
-        />
+          onVisibleChange={setFilePanelVisible}
+          label="agent documents"
+        />}
 
         <DocumentPanel onHeadingsChange={handleHeadingsChange} />
 
@@ -817,18 +464,6 @@ const App: React.FC = () => {
       <StatusBar />
       <SettingsModal />
       <SaveAllDialog />
-
-      {isDropTarget && (
-        <div className="drop-overlay" aria-hidden="true">
-          <div className="drop-overlay-inner">
-            <Upload size={40} />
-            <span className="drop-overlay-title">Drop to open</span>
-            <span className="drop-overlay-hint">
-              Markdown and text files open in a tab, folders are added to the file tree
-            </span>
-          </div>
-        </div>
-      )}
       </div>}
     </div>
   );

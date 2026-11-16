@@ -1,22 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { X, Folder, Trash2, FolderPlus, Settings, ExternalLink, Code, Plus, Palette } from 'lucide-react';
+import { X, Trash2, Settings, Code, Plus, Palette } from 'lucide-react';
 import { useStore } from '../store';
-import { pickDirectory, scanDirectories, isTauri, openInExplorer, checkForUpdate, getAppVersion } from '../utils/tauri';
+import { isTauri, checkForUpdate, getAppVersion } from '../utils/tauri';
 
-type SettingsCategory = 'directories' | 'general' | 'appearance' | 'highlighting';
+type SettingsCategory = 'general' | 'appearance' | 'highlighting';
 
 const SettingsModal: React.FC = () => {
   const settingsOpen = useStore((s) => s.settingsOpen);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
-  const directories = useStore((s) => s.directories);
-  const addDirectory = useStore((s) => s.addDirectory);
-  const removeDirectory = useStore((s) => s.removeDirectory);
-  const setFiles = useStore((s) => s.setFiles);
-  const autoRefresh = useStore((s) => s.autoRefresh);
-  const setAutoRefresh = useStore((s) => s.setAutoRefresh);
   const smoothScroll = useStore((s) => s.smoothScroll);
-  const showTextFiles = useStore((s) => s.showTextFiles);
-  const setShowTextFiles = useStore((s) => s.setShowTextFiles);
   const setSmoothScroll = useStore((s) => s.setSmoothScroll);
   const checkUpdatesOnStart = useStore((s) => s.checkUpdatesOnStart);
   const setCheckUpdatesOnStart = useStore((s) => s.setCheckUpdatesOnStart);
@@ -37,51 +29,13 @@ const SettingsModal: React.FC = () => {
   const setMarkdownTextColorLight = useStore((s) => s.setMarkdownTextColorLight);
   const setMarkdownTextColor = useStore((s) => s.setMarkdownTextColor);
 
-  const [activeCategory, setActiveCategory] = useState<SettingsCategory>('directories');
+  const [activeCategory, setActiveCategory] = useState<SettingsCategory>('general');
   const [newAliasKey, setNewAliasKey] = useState('');
   const [newAliasValue, setNewAliasValue] = useState('');
 
   const handleClose = useCallback(() => {
     setSettingsOpen(false);
   }, [setSettingsOpen]);
-
-  const handleAddDirectory = useCallback(async () => {
-    if (!isTauri()) {
-      alert('Directory picking requires the Tauri desktop app.');
-      return;
-    }
-
-    const path = await pickDirectory();
-    if (path) {
-      addDirectory(path);
-      // Rescan all directories to update the file tree
-      const { directories: allDirs } = useStore.getState();
-      const updatedDirs = allDirs.includes(path) ? allDirs : [...allDirs, path];
-      const files = await scanDirectories(updatedDirs);
-      setFiles(files);
-    }
-  }, [addDirectory, setFiles]);
-
-  const handleRemoveDirectory = useCallback(async (dir: string) => {
-    removeDirectory(dir);
-    // Rescan remaining directories
-    const { directories: remainingDirs } = useStore.getState();
-    const filteredDirs = remainingDirs.filter(d => d !== dir);
-    if (filteredDirs.length > 0 && isTauri()) {
-      const files = await scanDirectories(filteredDirs);
-      setFiles(files);
-    } else {
-      setFiles([]);
-    }
-  }, [removeDirectory, setFiles]);
-
-  const handleOpenInExplorer = useCallback(async (dir: string) => {
-    try {
-      await openInExplorer(dir);
-    } catch (error) {
-      console.error('Failed to open in explorer:', error);
-    }
-  }, []);
 
   const handleAddAlias = useCallback(() => {
     if (newAliasKey.trim() && newAliasValue.trim()) {
@@ -140,13 +94,6 @@ const SettingsModal: React.FC = () => {
               <span>Appearance</span>
             </button>
             <button
-              className={`settings-nav-item ${activeCategory === 'directories' ? 'active' : ''}`}
-              onClick={() => setActiveCategory('directories')}
-            >
-              <Folder size={16} />
-              <span>Directories</span>
-            </button>
-            <button
               className={`settings-nav-item ${activeCategory === 'highlighting' ? 'active' : ''}`}
               onClick={() => setActiveCategory('highlighting')}
             >
@@ -162,40 +109,6 @@ const SettingsModal: React.FC = () => {
                 <p className="settings-section-description">
                   Configure application behavior.
                 </p>
-
-                <div className="settings-option">
-                  <div className="settings-option-info">
-                    <span className="settings-option-label">Auto-refresh</span>
-                    <span className="settings-option-description">
-                      Update the file list and open documents when files change on disk
-                    </span>
-                  </div>
-                  <label className="settings-toggle">
-                    <input
-                      type="checkbox"
-                      checked={autoRefresh}
-                      onChange={(e) => setAutoRefresh(e.target.checked)}
-                    />
-                    <span className="settings-toggle-slider" />
-                  </label>
-                </div>
-
-                <div className="settings-option">
-                  <div className="settings-option-info">
-                    <span className="settings-option-label">Show text files</span>
-                    <span className="settings-option-description">
-                      List code, txt, fb2 and other text files in the file tree, not only markdown
-                    </span>
-                  </div>
-                  <label className="settings-toggle">
-                    <input
-                      type="checkbox"
-                      checked={showTextFiles}
-                      onChange={(e) => setShowTextFiles(e.target.checked)}
-                    />
-                    <span className="settings-toggle-slider" />
-                  </label>
-                </div>
 
                 <div className="settings-option">
                   <div className="settings-option-info">
@@ -305,51 +218,6 @@ const SettingsModal: React.FC = () => {
                     className="settings-color-input"
                   />
                 </div>
-              </div>
-            )}
-
-            {activeCategory === 'directories' && (
-              <div className="settings-section">
-                <h3>Watched Directories</h3>
-                <p className="settings-section-description">
-                  Add directories containing markdown files to browse.
-                </p>
-
-                <div className="settings-directory-list">
-                  {directories.length === 0 ? (
-                    <div className="settings-directory-empty">
-                      No directories added yet.
-                    </div>
-                  ) : (
-                    directories.map((dir) => (
-                      <div key={dir} className="settings-directory-item">
-                        <Folder size={16} className="settings-directory-icon" />
-                        <span className="settings-directory-path" title={dir}>
-                          {dir}
-                        </span>
-                        <button
-                          className="settings-directory-action"
-                          onClick={() => handleOpenInExplorer(dir)}
-                          title="Open in file explorer"
-                        >
-                          <ExternalLink size={16} />
-                        </button>
-                        <button
-                          className="settings-directory-remove"
-                          onClick={() => handleRemoveDirectory(dir)}
-                          title="Remove directory"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
-                    ))
-                  )}
-                </div>
-
-                <button className="settings-add-btn" onClick={handleAddDirectory}>
-                  <FolderPlus size={16} />
-                  <span>Add Directory</span>
-                </button>
               </div>
             )}
 

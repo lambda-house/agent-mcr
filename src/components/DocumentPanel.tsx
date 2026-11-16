@@ -242,10 +242,7 @@ const EmptyState: React.FC = () => (
     <FileQuestion size={64} className="document-empty-icon" aria-hidden="true" />
     <h2 className="document-empty-title">No Document Open</h2>
     <p className="document-empty-subtitle">
-      Select a markdown file from the sidebar, or drop one on this window
-    </p>
-    <p className="document-empty-hint">
-      <kbd>Ctrl</kbd>+<kbd>P</kbd> to quick open a file
+      Select a document from the list on the left
     </p>
   </div>
 );

@@ -35,7 +35,7 @@ export function refreshAgentWorkspace(): Promise<boolean> {
       const workspace = await getAgentWorkspace();
       watching = workspace.watching;
       const before = new Map(previous.map((e) => [e.path, e.modified]));
-      setAgentEntries(workspace.entries);
+      setAgentEntries(workspace.entries, workspace.folders ?? []);
       const changedOpen = workspace.entries.filter(
         (e) => documents[e.path] && before.has(e.path) && before.get(e.path) !== e.modified
       );
@@ -65,6 +65,27 @@ export async function markAgentFilesRead(paths: string[]): Promise<void> {
   const done = new Set(paths);
   const { agentEntries, setAgentEntries } = useStore.getState();
   setAgentEntries(agentEntries.map((e) => (done.has(e.path) ? { ...e, unread: false, isNew: false } : e)));
+}
+
+export interface AgentFolder { path: string; entries: AgentEntry[] }
+
+/**
+ * Agent documents by the session folder they belong to, in the order the
+ * backend gave the folders (most recent session first). A memory about a
+ * subfolder goes to the nearest session folder above it. `user` holds the
+ * rest: the agents' own files and memories of folders no session works in.
+ */
+export function agentFolders(entries: AgentEntry[], folders: string[]): { folders: AgentFolder[]; user: AgentEntry[] } {
+  const byPath = new Map<string, AgentEntry[]>(folders.map((f) => [f, []]));
+  const user: AgentEntry[] = [];
+  for (const entry of entries) {
+    const home = entry.folder == null ? undefined : folders
+      .filter((f) => entry.folder === f || entry.folder!.startsWith(`${f}/`))
+      .sort((a, b) => b.length - a.length)[0];
+    if (home) byPath.get(home)!.push(entry);
+    else user.push(entry);
+  }
+  return { folders: folders.map((path) => ({ path, entries: byPath.get(path)! })).filter((f) => f.entries.length > 0), user };
 }
 
 export function agentEntryMatches(entry: AgentEntry, query: string): boolean {

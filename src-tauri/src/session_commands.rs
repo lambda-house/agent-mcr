@@ -1,5 +1,5 @@
 use crate::{sessions, AccessState};
-use serde_json::{json, Value};
+
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -90,116 +90,6 @@ pub async fn sessions_snapshot(
     .await
     .map_err(|e| e.to_string())?
 }
-// Connect ONLY to the existing daemon. Never start/resume another writer against a live transcript.
-#[cfg(unix)]
-fn codex_request(method: &str, params: Value) -> Result<Value, String> {
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::net::UnixStream;
-    let path = dirs::home_dir()
-        .ok_or("Home directory unavailable")?
-        .join(".codex/app-server-control/app-server-control.sock");
-    let mut socket =
-        UnixStream::connect(path).map_err(|e| format!("Codex control unavailable: {e}"))?;
-    socket
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-    socket
-        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(socket.try_clone().map_err(|e| e.to_string())?);
-    fn receive(reader: &mut BufReader<UnixStream>, id: u64) -> Result<Value, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        while std::time::Instant::now() < deadline {
-            let mut line = Vec::new();
-            reader
-                .by_ref()
-                .take(8 * 1024 * 1024 + 1)
-                .read_until(b'\n', &mut line)
-                .map_err(|e| format!("Codex control: {e}"))?;
-            if line.last() != Some(&b'\n') {
-                return Err("Codex closed the connection or sent an oversized response".into());
-            }
-            let v: Value = serde_json::from_slice(&line).map_err(|_| "Invalid Codex response")?;
-            if v["id"] == id {
-                if v.get("error").is_some() {
-                    return Err(format!("Codex rejected request: {}", v["error"]));
-                }
-                return Ok(v["result"].clone());
-            }
-        }
-        Err("Codex request timed out".into())
-    }
-    writeln!(socket,"{}",json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"agent_mcr","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}})).map_err(|e|e.to_string())?;
-    receive(&mut reader, 1)?;
-    writeln!(socket, "{}", json!({"method":"initialized"})).map_err(|e| e.to_string())?;
-    writeln!(
-        socket,
-        "{}",
-        json!({"id":2,"method":method,"params":params})
-    )
-    .map_err(|e| e.to_string())?;
-    receive(&mut reader, 2)
-}
-#[cfg(not(unix))]
-fn codex_request(_: &str, _: Value) -> Result<Value, String> {
-    Err("Existing-daemon control is currently supported on macOS and Linux".into())
-}
-#[tauri::command]
-pub async fn session_control(
-    action: String,
-    id: String,
-    turn_id: Option<String>,
-    text: Option<String>,
-    app: AppHandle,
-    access: State<'_, AccessState>,
-) -> Result<Value, String> {
-    allowed(&access)?;
-    if action == "inspect" {
-        return tauri::async_runtime::spawn_blocking(move || {
-            codex_request("thread/read", json!({"threadId":id,"includeTurns":false}))
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    if !["steer", "interrupt"].contains(&action.as_str()) {
-        return Err("Unsupported control action".into());
-    }
-    let turn = turn_id
-        .filter(|s| !s.is_empty())
-        .ok_or("No observed turn id; refresh this session first")?;
-    let text = text.unwrap_or_default();
-    if action == "steer" && (text.trim().is_empty() || text.len() > 16000) {
-        return Err("Enter an instruction of 1–16000 bytes".into());
-    }
-    let mut dialog = app
-        .dialog()
-        .message(format!(
-            "{} session {}\nTurn {}\n\n{}",
-            action,
-            id,
-            turn,
-            if action == "steer" {
-                &text
-            } else {
-                "Interrupt the current turn"
-            }
-        ))
-        .title("Direct this Codex session")
-        .buttons(MessageDialogButtons::OkCancel);
-    if let Some(w) = app.get_webview_window("main") {
-        dialog = dialog.parent(&w);
-    }
-    if !dialog.blocking_show() {
-        return Err("Cancelled; nothing sent".into());
-    }
-    tauri::async_runtime::spawn_blocking(move|| {
-        let current=codex_request("thread/read",json!({"threadId":id,"includeTurns":false}))?;
-        if current["thread"]["status"]["type"]!="active" {return Err("Session is not active in this daemon; nothing sent".into());}
-        if action=="steer" {codex_request("turn/steer",json!({"threadId":id,"expectedTurnId":turn,"input":[{"type":"text","text":text,"text_elements":[]}]}))}
-        else {codex_request("turn/interrupt",json!({"threadId":id,"turnId":turn}))}
-    }).await.map_err(|e|e.to_string())?
-}
-
 /// Usage, tools and context figures of one session, for the Live view's
 /// stats pane. Same grant as the Sessions workspace; no transcript text.
 #[tauri::command]
