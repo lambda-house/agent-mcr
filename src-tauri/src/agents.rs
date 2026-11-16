@@ -297,9 +297,10 @@ pub trait Adapter: Sync {
     fn silent_until_first_turn(&self) -> bool {
         false
     }
-    /// The input box is on screen (the markers depend on the agent's version)
+    /// The input box is on screen (the markers depend on the agent's version).
+    /// False when unsure: text typed into a menu would answer it
     fn at_prompt(&self, _screen: &str) -> bool {
-        true
+        false
     }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Signal("INT")

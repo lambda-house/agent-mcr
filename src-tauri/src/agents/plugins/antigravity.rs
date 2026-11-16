@@ -18,6 +18,11 @@ impl Adapter for Antigravity {
         }
         Ok(cmd)
     }
+    /// Its status line says "? for shortcuts" only at the input box: a turn
+    /// shows "esc to cancel", and menus (folder trust, permissions) "enter Confirm"
+    fn at_prompt(&self, screen: &str) -> bool {
+        screen.contains("? for shortcuts") && !screen.contains("esc to cancel") && !screen.contains("enter Confirm")
+    }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Key("\x1b")
     }
