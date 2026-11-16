@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { BarChart3, BellRing, ChevronDown, ChevronRight, Columns2, Copy, Folder, FolderOpen, History, LayoutGrid, MoreHorizontal, Play, Plus, Radar, RotateCw, Rows2, Search, Square, Terminal, X } from 'lucide-react';
+import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, Folder, FolderOpen, History, MoreHorizontal, Play, Plus, Radar, RotateCw, Search, Terminal, X } from 'lucide-react';
 import { Button, Dialog } from '@teob/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
@@ -417,6 +417,10 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const sidebarOverride = pluginRegistry.getOverride('live:sidebar');
   const newAgentOverride = pluginRegistry.getOverride('live:new-agent');
   const layoutBarOverride = pluginRegistry.getOverride('live:layout-bar');
+  const paneTools = pluginRegistry.getOverride('live:pane-tools');
+  // Without the Layouts plugin nothing can close a pane: fold back to one
+  const panes = listLeaves(layout).length;
+  useEffect(() => { if (!paneTools && panes > 1) applyPreset('1'); }, [paneTools, panes, applyPreset]);
   const sessionHeaderOverride = pluginRegistry.getOverride('live:session-header');
 
   const closeNewAgent = () => { setNewAgentOpen(false); setProjectFilter(''); setResume(''); };
@@ -624,9 +628,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                 <span className="hs-empty-dot" aria-hidden="true"/>
                 <strong>Empty pane</strong>
                 <div className="hs-pane-tools">
-                  <button type="button" className="hs-pane-btn" aria-label="Split right" title="Split right" onClick={e => { e.stopPropagation(); splitPane(node.id, 'row'); }}><Columns2 size={13}/></button>
-                  <button type="button" className="hs-pane-btn" aria-label="Split down" title="Split down" onClick={e => { e.stopPropagation(); splitPane(node.id, 'col'); }}><Rows2 size={13}/></button>
-                  {multiPane && <button type="button" className="hs-pane-btn" aria-label="Close pane" title="Close pane" onClick={e => { e.stopPropagation(); closePane(node.id); }}><X size={13}/></button>}
+                  {paneTools?.({ leafId: node.id, multiPane, controller })}
                 </div>
               </header>
               <div className="hs-pane-empty">
@@ -743,10 +745,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                     <strong>{isSupervisor(h) ? 'Supervisor' : hostedLabel(h)}</strong>
                     <span title={h.cwd}>{h.cwd}</span>
                     <div className="hs-pane-tools">
-                      <button type="button" className="hs-pane-btn" aria-label="Split right" title="Split right" onClick={e => { e.stopPropagation(); splitPane(node.id, 'row'); }}><Columns2 size={13}/></button>
-                      <button type="button" className="hs-pane-btn" aria-label="Split down" title="Split down" onClick={e => { e.stopPropagation(); splitPane(node.id, 'col'); }}><Rows2 size={13}/></button>
                       <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>
-                      {multiPane && <button type="button" className="hs-pane-btn" aria-label="Close pane" title="Close pane" onClick={e => { e.stopPropagation(); closePane(node.id); }}><X size={13}/></button>}
+                      {paneTools?.({ leafId: node.id, multiPane, controller })}
                     </div>
                   </header>
                 );
@@ -777,22 +777,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           );
         };
 
-        const defaultLayoutBar = () => (
-          (opened.length >= 2 || multiPane) ? (
-            <div className="hs-layout-bar" role="toolbar" aria-label="Pane layout">
-              <span className="hs-layout-label">Layout</span>
-              <button type="button" className={`hs-layout-btn${leaves.length === 1 ? ' active' : ''}`} title="Single pane" aria-label="Single pane" onClick={() => applyPreset('1')}><Square size={12}/></button>
-              <button type="button" className={`hs-layout-btn${leaves.length === 2 ? ' active' : ''}`} title="Two columns" aria-label="Two columns" onClick={() => applyPreset('2-col')}><Columns2 size={12}/></button>
-              <button type="button" className={`hs-layout-btn${leaves.length >= 4 ? ' active' : ''}`} title="2×2 grid" aria-label="2×2 grid" onClick={() => applyPreset('2x2')}><LayoutGrid size={12}/></button>
-            </div>
-          ) : null
-        );
-
         return (
           <>
-            {layoutBarOverride
-              ? layoutBarOverride({ leavesCount: leaves.length, controller, defaultRender: defaultLayoutBar })
-              : defaultLayoutBar()}
+            {layoutBarOverride?.({ leavesCount: leaves.length, controller, defaultRender: () => null })}
             {leaves.length === 1 && !leaves[0].item
               ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
               : <div className="hs-layout-root">{renderNode(layout)}</div>}

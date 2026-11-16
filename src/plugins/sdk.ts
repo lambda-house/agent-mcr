@@ -115,6 +115,7 @@ export type OverrideSlot =
   | 'live:sidebar'
   | 'live:new-agent'
   | 'live:layout-bar'
+  | 'live:pane-tools'
   | 'live:session-header';
 
 export interface ComponentOverrideMap {
@@ -122,6 +123,8 @@ export interface ComponentOverrideMap {
   'live:sidebar': (ctx: { controller: LiveControllerContext; defaultRender: () => React.ReactNode }) => React.ReactNode;
   'live:new-agent': (ctx: { open: boolean; onClose: () => void; controller: LiveControllerContext; defaultRender: () => React.ReactNode }) => React.ReactNode;
   'live:layout-bar': (ctx: { leavesCount: number; controller: LiveControllerContext; defaultRender: () => React.ReactNode }) => React.ReactNode;
+  /** Buttons in a pane's title bar (split, close); the core shows none */
+  'live:pane-tools': (ctx: { leafId: string; multiPane: boolean; controller: LiveControllerContext }) => React.ReactNode;
   'live:session-header': (ctx: {
     session: Hosted;
     leafId: string;
