@@ -59,7 +59,7 @@ Every agent runs as your macOS user. The harness limits what an agent can do thr
 
 - `access.json`: what you've allowed
 - `sessions/index.sqlite`: the transcript index, which contains private transcript content
-- `history/` and `read-state/`: the Markdown reader's history and its "changed since you read it" copies
+- `read-state/`: the "changed since you read it" copies of agent documents
 - `analysis/mcp.sock`: the analysis MCP socket, while it's switched on
 - `runner.sock`, `harness.sock` and their logs: the two background units that host terminals and track sessions
 - `harness-state.json`: session states and tasks; `claude-hooks.json`: the hooks passed to hosted Claude sessions

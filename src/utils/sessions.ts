@@ -28,7 +28,6 @@ export const sessionApi = {
   stats: (provider: string, id: string) => invoke<Session>('session_stats', { provider, id }),
   detail: (provider: string, id: string) => invoke<Session>('session_details', { provider, id }),
   snapshot: () => invoke<Snapshot>('sessions_snapshot'),
-  control: (action: string, id: string, turnId?: string, text?: string) => invoke<unknown>('session_control', { action, id, turnId, text }),
 };
 export function sessionKey(s: Session): string { return `${s.provider}:${s.id}`; }
 export function totalTokens(u: Usage): number { return u.input + u.output; }
@@ -51,9 +50,6 @@ export function family(sessions: Session[], selected: Session): Session[] {
 }
 export const compact = (n: number): string => Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(n);
 export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-export function resumeCommand(s: Session): string {
-  return `cd ${shellQuote(s.cwd)} && ${s.provider === 'codex' ? 'codex resume' : 'claude --resume'} ${shellQuote(s.parentId && s.provider === 'claude' ? s.parentId : s.id)}`;
-}
 
 export function origin(s: Session): string { return s.origin || (s.parentId ? 'subagent' : 'unknown'); }
 export function within(path: string, directory: string): boolean {

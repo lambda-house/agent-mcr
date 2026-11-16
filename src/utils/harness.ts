@@ -4,7 +4,8 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 export interface Profile { id: string; label: string; command: string }
 export interface HostedExit { code: number; signal: string | null; at: number }
 /** Why a session needs the person: a prompt only they may answer, or a notification. */
-export interface Attention { kind: 'permission' | 'notification'; text: string; since: number }
+/** `assessment` and `report` come from the agent's own `report` tool: it needs the person, or finished a piece of work. */
+export interface Attention { kind: 'permission' | 'assessment' | 'notification'; text: string; since: number; report?: 'needs_human' | 'done' }
 /** What the harness service knows about a session (`harness::Tracked`). */
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';
@@ -13,6 +14,8 @@ export interface Tracked {
   named?: boolean;
   /** What the agent says it is doing (its `set_status` tool) */
   status?: string;
+  /** The part it plays, in its own words or the supervisor's */
+  role?: string;
 }
 /** A subagent a Claude session started, as its files show it (activity, not verified liveness). */
 export interface Subagent { id: string; description: string; agentType: string; model: string; started: number; lastActivity: number; finished?: boolean }

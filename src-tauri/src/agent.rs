@@ -86,6 +86,9 @@ pub struct AgentEntry {
     pub group: String,
     /// "user", "project" or "plugin".
     pub scope: &'static str,
+    /// The session folder it belongs to: the one it was found under, or the
+    /// project a memory is about. None for the agents' own files.
+    pub folder: Option<String>,
     /// Last change, ms since the epoch.
     pub modified: u64,
     /// Changed since the user last read it.
@@ -99,6 +102,8 @@ pub struct AgentEntry {
 pub struct AgentWorkspace {
     pub enabled: bool,
     pub entries: Vec<AgentEntry>,
+    /// The session folders that were looked through, most recent first.
+    pub folders: Vec<String>,
     /// Changes are reported as they happen (`agent-files-changed`); without
     /// a watcher the frontend polls.
     pub watching: bool,
@@ -379,6 +384,7 @@ fn make_entry(path: &Path, kind: Kind, group: String, scope: &'static str) -> Ag
         description,
         group,
         scope,
+        folder: None,
         modified: modified_ms(path),
         unread: false,
         is_new: false,
@@ -518,9 +524,12 @@ fn scan_user(out: &mut Vec<AgentEntry>) {
                 continue;
             }
             let name = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let label = decode_project_dir(&name).map(|p| display_path(&p)).unwrap_or(name);
+            let about = decode_project_dir(&name);
+            let label = about.as_deref().map(display_path).unwrap_or(name);
             for file in files {
-                out.push(make_entry(&file, Kind::Memory, label.clone(), "user"));
+                let mut entry = make_entry(&file, Kind::Memory, label.clone(), "user");
+                entry.folder = about.as_ref().map(|p| p.to_string_lossy().into_owned());
+                out.push(entry);
             }
         }
         let mut plans = Vec::new();
@@ -583,14 +592,18 @@ fn scan_user(out: &mut Vec<AgentEntry>) {
     }
 }
 
-/// All agent files: the agents' own folders, then the opened folders.
+/// All agent files: the agents' own folders, then the session folders.
 pub fn scan(opened_dirs: &[PathBuf]) -> Vec<AgentEntry> {
     let mut out = Vec::new();
     scan_user(&mut out);
     let mut visited = HashSet::new();
     let mut budget = MAX_PROJECT_DIRS;
     for dir in opened_dirs {
+        let from = out.len();
         scan_project(dir, &mut out, &mut visited, &mut budget);
+        for entry in &mut out[from..] {
+            entry.folder = Some(dir.to_string_lossy().into_owned());
+        }
     }
     // The same plugin from two marketplaces: the most recently changed one
     let mut newest: HashMap<(String, Kind, String), u64> = HashMap::new();
@@ -615,20 +628,6 @@ pub fn scan(opened_dirs: &[PathBuf]) -> Vec<AgentEntry> {
         entry.unread = unread;
         entry.is_new = is_new;
     }
-    out
-}
-
-/// Agent documents only in folders the user explicitly opened.
-pub fn scan_projects(opened_dirs: &[PathBuf]) -> Vec<AgentEntry> {
-    let mut out = Vec::new();
-    let mut visited = HashSet::new();
-    let mut budget = MAX_PROJECT_DIRS;
-    for dir in opened_dirs {
-        scan_project(dir, &mut out, &mut visited, &mut budget);
-    }
-    let mut seen = HashSet::new();
-    out.retain(|e| seen.insert(canonicalize(Path::new(&e.path)).unwrap_or_else(|_| PathBuf::from(&e.path))));
-    out.truncate(MAX_ENTRIES);
     out
 }
 
@@ -744,8 +743,8 @@ pub fn prune_read_state(entries: &[AgentEntry]) {
 /// Instructions files looked for in every folder of an opened project.
 const PROJECT_INSTRUCTIONS: &[&str] = &["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md", ".cursorrules"];
 
-/// Whether a path below an opened folder is one `scan_project` lists.
-fn is_project_agent_file(rel: &Path) -> bool {
+/// Whether a path below a session folder is one `scan_project` lists.
+pub fn is_project_agent_file(rel: &Path) -> bool {
     let Some(parts) = components(rel) else { return false };
     let Some(name) = parts.last() else { return false };
     if parts.iter().any(|p| p == ".git" || SKIPPED_DIRS.contains(&p.as_str())) {

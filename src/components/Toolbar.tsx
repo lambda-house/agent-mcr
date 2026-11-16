@@ -1,7 +1,5 @@
 import React, { useState, useCallback } from 'react';
 import {
-  FolderPlus,
-  Search,
   Edit3,
   Download,
   PanelLeft,
@@ -11,16 +9,12 @@ import {
   Moon,
   Sun,
   Settings,
-  History,
-  Bot,
-  FileSearch,
 } from 'lucide-react';
 import { useStore, MIN_ZOOM, MAX_ZOOM } from '../store';
 import { exportActiveDocument } from '../utils/export';
 import type { MenuItem } from '../utils/commands';
 import clsx from 'clsx';
 import MainMenu from './MainMenu';
-import WorkspaceMenu from './WorkspaceMenu';
 import WorkspaceSwitch from './WorkspaceSwitch';
 
 // ============================================================
@@ -96,34 +90,19 @@ interface ToolbarProps {
   onOpenSessions?: () => void;
   /** The main menu (see utils/commands.ts). */
   menu: MenuItem[];
-  onAddDirectory?: () => void;
   filePanelVisible?: boolean;
+  /** Absent in a memory reader window: it has no list */
   onToggleFilePanel?: () => void;
-  historyVisible?: boolean;
-  onToggleHistory?: () => void;
-  agentVisible?: boolean;
-  onToggleAgent?: () => void;
-  searchVisible?: boolean;
-  onToggleSearch?: () => void;
 }
 
 const Toolbar: React.FC<ToolbarProps> = ({
   menu,
   onOpenSessions,
-  onAddDirectory,
   filePanelVisible,
   onToggleFilePanel,
-  historyVisible,
-  onToggleHistory,
-  agentVisible,
-  onToggleAgent,
-  searchVisible,
-  onToggleSearch,
 }) => {
   const tocVisible = useStore((s) => s.tocVisible);
   const toggleTocVisible = useStore((s) => s.toggleTocVisible);
-  const filterQuery = useStore((s) => s.filterQuery);
-  const setFilterQuery = useStore((s) => s.setFilterQuery);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
   const activeTab = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? null);
   const theme = useStore((s) => s.theme);
@@ -131,10 +110,6 @@ const Toolbar: React.FC<ToolbarProps> = ({
   const toggleEditMode = useStore((s) => s.toggleEditMode);
   const toggleTheme = useStore((s) => s.toggleTheme);
   const [isExporting, setIsExporting] = useState(false);
-
-  const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    setFilterQuery(e.target.value);
-  }, [setFilterQuery]);
 
   const handleToggleToc = useCallback(() => {
     toggleTocVisible();
@@ -160,36 +135,15 @@ const Toolbar: React.FC<ToolbarProps> = ({
       <div className="toolbar-group">
         {onOpenSessions && <WorkspaceSwitch active="documents" onChange={workspace => { if (workspace === 'sessions') onOpenSessions(); }} />}
         <MainMenu items={menu} />
-        <button
+        {onToggleFilePanel && <button
           className={clsx('toolbar-button', filePanelVisible && 'active')}
           onClick={onToggleFilePanel}
-          title="Toggle Files Panel"
+          title="Agent documents (Ctrl+B)"
         >
           <PanelLeft size={16} />
-        </button>
+        </button>}
       </div>
 
-      <div className="toolbar-group">
-        <button
-          className="toolbar-button"
-          onClick={onAddDirectory}
-          title="Add Directory"
-        >
-          <FolderPlus size={16} />
-        </button>
-        <WorkspaceMenu />
-      </div>
-      
-      <div className="toolbar-search">
-        <Search size={13} className="toolbar-search-icon" />
-        <input
-          type="text"
-          placeholder="Search files..."
-          value={filterQuery}
-          onChange={handleSearchChange}
-        />
-      </div>
-      
       <div className="toolbar-separator" />
       
       {/* Center Section */}
@@ -208,28 +162,6 @@ const Toolbar: React.FC<ToolbarProps> = ({
           title={activeTab ? 'Export as HTML' : 'No document to export'}
         >
           <Download size={16} />
-        </button>
-        <button
-          className={clsx('toolbar-button', searchVisible && 'active')}
-          onClick={onToggleSearch}
-          title="Search in tabs / folders (Ctrl+Shift+F)"
-        >
-          <FileSearch size={16} />
-        </button>
-        <button
-          className={clsx('toolbar-button', historyVisible && 'active')}
-          onClick={onToggleHistory}
-          title="Toggle History"
-        >
-          <History size={16} />
-        </button>
-        <button
-          className={clsx('toolbar-button', agentVisible && filePanelVisible && !searchVisible && !historyVisible && 'active')}
-          onClick={onToggleAgent}
-          title={agentVisible && filePanelVisible && !searchVisible && !historyVisible
-            ? 'Hide global agent files (Ctrl+Shift+A)' : 'Show global agent files (Ctrl+Shift+A)'}
-        >
-          <Bot size={16} />
         </button>
       </div>
       

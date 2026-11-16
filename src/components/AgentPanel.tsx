@@ -1,9 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, CheckCheck, ChevronDown, ChevronRight, EyeOff, RefreshCw, Search, X } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Bot, CheckCheck, ChevronDown, ChevronRight, EyeOff, Folder, RefreshCw, Search } from 'lucide-react';
 import clsx from 'clsx';
 import { useStore } from '../store';
 import {
-  appendToHistory,
   disableAgentWorkspace,
   enableAgentWorkspace,
   readFile,
@@ -13,14 +12,18 @@ import {
 import {
   AGENT_SECTIONS,
   agentEntryMatches,
+  agentFolders,
   formatAge,
   markAgentFilesRead,
   refreshAgentWorkspace,
 } from '../utils/agent';
-import { getFileName } from '../utils/files';
+import { shortPath } from '../utils/harness';
+import PanelZoomBadge from './PanelZoomBadge';
+import { useSmoothWheelScroll } from '../hooks/useSmoothWheelScroll';
 
 // ============================================================
-// Agent Panel: instructions, rules, memory, plans and skills of coding agents
+// Agent documents: instructions, rules, memory, plans and skills of coding
+// agents, by the folder their sessions work in
 // ============================================================
 
 /** Kinds whose entries show their description (a skill is what it says it does). */
@@ -40,11 +43,6 @@ const AgentItem: React.FC<{ entry: AgentEntry; active: boolean; showGroup?: bool
       const content = await readFile(entry.path);
       reloadDocument(entry.path, content);
       openDocument(entry.path, content, { preview });
-      if (preview) {
-        appendToHistory(entry.path, getFileName(entry.path)).catch((error) => {
-          console.error('Failed to log to history:', error);
-        });
-      }
     } catch (error) {
       console.error('Failed to open agent file:', error);
     }
@@ -81,16 +79,22 @@ const AgentItem: React.FC<{ entry: AgentEntry; active: boolean; showGroup?: bool
   );
 };
 
-const AgentPanel: React.FC = () => {
+/** Session folders shown open before the person chooses. */
+const OPEN_FOLDERS = 4;
+
+const AgentPanel: React.FC<{ width: number }> = ({ width }) => {
   const entries = useStore((s) => s.agentEntries);
+  const sessionFolders = useStore((s) => s.agentFolders);
   const setAgentEntries = useStore((s) => s.setAgentEntries);
-  const setAgentVisible = useStore((s) => s.setAgentVisible);
   const activePath = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.path ?? null);
+  const zoom = useStore((s) => s.panelZoom.files);
+  const smoothScroll = useStore((s) => s.smoothScroll);
   const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [rootCollapsed, setRootCollapsed] = useState(true);
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState('');
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ plan: true, command: true });
+  const treeRef = useRef<HTMLElement>(null);
+  useSmoothWheelScroll(treeRef, smoothScroll, enabled === true);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -103,9 +107,7 @@ const AgentPanel: React.FC = () => {
     }
   }, []);
 
-  useEffect(() => {
-    if (!rootCollapsed) refresh();
-  }, [rootCollapsed, refresh]);
+  useEffect(() => { refresh(); }, [refresh]);
 
   const handleEnable = useCallback(async () => {
     try {
@@ -117,21 +119,21 @@ const AgentPanel: React.FC = () => {
 
   const handleDisable = useCallback(async () => {
     await disableAgentWorkspace();
-    setAgentEntries([]);
+    setAgentEntries([], []);
     setEnabled(false);
   }, [setAgentEntries]);
 
-  const globalEntries = useMemo(() => entries.filter((e) => e.scope !== 'project'), [entries]);
-  const visible = useMemo(() => globalEntries.filter((e) => agentEntryMatches(e, query)), [globalEntries, query]);
+  const visible = useMemo(() => entries.filter((e) => agentEntryMatches(e, query)), [entries, query]);
   const changed = useMemo(() => visible.filter((e) => e.unread && !e.isNew), [visible]);
+  const grouped = useMemo(() => agentFolders(visible, sessionFolders), [visible, sessionFolders]);
 
   const handleMarkAllRead = useCallback(() => {
-    markAgentFilesRead(globalEntries.filter((e) => e.unread).map((e) => e.path)).catch((error) => {
+    markAgentFilesRead(entries.filter((e) => e.unread).map((e) => e.path)).catch((error) => {
       console.error('Failed to save read state:', error);
     });
-  }, [globalEntries]);
+  }, [entries]);
 
-  const toggleSection = (key: string) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
+  const toggleSection = (key: string, open: boolean) => setCollapsed((c) => ({ ...c, [key]: open }));
 
   const renderSection = (key: string, label: string, items: AgentEntry[], flat = false) => {
     if (items.length === 0) return null;
@@ -145,7 +147,7 @@ const AgentPanel: React.FC = () => {
     const unread = items.filter((e) => e.unread).length;
     return (
       <section className="agent-section" key={key}>
-        <button type="button" className="agent-section-header" onClick={() => toggleSection(key)}>
+        <button type="button" className="agent-section-header" aria-expanded={!isCollapsed} onClick={() => toggleSection(key, !isCollapsed)}>
           {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
           <span className="agent-section-title">{label}</span>
           <span className="agent-section-count">
@@ -164,66 +166,72 @@ const AgentPanel: React.FC = () => {
     );
   };
 
+  // A session folder: its documents by kind, under the kind's name
+  const renderFolder = (path: string, items: AgentEntry[], index: number) => {
+    const key = `folder:${path}`;
+    const isCollapsed = !query && (collapsed[key] ?? index >= OPEN_FOLDERS);
+    const unread = items.filter((e) => e.unread).length;
+    return (
+      <section className="directory-section agent-folder" key={key} aria-label={`Agent documents in ${path}`}>
+        <button type="button" className="directory-section-header agent-folder-header" aria-expanded={!isCollapsed} onClick={() => toggleSection(key, !isCollapsed)}>
+          <span className={clsx('directory-section-expand', !isCollapsed && 'expanded')}><ChevronRight size={14} /></span>
+          <Folder size={14} className="directory-section-icon" />
+          <span className="directory-section-path" title={path}>{shortPath(path)}</span>
+          <span className="agent-section-count">{unread > 0 ? `${unread} new · ` : ''}{items.length}</span>
+        </button>
+        {!isCollapsed && AGENT_SECTIONS.map(({ kind, label }) => {
+          const ofKind = items.filter((e) => e.kind === kind);
+          return ofKind.length === 0 ? null : (
+            <div className="agent-group" key={kind}>
+              <div className="agent-group-title">{label}</div>
+              {ofKind.map((entry) => <AgentItem key={entry.path} entry={entry} active={entry.path === activePath} />)}
+            </div>
+          );
+        })}
+      </section>
+    );
+  };
+
   return (
-    <section className="directory-section global-agent-section" aria-label="Global agent files">
-      <div className="directory-section-header">
-        <button type="button" className="global-agent-root-toggle" aria-expanded={!rootCollapsed}
-          onClick={() => setRootCollapsed((value) => !value)}>
-          <span className={clsx('directory-section-expand', !rootCollapsed && 'expanded')}>
-            <ChevronRight size={14} />
-          </span>
-          <Bot size={14} className="directory-section-icon" />
-          <span className="global-agent-root-title">Global agent files</span>
-          {globalEntries.some((e) => e.unread) && <span className="agent-section-count">Changed</span>}
-        </button>
-        {!rootCollapsed && enabled && (
-          <div className="agent-panel-actions">
-            <button
-              className="agent-panel-action"
-              onClick={handleMarkAllRead}
-              title="Mark everything as read"
-              disabled={!globalEntries.some((e) => e.unread)}
-            >
-              <CheckCheck size={14} />
+    <aside className="file-panel" style={{ width }} data-zoom-panel="files">
+      <div className="file-panel-header">
+        <span className="file-panel-title">Agent documents</span>
+        <div className="file-panel-actions">
+          <PanelZoomBadge panel="files" />
+          {enabled && <>
+            <button className="file-panel-action" onClick={handleMarkAllRead} title="Mark everything as read"
+              disabled={!entries.some((e) => e.unread)}>
+              <CheckCheck size={16} />
             </button>
-            <button
-              className={clsx('agent-panel-action', loading && 'spinning')}
-              onClick={refresh}
-              title="Refresh"
-              disabled={loading}
-            >
-              <RefreshCw size={14} />
+            <button className={clsx('file-panel-action', loading && 'spinning')} onClick={refresh} title="Refresh" disabled={loading}>
+              <RefreshCw size={16} />
             </button>
-            <button className="agent-panel-action" onClick={handleDisable} title="Turn off global agent access">
-              <EyeOff size={14} />
+            <button className="file-panel-action" onClick={handleDisable} title="Stop reading agent documents">
+              <EyeOff size={16} />
             </button>
-          </div>
-        )}
-        <button type="button" className="directory-section-action" onClick={() => setAgentVisible(false)}
-          title="Hide global agent files (show again with the toolbar button)" aria-label="Hide global agent files">
-          <X size={14} />
-        </button>
+          </>}
+        </div>
       </div>
 
-      {!rootCollapsed && enabled === null && <p className="agent-panel-empty">Loading agent files…</p>}
-      {!rootCollapsed && enabled === false && (
+      {enabled === null && <p className="agent-panel-empty">Loading agent documents…</p>}
+      {enabled === false && (
         <div className="agent-panel-intro">
           <Bot size={32} aria-hidden="true" />
           <p>
             See what your coding agents read and write: <code>CLAUDE.md</code> and <code>AGENTS.md</code>,
-            rules, memory, plans, skills and commands from your agent folders, with what changed since you last looked.
+            rules, memory, plans, skills and commands, with what changed since you last looked.
           </p>
           <p className="agent-panel-intro-detail">
-            Covers Claude Code, Codex and Gemini CLI. Use Files → Agents for agent files in folders you open.
+            Covers the agents' own folders (Claude Code, Codex, Gemini CLI) and the folders your sessions work in.
             Settings, keys and transcripts are never read.
           </p>
           <button type="button" className="agent-panel-enable" onClick={handleEnable}>
-            Show agent files
+            Show agent documents
           </button>
         </div>
       )}
 
-      {!rootCollapsed && enabled && (
+      {enabled && (
         <>
           <div className="agent-panel-filter">
             <Search size={13} className="agent-panel-filter-icon" aria-hidden="true" />
@@ -231,23 +239,27 @@ const AgentPanel: React.FC = () => {
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Filter skills, memory, plans…"
-              aria-label="Filter agent files"
+              placeholder="Filter memory, plans, skills…"
+              aria-label="Filter agent documents"
             />
           </div>
-          <div className="agent-panel-content" role="tree">
-            {renderSection('changed', 'Changed since you read them', changed, true)}
-            {AGENT_SECTIONS.map(({ kind, label }) =>
-              renderSection(kind, label, visible.filter((e) => e.kind === kind)))}
-            {visible.length === 0 && (
-              <p className="agent-panel-empty">
-                {globalEntries.length === 0 ? 'No global agent files found yet.' : 'Nothing matches the filter.'}
-              </p>
-            )}
-          </div>
+          <nav ref={treeRef} className="file-tree" role="tree" aria-label="Agent documents">
+            <div className="panel-zoom agent-panel-content" style={{ zoom: zoom / 100 }}>
+              {renderSection('changed', 'Changed since you read them', changed, true)}
+              {grouped.folders.map((f, index) => renderFolder(f.path, f.entries, index))}
+              {grouped.user.length > 0 && <div className="agent-user-title">All folders</div>}
+              {AGENT_SECTIONS.map(({ kind, label }) =>
+                renderSection(kind, label, grouped.user.filter((e) => e.kind === kind)))}
+              {visible.length === 0 && (
+                <p className="agent-panel-empty">
+                  {entries.length === 0 ? 'No agent documents found yet.' : 'Nothing matches the filter.'}
+                </p>
+              )}
+            </div>
+          </nav>
         </>
       )}
-    </section>
+    </aside>
   );
 };
 

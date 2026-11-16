@@ -209,6 +209,8 @@ export interface AppState {
   agentVisible: boolean;
   /** Agent files from the last scan; empty while the workspace is off. */
   agentEntries: AgentEntry[];
+  /** The session folders the last scan looked through, most recent first */
+  agentFolders: string[];
 
   // Workspaces
   workspaces: Workspace[];
@@ -317,7 +319,7 @@ export interface AppState {
   toggleHistoryVisible: () => void;
   setAgentVisible: (visible: boolean) => void;
   toggleAgentVisible: () => void;
-  setAgentEntries: (entries: AgentEntry[]) => void;
+  setAgentEntries: (entries: AgentEntry[], folders?: string[]) => void;
   /**
    * Show what is on disk now in an open document, unless it has unsaved
    * edits. Returns whether the document was updated.
@@ -570,6 +572,7 @@ export const useStore = create<AppState>()(
       historyVisible: false,
       agentVisible: true,
       agentEntries: [],
+      agentFolders: [],
       workspaces: [],
       activeWorkspace: null,
       searchOptions: DEFAULT_SEARCH_OPTIONS,
@@ -1055,7 +1058,7 @@ export const useStore = create<AppState>()(
         get().setAgentVisible(!state.agentVisible || !state.filePanelVisible || state.searchVisible || state.historyVisible);
       },
 
-      setAgentEntries: (entries) => set({ agentEntries: entries }),
+      setAgentEntries: (entries, folders) => set((state) => ({ agentEntries: entries, agentFolders: folders ?? state.agentFolders })),
 
       reloadDocument: (path, content) => {
         const doc = get().documents[path];

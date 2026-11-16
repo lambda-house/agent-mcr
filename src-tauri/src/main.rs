@@ -6,15 +6,12 @@
     windows_subsystem = "windows"
 )]
 
-use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher, Event};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tauri::{AppHandle, DragDropEvent, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::http::{Response as HttpResponse, StatusCode};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -95,8 +92,6 @@ impl AppError {
 
 #[derive(Default)]
 pub struct AppState {
-    pub watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
-    pub watched_paths: Arc<Mutex<HashSet<PathBuf>>>,
     /// Agent files watcher, while the agent workspace is on.
     pub agent_watch: Arc<Mutex<Option<agent::Watch>>>,
 }
@@ -104,9 +99,6 @@ pub struct AppState {
 // ============================================================
 // Security: Access List
 // ============================================================
-
-const MAX_SCAN_DEPTH: usize = 10;
-const MAX_FILES_PER_DIRECTORY: usize = 10000;
 
 /// Folders and files the user opened: picked in the folder or file dialog,
 /// dropped on the window, or passed on the command line ("Open with"). Every
@@ -132,9 +124,22 @@ pub struct Access {
     session_workspace: bool,
     #[serde(default)]
     session_memories: bool,
+    /// Folders agent sessions work in, as the harness and the session index
+    /// report them (never the webview). Agent files inside them count as
+    /// opened while the agent workspace is on. Not saved: found again at each scan.
+    #[serde(skip)]
+    session_folders: Vec<PathBuf>,
 }
 
 impl Access {
+    /// An agent's own document, or an agent file in a folder a session works in.
+    fn is_agent_file(&self, path: &Path) -> bool {
+        self.agent_workspace
+            && (agent::is_agent_document(path)
+                || (is_markdown_file(path)
+                    && self.session_folders.iter().any(|dir| path.strip_prefix(dir).is_ok_and(agent::is_project_agent_file))))
+    }
+
     fn in_tree(&self, path: &Path) -> bool {
         self.directories.iter().any(|dir| path.starts_with(dir))
     }
@@ -168,14 +173,14 @@ impl Access {
     fn can_open(&self, path: &Path) -> bool {
         self.files.iter().any(|file| file == path)
             || (self.in_tree(path) && is_viewable_file(path, true))
-            || (self.agent_workspace && agent::is_agent_document(path))
+            || self.is_agent_file(path)
     }
 
     /// Metadata and "reveal in file manager".
     fn can_stat(&self, path: &Path) -> bool {
         self.in_tree(path)
             || self.files.iter().any(|file| file == path)
-            || (self.agent_workspace && agent::is_agent_document(path))
+            || self.is_agent_file(path)
     }
 
     /// Images referenced by documents (the `localfile://` protocol).
@@ -187,7 +192,6 @@ impl Access {
 
     fn allows(&self, path: &Path, use_: Use) -> bool {
         match use_ {
-            Use::List => self.can_list(path),
             Use::Open => self.can_open(path),
             Use::Stat => self.can_stat(path),
             Use::Image => self.can_read_image(path),
@@ -198,7 +202,6 @@ impl Access {
 /// What a command does with a path, for the access check.
 #[derive(Debug, Clone, Copy)]
 enum Use {
-    List,
     Open,
     Stat,
     Image,
@@ -208,7 +211,6 @@ impl Use {
     /// Whether a symlink's target is the kind of thing this use may reach.
     fn fits_target(self, real: &Path) -> bool {
         match self {
-            Use::List => real.is_dir(),
             // Markdown only: config files with tokens are text too (a cloned
             // repo's notes.md may point at ~/.config/gh/hosts.yml)
             Use::Open => real.is_file() && is_markdown_file(real),
@@ -230,23 +232,18 @@ struct Target {
 pub struct AccessState {
     access: Mutex<Access>,
     file: Option<PathBuf>,
-    /// No access file existed at startup: the first `adopt_session_access`
-    /// call may carry over a session saved by a version without the list.
-    migration_pending: Mutex<bool>,
 }
 
 impl AccessState {
     fn load() -> Self {
         let file = get_config_dir().ok().map(|dir| dir.join("access.json"));
         let saved = file.as_ref().and_then(|f| fs::read(f).ok());
-        let migration_pending = saved.is_none();
         let access = saved
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         Self {
             access: Mutex::new(access),
             file,
-            migration_pending: Mutex::new(migration_pending),
         }
     }
 
@@ -300,11 +297,15 @@ impl AccessState {
         }
     }
 
-    /// Whether the agent workspace is on, and the opened folders.
-    fn agent_scope(&self) -> (bool, Vec<PathBuf>) {
-        self.access.lock()
-            .map(|access| (access.agent_workspace, access.directories.clone()))
-            .unwrap_or_default()
+    fn agent_workspace_on(&self) -> bool {
+        self.access.lock().map(|access| access.agent_workspace).unwrap_or(false)
+    }
+
+    /// Replace the session folders (found by `session_folders`, never given by the webview).
+    fn set_session_folders(&self, folders: Vec<PathBuf>) {
+        if let Ok(mut access) = self.access.lock() {
+            access.session_folders = folders;
+        }
     }
 
     fn save(&self, access: &Access) {
@@ -340,13 +341,6 @@ fn expand_home(path_str: &str) -> Result<PathBuf, AppError> {
     } else {
         Ok(PathBuf::from(path_str))
     }
-}
-
-/// Absolute, symlink-free path of an existing file or folder; `~/` is expanded.
-fn expand_path(path_str: &str) -> Result<PathBuf, AppError> {
-    canonicalize(&expand_home(path_str)?).map_err(|e| {
-        AppError::with_details("PATH_ERROR", "Invalid path", &e.to_string())
-    })
 }
 
 /// An existing path both as named and resolved. A relative path or one with
@@ -562,134 +556,9 @@ fn encode_text(content: &str, previous: Option<&[u8]>) -> Result<Vec<u8>, AppErr
     }
 }
 
-/// Build/dependency/VCS folders whose churn must not trigger a tree rescan
-/// (a build or `git checkout` produces thousands of events there).
-fn is_watch_noise(path: &Path) -> bool {
-    path.components().any(|c| {
-        let name = c.as_os_str();
-        name == "node_modules" || name == "target" || name == ".git"
-    })
-}
-
-/// Heavy build/dependency folders skipped while scanning. Dot-folders are
-/// listed like any other; folders without markdown are pruned anyway.
-fn is_hidden(name: &str) -> bool {
-    name == "node_modules" || name == "target"
-}
-
-/// List a folder's documents. Symlinked folders are followed, but each real
-/// folder is listed once, so a link to a parent can't loop.
-fn scan_directory_recursive(
-    dir_path: &Path,
-    depth: usize,
-    file_count: &mut usize,
-    include_text: bool,
-    visited: &mut HashSet<PathBuf>,
-) -> Option<FileNode> {
-    if depth > MAX_SCAN_DEPTH || *file_count > MAX_FILES_PER_DIRECTORY {
-        return None;
-    }
-    
-    if !dir_path.is_dir() {
-        return None;
-    }
-
-    if !visited.insert(canonicalize(dir_path).ok()?) {
-        return None;
-    }
-    
-    let name = dir_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| dir_path.to_string_lossy().to_string());
-    
-    if is_hidden(&name) {
-        return None;
-    }
-    
-    let path_str = dir_path.to_string_lossy().to_string();
-    let mut children: Vec<FileNode> = Vec::new();
-    let mut has_md_files = false;
-    let count_before = *file_count;
-    
-    let entries = match fs::read_dir(dir_path) {
-        Ok(entries) => entries,
-        Err(_) => return None,
-    };
-    
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    entries.sort_by(|a, b| {
-        let a_is_dir = a.path().is_dir();
-        let b_is_dir = b.path().is_dir();
-        match (a_is_dir, b_is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.file_name().cmp(&b.file_name()),
-        }
-    });
-    
-    for entry in entries {
-        if *file_count > MAX_FILES_PER_DIRECTORY {
-            break;
-        }
-        
-        let entry_path = entry.path();
-        let entry_name = entry.file_name().to_string_lossy().to_string();
-        
-        if is_hidden(&entry_name) {
-            continue;
-        }
-        
-        if entry_path.is_dir() {
-            if let Some(child) = scan_directory_recursive(&entry_path, depth + 1, file_count, include_text, visited) {
-                children.push(child);
-            }
-        } else if is_viewable_file(&entry_path, include_text)
-            && (!entry.file_type().is_ok_and(|t| t.is_symlink())
-                || canonicalize(&entry_path).is_ok_and(|real| is_markdown_file(&real)))
-        {
-            *file_count += 1;
-            has_md_files |= is_markdown_file(&entry_path);
-            children.push(FileNode {
-                id: generate_id(&entry_path.to_string_lossy()),
-                name: entry_name.clone(),
-                path: entry_path.to_string_lossy().to_string(),
-                display_path: entry_name,
-                node_type: "file".to_string(),
-                children: None,
-                is_expanded: None,
-            });
-        }
-    }
-    
-    // A folder containing only other text files is not part of the Markdown tree.
-    // Keep those files in folders that also contain a Markdown document.
-    if !has_md_files && !children.iter().any(|child| child.node_type == "directory") {
-        *file_count = count_before;
-        return None;
-    }
-    
-    Some(FileNode {
-        id: generate_id(&path_str),
-        name: name.clone(),
-        path: path_str,
-        display_path: name,
-        node_type: "directory".to_string(),
-        children: Some(children),
-        is_expanded: Some(false),
-    })
-}
-
 // ============================================================
 // History Functions
 // ============================================================
-
-/// Oldest entries are dropped beyond this many.
-const MAX_HISTORY_ENTRIES: usize = 1000;
-
-/// Serializes read-modify-write of history.md: concurrent opens would
-/// otherwise lose entries.
-static HISTORY_LOCK: Mutex<()> = Mutex::new(());
 
 fn get_config_dir() -> Result<PathBuf, AppError> {
     dirs::config_dir()
@@ -699,213 +568,9 @@ fn get_config_dir() -> Result<PathBuf, AppError> {
         .ok_or_else(|| AppError::new("CONFIG_ERROR", "Cannot determine config directory"))
 }
 
-fn get_history_file_path() -> Result<PathBuf, AppError> {
-    let config_dir = get_config_dir()?;
-    Ok(config_dir.join("history").join("history.md"))
-}
-
-fn ensure_history_dir() -> Result<PathBuf, AppError> {
-    let history_path = get_history_file_path()?;
-    if let Some(parent) = history_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            AppError::with_details("FS_ERROR", "Failed to create history directory", &e.to_string())
-        })?;
-    }
-    Ok(history_path)
-}
-
-/// Link text: every ASCII punctuation character backslash-escaped, so names
-/// with `[`, `]`, `*` or `_` stay literal.
-fn markdown_link_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_ascii_punctuation() {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Link destination: percent-encode everything that could end or confuse it
-/// (spaces, parentheses, `<>`, `%`, backslashes...). The history panel decodes
-/// the href with `decodeURIComponent`.
-fn markdown_link_destination(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for c in path.chars() {
-        if c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_' | '~' | ':') || !c.is_ascii() {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{:02X}", c as u32));
-        }
-    }
-    out
-}
-
-/// Insert an entry under today's date (newest first within a day; days are in
-/// chronological order) and drop the oldest entries beyond the cap.
-fn add_history_entry(content: &str, date_str: &str, entry: &str, max_entries: usize) -> String {
-    // Preamble ("# History", notes) and the "## <date>" sections in file order
-    let mut preamble = String::new();
-    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-    for line in content.lines() {
-        if let Some(date) = line.strip_prefix("## ") {
-            sections.push((date.trim().to_string(), Vec::new()));
-        } else if let Some((_, entries)) = sections.last_mut() {
-            if !line.trim().is_empty() {
-                entries.push(line.to_string());
-            }
-        } else {
-            preamble.push_str(line);
-            preamble.push('\n');
-        }
-    }
-
-    match sections.iter_mut().find(|(date, _)| date == date_str) {
-        Some((_, entries)) => entries.insert(0, entry.to_string()),
-        None => sections.push((date_str.to_string(), vec![entry.to_string()])),
-    }
-
-    // Oldest day first, oldest entry last within a day
-    let mut total: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
-    while total > max_entries {
-        let Some((_, oldest_day)) = sections.first_mut() else { break };
-        oldest_day.pop();
-        total -= 1;
-        if oldest_day.is_empty() {
-            sections.remove(0);
-        }
-    }
-
-    let mut out = preamble.trim_end().to_string();
-    out.push('\n');
-    for (date, entries) in &sections {
-        out.push_str(&format!("\n## {}\n", date));
-        for entry in entries {
-            out.push_str(entry);
-            out.push('\n');
-        }
-    }
-    out
-}
-
 // ============================================================
 // Tauri Commands
 // ============================================================
-
-#[tauri::command]
-async fn get_history_path() -> Result<String, AppError> {
-    let path = get_history_file_path()?;
-    Ok(path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-async fn read_history() -> Result<String, AppError> {
-    let path = get_history_file_path()?;
-
-    if !path.exists() {
-        return Ok(String::from("# History\n\nNo files opened yet.\n"));
-    }
-
-    fs::read_to_string(&path)
-        .map_err(|e| AppError::with_details("FILE_ERROR", "Failed to read history", &e.to_string()))
-}
-
-#[tauri::command]
-async fn append_to_history(
-    file_path: String,
-    file_name: String,
-    access: State<'_, AccessState>,
-) -> Result<(), AppError> {
-    // Only files the app could open end up in the history
-    let target = expand_target(&file_path)?;
-    access.check(&target, Use::Open)?;
-
-    let _guard = HISTORY_LOCK.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to lock history"))?;
-    let history_path = ensure_history_dir()?;
-
-    let now = chrono::Local::now();
-    let date_str = now.format("%Y-%m-%d").to_string();
-    let entry = format!(
-        "- {} [{}]({})",
-        now.format("%H:%M"),
-        markdown_link_text(&file_name),
-        markdown_link_destination(&target.named.to_string_lossy()),
-    );
-
-    let content = fs::read_to_string(&history_path).unwrap_or_else(|_| String::from("# History\n"));
-    let content = add_history_entry(&content, &date_str, &entry, MAX_HISTORY_ENTRIES);
-
-    atomic_write(&history_path, content.as_bytes())
-        .map_err(|e| AppError::with_details("FILE_ERROR", "Failed to write history", &e.to_string()))
-}
-
-#[tauri::command]
-async fn clear_history() -> Result<(), AppError> {
-    let _guard = HISTORY_LOCK.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to lock history"))?;
-    let history_path = ensure_history_dir()?;
-    let content = "# History\n\nHistory cleared.\n";
-
-    atomic_write(&history_path, content.as_bytes())
-        .map_err(|e| AppError::with_details("FILE_ERROR", "Failed to clear history", &e.to_string()))
-}
-
-#[tauri::command]
-async fn scan_directories(
-    paths: Vec<String>,
-    include_text_files: Option<bool>,
-    access: State<'_, AccessState>,
-) -> Result<Vec<FileNode>, AppError> {
-    let include_text = include_text_files.unwrap_or(false);
-    let mut results = Vec::new();
-    
-    for path_str in paths {
-        let target = match expand_target(&path_str).and_then(|t| {
-            access.check(&t, Use::List)?;
-            Ok(t)
-        }) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Skipping '{}': {}", path_str, e.message);
-                continue;
-            }
-        };
-        
-        let mut file_count = 0;
-        let mut visited = HashSet::new();
-        if let Some(node) = scan_directory_recursive(&target.named, 0, &mut file_count, include_text, &mut visited) {
-            results.push(node);
-        }
-    }
-    
-    Ok(results)
-}
-
-#[tauri::command]
-async fn scan_project_agent_files(
-    paths: Vec<String>,
-    access: State<'_, AccessState>,
-) -> Result<Vec<agent::AgentEntry>, AppError> {
-    let mut opened = Vec::new();
-    let mut real_roots = Vec::new();
-    for path in paths {
-        let target = expand_target(&path)?;
-        access.check(&target, Use::List)?;
-        real_roots.push(target.real);
-        opened.push(target.named);
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        agent::scan_projects(&opened).into_iter().filter(|entry| {
-            canonicalize(Path::new(&entry.path)).ok().is_some_and(|real| {
-                real_roots.iter().any(|root| real.starts_with(root)) && is_markdown_file(&real)
-            })
-        }).collect()
-    })
-        .await
-        .map_err(|e| AppError::with_details("SCAN_ERROR", "Failed to list project agent files", &e.to_string()))
-}
 
 #[tauri::command]
 async fn read_file(path: String, access: State<'_, AccessState>) -> Result<String, AppError> {
@@ -968,36 +633,6 @@ async fn pick_directory(app: AppHandle, access: State<'_, AccessState>) -> Resul
     Ok(Some(canonical.to_string_lossy().to_string()))
 }
 
-/// Native file picker for documents; several can be chosen. The chosen files
-/// are added to the access list. Empty when cancelled.
-///
-/// The dialog filters by extension, so text files without one (README,
-/// Makefile) can't be picked here: they open from a folder or by drag & drop.
-#[tauri::command]
-async fn pick_files(app: AppHandle, access: State<'_, AccessState>) -> Result<Vec<String>, AppError> {
-    let documents: Vec<&str> = MARKDOWN_EXTENSIONS.iter().chain(TEXT_FILE_EXTENSIONS).copied().collect();
-    let dialog = app.dialog().file()
-        .set_title("Open File")
-        .add_filter("Markdown and text files", &documents)
-        .add_filter("Markdown", MARKDOWN_EXTENSIONS);
-    // Modal to the window where the dialog plugin's own `open` does that too
-    #[cfg(any(windows, target_os = "macos"))]
-    let dialog = match app.get_webview_window("main") {
-        Some(window) => dialog.set_parent(&window),
-        None => dialog,
-    };
-
-    let Some(picked) = dialog.blocking_pick_files() else {
-        return Ok(Vec::new());
-    };
-    let paths: Vec<PathBuf> = picked.into_iter()
-        .filter_map(|file| file.into_path().ok())
-        .filter_map(|path| canonicalize(&path).ok())
-        .collect();
-    access.grant(&paths);
-    Ok(paths.iter().map(|path| path.to_string_lossy().to_string()).collect())
-}
-
 /// Native save dialog, then write `content` (UTF-8) where the user chose.
 /// Returns the saved path, or `None` when cancelled.
 #[tauri::command]
@@ -1027,52 +662,6 @@ async fn export_file(
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
-/// One-time carry-over of a session saved before the access list existed:
-/// its folders, tabs and workspaces, plus the files in the history. Only works
-/// while no access file has been written yet.
-#[tauri::command]
-async fn adopt_session_access(
-    directories: Vec<String>,
-    files: Vec<String>,
-    access: State<'_, AccessState>,
-) -> Result<(), AppError> {
-    let mut pending = access.migration_pending.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to access the access list"))?;
-    if !*pending {
-        return Ok(());
-    }
-    *pending = false;
-
-    let history = get_history_file_path().ok()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .unwrap_or_default();
-    let history_files = history_link_destinations(&history);
-
-    let paths: Vec<PathBuf> = directories.iter()
-        .chain(files.iter())
-        .chain(history_files.iter())
-        .filter_map(|path| expand_path(path).ok())
-        .collect();
-    access.grant(&paths);
-
-    // Write the file even when nothing was granted, so this never runs again
-    if let Ok(list) = access.access.lock() {
-        access.save(&list);
-    }
-    Ok(())
-}
-
-/// Link destinations in history.md (`- 12:34 [name](path)`), decoded.
-fn history_link_destinations(history: &str) -> Vec<String> {
-    history.lines()
-        .filter_map(|line| {
-            let line = line.trim_end().strip_suffix(')')?;
-            let start = line.rfind("](")? + 2;
-            Some(percent_decode(&line[start..]))
-        })
-        .collect()
-}
-
 #[tauri::command]
 async fn get_file_info(path: String, access: State<'_, AccessState>) -> Result<serde_json::Value, AppError> {
     let expanded = expand_target(&path)?;
@@ -1090,78 +679,6 @@ async fn get_file_info(path: String, access: State<'_, AccessState>) -> Result<s
         "isReadOnly": metadata.permissions().readonly(),
         "isDirectory": metadata.is_dir(),
     }))
-}
-
-#[tauri::command]
-async fn start_watching(
-    paths: Vec<String>,
-    app_handle: AppHandle,
-    state: State<'_, AppState>,
-    access: State<'_, AccessState>,
-) -> Result<(), AppError> {
-    let mut watcher_guard = state.watcher.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to access watcher"))?;
-    let mut watched_paths = state.watched_paths.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to access watched paths"))?;
-    
-    // Create new watcher
-    let app_handle_clone = app_handle.clone();
-    let watcher = RecommendedWatcher::new(
-        move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                for path in event.paths {
-                    if is_watch_noise(&path) {
-                        continue;
-                    }
-                    if is_viewable_file(&path, true) || path.is_dir() {
-                        let event_type = match event.kind {
-                            notify::EventKind::Create(_) => "created",
-                            notify::EventKind::Modify(_) => "modified",
-                            notify::EventKind::Remove(_) => "removed",
-                            _ => continue,
-                        };
-                        
-                        let _ = app_handle_clone.emit("files-changed", FileChangeEvent {
-                            event_type: event_type.to_string(),
-                            path: path.to_string_lossy().to_string(),
-                        });
-                    }
-                }
-            }
-        },
-        NotifyConfig::default().with_poll_interval(Duration::from_millis(300)),
-    ).map_err(|e| AppError::with_details("WATCHER_ERROR", "Failed to create file watcher", &e.to_string()))?;
-    
-    *watcher_guard = Some(watcher);
-    watched_paths.clear();
-    
-    // Watch each path
-    if let Some(ref mut w) = *watcher_guard {
-        for path_str in paths {
-            let Ok(target) = expand_target(&path_str) else { continue };
-            if access.check(&target, Use::List).is_err() {
-                continue;
-            }
-            if w.watch(&target.real, RecursiveMode::Recursive).is_ok() {
-                watched_paths.insert(target.real);
-            }
-        }
-    }
-    
-    Ok(())
-}
-
-#[tauri::command]
-async fn stop_watching(state: State<'_, AppState>) -> Result<(), AppError> {
-    let mut watcher_guard = state.watcher.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to access watcher"))?;
-    let mut watched_paths = state.watched_paths.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to access watched paths"))?;
-
-    *watcher_guard = None;
-    watched_paths.clear();
-
-    Ok(())
 }
 
 #[tauri::command]
@@ -1291,6 +808,58 @@ async fn open_external(url: String, app: AppHandle) -> Result<(), AppError> {
 // Agent workspace
 // ============================================================
 
+/// How far back a past session makes its folder a session folder.
+const SESSION_FOLDER_DAYS: u64 = 30;
+const MAX_SESSION_FOLDERS: usize = 40;
+
+/// The folders agent sessions work in, most recent first: those of the
+/// sessions hosted now, the folders added in Live, and the folders of indexed
+/// sessions of the last `SESSION_FOLDER_DAYS` (when the Sessions workspace is
+/// on). The home folder and everything above it are left out: looking through
+/// them would read far more than a project.
+fn session_folders(access: &AccessState, sessions: &session_commands::SessionState) -> Vec<PathBuf> {
+    let mut found: Vec<(u64, PathBuf)> = Vec::new();
+    if let Ok(dir) = get_config_dir() {
+        // Only a service that already runs: listing documents must not start one
+        let hosted = std::os::unix::net::UnixStream::connect(harness::socket(&dir)).is_ok()
+            .then(|| harness::call(&dir, serde_json::json!({"op": "sessions"})).ok())
+            .flatten();
+        for s in hosted.iter().flat_map(|h| h["sessions"].as_array().into_iter().flatten()) {
+            if let Some(cwd) = s["cwd"].as_str() {
+                found.push((u64::MAX, PathBuf::from(cwd)));
+            }
+        }
+    }
+    let (opened, indexed) = access.access.lock()
+        .map(|a| (a.directories.clone(), a.session_workspace))
+        .unwrap_or_default();
+    found.extend(opened.into_iter().map(|dir| (u64::MAX - 1, dir)));
+    if indexed {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+            .saturating_sub(SESSION_FOLDER_DAYS * 86_400_000);
+        if let Ok(index) = sessions.index.lock() {
+            found.extend(index.summaries().into_iter().filter(|s| s.modified >= since && !s.cwd.is_empty()).map(|s| (s.modified, PathBuf::from(s.cwd))));
+        }
+    }
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let home = dirs::home_dir().and_then(|h| canonicalize(&h).ok());
+    let mut folders: Vec<PathBuf> = Vec::new();
+    for (_, dir) in found {
+        let Ok(real) = canonicalize(&dir) else { continue };
+        let too_wide = home.as_deref().is_some_and(|home| home.starts_with(&real));
+        if real.is_dir() && !too_wide && !folders.contains(&real) {
+            folders.push(real);
+            if folders.len() >= MAX_SESSION_FOLDERS {
+                break;
+            }
+        }
+    }
+    folders
+}
+
 /// The agent files (instructions, memory, plans, skills) with their read
 /// state. Empty while the workspace is off.
 #[tauri::command]
@@ -1298,11 +867,15 @@ async fn agent_workspace(
     app: AppHandle,
     state: State<'_, AppState>,
     access: State<'_, AccessState>,
+    sessions: State<'_, session_commands::SessionState>,
 ) -> Result<agent::AgentWorkspace, AppError> {
-    let (enabled, directories) = access.agent_scope();
+    let enabled = access.agent_workspace_on();
     if !enabled {
-        return Ok(agent::AgentWorkspace { enabled, entries: Vec::new(), watching: false });
+        return Ok(agent::AgentWorkspace { enabled, entries: Vec::new(), folders: Vec::new(), watching: false });
     }
+    let directories = session_folders(&access, &sessions);
+    access.set_session_folders(directories.clone());
+    let folders = directories.iter().map(|d| d.to_string_lossy().into_owned()).collect();
     static PRUNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let prune = !PRUNED.swap(true, std::sync::atomic::Ordering::Relaxed);
     let agent_watch = Arc::clone(&state.agent_watch);
@@ -1327,22 +900,26 @@ async fn agent_workspace(
     })
         .await
         .map_err(|e| AppError::with_details("SCAN_ERROR", "Failed to list agent files", &e.to_string()))?;
-    Ok(agent::AgentWorkspace { enabled, entries, watching })
+    Ok(agent::AgentWorkspace { enabled, entries, folders, watching })
 }
 
 /// Turn the agent workspace on after the user confirms it in a native dialog
 /// (the webview can't answer it). Returns whether it is on.
 #[tauri::command]
-async fn enable_agent_workspace(app: AppHandle, access: State<'_, AccessState>) -> Result<bool, AppError> {
+async fn enable_agent_workspace(
+    app: AppHandle,
+    access: State<'_, AccessState>,
+    sessions: State<'_, session_commands::SessionState>,
+) -> Result<bool, AppError> {
     let locations = agent::found_locations();
     let found = if locations.is_empty() {
-        "No agent folders were found yet. Agent files in the folders you open are still listed.".to_string()
+        "No agent folders were found yet.".to_string()
     } else {
         format!("Agent MCR will read the markdown files coding agents keep in:\n\n{}", locations.join("\n"))
     };
     let mut dialog = app.dialog()
         .message(format!(
-            "{}\n\nThat is instructions (CLAUDE.md, AGENTS.md), rules, memory, plans, skills, agents and commands. Settings, keys and session transcripts are not read.",
+            "{}\n\nand the same kinds of file in the folders your agent sessions work in.\n\nThat is instructions (CLAUDE.md, AGENTS.md), rules, memory, plans, skills, agents and commands. Settings, keys and session transcripts are not read.",
             found
         ))
         .title("Show agent files?")
@@ -1355,7 +932,8 @@ async fn enable_agent_workspace(app: AppHandle, access: State<'_, AccessState>) 
         return Ok(false);
     }
     access.set_agent_workspace(true);
-    let (_, directories) = access.agent_scope();
+    let directories = session_folders(&access, &sessions);
+    access.set_session_folders(directories.clone());
     // Everything there now counts as read: only later changes are highlighted
     tauri::async_runtime::spawn_blocking(move || agent::mark_all_read(&agent::scan(&directories)));
     Ok(true)
@@ -1564,58 +1142,6 @@ fn serve_local_image(access: &AccessState, url_path: &str) -> HttpResponse<Vec<u
 // Main Entry Point
 // ============================================================
 
-/// Files/folders passed on the command line (e.g. "Open with" from a file
-/// manager). Taken once by the frontend after it has restored the session.
-#[derive(Default)]
-struct LaunchPathQueue {
-    pending: Vec<String>,
-    frontend_ready: bool,
-}
-
-#[derive(Default)]
-pub struct LaunchPaths(Mutex<LaunchPathQueue>);
-
-impl LaunchPaths {
-    fn take(&self) -> Vec<String> {
-        let mut queue = self.0.lock().unwrap();
-        queue.frontend_ready = true;
-        std::mem::take(&mut queue.pending)
-    }
-
-    fn deliver(&self, app: &AppHandle, paths: Vec<String>) {
-        if paths.is_empty() { return; }
-        let mut queue = self.0.lock().unwrap();
-        if !queue.frontend_ready {
-            queue.pending.extend(paths);
-            return;
-        }
-        drop(queue);
-        let _ = app.emit_to("main", "open-paths", paths);
-    }
-}
-
-/// Resolve command-line arguments to absolute paths, skipping flags.
-/// Relative paths are resolved against `cwd` (the launching process' cwd).
-fn resolve_cli_paths(args: &[String], cwd: &Path) -> Vec<String> {
-    args.iter()
-        .skip(1) // argv[0] is the executable
-        .filter(|arg| !arg.starts_with('-'))
-        .map(|arg| {
-            let path = match arg.strip_prefix("file://") {
-                Some(uri) => PathBuf::from(percent_decode(uri)),
-                None => PathBuf::from(arg),
-            };
-            let path = if path.is_absolute() { path } else { cwd.join(path) };
-            path.canonicalize().unwrap_or(path).to_string_lossy().to_string()
-        })
-        .collect()
-}
-
-#[tauri::command]
-fn take_launch_paths(launch: State<'_, LaunchPaths>) -> Vec<String> {
-    launch.take()
-}
-
 /// Replace the placeholder system File/Help menus with actions backed by the
 /// same commands as the toolbar. Standard Edit and window actions stay native.
 fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
@@ -1626,9 +1152,6 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
         .hide().hide_others().separator().quit().build()?;
 
     let file = SubmenuBuilder::new(handle, "File")
-        .text("file.open", "Open File…")
-        .text("file.openFolder", "Open Folder…")
-        .separator()
         .text("file.save", "Save File")
         .text("file.saveAll", "Save All…")
         .text("file.exportMarkdown", "Export as Markdown…")
@@ -1743,31 +1266,20 @@ fn main() {
     #[cfg(target_os = "linux")]
     apply_linux_rendering_workarounds();
 
-    let args: Vec<String> = std::env::args().collect();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let launch_paths = resolve_cli_paths(&args, &cwd);
-
-    // Files the app was launched with were chosen by the user
     let access = AccessState::load();
-    access.grant(&launch_paths);
 
     tauri::Builder::default()
-        // Must be the first plugin: a second launch ("Open with" while the app
-        // is already running) hands its files to this instance and exits.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-            let paths = resolve_cli_paths(&argv, Path::new(&cwd));
-            app.state::<AccessState>().grant(&paths);
+        // Must be the first plugin: a second launch brings this instance forward and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
-            app.state::<LaunchPaths>().deliver(app, paths);
         }))
         .manage(AppState::default())
         .manage(session_commands::SessionState::default())
         .manage(session_analysis_commands::AnalysisState::default())
         .manage(access)
-        .manage(LaunchPaths(Mutex::new(LaunchPathQueue { pending: launch_paths, frontend_ready: false })))
         .manage(PendingUpdate::default())
         .manage(harness_commands::HarnessState::default())
         .plugin(tauri_plugin_dialog::init())
@@ -1780,14 +1292,6 @@ fn main() {
             install_app_menu(app)?;
             session_analysis_commands::start_scanner(app.handle().clone());
             Ok(())
-        })
-        // Dropped files and folders were chosen by the user. Tauri runs this
-        // listener in the same event-loop turn that queues the drop event for
-        // the webview, so the paths are granted before the frontend sees them.
-        .on_window_event(|window, event| {
-            if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
-                window.state::<AccessState>().grant(paths);
-            }
         })
         .register_uri_scheme_protocol("localfile", |ctx, request| {
             serve_local_image(&ctx.app_handle().state::<AccessState>(), request.uri().path())
@@ -1824,28 +1328,16 @@ fn main() {
             session_commands::session_memories,
             session_commands::read_session_memory,
             session_commands::open_session_memory_window,
-            session_commands::session_control,
-            scan_directories,
-            scan_project_agent_files,
             read_file,
             write_file,
             pick_directory,
-            pick_files,
             export_file,
-            adopt_session_access,
             get_file_info,
-            start_watching,
-            stop_watching,
             open_in_explorer,
             follow_local_link,
             open_external,
             check_for_update,
             install_update,
-            get_history_path,
-            read_history,
-            append_to_history,
-            clear_history,
-            take_launch_paths,
             agent_workspace,
             enable_agent_workspace,
             disable_agent_workspace,
@@ -1854,19 +1346,8 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = event {
-                let paths: Vec<String> = urls.into_iter()
-                    .filter_map(|url| url.to_file_path().ok())
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect();
-                app.state::<AccessState>().grant(&paths);
-                app.state::<LaunchPaths>().deliver(app, paths);
-            }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
-        });
+        // Files handed over by the system ("Open with") are not opened: the app shows agent documents only
+        .run(|_app, _event| {});
 }
 
 #[cfg(test)]
@@ -1955,14 +1436,12 @@ mod tests {
         let state = AccessState {
             access: Mutex::new(Access::default()),
             file: None,
-            migration_pending: Mutex::new(false),
         };
         state.grant([&docs]);
         let check = |path: PathBuf, use_| state.check(&resolve_target(&path).unwrap(), use_).is_ok();
 
         assert!(check(docs.join("notes.md"), Use::Open), "link to a document");
         assert!(check(docs.join("guide/a.md"), Use::Open), "document in a linked folder");
-        assert!(check(docs.join("guide"), Use::List));
         assert!(check(docs.join("pic.png"), Use::Image));
         assert!(!check(docs.join("key.md"), Use::Open), "a .md name doesn't make a key a document");
         assert!(!check(docs.join("hosts.yml"), Use::Open), "a link out of the folder reaches Markdown only");
@@ -1970,29 +1449,22 @@ mod tests {
         assert!(!check(outside.join("notes.md"), Use::Open), "the target itself isn't opened");
         assert!(!check(docs.join("guide/../notes.md"), Use::Open), "no `..` through a link");
 
-        // A link back to the folder is listed once
-        let mut visited = HashSet::new();
-        let tree = scan_directory_recursive(&docs, 0, &mut 0, false, &mut visited).unwrap();
-        let names: Vec<_> = tree.children.unwrap().iter().map(|c| c.name.clone()).collect();
-        assert_eq!(names, ["guide", "notes.md"], "no link to a non-document, no loop");
-
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn file_tree_skips_folders_without_markdown_even_when_text_is_visible() {
-        let root = temp_dir("markdown-tree");
-        fs::create_dir_all(root.join("code/nested")).unwrap();
-        fs::create_dir_all(root.join("docs/nested")).unwrap();
-        fs::write(root.join("code/nested/main.rs"), "fn main() {}").unwrap();
-        fs::write(root.join("docs/README.md"), "# Docs").unwrap();
-        fs::write(root.join("docs/nested/notes.txt"), "text").unwrap();
-        let mut visited = HashSet::new();
-        let tree = scan_directory_recursive(&root, 0, &mut 0, true, &mut visited).unwrap();
-        let children = tree.children.unwrap();
-        assert_eq!(children.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["docs"]);
-        assert_eq!(children[0].children.as_ref().unwrap().iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["README.md"]);
-        let _ = fs::remove_dir_all(&root);
+    fn agent_files_of_session_folders_open_only_while_the_workspace_is_on() {
+        let mut access = Access { agent_workspace: true, session_folders: vec![PathBuf::from("/work/app")], ..Access::default() };
+        for path in ["/work/app/CLAUDE.md", "/work/app/AGENTS.md", "/work/app/.claude/plans/next.md", "/work/app/crates/core/CLAUDE.md", "/work/app/.cursor/rules/api.mdc"] {
+            assert!(access.can_open(Path::new(path)) && access.can_stat(Path::new(path)), "{path}");
+        }
+        // Nothing else in the folder, and nothing in a folder no session works in
+        for path in ["/work/app/README.md", "/work/app/src/main.rs", "/work/app/.claude/settings.json", "/work/app/.env", "/work/app/node_modules/x/CLAUDE.md", "/work/other/CLAUDE.md", "/work/application/CLAUDE.md"] {
+            assert!(!access.can_open(Path::new(path)), "{path}");
+        }
+        assert!(!access.can_list(Path::new("/work/app")) && !access.can_read_image(Path::new("/work/app/logo.png")));
+        access.agent_workspace = false;
+        assert!(!access.can_open(Path::new("/work/app/CLAUDE.md")));
     }
 
     #[test]
@@ -2021,17 +1493,6 @@ mod tests {
     }
 
     #[test]
-    fn history_links_survive_spaces_brackets_and_round_trip() {
-        let path = "/Users/me/My Notes (old)/[draft] 100%.md";
-        let entry = format!("- 10:00 [{}]({})", markdown_link_text("[draft] 100%.md"), markdown_link_destination(path));
-        assert_eq!(
-            entry,
-            r"- 10:00 [\[draft\] 100\%\.md](/Users/me/My%20Notes%20%28old%29/%5Bdraft%5D%20100%25.md)"
-        );
-        assert_eq!(history_link_destinations(&entry), vec![path.to_string()]);
-    }
-
-    #[test]
     fn only_app_pages_are_navigable() {
         let url = |s: &str| tauri::Url::parse(s).unwrap();
         assert!(is_app_url(&url("tauri://localhost/index.html")));
@@ -2043,23 +1504,4 @@ mod tests {
         assert!(!is_app_url(&url("localfile://localhost/x.png")));
     }
 
-    #[test]
-    fn history_is_capped_and_newest_first_within_a_day() {
-        let mut content = String::from("# History\n");
-        for i in 0..5 {
-            content = add_history_entry(&content, "2026-10-09", &format!("- old {}", i), 4);
-        }
-        content = add_history_entry(&content, "2026-10-10", "- new", 4);
-
-        assert_eq!(
-            content,
-            "# History\n\n## 2026-10-09\n- old 4\n- old 3\n- old 2\n\n## 2026-10-10\n- new\n"
-        );
-
-        // A full day is dropped once its entries are gone
-        for i in 0..3 {
-            content = add_history_entry(&content, "2026-10-10", &format!("- newer {}", i), 4);
-        }
-        assert!(!content.contains("2026-10-09"));
-    }
 }

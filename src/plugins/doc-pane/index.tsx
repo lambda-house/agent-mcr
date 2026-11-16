@@ -4,7 +4,6 @@ import LiveDocPane from '../../components/LiveDocPane';
 import { useStore } from '../../store';
 import { getFileName } from '../../utils/files';
 import { saveDocumentToDisk } from '../../utils/save';
-import { pickFiles, readFile } from '../../utils/tauri';
 import { listLeaves } from '../../utils/paneLayout';
 import { createPlugin, pluginRegistry, type LiveControllerContext } from '../sdk';
 
@@ -26,15 +25,27 @@ function useDocEditing(path: string): [boolean, () => void] {
   return [editing, toggle];
 }
 
+function pickLocalFiles(): Promise<File[]> {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = '.md,.markdown,.txt,.json,.yaml,.yml,.toml,.ts,.tsx,.js,.jsx,.rs,.css,.html';
+    input.onchange = () => resolve(Array.from(input.files ?? []));
+    input.click();
+  });
+}
+
 async function pickAndOpenDocuments(controller: LiveControllerContext, targetLeafId?: string): Promise<void> {
   try {
-    const paths = await pickFiles();
+    const files = await pickLocalFiles();
     const { openDocument } = useStore.getState();
-    for (let i = 0; i < paths.length; i++) {
-      const path = paths[i];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const path = file.name;
       const existing = useStore.getState().documents[path];
       if (existing === undefined) {
-        const content = await readFile(path);
+        const content = await file.text();
         openDocument(path, content, { preview: false });
       }
       const item = { kind: 'doc', path } as const;

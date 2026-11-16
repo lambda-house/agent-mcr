@@ -95,8 +95,6 @@ export function isSubmenu(item: MenuItem): item is Submenu {
 
 /** What the commands need from the app shell (App.tsx); the rest is in the store. */
 export interface MenuActions {
-  openFile: () => void;
-  openFolder: () => void;
   reopenClosedTab: () => void;
 }
 
@@ -118,14 +116,6 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
   };
 
   return [
-    {
-      id: 'file.open',
-      label: 'Open File…',
-      shortcut: { mod: true, key: 'o' },
-      run: actions.openFile,
-    },
-    { id: 'file.openFolder', label: 'Open Folder…', run: actions.openFolder },
-    'separator',
     {
       id: 'file.save',
       label: 'Save File',
@@ -163,24 +153,10 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
       items: [
         {
           id: 'view.filePanel',
-          label: 'File Panel',
+          label: 'Agent Documents',
           shortcut: { mod: true, key: 'b' },
           checked: (s) => s.filePanelVisible,
           run: () => state().setFilePanelVisible(!state().filePanelVisible),
-        },
-        {
-          id: 'view.history',
-          label: 'History',
-          shortcut: { mod: true, key: 'h' },
-          checked: (s) => s.historyVisible,
-          run: () => state().toggleHistoryVisible(),
-        },
-        {
-          id: 'view.agentFiles',
-          label: 'Show Global Agent Files',
-          shortcut: { mod: true, shift: true, key: 'a' },
-          checked: (s) => s.agentVisible,
-          run: () => state().toggleAgentVisible(),
         },
         {
           id: 'view.toc',
@@ -256,18 +232,6 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
           shortcut: { mod: true, key: 'f' },
           enabled: hasDocument,
           run: () => state().openFind(getSelectedText()),
-        },
-        {
-          id: 'search.searchFiles',
-          label: 'Search in Tabs and Folders…',
-          shortcut: { mod: true, shift: true, key: 'f' },
-          run: () => state().openSearch(getSelectedText()),
-        },
-        {
-          id: 'search.filterFiles',
-          label: 'Filter Files…',
-          shortcut: { mod: true, key: 'p' },
-          run: () => document.querySelector<HTMLInputElement>('.toolbar-search input')?.focus(),
         },
       ],
     },
