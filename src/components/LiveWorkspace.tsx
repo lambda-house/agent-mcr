@@ -521,12 +521,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         </button>
         {supervisor && <RowMenu label="Actions for the supervisor" actions={actions(supervisor)}/>}
       </div>
-      <form className="hs-add" onSubmit={e => { e.preventDefault(); addFolder(cwd); }}>
-        <input aria-label="Add a folder" list="hs-folders" value={cwd} onChange={e => setCwd(e.target.value)} placeholder="Add a folder to work in…"/>
-        <datalist id="hs-folders">{suggestions.map(d => <option key={d} value={d}/>)}</datalist>
-        <button type="button" title="Choose folder…" aria-label="Choose folder" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}><FolderOpen size={14}/></button>
-        <button type="submit" disabled={!cwd.trim()} title="Add folder to the list" aria-label="Add folder"><Plus size={14}/></button>
-      </form>
+      <div className="hs-add">
+        <Button variant="ghost" size="sm" title="Choose a folder to work in" aria-label="Add project" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}><Plus size={14}/> Add project</Button>
+      </div>
       <ul className="hs-dirs">
         {shown.map(d => {
           const name = d.path.split('/').filter(Boolean).pop() ?? d.path;
@@ -559,7 +556,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         })}
       </ul>
       {sections.length > shown.length && <button type="button" className="hs-more-folders" onClick={() => setAllHistory(true)}>{sections.length - shown.length} more folders with history</button>}
-      {!sections.length && status && <p className="hs-empty">No sessions yet. Add a folder above and start an agent in it; it keeps running when you close the app.</p>}
+      {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
       {pluginRegistry.getSidebarSections().map(section => (
         <div key={section.id} className="hs-plugin-sidebar-section">
           {section.render(controller)}

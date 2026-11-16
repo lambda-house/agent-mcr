@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LiveWorkspace from './LiveWorkspace';
 import { harnessApi, type Hosted } from '../utils/harness';
+import { pickDirectory } from '../utils/tauri';
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), ack: vi.fn(), supervisor: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
@@ -116,14 +117,13 @@ describe('Live workspace', () => {
     expect(localStorage.getItem('hs-dirs')).toBe('[]');
   });
 
-  it('adds a folder and starts an agent inside it', async () => {
+  it('adds a project folder and starts an agent inside it', async () => {
     vi.mocked(harnessApi.list).mockResolvedValue([]);
     vi.mocked(harnessApi.spawn).mockResolvedValue({ ...running, cwd: '/Users/me/new' });
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    expect(host.textContent).toContain('Add a folder above');
-    const input = host.querySelector('input[aria-label="Add a folder"]') as HTMLInputElement;
-    await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '/Users/me/new/'); input.dispatchEvent(new Event('input', { bubbles: true })); });
-    await act(async () => button('Add folder').click());
+    expect(host.textContent).toContain('Add a project above');
+    vi.mocked(pickDirectory).mockResolvedValue('/Users/me/new/');
+    await act(async () => button('Add project').click()); await flush();
     expect(folders().map(f => f.querySelector('.hs-dir-path')?.textContent)).toEqual(['~/new']);
     vi.mocked(harnessApi.list).mockResolvedValue([{ ...running, cwd: '/Users/me/new' }]);
     // One "+" per folder: its menu offers the agents, not a shell

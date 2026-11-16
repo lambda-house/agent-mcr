@@ -303,8 +303,7 @@
 
 /* Add a folder: one line above the sections */
 .hs-add { display: flex; gap: 5px; padding: 8px 8px 6px; }
-.hs-add input { flex: 1; min-width: 0; padding: 4px 7px; border: 1px solid var(--sc-border); border-radius: 6px; background: var(--sc-bg); font-size: 12px; }
-.session-cockpit .hs-add button { padding: 4px 7px; color: var(--sc-muted); }
+.session-cockpit .hs-add button { color: var(--sc-muted); }
 /* A folder: a bracket on the left and a line on top, with the folder's path set into the line */
 .hs-list li.hs-dir, .ss-dir { display: block; margin: 14px 0 6px 2px; padding: 0 0 2px 3px; border-left: 2px solid var(--sc-border); border-top: 1px solid var(--sc-border); border-radius: 6px 0 0 6px; min-width: 0; max-width: none; }
 .hs-list li.hs-dir.live { border-color: var(--sc-accent); border-top-color: color-mix(in srgb, var(--sc-accent) 55%, var(--sc-border)); }
