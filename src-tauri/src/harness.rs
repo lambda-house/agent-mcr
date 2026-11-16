@@ -6,6 +6,8 @@
 //! State comes from the agents' own hooks (`--harness-hook`), passed per
 //! launch; nothing is written into the user's agent config files.
 
+#[cfg(any(windows, test))]
+pub use crate::agents::{cmd_line, windows_args};
 pub use crate::agents::{command_line, Launch};
 use crate::ipc::{self, Listener, Stream};
 use crate::peer;
@@ -161,8 +163,26 @@ fn new_uuid() -> String {
     format!("{}-{}-4{}-a{}-{}", &hex[..8], &hex[8..12], &hex[13..16], &hex[17..20], &hex[20..32])
 }
 
-/// Every profile runs in a login shell, so agents see the PATH, keys and
+/// Windows launch argv: `powershell.exe -NoLogo` for shell, `cmd.exe /d /v:off /s /c "<line>"` for agents.
+#[cfg(any(windows, test))]
+pub fn windows_argv_for(l: &Launch) -> Result<Vec<String>, String> {
+    let args = windows_args(l)?;
+    if l.profile == "shell" {
+        return Ok(args);
+    }
+    Ok(vec![
+        "cmd.exe".into(),
+        "/d".into(),
+        "/v:off".into(),
+        "/s".into(),
+        "/c".into(),
+        cmd_line(&args)?,
+    ])
+}
+
+/// Every profile runs in a login shell on Unix, so agents see the PATH, keys and
 /// version managers the user has in Terminal.
+#[cfg(unix)]
 pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
     let cmd = command_line(l)?;
     let mut shell = login_shell();
@@ -174,10 +194,25 @@ pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
     Ok(if cmd.is_empty() { vec![shell, "-l".into()] } else { vec![shell, "-l".into(), "-i".into(), "-c".into(), cmd] })
 }
 
+/// Windows launch argv: `cmd.exe /d /v:off /s /c "<command line>"` (or `powershell.exe -NoLogo`).
+#[cfg(windows)]
+pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
+    windows_argv_for(l)
+}
+
+/// Claude hook command string for the current platform.
+pub fn claude_hook_command(exe: &str, event: &str, windows: bool) -> String {
+    if windows {
+        format!("\"{}\" --harness-hook {event}", exe.replace('\\', "/"))
+    } else {
+        format!("{} --harness-hook {event}", sh(exe))
+    }
+}
+
 /// Claude Code hooks for one launch (`--settings`): each reports to this
 /// service and prints nothing, so it never changes what the agent does.
 pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
-    let hook = |event: &str| json!([{ "hooks": [{ "type": "command", "command": format!("{} --harness-hook {event}", sh(exe)), "timeout": 5 }] }]);
+    let hook = |event: &str| json!([{ "hooks": [{ "type": "command", "command": claude_hook_command(exe, event, cfg!(windows)), "timeout": 5 }] }]);
     let mut hooks = serde_json::Map::new();
     for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop"] {
         hooks.insert(event.into(), hook(event));
@@ -1425,6 +1460,11 @@ impl Harness {
         let mcp = self.dir.join(if supervisor { "claude-supervisor-mcp.json" } else { "claude-mcp.json" });
         let plugin = self.dir.join("claude-plugin");
         let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
+        if cfg!(windows) && agent.is_agent() {
+            if let Some(text) = task {
+                plain_prompt(text)?;
+            }
+        }
         let argv = argv_for(&Launch {
             supervisor,
             plugin: &plugin.display().to_string(),
@@ -1435,7 +1475,8 @@ impl Harness {
             mcp: &mcp.display().to_string(),
             agent_session: agent_session.as_deref(),
             resume,
-            task,
+            // Free text never goes in Windows argv; it is queued and typed when ready.
+            task: if cfg!(windows) { None } else { task },
         })?;
         let id = runner::random_id()[..12].to_string();
         let name: String = req["name"].as_str().unwrap_or("").trim().chars().take(80).collect();
@@ -1465,8 +1506,9 @@ impl Harness {
         }))?;
         let now = now_ms();
         let first_task = task.map(|_| format!("t{}", &runner::random_id()[..10]));
+        let task_in_argv = task.is_some() && !cfg!(windows);
         self.update(|s| {
-            let state = match (agent.is_agent(), task.is_some()) {
+            let state = match (agent.is_agent(), task_in_argv) {
                 (true, true) => "working",
                 (true, false) if agent.reports_from_start() => "starting",
                 _ => "unknown",
@@ -1488,7 +1530,16 @@ impl Harness {
             if let (Some(text), Some(task_id)) = (task, first_task.clone()) {
                 s.tasks.insert(
                     task_id.clone(),
-                    Task { id: task_id, session: id.clone(), text: text.into(), state: "working".into(), created: now, started: now, finished: 0, result: None },
+                    Task {
+                        id: task_id,
+                        session: id.clone(),
+                        text: text.into(),
+                        state: if task_in_argv { "working".into() } else { "queued".into() },
+                        created: now,
+                        started: if task_in_argv { now } else { 0 },
+                        finished: 0,
+                        result: None,
+                    },
                 );
             }
         });
@@ -2848,6 +2899,85 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_argv_and_claude_hooks_match_spec() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let shell = windows_argv_for(&Launch { profile: "shell", ..Launch::default() }).unwrap();
+        assert_eq!(shell, vec!["powershell.exe", "-NoLogo"]);
+
+        for profile in ["claude", "codex", "antigravity"] {
+            let argv = windows_argv_for(&Launch {
+                profile,
+                exe: "C:\\Program Files\\Agent MCR\\agent-mcr.exe",
+                settings: "C:\\cfg\\claude-hooks.json",
+                mcp: "C:\\cfg\\claude-mcp.json",
+                plugin: "C:\\cfg\\claude-plugin",
+                note: true,
+                supervisor: true,
+                agent_session: Some(id),
+                task: Some("ignored on windows"),
+                ..Launch::default()
+            }).unwrap();
+            assert_eq!(&argv[..5], &["cmd.exe", "/d", "/v:off", "/s", "/c"]);
+            assert!(argv[5].starts_with("\"\"") && argv[5].ends_with("\"\""));
+            assert!(!argv[5].contains("ignored on windows"));
+        }
+
+        let hook = claude_hook_command("C:\\Program Files\\Agent MCR\\agent-mcr.exe", "Stop", true);
+        assert_eq!(hook, "\"C:/Program Files/Agent MCR/agent-mcr.exe\" --harness-hook Stop");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_line_preserves_argv_through_cmd_and_npm_shim() {
+        use std::os::windows::process::CommandExt;
+        let exe = std::env::current_exe().unwrap();
+        let probe = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples").join("argv_probe.exe"))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| {
+                let status = std::process::Command::new("cargo")
+                    .args(["build", "--example", "argv_probe"])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "failed to build argv_probe example");
+                exe.parent().unwrap().parent().unwrap().join("examples").join("argv_probe.exe")
+            });
+        assert!(probe.is_file(), "argv_probe.exe missing at {}", probe.display());
+
+        let dir = std::env::temp_dir().join(format!("mcr-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe_copy = dir.join("argv_probe.exe");
+        std::fs::copy(&probe, &probe_copy).unwrap();
+        let shim = dir.join("argv_probe.cmd");
+        std::fs::write(&shim, "@\"%~dp0argv_probe.exe\" %*\r\n").unwrap();
+
+        let payload = vec![
+            "".to_string(),
+            "hello world".to_string(),
+            "C:\\dir with space\\".to_string(),
+            "a & b | c < d > e ^ f (g) !h!".to_string(),
+        ];
+
+        for prog in [&probe_copy, &shim] {
+            let mut full = vec![prog.display().to_string()];
+            full.extend(payload.iter().cloned());
+            let line = cmd_line(&full).unwrap();
+            let out = std::process::Command::new("cmd.exe")
+                .raw_arg("/d /v:off /s /c ")
+                .raw_arg(&line)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "cmd failed for {}: {}", prog.display(), String::from_utf8_lossy(&out.stderr));
+            let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(got, payload, "argv mismatch via {}", prog.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn disabled_profiles_are_refused_before_launch_and_cli_never_bypasses_approval() {
