@@ -5,10 +5,8 @@
 These files and directories are isolated from upstream core files:
 
 - `src/plugins/` — Plugin SDK (`sdk.ts`, `usePlugins.ts`, `index.ts`) and plugins:
-  - `src/plugins/handoff/` — `Handoff` top tab
   - `src/plugins/doc-pane/` — `doc` pane renderer, `Documents` sidebar section, `Open file` action
   - `src/plugins/theme-overrides/` — custom CSS tokens and visual overrides
-- `src/components/HandoffWorkspace.tsx` + `src/styles/handoff.css`
 - `src/components/LiveDocPane.tsx`
 - `src/utils/paneLayout.ts` + `src/utils/paneLayout.test.ts`
 - `src/teob-ui/` + `src/styles/teob/` (with CSS imports in `src/styles/index.css` / `src/main.tsx`)

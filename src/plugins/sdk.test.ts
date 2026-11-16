@@ -10,12 +10,10 @@ describe('plugin system', () => {
 
   it('auto-discovers built-in plugins', () => {
     const ids = pluginRegistry.listPlugins().map(p => p.id);
-    expect(ids).toContain('handoff');
     expect(ids).toContain('doc-pane');
     expect(ids).toContain('theme-overrides');
     expect(ids).toContain('teob-theme');
     expect(ids).toContain('command-panel');
-    expect(pluginRegistry.getTopTabs().some(t => t.id === 'handoff')).toBe(true);
     expect(pluginRegistry.getPaneType('doc')).toBeDefined();
     expect(pluginRegistry.getSidebarSections().some(s => s.id === 'documents')).toBe(true);
     expect(pluginRegistry.getEmptyActions().some(a => a.id === 'open-file')).toBe(true);

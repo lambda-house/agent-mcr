@@ -5,7 +5,6 @@ import {
   Database,
   Shield,
   Puzzle,
-  ArrowRightLeft,
   FileText,
   Folder,
   Palette,
@@ -27,7 +26,6 @@ type SettingsCategory =
   | (string & {});
 
 function pluginIcon(id: string) {
-  if (id === 'handoff') return <ArrowRightLeft size={16} />;
   if (id === 'doc-pane') return <FileText size={16} />;
   if (id === 'theme-overrides' || id === 'teob-theme') return <Palette size={16} />;
   if (id === 'command-panel') return <Command size={16} />;
