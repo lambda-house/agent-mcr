@@ -23,7 +23,7 @@
     "@fontsource/jetbrains-mono": "^5.3.0",
     "@lezer/highlight": "^1.2.5",
     "@tauri-apps/api": "^2.12.2",
-    "@teob/ui": "git+https://github.com/teob-cc/teob-ui.git#0e05387c20acd71ded3ab9b6ff8be45eb7e2645a",
+    "@teob/ui": "git+https://github.com/teob-cc/teob-ui.git#e804a8cda2c83144debf845d80c40f0f097adfa3",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-webgl": "^0.19.0",
