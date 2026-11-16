@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, windows-port, windows-port-b]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -33,6 +34,11 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      - name: Authenticate private dependencies
+        env:
+          TEOB_UI_TOKEN: ${{ secrets.TEOB_UI_TOKEN }}
+        run: git config --global url."https://x-access-token:${TEOB_UI_TOKEN}@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
+
       - run: npm ci
 
       - name: Typecheck and build frontend
@@ -45,6 +51,40 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --locked --all-targets
 
+      - name: Test Rust backend
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Authenticate private dependencies
+        shell: bash
+        env:
+          TEOB_UI_TOKEN: ${{ secrets.TEOB_UI_TOKEN }}
+        run: git config --global url."https://x-access-token:${TEOB_UI_TOKEN}@github.com/teob-cc/".insteadOf "https://github.com/teob-cc/"
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Lint Rust backend
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test Rust backend
         working-directory: src-tauri
         run: cargo test --locked
