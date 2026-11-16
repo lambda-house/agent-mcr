@@ -1209,7 +1209,7 @@ fn main() {
 
     let access = AccessState::load();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Must be the first plugin: a second launch brings this instance forward and exits.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -1283,8 +1283,21 @@ fn main() {
             read_snapshot,
             mark_read,
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .build(tauri::generate_context!());
+    #[cfg(windows)]
+    let app = app.unwrap_or_else(|error| {
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(window: *mut std::ffi::c_void, text: *const u16, title: *const u16, kind: u32) -> i32;
+        }
+        let text: Vec<u16> = format!("Agent MCR could not start. Make sure Microsoft Edge WebView2 Runtime is installed.\n\n{error}").encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "Agent MCR".encode_utf16().chain(Some(0)).collect();
+        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10); }
+        std::process::exit(1);
+    });
+    #[cfg(not(windows))]
+    let app = app.expect("error while building tauri application");
+    app
         // Files handed over by the system ("Open with") are not opened: the app shows agent documents only
         .run(|_app, _event| {});
 }
