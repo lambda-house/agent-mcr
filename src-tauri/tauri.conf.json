@@ -61,15 +61,8 @@
     "category": "Productivity",
     "copyright": "© 2026 Lambda House",
     "fileAssociations": [],
-    "createUpdaterArtifacts": false,
     "macOS": {
       "signingIdentity": "-"
-    }
-  },
-  "plugins": {
-    "updater": {
-      "pubkey": "",
-      "endpoints": []
     }
   }
 }

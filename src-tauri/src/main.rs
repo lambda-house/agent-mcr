@@ -16,7 +16,6 @@ use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::http::{Response as HttpResponse, StatusCode};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
-use tauri_plugin_updater::UpdaterExt;
 
 mod agent;
 #[cfg(unix)]
@@ -972,60 +971,6 @@ async fn mark_read(paths: Vec<String>, access: State<'_, AccessState>) -> Result
 }
 
 // ============================================================
-// Updates
-// ============================================================
-
-/// The update found by `check_for_update`, kept for `install_update`.
-#[derive(Default)]
-pub struct PendingUpdate(Mutex<Option<tauri_plugin_updater::Update>>);
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateInfo {
-    version: String,
-    current_version: String,
-    notes: Option<String>,
-}
-
-/// Ask the release server (`plugins.updater.endpoints` in tauri.conf.json)
-/// for a newer version. `None` when this one is the latest.
-const RELEASE_CHANNEL: bool = false;
-
-#[tauri::command]
-async fn check_for_update(app: AppHandle, pending: State<'_, PendingUpdate>) -> Result<Option<UpdateInfo>, AppError> {
-    // Agent MCR has no release channel yet; never offer MDViewer's.
-    if !RELEASE_CHANNEL {
-        return Ok(None);
-    }
-    let update = app.updater()
-        .map_err(|e| AppError::with_details("UPDATE_ERROR", "Updater unavailable", &e.to_string()))?
-        .check()
-        .await
-        .map_err(|e| AppError::with_details("UPDATE_ERROR", "Could not check for updates", &e.to_string()))?;
-    let info = update.as_ref().map(|update| UpdateInfo {
-        version: update.version.clone(),
-        current_version: update.current_version.clone(),
-        notes: update.body.clone(),
-    });
-    *pending.0.lock().map_err(|_| AppError::new("STATE_ERROR", "Failed to store the update"))? = update;
-    Ok(info)
-}
-
-/// Download the update found by `check_for_update`, verify its signature
-/// against `plugins.updater.pubkey`, install it and restart.
-#[tauri::command]
-async fn install_update(app: AppHandle, pending: State<'_, PendingUpdate>) -> Result<(), AppError> {
-    let update = pending.0.lock()
-        .map_err(|_| AppError::new("STATE_ERROR", "Failed to read the update"))?
-        .take()
-        .ok_or_else(|| AppError::new("UPDATE_ERROR", "No update to install"))?;
-    update.download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| AppError::with_details("UPDATE_ERROR", "Failed to install the update", &e.to_string()))?;
-    app.restart()
-}
-
-// ============================================================
 // Navigation Guard
 // ============================================================
 
@@ -1280,11 +1225,8 @@ fn main() {
         .manage(session_commands::SessionState::default())
         .manage(session_analysis_commands::AnalysisState::default())
         .manage(access)
-        .manage(PendingUpdate::default())
         .manage(harness_commands::HarnessState::default())
         .plugin(tauri_plugin_dialog::init())
-        // Used from Rust only (`check_for_update`, `install_update`)
-        .plugin(tauri_plugin_updater::Builder::new().build())
         // Used from Rust only (`open_external`); no JS permissions are granted
         .plugin(tauri_plugin_opener::init())
         .plugin(navigation_guard())
@@ -1336,8 +1278,6 @@ fn main() {
             open_in_explorer,
             follow_local_link,
             open_external,
-            check_for_update,
-            install_update,
             agent_workspace,
             enable_agent_workspace,
             disable_agent_workspace,

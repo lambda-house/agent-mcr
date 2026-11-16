@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { X, Trash2, Settings, Code, Plus, Palette } from 'lucide-react';
 import { useStore } from '../store';
-import { isTauri, checkForUpdate, getAppVersion } from '../utils/tauri';
+import { getAppVersion } from '../utils/tauri';
 
 type SettingsCategory = 'general' | 'appearance' | 'highlighting';
 
@@ -10,10 +10,6 @@ const SettingsModal: React.FC = () => {
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
   const smoothScroll = useStore((s) => s.smoothScroll);
   const setSmoothScroll = useStore((s) => s.setSmoothScroll);
-  const checkUpdatesOnStart = useStore((s) => s.checkUpdatesOnStart);
-  const setCheckUpdatesOnStart = useStore((s) => s.setCheckUpdatesOnStart);
-  const setAvailableUpdate = useStore((s) => s.setAvailableUpdate);
-  const [updateStatus, setUpdateStatus] = useState('');
   const [appVersion, setAppVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -146,38 +142,11 @@ const SettingsModal: React.FC = () => {
 
                 <div className="settings-option">
                   <div className="settings-option-info">
-                    <span className="settings-option-label">Check for updates on start</span>
+                    <span className="settings-option-label">Version</span>
                     <span className="settings-option-description">
-                      {appVersion && `You have Agent MCR ${appVersion}. `}
-                      {updateStatus || 'Look for a new version on GitHub when the app starts. Updates install only when you click Install'}
+                      {appVersion ? `Agent MCR ${appVersion}. ` : ''}The app does not update itself and does not look for new versions.
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    className="settings-button"
-                    disabled={!isTauri() || updateStatus === 'Checking…'}
-                    onClick={async () => {
-                      setUpdateStatus('Checking…');
-                      try {
-                        const update = await checkForUpdate();
-                        setAvailableUpdate(update);
-                        setUpdateStatus(update ? `Version ${update.version} is available, see the bar above` : 'You have the latest version');
-                      } catch (error) {
-                        const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error);
-                        setUpdateStatus(`Could not check: ${message}`);
-                      }
-                    }}
-                  >
-                    Check now
-                  </button>
-                  <label className="settings-toggle">
-                    <input
-                      type="checkbox"
-                      checked={checkUpdatesOnStart}
-                      onChange={(e) => setCheckUpdatesOnStart(e.target.checked)}
-                    />
-                    <span className="settings-toggle-slider" />
-                  </label>
                 </div>
               </div>
             )}

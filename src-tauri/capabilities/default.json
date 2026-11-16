@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for MDViewer. File access goes through the app's own commands, which check the access list; dialogs are opened from Rust.",
+  "description": "Default capabilities for Agent MCR. File access goes through the app's own commands, which check the access list; dialogs are opened from Rust.",
   "windows": ["main", "memory-*"],
   "permissions": [
     "core:default",

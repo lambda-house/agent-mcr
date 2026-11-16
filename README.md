@@ -5,13 +5,15 @@
 - **Sessions.** The Claude Code and Codex sessions on this machine: active and inactive, who started whom, models, tokens, tool calls, and ticket mentions.
 - **Live.** Claude Code, Codex and shell terminals running inside the app. They keep running when the app quits. Each shows what it is doing (working, idle, waiting for you), and the ones waiting for you are listed on top and raise a macOS notification. An earlier Claude or Codex session can be resumed here.
 - **Supervisor.** A Supervisor session in the app, or an outside agent you allowed, creates and resumes sessions, gives them tasks and follows the results through an MCP server (below). It cannot answer permission prompts: those are yours.
-- **Planned.** A dependency graph, tools agents use to talk to each other, a git worktree per session, and infrastructure tools through a local [agentgateway](https://agentgateway.dev).
+- **Between sessions.** Every hosted agent gets the `mcr` tools: see its peers and their roles, message them, report to you that it needs you or that a piece of work is done, and leave notes for later sessions on a bulletin board.
+- **Documents.** The agents' own Markdown (instructions, rules, memory, plans, skills) by the folder their sessions work in, with what changed since you last read it.
+- **Planned.** A dependency graph, a git worktree per session, and memory shared between agents.
 
-The architecture and its decisions are in [docs/AGENT_HARNESS_DESIGN.md](docs/AGENT_HARNESS_DESIGN.md).
+How it is built: [ARCHITECTURE.md](ARCHITECTURE.md). The design it grows towards and its decisions: [docs/AGENT_HARNESS_DESIGN.md](docs/AGENT_HARNESS_DESIGN.md).
 
 ## Status
 
-Pre-release (0.1.0): macOS only, no published builds and no updates.
+Pre-release (0.1.0): macOS only, no published builds. The app does not update itself.
 
 ## Build and run
 
