@@ -222,6 +222,17 @@ impl Service {
             return Ok(());
         }
         let parent = path.parent().ok_or("Socket directory missing")?;
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if std::fs::symlink_metadata(parent)
+                .map_err(|e| e.to_string())?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("Socket directory cannot be a symlink".into());
+            }
+        }
         private_dir(parent)?;
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if Stream::connect(path).is_ok() {
@@ -514,7 +525,7 @@ mod socket_tests {
     fn service_start_enforces_socket_hygiene_and_concurrent_revocation() {
         let dir = short_temp_dir("s");
         let sock_dir = dir.join("analysis");
-        std::fs::create_dir_all(&sock_dir).unwrap();
+        crate::ipc::private_dir(&sock_dir).unwrap();
         let sock = sock_dir.join("mcp.sock");
 
         // Refuses a regular non-socket file at the socket path.
@@ -548,6 +559,39 @@ mod socket_tests {
         for (_c, mut reader) in clients {
             assert!(read_frame(&mut reader).unwrap().is_none());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_start_rejects_symlink_parent() {
+        let dir = short_temp_dir("sym");
+        let target = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let svc = Arc::new(Service::default());
+        let err = svc.start(&link.join("mcp.sock"), Arc::new(Mutex::new(Index::default()))).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_start_creates_missing_analysis_dir() {
+        let dir = short_temp_dir("fresh");
+        let sock = dir.join("analysis").join("mcp.sock");
+        assert!(!dir.join("analysis").exists());
+        let svc = Arc::new(Service::default());
+        *svc.grant.lock().unwrap() = Grant { enabled: true, ..Grant::default() };
+        svc.start(&sock, Arc::new(Mutex::new(Index::default()))).unwrap();
+        assert!(sock.exists());
+        let mut client = Stream::connect(&sock).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        writeln!(client, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"fresh-test"},"capabilities":{}}})).unwrap();
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap()["result"]["serverInfo"]["name"], "agent-mcr-analysis");
+        svc.revoke();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
