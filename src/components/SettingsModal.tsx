@@ -6,7 +6,6 @@ import {
   Shield,
   Puzzle,
   FileText,
-  Folder,
   Palette,
   Command,
 } from 'lucide-react';
@@ -29,7 +28,6 @@ function pluginIcon(id: string) {
   if (id === 'doc-pane') return <FileText size={16} />;
   if (id === 'theme-overrides' || id === 'teob-theme') return <Palette size={16} />;
   if (id === 'command-panel') return <Command size={16} />;
-  if (id === 'projects-sidebar') return <Folder size={16} />;
   return <Puzzle size={16} />;
 }
 
