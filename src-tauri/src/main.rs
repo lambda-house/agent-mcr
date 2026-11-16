@@ -557,12 +557,20 @@ fn encode_text(content: &str, previous: Option<&[u8]>) -> Result<Vec<u8>, AppErr
 // History Functions
 // ============================================================
 
+fn config_dir_from(
+    config: Option<PathBuf>,
+    data_local: Option<PathBuf>,
+    windows: bool,
+) -> Option<PathBuf> {
+    (if windows { data_local } else { config }).map(|p| p.join("agent-mcr"))
+}
+
 fn get_config_dir() -> Result<PathBuf, AppError> {
-    dirs::config_dir()
-        .map(|p| {
-            p.join("agent-mcr")
-        })
-        .ok_or_else(|| AppError::new("CONFIG_ERROR", "Cannot determine config directory"))
+    let dir = config_dir_from(dirs::config_dir(), dirs::data_local_dir(), cfg!(windows))
+        .ok_or_else(|| AppError::new("CONFIG_ERROR", "Cannot determine config directory"))?;
+    ipc::private_dir(&dir)
+        .map_err(|e| AppError::with_details("CONFIG_ERROR", "Cannot secure config directory", &e))?;
+    Ok(dir)
 }
 
 // ============================================================
@@ -1199,7 +1207,7 @@ fn main() {
         _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
-        let path = std::env::args().nth(2).map(PathBuf::from).or_else(||get_config_dir().ok().map(|p|p.join("analysis/mcp.sock")));
+        let path = std::env::args().nth(2).map(PathBuf::from).or_else(|| get_config_dir().ok().map(|p| p.join("analysis").join("mcp.sock")));
         let result = path.ok_or_else(||"Configuration directory unavailable".to_string()).and_then(|p|session_mcp::bridge(&p));
         if let Err(e) = result {eprintln!("{e}");std::process::exit(1);}
         return;
@@ -1465,6 +1473,15 @@ mod tests {
         assert!(!is_app_url(&url("http://tauri.localhost.evil.com/")));
         assert!(!is_app_url(&url("file:///etc/passwd")));
         assert!(!is_app_url(&url("localfile://localhost/x.png")));
+    }
+
+    #[test]
+    fn config_dir_uses_data_local_on_windows_and_config_on_unix() {
+        let cfg = Some(PathBuf::from("/cfg"));
+        let local = Some(PathBuf::from("/local"));
+        assert_eq!(config_dir_from(cfg.clone(), local.clone(), true), Some(PathBuf::from("/local/agent-mcr")));
+        assert_eq!(config_dir_from(cfg, local, false), Some(PathBuf::from("/cfg/agent-mcr")));
+        assert_eq!(config_dir_from(Some(PathBuf::from("/cfg")), None, true), None);
     }
 
 }

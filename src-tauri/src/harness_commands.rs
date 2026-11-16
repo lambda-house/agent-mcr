@@ -291,25 +291,21 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
     let ext = image_extension(bytes).ok_or("Not a PNG, JPEG, GIF or WebP image")?;
     // ~/Library/Caches has no space in its path (Application Support does), so
     // the typed path needs no quoting in most agents' prompts.
-    let dir = dirs::cache_dir().ok_or("Cache directory unavailable")?.join("agent-mcr/attachments").join(&id);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let cache_root = dirs::cache_dir().ok_or("Cache directory unavailable")?.join("agent-mcr");
+    crate::ipc::private_dir(&cache_root)?;
+    let root = cache_root.join("attachments");
+    crate::ipc::private_dir(&root)?;
     // Screenshots can show anything: the user's alone, and not kept for good
-    if let Some(root) = dir.parent() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+    let old = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PASTED_IMAGE_KEPT));
+    for session in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        for file in std::fs::read_dir(session.path()).into_iter().flatten().flatten().filter(|f| old(&f.path())) {
+            let _ = std::fs::remove_file(file.path());
         }
-        let old = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PASTED_IMAGE_KEPT));
-        for session in std::fs::read_dir(root).into_iter().flatten().flatten() {
-            for file in std::fs::read_dir(session.path()).into_iter().flatten().flatten().filter(|f| old(&f.path())) {
-                let _ = std::fs::remove_file(file.path());
-            }
-            // Fails, as it should, while the folder still holds images
-            let _ = std::fs::remove_dir(session.path());
-        }
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // Fails, as it should, while the folder still holds images
+        let _ = std::fs::remove_dir(session.path());
     }
+    let dir = root.join(&id);
+    crate::ipc::private_dir(&dir)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
     let path = dir.join(format!("pasted-{stamp}.{ext}"));
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;

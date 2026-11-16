@@ -63,7 +63,8 @@ pub async fn enable_analysis(
     }
     let path = crate::get_config_dir()
         .map_err(|e| e.message)?
-        .join("analysis/mcp.sock");
+        .join("analysis")
+        .join("mcp.sock");
     state.0.start(&path, sessions.index.clone())?;
     *state.0.grant.lock().map_err(|_| "Grant unavailable")? = Grant {
         enabled: true,
