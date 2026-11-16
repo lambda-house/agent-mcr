@@ -49,6 +49,15 @@ Claude hook commands use `"<exe with forward slashes>" --harness-hook <Event>`, 
 
 **Out of scope.** Code signing (SmartScreen will warn), an updater (MCR-24), D8 worktrees (not built on any platform), ARM64 builds.
 
+## Team and workflow (operator decision, 2026-11-16)
+
+- Executor A ("Windows port: executor", Antigravity): worktree `agent-mcr-windows`, branch `windows-port`. Track: W2–W7 and R1–R3, and the merges.
+- Executor B ("Windows port: executor B", Codex): worktree `agent-mcr-windows-b`, branch `windows-port-b` (from 9116835). Track: W8, W9, W10, W11, W12.
+- Pipeline: an executor starts its next task as soon as it reports a commit; review fixes come as follow-up commits. At most one unreviewed task per executor ahead of the reviewer.
+- Review: the executor runs the full gate. The reviewer re-runs only `cargo xwin clippy` (plus `cargo test` when the diff touches Rust tests) and reads the diff closely. The full gate runs on every merge and at the final check.
+- File ownership, to keep merges small: `harness.rs`, `runner.rs`, `peer.rs`, `ipc.rs`, `agents*`, `session_mcp.rs`, `session_analysis_commands.rs`, `Cargo.toml`/`Cargo.lock` belong to A. `agent.rs`, `sessions.rs`, `session_memory.rs`, `src/`, `tauri.conf.json`, `package.json`, `.github/`, `CLAUDE.md`, `README.md`, `docs/SESSION_ANALYSIS_MCP.md`, `docs/AGENT_HARNESS_DESIGN.md` belong to B. `main.rs` is shared: A owns `get_config_dir` and the `--runner`/`--harness`/`--mcp` branches (W3, W7); B may change only `session_folders` and the Access path checks (W8). `docs/WINDOWS_PORT.md`: the planner edits the plan; A writes only under "Wine findings". A needed change in a file the other owns goes to the planner, who hands it to the owner. B collects doc notes from A's commits for W12.
+- Merges: A merges `windows-port-b` into `windows-port` and runs the full gate, after the reviewer approves W9, after W11, and before the final check. B then merges `windows-port` back into `windows-port-b` before its next task.
+
 ## Tasks
 
 | Id | Goal | Files | Acceptance |
