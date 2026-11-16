@@ -179,11 +179,56 @@ struct Output {
 
 struct Session {
     info: Mutex<Info>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     #[cfg(windows)]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    #[cfg(windows)]
+    job: Mutex<Option<WinJob>>,
     output: Mutex<Output>,
+}
+
+#[cfg(windows)]
+struct WinJob(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: Win32 job object handle is thread-safe for TerminateJobObject / CloseHandle.
+#[cfg(windows)]
+unsafe impl Send for WinJob {}
+
+#[cfg(windows)]
+impl Drop for WinJob {
+    fn drop(&mut self) {
+        // SAFETY: owned handle.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn assign_job(pid: Option<u32>) -> Option<WinJob> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+    let pid = pid?;
+    // SAFETY: creating an anonymous job object.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return None;
+    }
+    let job = WinJob(job);
+    // SAFETY: opening child process to assign to job.
+    let proc = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+    if proc.is_null() {
+        return None;
+    }
+    // SAFETY: both handles are valid.
+    let ok = unsafe { AssignProcessToJobObject(job.0, proc) } != 0;
+    // SAFETY: closing temporary process handle.
+    unsafe { CloseHandle(proc) };
+    ok.then_some(job)
 }
 
 #[derive(Default)]
@@ -262,6 +307,8 @@ impl Runner {
         drop(pair.slave);
         #[cfg(windows)]
         let killer = child.clone_killer();
+        #[cfg(windows)]
+        let job = assign_job(child.process_id());
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let info = Info {
@@ -279,10 +326,12 @@ impl Runner {
         };
         let session = Arc::new(Session {
             info: Mutex::new(info.clone()),
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            master: Mutex::new(Some(pair.master)),
+            writer: Mutex::new(Some(writer)),
             #[cfg(windows)]
             killer: Mutex::new(killer),
+            #[cfg(windows)]
+            job: Mutex::new(job),
             output: Mutex::new(Output {
                 ring: VecDeque::new(),
                 views: Vec::new(),
@@ -382,7 +431,10 @@ impl Runner {
         // Ctrl-C semantics: the terminal's foreground process group. Otherwise the
         // whole group the child leads (it is a session leader in its own PTY).
         let group = if sig == libc::SIGINT {
-            lock(&session.master).process_group_leader().unwrap_or(pid)
+            lock(&session.master)
+                .as_ref()
+                .and_then(|m| m.process_group_leader())
+                .unwrap_or(pid)
         } else {
             pid
         };
@@ -402,9 +454,24 @@ impl Runner {
         match name {
             "INT" => {
                 let mut writer = lock(&session.writer);
+                let Some(writer) = writer.as_mut() else {
+                    return Err("The session has ended".into());
+                };
                 writer.write_all(&[0x03]).and_then(|_| writer.flush()).map_err(|e| e.to_string())
             }
-            "TERM" | "HUP" | "KILL" => lock(&session.killer).kill().map_err(|e| e.to_string()),
+            "TERM" | "HUP" | "KILL" => {
+                // Terminate the entire job tree first, then kill the direct child and close ConPTY handles.
+                if let Some(job) = lock(&session.job).take() {
+                    // SAFETY: `job.0` is a valid job object handle.
+                    unsafe {
+                        windows_sys::Win32::System::JobObjects::TerminateJobObject(job.0, 1);
+                    }
+                }
+                let res = lock(&session.killer).kill().map_err(|e| e.to_string());
+                lock(&session.writer).take();
+                lock(&session.master).take();
+                res
+            }
             _ => Err(format!("Unknown signal {name}")),
         }
     }
@@ -430,7 +497,11 @@ impl Runner {
                 let session = self.get(id()?)?;
                 let cols = req["cols"].as_u64().unwrap_or(80).clamp(10, 1000) as u16;
                 let rows = req["rows"].as_u64().unwrap_or(24).clamp(2, 500) as u16;
-                lock(&session.master)
+                let master = lock(&session.master);
+                let Some(master) = master.as_ref() else {
+                    return Err("The session has ended".into());
+                };
+                master
                     .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
                     .map_err(|e| e.to_string())?;
                 let mut info = lock(&session.info);
@@ -441,6 +512,9 @@ impl Runner {
                 let session = self.get(id()?)?;
                 let data = req["data"].as_str().ok_or("Missing data")?;
                 let mut writer = lock(&session.writer);
+                let Some(writer) = writer.as_mut() else {
+                    return Err("The session has ended".into());
+                };
                 writer.write_all(data.as_bytes()).and_then(|_| writer.flush()).map_err(|e| e.to_string())?;
                 Ok(json!({}))
             }
@@ -486,6 +560,9 @@ impl Runner {
                     break;
                 }
                 let mut writer = lock(&typing.writer);
+                let Some(writer) = writer.as_mut() else {
+                    break;
+                };
                 if writer.write_all(&buf[..n]).and_then(|_| writer.flush()).is_err() {
                     break;
                 }
@@ -947,7 +1024,7 @@ mod tests {
             .call(json!({
                 "op": "spawn",
                 "id": "t1",
-                "argv": ["cmd.exe", "/c", "echo ready& set /p line=& echo got %line%& exit /b 3"],
+                "argv": ["cmd.exe", "/v:on", "/c", "echo ready& set /p line=& echo got !line!& exit /b 3"],
                 "cwd": cwd,
                 "cols": 80,
                 "rows": 24
@@ -1026,6 +1103,8 @@ mod tests {
         control.call(json!({"op": "write", "id": "cmd", "data": "echo typed by the service\r\n"})).unwrap();
         read_until(&mut out, "typed by the service");
         control.call(json!({"op": "resize", "id": "cmd", "cols": 120, "rows": 40})).unwrap();
+        // Spawn a descendant process inside the ConPTY session so TERM verifies full-tree termination.
+        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"Start-Sleep 30\"\r\n"})).unwrap();
         assert!(control.call(json!({"op": "forget", "id": "cmd"})).is_err(), "a running session can't be forgotten");
         control.call(json!({"op": "signal", "id": "cmd", "signal": "TERM"})).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
