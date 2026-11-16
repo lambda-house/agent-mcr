@@ -13,8 +13,8 @@ export function documentWindowStorage(source: Pick<Storage, 'getItem'>) {
           'smoothScroll', 'loadRemoteImages', 'languageAliases', 'tocWidth', 'tocVisible',
         ].filter(key => key in saved).map(key => [key, saved[key]]));
       } catch { /* Use the reader defaults if the saved preferences are invalid. */ }
-      return JSON.stringify({ version: 4, state: {
-        ...preferences, filePanelVisible: false, agentVisible: false,
+      return JSON.stringify({ version: 5, state: {
+        ...preferences, filePanelVisible: false,
         editMode: false,
       } });
     },
