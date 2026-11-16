@@ -311,6 +311,9 @@ impl Runner {
         drop(pair.slave);
         #[cfg(windows)]
         let killer = child.clone_killer();
+        // Note: portable-pty spawns the child before AssignProcessToJobObject runs;
+        // a descendant spawned in those microseconds before assignment is still
+        // covered by ClosePseudoConsole when master/writer are dropped on signal.
         #[cfg(windows)]
         let job = match assign_job(child.process_id()) {
             Ok(job) => Some(job),
@@ -623,19 +626,22 @@ impl Runner {
     /// service. A hosted session, or any other program, gets nothing but
     /// `hello`: typing into a terminal answers its prompts, and `spawn` runs
     /// a command outside every agent's sandbox.
-    fn trusts(&self, stream: &Stream) -> bool {
-        if !crate::peer::is_this_program(stream) {
+    fn trusts(&self, peer: &crate::peer::Peer) -> bool {
+        if !peer.is_this_program() {
             return false;
         }
         let children: Vec<i32> = lock(&self.sessions).values().filter_map(|s| { let info = lock(&s.info); info.pid.filter(|_| info.exit.is_none()).map(|p| p as i32) }).collect();
-        crate::peer::pid(stream).is_some_and(|pid| crate::peer::ancestor_among(pid, &children).is_none())
+        peer.ancestor_among(&children).is_none()
     }
 
-    fn handle(self: &Arc<Self>, stream: Stream) -> std::io::Result<()> {
-        if !crate::peer::same_user(&stream) {
+    fn handle(self: &Arc<Self>, stream: Stream, accepted_at: u64) -> std::io::Result<()> {
+        let Some(peer) = crate::peer::Peer::open(&stream, accepted_at) else {
+            return Ok(());
+        };
+        if !peer.same_user() {
             return Ok(());
         }
-        let trusted = self.trusts(&stream);
+        let trusted = self.trusts(&peer);
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
         loop {
@@ -703,11 +709,12 @@ pub fn serve(socket: &Path) -> Result<(), String> {
     });
 
     for stream in listener.incoming() {
+        let accepted_at = crate::peer::accept_time();
         let Ok(stream) = stream else { continue };
         let runner = runner.clone();
         runner.connections.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let _ = runner.handle(stream);
+            let _ = runner.handle(stream, accepted_at);
             runner.connections.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -1147,9 +1154,8 @@ mod tests {
         // Verify the descendant process actually exited.
         unsafe {
             use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-            use windows_sys::Win32::System::Threading::{
-                OpenProcess, WaitForSingleObject, SYNCHRONIZE,
-            };
+            use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+            use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
             let proc = OpenProcess(SYNCHRONIZE, 0, desc_pid);
             if !proc.is_null() {
                 let waited = WaitForSingleObject(proc, 5000);

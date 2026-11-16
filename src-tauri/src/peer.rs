@@ -12,8 +12,25 @@ use crate::ipc::Stream;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-/// The user and process that opened the connection.
+/// Whether `created` is strictly earlier than `bound` (guards against PID reuse).
+#[cfg(any(windows, test))]
+pub fn created_before(created: u64, bound: u64) -> bool {
+    created < bound
+}
+
+/// Current timestamp in 100ns FILETIME units on Windows (0 on Unix).
+#[cfg(unix)]
+pub fn accept_time() -> u64 {
+    0
+}
+
+/// Current timestamp in 100ns FILETIME units on Windows.
+#[cfg(windows)]
+pub fn accept_time() -> u64 {
+    win::now_filetime()
+}
 #[cfg(target_os = "macos")]
+/// The user and process that opened the connection.
 fn credentials(stream: &Stream) -> Option<(u32, i32)> {
     let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
     // SAFETY: both pointers are valid for writes.
@@ -104,8 +121,17 @@ mod win {
         GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
         QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 
     const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
+
+    pub fn now_filetime() -> u64 {
+        // SAFETY: zeroed FILETIME is valid.
+        let mut ft: FILETIME = unsafe { std::mem::zeroed() };
+        // SAFETY: `ft` is valid for writes.
+        unsafe { GetSystemTimeAsFileTime(&mut ft) };
+        ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+    }
 
     struct Handle(HANDLE);
 
@@ -195,6 +221,57 @@ mod win {
         Some(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec())
     }
 
+    pub struct Peer {
+        pub pid: i32,
+        handle: Handle,
+        created: u64,
+    }
+
+    impl Peer {
+        pub fn open(stream: &Stream, accepted_at: u64) -> Option<Self> {
+            let pid = pid(stream)?;
+            let pid_u32 = u32::try_from(pid).ok().filter(|&p| p > 0)?;
+            let handle = Handle::open_process(pid_u32)?;
+            let created = creation_time(handle.0)?;
+            if !super::created_before(created, accepted_at) {
+                return None;
+            }
+            Some(Self { pid, handle, created })
+        }
+
+        pub fn same_user(&self) -> bool {
+            same_user_handle(&self.handle)
+        }
+
+        pub fn is_this_program(&self) -> bool {
+            if !self.same_user() {
+                return false;
+            }
+            match (program_handle(&self.handle), std::env::current_exe()) {
+                (Some(theirs), Ok(ours)) => super::real(&theirs) == super::real(&ours),
+                _ => false,
+            }
+        }
+
+        pub fn ancestor_among(&self, roots: &[i32]) -> Option<i32> {
+            let mut cur_pid = self.pid;
+            let mut cur_created = self.created;
+            for _ in 0..32 {
+                if roots.contains(&cur_pid) {
+                    return Some(cur_pid);
+                }
+                let (up_pid, up_handle, up_created) = parent_with_handle(cur_pid, cur_created)?;
+                if up_pid <= 1 {
+                    return None;
+                }
+                cur_pid = up_pid;
+                cur_created = up_created;
+                let _ = up_handle;
+            }
+            None
+        }
+    }
+
     fn same_user_handle(peer_proc: &Handle) -> bool {
         let Some(mut theirs) = process_user_sid(peer_proc.0) else {
             return false;
@@ -208,33 +285,6 @@ mod win {
             IsValidSid(mine.as_mut_ptr().cast()) != 0
                 && IsValidSid(theirs.as_mut_ptr().cast()) != 0
                 && EqualSid(mine.as_mut_ptr().cast(), theirs.as_mut_ptr().cast()) != 0
-        }
-    }
-
-    pub fn same_user(stream: &Stream) -> bool {
-        let Some(peer_pid) = pid(stream).and_then(|p| u32::try_from(p).ok()) else {
-            return false;
-        };
-        let Some(peer_proc) = Handle::open_process(peer_pid) else {
-            return false;
-        };
-        same_user_handle(&peer_proc)
-    }
-
-    pub fn is_this_program(stream: &Stream) -> bool {
-        let Some(peer_pid) = pid(stream).and_then(|p| u32::try_from(p).ok()) else {
-            return false;
-        };
-        // Open the process handle once so SID and image path are read from the same kernel process object.
-        let Some(peer_proc) = Handle::open_process(peer_pid) else {
-            return false;
-        };
-        if !same_user_handle(&peer_proc) {
-            return false;
-        }
-        match (program_handle(&peer_proc), std::env::current_exe()) {
-            (Some(theirs), Ok(ours)) => super::real(&theirs) == super::real(&ours),
-            _ => false,
         }
     }
 
@@ -253,10 +303,8 @@ mod win {
         Some(((created.dwHighDateTime as u64) << 32) | (created.dwLowDateTime as u64))
     }
 
-    pub fn parent(pid: i32) -> Option<i32> {
+    fn parent_with_handle(pid: i32, child_created: u64) -> Option<(i32, Handle, u64)> {
         let child_pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
-        let child_proc = Handle::open_process(child_pid)?;
-        let child_created = creation_time(child_proc.0)?;
 
         // SAFETY: plain snapshot syscall.
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -284,13 +332,22 @@ mod win {
             }
         }
         let ppid = ppid.filter(|&p| p != 0 && p != child_pid)?;
-        // Windows reuses PIDs and does not re-parent orphans: verify the candidate parent started no later than the child.
+        // Windows reuses PIDs and does not re-parent orphans: verify the candidate parent started strictly before the child.
         let parent_proc = Handle::open_process(ppid)?;
         let parent_created = creation_time(parent_proc.0)?;
-        if parent_created > child_created {
+        if !super::created_before(parent_created, child_created) {
             return None;
         }
-        i32::try_from(ppid).ok().filter(|&p| p > 0)
+        let ppid_i32 = i32::try_from(ppid).ok().filter(|&p| p > 0)?;
+        Some((ppid_i32, parent_proc, parent_created))
+    }
+
+    #[cfg(all(windows, test))]
+    pub fn parent(pid: i32) -> Option<i32> {
+        let child_pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
+        let child_proc = Handle::open_process(child_pid)?;
+        let child_created = creation_time(child_proc.0)?;
+        parent_with_handle(pid, child_created).map(|(p, _, _)| p)
     }
 
     fn program_handle(handle: &Handle) -> Option<PathBuf> {
@@ -320,17 +377,70 @@ mod win {
     }
 }
 
-#[cfg(windows)]
-pub fn same_user(stream: &Stream) -> bool {
-    win::same_user(stream)
+#[cfg(unix)]
+pub struct Peer {
+    pid: i32,
+    same_user: bool,
+    is_this_program: bool,
+}
+
+#[cfg(unix)]
+impl Peer {
+    pub fn open(stream: &Stream, _accepted_at: u64) -> Option<Self> {
+        let pid = pid(stream)?;
+        Some(Self {
+            pid,
+            same_user: same_user(stream),
+            is_this_program: is_this_program(stream),
+        })
+    }
+
+    pub fn same_user(&self) -> bool {
+        self.same_user
+    }
+
+    pub fn is_this_program(&self) -> bool {
+        self.is_this_program
+    }
+
+    pub fn ancestor_among(&self, roots: &[i32]) -> Option<i32> {
+        ancestor_among(self.pid, roots)
+    }
 }
 
 #[cfg(windows)]
+pub struct Peer(win::Peer);
+
+#[cfg(windows)]
+impl Peer {
+    pub fn open(stream: &Stream, accepted_at: u64) -> Option<Self> {
+        win::Peer::open(stream, accepted_at).map(Self)
+    }
+
+    pub fn same_user(&self) -> bool {
+        self.0.same_user()
+    }
+
+    pub fn is_this_program(&self) -> bool {
+        self.0.is_this_program()
+    }
+
+    pub fn ancestor_among(&self, roots: &[i32]) -> Option<i32> {
+        self.0.ancestor_among(roots)
+    }
+}
+
+#[cfg(all(windows, test))]
+pub fn same_user(stream: &Stream) -> bool {
+    Peer::open(stream, accept_time()).is_some_and(|p| p.same_user())
+}
+
+#[cfg(all(windows, test))]
 pub fn pid(stream: &Stream) -> Option<i32> {
     win::pid(stream)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub fn parent(pid: i32) -> Option<i32> {
     win::parent(pid)
 }
@@ -361,12 +471,13 @@ pub fn is_this_program(stream: &Stream) -> bool {
 
 /// The connection comes from this very program (the app, the harness service
 /// or one of its bridges), run by the same user.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub fn is_this_program(stream: &Stream) -> bool {
-    win::is_this_program(stream)
+    Peer::open(stream, accept_time()).is_some_and(|p| p.is_this_program())
 }
 
 /// The first of `roots` that `pid` is, or descends from.
+#[cfg(any(unix, test))]
 pub fn ancestor_among(mut pid: i32, roots: &[i32]) -> Option<i32> {
     for _ in 0..32 {
         if roots.contains(&pid) {
@@ -401,16 +512,29 @@ mod tests {
     }
 
     #[test]
+    fn created_before_rejects_equal_or_later_timestamps() {
+        assert!(created_before(99, 100));
+        assert!(!created_before(100, 100));
+        assert!(!created_before(101, 100));
+    }
+
+    #[test]
     fn a_connection_from_this_process_is_recognised() {
+        let accepted_at = accept_time();
         let (a, _b) = stream_pair();
         assert!(same_user(&a));
         assert_eq!(pid(&a), Some(std::process::id() as i32));
         assert!(is_this_program(&a));
+        let peer = Peer::open(&a, accepted_at).unwrap();
+        assert!(peer.same_user());
+        assert!(peer.is_this_program());
         let me = std::process::id() as i32;
+        assert_eq!(peer.ancestor_among(&[me]), Some(me));
         assert_eq!(program(me).map(|p| real(&p)), std::env::current_exe().ok().map(|p| real(&p)));
         assert_eq!(ancestor_among(me, &[me]), Some(me));
         let up = parent(me).unwrap();
         assert_eq!(ancestor_among(me, &[up]), Some(up));
+        assert_eq!(peer.ancestor_among(&[up]), Some(up));
         assert_eq!(ancestor_among(me, &[]), None);
     }
 }

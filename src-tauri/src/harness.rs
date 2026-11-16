@@ -1860,8 +1860,8 @@ impl Harness {
 
     /// The hosted session a connection comes from: its process descends from
     /// one of the runner's children. Nothing the caller says is trusted.
-    fn caller(&self, stream: &Stream) -> Result<String, String> {
-        match self.who(stream) {
+    fn caller(&self, peer: &peer::Peer) -> Result<String, String> {
+        match self.who(peer) {
             Caller::Session { id, .. } => Ok(id),
             Caller::Outside => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
             Caller::Unknown => Err("Cannot tell which process is calling".into()),
@@ -1869,23 +1869,22 @@ impl Harness {
     }
 
     /// Where a connection comes from, by the caller's process alone.
-    fn who(&self, stream: &Stream) -> Caller {
-        let Some(pid) = peer::pid(stream) else { return Caller::Unknown };
+    fn who(&self, peer: &peer::Peer) -> Caller {
         let Ok(list) = self.runner(json!({"op": "list"})) else { return Caller::Unknown };
         let live: Vec<(i32, &Value)> = list["sessions"]
             .as_array()
             .map(|all| all.iter().filter(|s| s["exit"].is_null()).filter_map(|s| Some((s["pid"].as_i64()? as i32, s))).collect())
             .unwrap_or_default();
         let roots: Vec<i32> = live.iter().map(|(pid, _)| *pid).collect();
-        match peer::ancestor_among(pid, &roots).and_then(|root| live.iter().find(|(pid, _)| *pid == root)) {
+        match peer.ancestor_among(&roots).and_then(|root| live.iter().find(|(pid, _)| *pid == root)) {
             Some((_, s)) => Caller::Session { id: s["id"].as_str().unwrap_or("").into(), supervisor: s["meta"]["role"] == "supervisor" },
             None => Caller::Outside,
         }
     }
 
-    fn agent(&self, mut reader: BufReader<Stream>, mut writer: Stream, mcp_client: bool) -> std::io::Result<()> {
+    fn agent(&self, mut reader: BufReader<Stream>, mut writer: Stream, mcp_client: bool, peer: &peer::Peer) -> std::io::Result<()> {
         // Refused callers still get a working MCP server whose tools say why
-        let me = self.caller(&writer);
+        let me = self.caller(peer);
         // The session has the tools for as long as a bridge of its is connected
         let bridged = |by: isize| {
             if let (true, Ok(id)) = (mcp_client, &me) {
@@ -2331,11 +2330,11 @@ impl Harness {
         }
     }
 
-    fn supervise(&self, mut reader: BufReader<Stream>, mut writer: Stream) -> std::io::Result<()> {
+    fn supervise(&self, mut reader: BufReader<Stream>, mut writer: Stream, peer: &peer::Peer) -> std::io::Result<()> {
         // Only the Supervisor session has these tools. An agent outside the
         // harness gets them when the operator allowed that, and not otherwise:
         // a worker's process that left its session looks like an outside one.
-        let who = self.who(&writer);
+        let who = self.who(peer);
         let refusal = || match &who {
             Caller::Session { supervisor: true, .. } => None,
             Caller::Session { .. } => Some("Refused: this is a worker session. Only the Supervisor session has the supervisor tools; use the mcr tools to reach other sessions."),
@@ -2361,8 +2360,11 @@ impl Harness {
         }
     }
 
-    fn handle(&self, stream: Stream) -> std::io::Result<()> {
-        if !peer::same_user(&stream) {
+    fn handle(&self, stream: Stream, accepted_at: u64) -> std::io::Result<()> {
+        let Some(peer) = peer::Peer::open(&stream, accepted_at) else {
+            return Ok(());
+        };
+        if !peer.same_user() {
             return Ok(());
         }
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -2377,16 +2379,16 @@ impl Harness {
                 return writeln!(writer, "{}", json!({"error": "Invalid request"}));
             };
             if req["op"] == "supervise" {
-                return self.supervise(reader, writer);
+                return self.supervise(reader, writer, &peer);
             }
             if req["op"] == "agent" {
-                return self.agent(reader, writer, req["cli"] != true);
+                return self.agent(reader, writer, req["cli"] != true, &peer);
             }
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
                 self.control(&req)
             } else {
-                match (op, &*who.get_or_insert_with(|| self.who(&writer))) {
+                match (op, &*who.get_or_insert_with(|| self.who(&peer))) {
                     // A hook speaks for the session its process runs in, whatever it says
                     ("hook", Caller::Session { id, .. }) => {
                         self.hook(id, req["event"].as_str().unwrap_or(""), &req["payload"]);
@@ -2394,7 +2396,7 @@ impl Harness {
                     }
                     ("hook", _) => Ok(json!({})),
                     // Everything else is the app's: a hosted session has the tools instead
-                    (_, Caller::Outside) if peer::is_this_program(&writer) => self.control(&req),
+                    (_, Caller::Outside) if peer.is_this_program() => self.control(&req),
                     _ => Err(format!(
                         "Refused: only the Agent MCR app manages sessions, and only the copy that started this service ({}). After switching builds or moving the app, restart the background units",
                         std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
@@ -2608,11 +2610,12 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     });
 
     for stream in listener.incoming() {
+        let accepted_at = peer::accept_time();
         let Ok(stream) = stream else { continue };
         let harness = harness.clone();
         harness.connections.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let _ = harness.handle(stream);
+            let _ = harness.handle(stream, accepted_at);
             harness.connections.fetch_sub(1, Ordering::SeqCst);
         });
     }

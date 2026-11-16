@@ -256,10 +256,11 @@ impl Service {
         std::thread::spawn(move || {
             let mut next = 0u64;
             for incoming in listener.incoming() {
+                let accepted_at = crate::peer::accept_time();
                 let Ok(stream) = incoming else {
                     break;
                 };
-                if !crate::peer::same_user(&stream) {
+                if !crate::peer::Peer::open(&stream, accepted_at).is_some_and(|p| p.same_user()) {
                     continue;
                 }
                 if !service.grant.lock().unwrap().enabled
