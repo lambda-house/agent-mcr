@@ -92,7 +92,12 @@ Wine differs from Windows (ConPTY, AF_UNIX and its `SIO_AF_UNIX_GETPEERPID`, pro
 
 ### Wine findings
 
-None yet.
+- **R1 (smoke run, commit `9116835`)**:
+  - Bottle: `agent-mcr-test` (Windows 10, Rum 2.0.0-beta.1).
+  - WebView2: Evergreen bootstrapper (`MicrosoftEdgeWebview2Setup.exe /silent /install`) exited 0 without installing; standalone x64 installer (`MicrosoftEdgeWebView2RuntimeInstallerX64.exe /silent /install`, `linkid=2124701`) installed `EdgeWebView\Application\157.0.4341.60` cleanly.
+  - Build: `npm run build` + `cargo xwin build --target x86_64-pc-windows-msvc` (debug, `custom-protocol` default).
+  - Run: `agent-mcr.exe` started and stayed running alongside `msedgewebview2.exe` (`--embedded-browser-webview=1 --webview-exe-name=agent-mcr.exe --user-data-dir=C:\users\vadim\AppData\Local\cc.lambdahouse.agent-mcr\EBWebView` and `crashpad-handler`); `EBWebView` initialized (`Default`, `Local State`, `Last Version` created). Zero Rust panics or app errors on stdout/stderr (`WINEDEBUG=-all`); `WINEDEBUG=err+all` showed only standard Wine stubs (`NtQueryInformationToken` class 39, `SetPreferredAppMode`, `UIViewSettings`, `RegisterPowerSettingNotification`).
+  - Verdict: **pass** (no ours/WebView2 errors; headless verification of process + WebView2 profile initialization; visual pixel check deferred to manual list).
 
 ## Verification status
 
