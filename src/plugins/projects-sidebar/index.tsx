@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { BellRing, Check, ChevronDown, ChevronRight, Copy, Folder, Pencil, Plus, Radar, Search, SquarePen, X } from 'lucide-react';
-import { Button, Kbd } from '../../teob-ui';
+import { Button, Kbd } from '@teob/ui';
 import AgentMark from '../../components/AgentMark';
 import {
   groupSessions,

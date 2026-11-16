@@ -11,7 +11,7 @@ import {
   Palette,
   Command,
 } from 'lucide-react';
-import { Badge, Button, Kbd, Notice, SettingRow } from '../teob-ui';
+import { Badge, Button, Kbd, Notice, SettingRow } from '@teob/ui';
 import { useStore } from '../store';
 import { isTauri, checkForUpdate, getAppVersion } from '../utils/tauri';
 import { pluginRegistry, usePluginVersion } from '../plugins';

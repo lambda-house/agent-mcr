@@ -1,7 +1,7 @@
 import { createPlugin } from '../sdk';
-import { MotionProvider, ToastProvider } from '../../teob-ui';
-import tokensCss from '../../styles/teob/tokens.css?inline';
-import bridgeCss from '../../styles/teob/agent-mcr-bridge.css?inline';
+import { MotionProvider, ToastProvider } from '@teob/ui';
+import tokensCss from '@teob/ui/tokens.css?inline';
+import bridgeCss from '@teob/ui/bridges/agent-mcr.css?inline';
 
 export const plugin = createPlugin({
   id: 'teob-theme',

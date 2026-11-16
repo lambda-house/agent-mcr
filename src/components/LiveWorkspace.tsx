@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { BarChart3, BellRing, ChevronDown, ChevronRight, Columns2, Copy, Folder, FolderOpen, History, LayoutGrid, MoreHorizontal, Play, Plus, Radar, RotateCw, Rows2, Search, Square, Terminal, X } from 'lucide-react';
-import { Button, Dialog } from '../teob-ui';
+import { Button, Dialog } from '@teob/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';

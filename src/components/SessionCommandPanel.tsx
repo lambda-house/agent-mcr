@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
-import { Badge, DescList, Kbd, ScrollArea, StatusDot, cx } from '../teob-ui';
+import { Badge, DescList, Kbd, ScrollArea, StatusDot, cx } from '@teob/ui';
 import { compact, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
 import type { TopTabPlugin } from '../plugins/sdk';
