@@ -1262,6 +1262,7 @@ fn main() {
             harness_commands::harness_background_stop,
             harness_commands::harness_list,
             harness_commands::harness_spawn,
+            harness_commands::harness_bind,
             harness_commands::harness_supervisor,
             harness_commands::harness_resumable,
             harness_commands::harness_ack,

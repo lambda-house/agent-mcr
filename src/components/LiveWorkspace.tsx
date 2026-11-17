@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, Terminal, FolderOpen, FolderPlus, History, MoreHorizontal, Plus, Radar, RotateCw, Search, X } from 'lucide-react';
+import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Link2, Network, Terminal, Unlink, FolderOpen, FolderPlus, History, MoreHorizontal, Plus, Radar, RotateCw, Search, X } from 'lucide-react';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import { BackgroundGate, BackgroundPanel } from './Background';
 import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, executorsBelow, relationRows, type RelationRow, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
@@ -90,6 +90,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const [allHistory, setAllHistory] = useState(false);
   const [copied, setCopied] = useState(false);
   const [referenced, setReferenced] = useState('');
+  // The session being connected to a supervisor: its row shows the chooser
+  const [binding, setBinding] = useState('');
   // The usage pane beside the terminal: open or closed is this viewer's preference
   const [stats, setStats] = useState(() => { try { return localStorage.getItem('hs-stats') === '1'; } catch { return false; } });
   const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
@@ -180,7 +182,15 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       if (!fresh.resumed) setError(`${hostedLabel(h)} had no saved conversation to continue: it started fresh in the same folder.`);
     }).catch(e => { setError(err(e)); void refresh(); });
   };
+  /** A new session that works for `h`, in its folder */
+  const startExecutor = (h: Hosted, profile: string) => launch(() => harnessApi.spawn(profile, h.cwd, 120, 32, undefined, h.id));
+  const connect_to = (id: string, supervisorId: string | null) => { setBinding(''); act(async () => { await harnessApi.bind(id, supervisorId); }); };
+  const isAgent = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');
   const actions = (h: Hosted): Action[] => [
+    // Any agent session can have executors; the Supervisor sees everything already
+    ...(isAgent(h) && !isSupervisor(h) ? START.map(([profile, what]) => ({ label: `New executor (${what})`, icon: <CornerDownRight size={13}/>, run: () => void startExecutor(h, profile) })) : []),
+    ...(!h.exit && !isSupervisor(h) && !h.harness?.supervisor ? [{ label: 'Connect to supervisor…', icon: <Link2 size={13}/>, run: () => setBinding(h.id) }] : []),
+    ...(!h.exit && h.harness?.supervisor ? [{ label: 'Detach from supervisor', icon: <Unlink size={13}/>, run: () => connect_to(h.id, null) }] : []),
     { label: 'Copy reference', icon: <Copy size={13}/>, run: () => copyReference(h) },
     ...(canRestart(h) ? [{ label: 'Restart (reload settings)', icon: <RotateCw size={13}/>, run: () => restart(h) }] : []),
     { label: h.exit ? 'Remove from the list' : 'Close session', icon: <X size={13}/>, run: () => close(h) },
@@ -193,8 +203,13 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
   const names = new Map(hosted.map(h => [h.id, hostedLabel(h)]));
   const supervisorSummary = supervisor ? sessionSummary(supervisor, Date.now()) : null;
-  const row = (h: Hosted) => {
+  const row = ({ session: h, depth, executors, elsewhere }: RelationRow) => {
     const state = hostedState(h);
+    const role = executors ? 'is-supervisor' : '';
+    const works = h.harness?.supervisor ? 'is-executor' : '';
+    // Sessions it could work for: live agents, not itself and not below it
+    const below = binding === h.id ? executorsBelow(h.id, hosted) : null;
+    const candidates = below ? hosted.filter(x => isAgent(x) && !isSupervisor(x) && x.id !== h.id && !below.has(x.id)) : [];
     const label = hostedLabel(h);
     const detail = h.exit
       ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
@@ -202,13 +217,19 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     const subs = (h.subagents ?? []).filter(a => !a.finished);
     const shells = h.exit ? [] : h.shells ?? [];
     const summary = sessionSummary(h, Date.now());
-    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now())].filter(Boolean).join(' ')}>
+    return <li key={h.id} style={depth ? { ['--level' as string]: Math.min(depth, 4) } : undefined} data-depth={depth || undefined}
+      className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now()), role, works, depth ? 'hs-nested' : ''].filter(Boolean).join(' ')}>
       <button className="hs-item" onClick={() => select(h.id)}
         draggable={!h.exit} onDragStart={e => { e.dataTransfer.setData(SESSION_DRAG_TYPE, h.id); e.dataTransfer.setData('text/plain', sessionReference(h)); e.dataTransfer.effectAllowed = 'copy'; }}
         title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}${h.exit ? '' : '\nDrag into a terminal to point its agent at this session'}`}>
         <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
         <span className="hs-item-text">
-          <strong><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}</strong>
+          <strong>
+            {works && <span className="hs-rel executor" title={`Executor of ${names.get(h.harness?.supervisor ?? '') ?? 'a session'}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
+            <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}
+            {executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
+          </strong>
+          {elsewhere && <small className="hs-under" title={elsewhere.cwd}>under {hostedLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>}
           <SessionMetrics hosted={h} data={metrics}/>
           {detail && <small>{detail}</small>}
           {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
@@ -216,6 +237,13 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         </span>
       </button>
       <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
+      {binding === h.id && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
+        <select aria-label="Supervisor" autoFocus defaultValue="" onChange={e => { if (e.target.value) connect_to(h.id, e.target.value); }}>
+          <option value="" disabled>{candidates.length ? 'Works for…' : 'No other agent session is running'}</option>
+          {candidates.map(x => <option key={x.id} value={x.id}>{hostedLabel(x)} · {shortPath(tildePath(x.cwd, home))}</option>)}
+        </select>
+        <button type="button" onClick={() => setBinding('')}>Cancel</button>
+      </form>}
       {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
         {shells.map(sh => {
           const now = Date.now();
@@ -287,7 +315,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
             </header>
-            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{d.sessions.map(row)}</ul>}
+            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(row)}</ul>}
             {d.earlier.length > 0 && <div className="hs-earlier">
               <button type="button" className="hs-earlier-toggle" aria-expanded={open} onClick={() => setEarlierOpen(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>
                 {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<History size={11}/> Earlier · {d.earlier.length} · last {formatAge(d.earlier[0].modified)}

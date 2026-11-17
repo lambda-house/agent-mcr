@@ -61,7 +61,7 @@ describe('Live workspace', () => {
     expect(host.querySelector('[role="menu"]')).toBeNull();
     const item = (text: string) => [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes(text)) as HTMLButtonElement;
     await act(async () => button('Actions for Fixing tests').click());
-    expect([...host.querySelectorAll('[role="menuitem"]')].map(b => b.textContent?.trim())).toEqual(['Copy reference', 'Restart (reload settings)', 'Close session']);
+    expect([...host.querySelectorAll('[role="menuitem"]')].map(b => b.textContent?.trim())).toEqual(['New executor (Claude Code)', 'New executor (Codex)', 'Connect to supervisor…', 'Copy reference', 'Restart (reload settings)', 'Close session']);
     await act(async () => item('Copy reference').click()); await flush();
     // A pointer, not a paragraph: the id the mcr tools take, and the name for the reader
     expect(copy.mock.calls[0][0]).toBe("mcr:r1 'Fixing tests'");
