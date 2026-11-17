@@ -1,7 +1,6 @@
-/* Settings Modal — @teob/ui surface model & token styling */
+/* Settings Modal and surface tokens */
 
-/* Fallback tokens when the teob-theme plugin is disabled (default agent-mcr theme) */
-:root:not([data-teob-theme='on']) {
+:root {
   --canvas: var(--surface-bg, #1e1e1e);
   --surface-1: var(--surface-elevated, #252526);
   --surface-2: var(--surface-overlay, #2d2d30);
@@ -52,11 +51,14 @@
   --fs-13: 13px;
   --fs-14: 14px;
   --fs-16: 16px;
+  --bg-subtle: var(--layer-1);
+  --bg-hover: var(--layer-hover);
+  --success: var(--ok);
   --dur-fast: 120ms;
   --ease-standard: cubic-bezier(0.2, 0, 0, 1);
 }
 
-:root[data-theme='light']:not([data-teob-theme='on']) {
+:root[data-theme='light'] {
   --layer-3: #d4d4d4;
   --overlay: rgba(0, 0, 0, 0.25);
   --line-strong: #b8b8b8;
@@ -119,7 +121,7 @@
   }
 }
 
-/* Ensure @teob/ui Button & Input win over unlayered base resets in index.css */
+/* Buttons and inputs inside the settings modal win over the base resets in index.css */
 .settings-modal .ui-btn {
   display: inline-flex;
   align-items: center;
@@ -368,7 +370,7 @@
   color: var(--text-soft);
 }
 
-/* Toggle Switch (teob-ui tokens) */
+/* Toggle Switch */
 .settings-modal .settings-toggle {
   position: relative;
   display: inline-block;

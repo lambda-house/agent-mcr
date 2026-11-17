@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
-import { DescList, Kbd, ScrollArea, StatusDot, cx } from '@teob/ui';
+import { DescList, Kbd, ScrollArea, StatusDot, cx } from '@/ui';
 import { cacheState, compact, contextWindow, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
 import { harnessApi, hostedState, liveSessionLabel, runningFor, STATE_LABEL, type Hosted } from '../utils/harness';

@@ -17,7 +17,7 @@ Pre-release (0.1.1): macOS on Apple Silicon only. Builds are on the [releases pa
 
 ## Build and run
 
-Needs Node.js, Rust and the Xcode command-line tools, and read access to the private `teob-cc/teob-ui` repository on GitHub: `@teob/ui` is installed from it over HTTPS, pinned to a commit (signing in with `gh auth login` is enough).
+Needs Node.js, Rust and the Xcode command-line tools.
 
 ```bash
 npm ci

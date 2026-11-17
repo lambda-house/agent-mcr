@@ -6,10 +6,9 @@ import {
   Shield,
   Puzzle,
   FileText,
-  Palette,
   Terminal,
 } from 'lucide-react';
-import { Badge, Button, Kbd, Notice, SettingRow } from '@teob/ui';
+import { Badge, Button, Kbd, Notice, SettingRow } from '@/ui';
 import { useStore } from '../store';
 import { getAppVersion } from '../utils/tauri';
 import { pluginRegistry, usePluginVersion } from '../plugins';
@@ -27,7 +26,6 @@ type SettingsCategory =
 
 function pluginIcon(id: string) {
   if (id === 'doc-pane') return <FileText size={16} />;
-  if (id === 'teob-theme') return <Palette size={16} />;
   return <Puzzle size={16} />;
 }
 

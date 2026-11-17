@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Search } from 'lucide-react';
-import { Kbd } from '@teob/ui';
+import { Kbd } from '@/ui';
 import { createPlugin, pluginRegistry, type GlobalOverlayContext } from '../sdk';
 import SessionCommandPanel from '../../components/SessionCommandPanel';
 
