@@ -333,6 +333,12 @@ struct Link {
     connected_at: u64,
     events: u64,
     actions: u64,
+    /// Envelopes of any kind since the service started, the kind of the last one, and
+    /// the last event Slack sent that was not kept (its type and why), to tell
+    /// "Slack sends nothing" from "it arrives and is dropped"
+    envelopes: u64,
+    last_envelope: String,
+    last_dropped: String,
     catch_up_after: u64,
 }
 
@@ -450,6 +456,9 @@ impl Slack {
             "connectedAt": link.connected_at,
             "eventsSeen": link.events,
             "actionsSeen": link.actions,
+            "envelopesSeen": link.envelopes,
+            "lastEnvelope": link.last_envelope,
+            "lastDropped": link.last_dropped,
             "channels": channels,
             "users": state.users,
             "posts": posts.iter().rev().take(60).map(|p| { let mut v = json!(p); v["channelName"] = json!(name(&p.channel)); v }).collect::<Vec<_>>(),
@@ -822,6 +831,11 @@ impl Slack {
     /// then delivered. Slack sends again what it gets no receipt for.
     pub fn on_event(&self, host: &dyn Host, event: &Value, ack: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         let key = self.record(event, false);
+        if key.is_none() {
+            // Kind, subtype and channel only: never the text of something that was not kept
+            let field = |k: &str| event[k].as_str().unwrap_or("-").chars().take(40).collect::<String>();
+            lock(&self.link).last_dropped = format!("{} (subtype {}, channel {}{})", field("type"), field("subtype"), field("channel"), if event["bot_id"].is_null() { "" } else { ", from a bot" });
+        }
         ack()?;
         match key {
             Some(key) => self.route(host, &key),
@@ -1466,6 +1480,11 @@ impl Slack {
                 Err(e) => return Err(format!("Slack was not reached: {e}")),
             };
             let Ok(envelope) = serde_json::from_str::<Value>(&text) else { continue };
+            {
+                let mut link = lock(&self.link);
+                link.envelopes += 1;
+                link.last_envelope = envelope["type"].as_str().unwrap_or("").chars().take(40).collect();
+            }
             match envelope["type"].as_str().unwrap_or("") {
                 "hello" => {
                     self.set_link("connected", "");

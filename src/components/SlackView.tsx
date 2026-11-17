@@ -181,6 +181,7 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
           <span className={`hs-dot ${status.link === 'connected' ? 'idle' : status.link === 'off' ? 'past' : status.link === 'refused' ? 'failed' : 'working'}`} aria-hidden/>
           <span>{LINK[status.link]}{status.lastEvent ? ` · last event ${formatAge(status.lastEvent)}` : ''}{status.link === 'connected' ? ` · ${status.eventsSeen ?? 0} event${status.eventsSeen === 1 ? '' : 's'} received` : ''}{status.linkError ? ` · ${status.linkError}` : ''}</span>
         </div>
+        {status.link !== 'off' && <p className="hs-slack-counts" title="What arrived from Slack since the harness service started">From Slack: {status.envelopesSeen ?? 0} frame{status.envelopesSeen === 1 ? '' : 's'}{status.lastEnvelope ? `, the last a ${status.lastEnvelope}` : ''} · {status.eventsSeen ?? 0} events · {status.actionsSeen ?? 0} button presses{status.lastDropped ? ` · last event not kept: ${status.lastDropped}` : ''}</p>}
         {(c.missingScopes?.length ?? 0) > 0 && <p className="hs-slack-warning" role="alert">
           The Slack app lacks {c.missingScopes!.length === 1 ? 'a permission' : 'permissions'} this needs: <b>{c.missingScopes!.join(', ')}</b>. Add {c.missingScopes!.length === 1 ? 'it' : 'them'} in the Slack app under OAuth &amp; Permissions &gt; Bot Token Scopes, reinstall the app to the workspace, then press Channels. Or recreate the app from docs/slack-app-manifest.yaml.
         </p>}
