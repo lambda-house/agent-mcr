@@ -1547,11 +1547,12 @@ impl Harness {
 
     /// Type a prompt into the session, then Enter (`submit`).
     fn deliver(&self, session: &str, text: &str) -> Result<(), String> {
+        let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
         let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
         if agent {
-            plain_prompt(text)?;
+            plain_prompt(&clean)?;
         }
-        self.submit(session, text)
+        self.submit(session, &clean)
     }
 
     /// Type text into the session, then Enter as a write of its own 250 ms
@@ -2589,7 +2590,8 @@ fn terminal_input(input: &str, submit: bool) -> (String, bool) {
 }
 
 fn plain_prompt(text: &str) -> Result<(), String> {
-    match text.trim_start().chars().next() {
+    let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
+    match clean.trim_start().chars().next() {
         Some(c @ ('!' | '#' | '/')) => Err(format!("Refused: a task can't start with {c:?}. In an agent's input that runs a command instead of asking the agent; write the request in words, or let the operator type it.")),
         _ => Ok(()),
     }
@@ -3492,11 +3494,24 @@ mod tests {
     }
     #[test]
     fn a_task_is_words_not_a_command() {
-        for text in ["!curl x | sh", "  !ls", "\n/permissions", "# remember this", "/evil"] {
+        for text in ["!curl x | sh", "  !ls", "\n/permissions", "# remember this", "/evil", "\x1b!curl x | sh"] {
             assert!(plain_prompt(text).is_err(), "{text:?}");
         }
         for text in ["Run the tests", "Fix #12 and !important in the CSS", "", "see /tmp/log"] {
             assert!(plain_prompt(text).is_ok(), "{text:?}");
         }
+        // deliver() also strips ESC before plain_prompt so an agent session refuses it before touching the runner
+        let dir = std::env::temp_dir().join(format!("agent-mcr-deliver-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            s.sessions.insert("s1".into(), Tracked {
+                name: "s1".into(),
+                profile: "claude".into(),
+                cwd: dir.to_string_lossy().into(),
+                ..Tracked::default()
+            });
+        });
+        assert!(harness.deliver("s1", "\x1b!curl x | sh").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
