@@ -79,23 +79,29 @@ describe('Live workspace', () => {
     expect(folders()[0].className).toContain('live');
     const items = [...host.querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim());
     // An unnamed session goes by the title its agent gave it; the agent kind is a mark; the folder is the section
-    expect(items).toEqual(['Fixing tests']);
-    expect([...host.querySelectorAll('.hs-item .hs-mark')].map(e => e.getAttribute('aria-label'))).toEqual(['Claude Code']);
+    expect(items).toEqual(['Fixing tests', 'Shell']);
+    expect([...host.querySelectorAll('.hs-item .hs-mark')].map(e => e.getAttribute('aria-label'))).toEqual(['Claude Code', 'Shell']);
     // The dot carries the state; pid and output age are not in the row
     expect(rows().map(li => li.textContent).join(' ')).not.toMatch(/pid|output|running/);
     expect(host.querySelector('.hs-dot.running')?.getAttribute('aria-label')).toBe('running');
-    expect(host.textContent).not.toContain('exited with 0');
+    expect(host.querySelector('.hs-dot.exited')?.getAttribute('aria-label')).toBe('exited');
     expect(rows().map(li => li.textContent).join(' ')).not.toContain('Runner pid');
-    expect(host.textContent).not.toContain('Completed');
   });
 
-  it('hides ended sessions and their empty folders without deleting them', async () => {
+  it('keeps ended sessions in the list in exited state, allows viewing output and removing them', async () => {
+    vi.mocked(harnessApi.forget).mockResolvedValue();
     vi.mocked(harnessApi.list).mockResolvedValue([running, { ...ended, cwd: '/work/finished' }]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    expect(folders().map(f => f.querySelector('.hs-dir-path')?.getAttribute('title'))).toEqual(['/work/repo']);
-    expect(host.textContent).not.toContain('Completed');
-    expect(button('Actions for Shell')).toBeNull();
-    expect(harnessApi.forget).not.toHaveBeenCalled();
+    expect(folders().map(f => f.querySelector('.hs-dir-path')?.getAttribute('title'))).toEqual(['/work/repo', '/work/finished']);
+    expect(host.querySelector('.hs-dot.exited')?.getAttribute('aria-label')).toBe('exited');
+    const endedButton = [...host.querySelectorAll('.hs-dir .hs-item')].find(b => b.textContent?.includes('Shell')) as HTMLButtonElement;
+    await act(async () => endedButton.click()); await flush();
+    expect(host.querySelector('.hs-pane:not([hidden]) [data-terminal="e1"]')).not.toBeNull();
+    await act(async () => button('Actions for Shell').click());
+    const remove = [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes('Remove from the list')) as HTMLButtonElement;
+    expect(remove).toBeTruthy();
+    await act(async () => remove.click()); await flush();
+    expect(harnessApi.forget).toHaveBeenCalledWith('e1');
   });
 
   it('has one action menu per row: copy a reference, restart, or close the session for good', async () => {
@@ -311,8 +317,7 @@ describe('Live workspace', () => {
     // Its own tile above the list, not a row in it
     expect(host.querySelector('.hs-supervisor')?.className).toContain('running selected');
     expect(host.querySelector('.hs-supervisor strong')?.textContent).toBe('Supervisor');
-    expect(rows()).toHaveLength(1);
-    expect(host.textContent).not.toContain('Completed');
+    expect(rows()).toHaveLength(2);
     expect(folders()).toHaveLength(1);
     expect(button('Actions for the supervisor')).not.toBeNull();
     // A second click selects the running one instead of starting another

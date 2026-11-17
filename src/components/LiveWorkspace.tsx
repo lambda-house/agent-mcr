@@ -396,7 +396,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     setCwd('');
   };
   const home = status?.home ?? '';
-  const sections = useMemo(() => directorySections(sorted.filter(h => !h.exit), resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
+  const sections = useMemo(() => directorySections(sorted, resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
 
