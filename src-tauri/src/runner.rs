@@ -673,11 +673,12 @@ pub const NOT_ALLOWED: &str = "Background processes are not allowed";
 /// replaced the person's running runner with a test binary, which ended every
 /// hosted session.
 fn may_manage(socket: &Path) -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    let real = crate::get_config_dir().ok();
-    socket.parent().is_some_and(|dir| real.as_deref() == Some(dir))
+    socket.parent().is_some_and(own_folder)
+}
+
+/// The app's own config folder, outside tests.
+fn own_folder(dir: &Path) -> bool {
+    !cfg!(test) && crate::get_config_dir().ok().as_deref() == Some(dir)
 }
 
 fn consent_file(dir: &Path) -> PathBuf {
@@ -687,7 +688,8 @@ fn consent_file(dir: &Path) -> PathBuf {
 /// What the person decided about the background units kept in `dir`:
 /// allowed, stopped, or nothing yet.
 pub fn consent(dir: &Path) -> Option<bool> {
-    decision(dir, installed(&RUNNER))
+    // Units installed by an earlier version count as allowed for the app's own folder only
+    decision(dir, own_folder(dir) && installed(&RUNNER))
 }
 
 fn decision(dir: &Path, installed: bool) -> Option<bool> {
@@ -1157,6 +1159,7 @@ mod tests {
         let fresh = dir.join("fresh");
         std::fs::create_dir_all(&fresh).unwrap();
         assert_eq!(ensure(&fresh.join("runner.sock")).unwrap_err(), NOT_ALLOWED);
+        assert_eq!(consent(&fresh), None);
         assert!(!consent_file(&fresh).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
