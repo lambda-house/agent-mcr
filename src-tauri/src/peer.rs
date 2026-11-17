@@ -522,7 +522,9 @@ mod tests {
         let client = Stream::connect(&path).unwrap();
         let (server, _) = listener.accept().unwrap();
         let _ = std::fs::remove_file(&path);
-        (client, server)
+        // Return the accepted server stream first: on Windows AF_UNIX,
+        // SIO_AF_UNIX_GETPEERPID is populated on the accepted socket.
+        (server, client)
     }
 
     #[test]
