@@ -1,10 +1,10 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
-import { Badge, DescList, Kbd, ScrollArea, StatusDot, cx } from '@teob/ui';
+import { DescList, Kbd, ScrollArea, StatusDot, cx } from '@teob/ui';
 import { cacheState, compact, contextWindow, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
-import { harnessApi, hostedLabel, hostedState, runningFor, STATE_LABEL, type Hosted } from '../utils/harness';
+import { harnessApi, hostedState, liveSessionLabel, runningFor, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { TopTabPlugin } from '../plugins/sdk';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
@@ -161,7 +161,7 @@ export default function SessionCommandPanel({
           if (quickFilter === 'claude' && s.provider !== 'claude') return false;
           if (quickFilter === 'working' && rowStatus(s, live) !== 'working') return false;
           // A hosted session is found by the name it has in Live too
-          return matchesSession(s, query) || (!!live && !!query.trim() && hostedLabel(live).toLowerCase().includes(query.trim().toLowerCase()));
+          return matchesSession(s, query) || (!!live && !!query.trim() && liveSessionLabel(live, { [s.id]: formatSessionTitle(s) }).toLowerCase().includes(query.trim().toLowerCase()));
         })
         // Running conversations first; the order is otherwise the index's
         .sort((a, b) => Number(liveByKey.has(sessionKey(b))) - Number(liveByKey.has(sessionKey(a))))
@@ -170,7 +170,7 @@ export default function SessionCommandPanel({
       for (const s of matchingSessions) {
         const key = sessionKey(s);
         const live = liveByKey.get(key);
-        const title = live ? hostedLabel(live, { [s.id]: formatSessionTitle(s) }) : formatSessionTitle(s);
+        const title = live ? liveSessionLabel(live, { [s.id]: formatSessionTitle(s) }) : formatSessionTitle(s);
         const folder = s.cwd ? s.cwd.replace(/^\/(Users|home)\/[^/]+/, '~') : '';
         const age = s.modified ? formatAge(s.modified) : '';
         const metaParts = [folder, s.model, age].filter(Boolean);
@@ -575,15 +575,6 @@ export default function SessionCommandPanel({
                           },
                         ]}
                       />
-                      {activeItem.session.tickets.length > 0 && (
-                        <div className="cmd-preview__tickets">
-                          {activeItem.session.tickets.map((t) => (
-                            <Badge key={t} tone="accent">
-                              {t}
-                            </Badge>
-                          ))}
-                        </div>
-                      )}
                       <div className="cmd-preview__footer">
                         <Kbd>↵</Kbd> {activeItem.live && onOpenLive ? 'Show in Live' : 'Open session inspector'}
                       </div>

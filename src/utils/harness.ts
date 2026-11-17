@@ -218,6 +218,11 @@ export function hostedLabel(h: Hosted, titles: Record<string, string> = {}): str
   return named || h.meta.name || meaningfulName || h.harness?.role?.trim() || titles[h.harness?.agentSession ?? ''] || titleName(h) || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;
 }
 
+/** Display name shown in the Live sidebar (and command panel) for a hosted session. */
+export function liveSessionLabel(h: Hosted, titles: Record<string, string> = {}): string {
+  return isSupervisor(h) ? 'Supervisor' : hostedLabel(h, titles);
+}
+
 export type HostedState = 'running' | 'starting' | 'working' | 'idle' | 'waiting' | 'exited' | 'failed';
 
 /** `running` means alive with nothing more known (a shell, or an agent that hasn't reported yet). */

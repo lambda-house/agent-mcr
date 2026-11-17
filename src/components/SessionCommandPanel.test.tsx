@@ -45,6 +45,20 @@ describe('Command panel', () => {
     expect(onSelectSession).not.toHaveBeenCalled();
   });
 
+  it('uses the same display name as the Live sidebar for supervisor sessions and omits ticket pills', async () => {
+    const sup: Hosted = { ...hosted, id: 'sup1', meta: { label: 'Claude Code', profile: 'claude', name: 'ignored', role: 'supervisor' }, harness: { profile: 'claude', state: 'idle', agentSession: 'b' } as Hosted['harness'] };
+    vi.mocked(harnessApi.list).mockResolvedValue([sup]);
+    const s = { ...session('b', 'Fix the parser', 1), tickets: ['MCR-24', 'MEM-12'] };
+    await act(async () => root.render(<SessionCommandPanel open hideTrigger onOpenChange={() => {}} enabled sessions={[s]}
+      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
+    await flush();
+    const rows = [...document.querySelectorAll('[role="option"]')].filter(r => r.id.includes('session:'));
+    expect(rows.map(r => r.querySelector('.cmd-item__label')?.textContent)).toEqual(['Supervisor']);
+    expect(document.querySelector('.cmd-preview__tickets')).toBeNull();
+    expect(document.body.textContent).not.toContain('MCR-24');
+    expect(document.body.textContent).not.toContain('MEM-12');
+  });
+
   it('opens on Cmd+S even while the terminal has focus, and leaves Ctrl+K and Ctrl+S alone', async () => {
     const onOpenChange = vi.fn();
     await act(async () => root.render(<SessionCommandPanel open={false} hideTrigger onOpenChange={onOpenChange} enabled sessions={[]}

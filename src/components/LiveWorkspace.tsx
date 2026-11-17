@@ -7,7 +7,7 @@ import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import { BackgroundGate, BackgroundPanel } from './Background';
 import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, tildePath, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, tildePath, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -75,7 +75,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   /** Open the search view narrowed to a folder */
   onSearch?: (directory: string) => void;
 }) {
-  const sessionLabel = (h: Hosted) => hostedLabel(h, titles);
+  const sessionLabel = (h: Hosted) => liveSessionLabel(h, titles);
   const metrics = useSessionMetrics(active);
   // Null: the default width, a share of the window
   const [listWidth, setListWidth] = useState<number | null>(storedWidth);
@@ -598,7 +598,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       </div>
       <RowMenu className="hs-notifications-wrap" buttonClassName="hs-notifications" label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
         icon={<><BellRing size={14}/> Notifications{waiting.length > 0 && ` · ${waiting.length}`}</>}
-        actions={waiting.map(h => ({ label: `${isSupervisor(h) ? 'Supervisor' : sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
+        actions={waiting.map(h => ({ label: `${sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
       {gate && <BackgroundGate stopped={gate === 'stopped'} onAllowed={connect}/>}
       <ul className="hs-dirs">
         {shown.map(d => {
@@ -786,7 +786,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                                     profile={cand.harness?.profile || cand.meta.profile || ''}
                                     size={13}
                                   />
-                                  <strong>{isSupervisor(cand) ? 'Supervisor' : sessionLabel(cand)}</strong>
+                                  <strong>{sessionLabel(cand)}</strong>
                                   <small className={`hs-pick-state hs-pick-state--${state}`}>
                                     {STATE_LABEL[state]}
                                   </small>
@@ -812,7 +812,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                   <header className="hs-pane-title">
                     <span className={`hs-dot ${hostedState(h)}`} aria-label={STATE_LABEL[hostedState(h)]}/>
                     <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/>
-                    <strong>{isSupervisor(h) ? 'Supervisor' : sessionLabel(h)}</strong>
+                    <strong>{sessionLabel(h)}</strong>
                     <span title={h.cwd}>{h.cwd}</span>
                     <div className="hs-pane-tools">
                       <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>
