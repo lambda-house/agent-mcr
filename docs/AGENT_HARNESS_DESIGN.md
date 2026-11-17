@@ -315,7 +315,35 @@ Zero-tolerance counts, shown in the harness panel: rows shown live without a liv
 
 ## Slack connector (D14, MCR-26)
 
-**Status:** design only, nothing built. Ships after 1.0. Tasks: MCR-27 to MCR-40.
+**Status:** first version built on 2026-11-17 for an end-to-end test on the owner's workspace; not yet run against Slack (see "What is built"). Ships after 1.0. Tasks: MCR-27 to MCR-40.
+
+### What is built
+
+| Part | State |
+|---|---|
+| Connect flow: tokens checked with Slack, native confirmation, tokens in the Keychain, disconnect | Built; not run live |
+| Socket Mode connection in the harness service: store, acknowledge, deliver; reconnect; off switch | Built; the Web API side is tested against a fake, the WebSocket loop only compiles until the live run |
+| Channel policies in the app (Slack tab): listen, senders, route, posting, who may post | Built |
+| Routing to a session or the Supervisor as inbox data; threads stay with their session | Built, tested |
+| Catch-up of channels after a reconnect | Built, tested |
+| Harness tools `slack_channels`, `slack_reply`, `slack_post`, `slack_post_status`, `slack_thread`; supervisor tool `slack_status` | Built, tested |
+| Approval in the app (approve, edit then approve, deny with a reason) and in Slack (Approve, Deny) | Built, tested |
+| Sending as the bot, at most once, with the outcome told to the session | Built, tested |
+
+What differs from this design for now, and why:
+
+| Design | Now | Closes with |
+|---|---|---|
+| Slack classes in `harness.sqlite`; 30 days of messages | `slack-state.json`, rewritten atomically before any change is acted on; the last 2,000 messages and 500 posts | MCR-30 |
+| A pending post is an attention item in the attention list, repeated while unanswered | A badge on the Slack tab, the card in the Slack view and one macOS notification | MCR-35 |
+| Route to a new session from a launch profile | Not built: a session or the Supervisor | MCR-32 |
+| Catch-up of followed threads; a count of skipped messages | Channels only; "older messages were skipped" without a number | MCR-33 |
+| A list of sessions or profiles that may post | The routed session and replies in its threads, or every session (the service takes a list; the app offers these two) | MCR-31 |
+| User mentions for channel members by policy | Agent text mentions nobody | MCR-37 |
+| Deny with a reason in Slack | Deny without a reason; reasons are given in the app | MCR-36 |
+| A fake Socket Mode server in the tests | The connection loop is checked in the live run only | MCR-29 |
+| A post tool may return a task (Tasks extension) | It returns an id; the outcome arrives in the inbox | D2 gap, as for the other tools |
+| The connector works while the app is closed | True while a session runs. The harness service exits ten minutes after the last session ends, and with it the connection; what arrived meanwhile is caught up at the next start, within the catch-up bound | Owner decision if listening without sessions is wanted |
 
 **Goal.** Hosted sessions receive messages from chosen Slack channels and post replies or new messages to chosen channels. The operator sets, per channel, what is listened to, whose messages reach a session, and what may be posted. A post that policy does not allow automatically waits for the operator.
 

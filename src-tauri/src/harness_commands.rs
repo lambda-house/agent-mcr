@@ -288,6 +288,101 @@ pub async fn harness_restart(id: String) -> Result<Value, String> {
     blocking(move || service(json!({"op": "restart", "id": id, "force": true}))).await
 }
 
+// ---- Slack connector (docs/AGENT_HARNESS_DESIGN.md, D14) ----
+// Everything that widens what Slack may do is confirmed in a native dialog,
+// never granted by the page alone.
+
+#[tauri::command]
+pub async fn slack_status() -> Result<Value, String> {
+    blocking(|| service(json!({"op": "slack"}))).await
+}
+
+/// Check the tokens with Slack, ask the person, then keep the tokens in the Keychain.
+/// Returns null when the person said no.
+#[tauri::command]
+pub async fn slack_connect(app: tauri::AppHandle, bot: String, app_token: String, operator: String) -> Result<Value, String> {
+    blocking(move || {
+        let found = service(json!({"op": "slack_probe", "bot": bot, "app": app_token, "operator": operator}))?;
+        let text = |key: &str| found[key].as_str().unwrap_or("").to_string();
+        let message = format!(
+            "Workspace: {}\nBot: {}\n\n{} ({}) is recorded as you. Only this Slack user's button presses can approve or deny a post, and this is the first sender whose messages reach a session.\n\nThe two tokens are kept in the macOS Keychain on this Mac and are shown to no agent. Nothing is listened to and nothing can be posted until you set a channel's policy.",
+            text("team"), text("botName"), text("operatorName"), text("operator")
+        );
+        if !confirmed(&app, "Connect Slack?", message, "Connect", false) {
+            return Ok(Value::Null);
+        }
+        service(json!({"op": "slack_connect", "bot": bot, "app": app_token, "operator": operator}))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn slack_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        if !confirmed(&app, "Disconnect Slack?", "The tokens are removed from the Keychain, listening stops and posts that wait are cancelled. Channel policies are kept for the next time.".to_string(), "Disconnect", true) {
+            return service(json!({"op": "slack"}));
+        }
+        service(json!({"op": "slack_disconnect"}))
+    })
+    .await
+}
+
+/// The off switch. Turning it off needs no question.
+#[tauri::command]
+pub async fn slack_enable(on: bool) -> Result<Value, String> {
+    blocking(move || service(json!({"op": "slack_enable", "on": on}))).await
+}
+
+#[tauri::command]
+pub async fn slack_approval(on: bool) -> Result<Value, String> {
+    blocking(move || service(json!({"op": "slack_approval", "on": on}))).await
+}
+
+#[tauri::command]
+pub async fn slack_refresh() -> Result<Value, String> {
+    blocking(|| service(json!({"op": "slack_refresh"}))).await
+}
+
+/// Change a channel's policy. Posting without approval, and letting other
+/// people's messages reach an agent, are asked about first.
+#[tauri::command]
+pub async fn slack_policy(app: tauri::AppHandle, channel: String, policy: Value) -> Result<Value, String> {
+    valid_id(&channel)?;
+    blocking(move || {
+        let now = service(json!({"op": "slack"}))?;
+        let current = now["channels"].as_array().and_then(|all| all.iter().find(|c| c["id"] == channel.as_str())).cloned().ok_or("No such channel")?;
+        let name = current["name"].as_str().unwrap_or("").to_string();
+        if let Some(posting @ ("auto" | "thread")) = policy["posting"].as_str().filter(|p| current["posting"] != *p) {
+            let what = if posting == "auto" {
+                format!("Sessions that may post to #{name} will post there without asking you. An agent can post anything it has read: file contents, credentials it came across, what other channels said.")
+            } else {
+                format!("A session will answer in #{name} without asking you, in threads where a sender on the channel's list addressed it. An agent can put anything it has read into such an answer. New messages outside those threads still wait for your approval.")
+            };
+            if !confirmed(&app, "Post without your approval?", what, "Allow", true) {
+                return Ok(now);
+            }
+        }
+        let operator = now["connection"]["operator"].as_str().unwrap_or("");
+        let had: Vec<&str> = current["senders"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+        let added: Vec<&str> = policy["senders"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).filter(|u| *u != operator && !had.contains(u)).collect()).unwrap_or_default();
+        if !added.is_empty() {
+            let message = format!("Messages from {} in #{name} will reach an agent session. That agent can run commands as you, and it reads their messages as requests from Slack. Add only people you would let type into its terminal.", added.join(", "));
+            if !confirmed(&app, "Let other people's messages reach an agent?", message, "Allow", true) {
+                return Ok(now);
+            }
+        }
+        service(json!({"op": "slack_policy", "channel": channel, "policy": policy}))
+    })
+    .await
+}
+
+/// The person's decision on a post that waits: approve (with the text as they left it) or deny.
+#[tauri::command]
+pub async fn slack_decide(post: String, approve: bool, text: Option<String>, reason: Option<String>) -> Result<Value, String> {
+    valid_id(&post)?;
+    blocking(move || service(json!({"op": "slack_decide", "post": post, "approve": approve, "text": text, "reason": reason}))).await
+}
+
 fn valid_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err("Invalid id".into());

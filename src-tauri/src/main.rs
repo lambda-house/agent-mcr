@@ -30,6 +30,7 @@ mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
 mod session_mcp;
+mod slack;
 mod session_commands;
 mod session_db;
 mod session_memory;
@@ -1271,6 +1272,14 @@ fn main() {
             harness_commands::harness_forget,
             harness_commands::harness_restart,
             harness_commands::harness_outside_supervisors,
+            harness_commands::slack_status,
+            harness_commands::slack_connect,
+            harness_commands::slack_disconnect,
+            harness_commands::slack_enable,
+            harness_commands::slack_approval,
+            harness_commands::slack_refresh,
+            harness_commands::slack_policy,
+            harness_commands::slack_decide,
             harness_commands::terminal_attach,
             harness_commands::terminal_input,
             harness_commands::terminal_resize,

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronRight, ClipboardList, Play, RefreshCw, Search, Shield, Terminal, X, Zap } from 'lucide-react';
+import { Bot, ChevronRight, ClipboardList, MessageSquare, Play, RefreshCw, Search, Shield, Terminal, X, Zap } from 'lucide-react';
 import { compact, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -7,16 +7,17 @@ import '../styles/sessions.css';
 import SessionTree from './SessionTree';
 import WorkspaceSwitch from './WorkspaceSwitch';
 import SessionResults from './SessionResults';
-import { harnessApi } from '../utils/harness';
+import { harnessApi, slackApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import SessionAgentAccess from './SessionAgentAccess';
 import LiveWorkspace from './LiveWorkspace';
 import BoardView from './BoardView';
+import SlackView from './SlackView';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
-type View = 'live' | 'history' | 'board';
+type View = 'live' | 'history' | 'board' | 'slack';
 function savedView(): View {
-  try { const v = localStorage.getItem(VIEW_KEY); return v === 'history' || v === 'board' ? v : 'live'; } catch { return 'live'; }
+  try { const v = localStorage.getItem(VIEW_KEY); return v === 'history' || v === 'board' || v === 'slack' ? v : 'live'; } catch { return 'live'; }
 }
 
 const empty: Snapshot = { sessions: [], errors: [], scannedFiles: 0, pendingFiles: 0, indexedAt: 0 };
@@ -30,6 +31,15 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [view, setViewState] = useState<View>(savedView);
   const [focus, setFocus] = useState<{ id: string; at: number }>();
+  // Posts that wait for the person's approval: shown on the Slack tab from every view
+  const [slackWaiting, setSlackWaiting] = useState(0);
+  useEffect(() => {
+    if (!active || !isTauri()) return;
+    const look = () => { if (!document.hidden) slackApi.status().then(s => setSlackWaiting(s.counts.waiting)).catch(() => {}); };
+    look();
+    const timer = setInterval(look, 4000);
+    return () => clearInterval(timer);
+  }, [active]);
   const setView = (v: View) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
   const [data, setData] = useState<Snapshot>(empty);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
@@ -94,6 +104,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
         <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><Search size={13}/> Search</button>
         <button type="button" aria-current={view === 'board' ? 'page' : undefined} onClick={() => setView('board')} title="What sessions reported to you, and the notes they left for each other"><ClipboardList size={13}/> Board</button>
+        <button type="button" aria-current={view === 'slack' ? 'page' : undefined} onClick={() => setView('slack')} title="Slack: what is listened to, what sessions may post, and posts that wait for your approval"><MessageSquare size={13}/> Slack{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</button>
       </nav>
       <div className="sc-top-actions">
         {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button><button onClick={() => setUserMemories(true)}>User memories</button><button onClick={() => setAgentAccess(true)}>Agent access</button></>}
@@ -110,6 +121,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       </details>}
     </header>
     <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
+    {view === 'slack' && <SlackView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }} onWaiting={setSlackWaiting}/>}
     {view === 'board' && <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/>}
     {view === 'history' && <>
     {error && <div className="sc-banner" role="alert">{error}</div>}

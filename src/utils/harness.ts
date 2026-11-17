@@ -100,6 +100,46 @@ export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
   return open;
 }
 
+/** The Slack connector as the harness service reports it (decision D14). No token is in it. */
+export interface SlackConnection { team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number }
+export type SlackListen = 'off' | 'mentions' | 'all';
+export type SlackPosting = 'never' | 'approve' | 'thread' | 'auto';
+export interface SlackChannel {
+  id: string; name: string; private: boolean; member: boolean; listen: SlackListen; senders: string[];
+  route: { kind: 'none' | 'session' | 'supervisor'; session: string }; posting: SlackPosting; posters: string[]; skipped: boolean;
+}
+export type SlackPostState = 'waiting' | 'approved' | 'sending' | 'sent' | 'denied' | 'cancelled' | 'failed' | 'unknown';
+export interface SlackPost {
+  id: string; session: string; sessionName: string; channel: string; channelName: string; threadTs?: string | null; text: string;
+  state: SlackPostState; created: number; decided: number; allowedBy: string; reason?: string | null; link?: string | null;
+}
+export interface SlackReceived {
+  key: string; channel: string; channelName: string; user: string; userName: string; text: string; at: number;
+  caughtUp: boolean; session?: string | null; held?: string | null;
+}
+export interface SlackStatus {
+  connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;
+  channels: SlackChannel[]; users: Record<string, string>; posts: SlackPost[]; received: SlackReceived[];
+  audit: { at: number; kind: string; text: string }[];
+  counts: { sentWithoutApproval: number; refusedApprovals: number; deliveredFromStrangers: number; held: number; waiting: number };
+}
+export type SlackPolicy = Partial<{ listen: SlackListen; posting: SlackPosting; route: 'none' | 'session' | 'supervisor'; session: string; senders: string[]; posters: string[] }>;
+export const SLACK_POSTING: Record<SlackPosting, string> = {
+  never: 'Never', approve: 'Ask me each time', thread: 'Thread replies at once, the rest asks', auto: 'At once, without asking',
+};
+
+export const slackApi = {
+  status: () => invoke<SlackStatus>('slack_status'),
+  /** Null when the person said no in the native dialog */
+  connect: (bot: string, appToken: string, operator: string) => invoke<SlackStatus | null>('slack_connect', { bot, appToken, operator }),
+  disconnect: () => invoke<SlackStatus>('slack_disconnect'),
+  enable: (on: boolean) => invoke<SlackStatus>('slack_enable', { on }),
+  approval: (on: boolean) => invoke<SlackStatus>('slack_approval', { on }),
+  refresh: () => invoke<SlackStatus>('slack_refresh'),
+  policy: (channel: string, policy: SlackPolicy) => invoke<SlackStatus>('slack_policy', { channel, policy }),
+  decide: (post: string, approve: boolean, text?: string, reason?: string) => invoke<SlackStatus>('slack_decide', { post, approve, text: text ?? null, reason: reason || null }),
+};
+
 export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
   /** The background processes and the person's decision about them; starts nothing */
