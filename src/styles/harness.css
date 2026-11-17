@@ -471,3 +471,22 @@
 .hs-slack-audit { margin-top: 10px; color: var(--sc-muted); font-size: 11px; }
 .hs-slack-audit summary { cursor: pointer; padding: 4px 0; }
 .hs-slack-audit li { padding: 3px 0; overflow-wrap: anywhere; }
+
+/* Supervisors and executors (MCR-41): a rail and a mark per row; little indentation, capped at four levels */
+.hs-list li.hs-nested { margin-left: calc(var(--level, 1) * 9px); max-width: calc(100% - var(--level, 1) * 9px); border-left: 2px solid color-mix(in srgb, var(--sc-accent) 45%, var(--sc-border)); border-radius: 0 6px 6px 0; }
+.hs-list li.hs-nested.needs-you { border-left-color: #e0a23c; }
+.hs-rel { display: inline-flex; align-items: center; gap: 2px; margin: 0 3px 0 0; font-size: 10px; font-weight: 600; vertical-align: -1px; }
+.hs-rel.executor { color: var(--sc-muted); }
+.hs-rel.supervisor { margin: 0 0 0 5px; padding: 0 4px; border-radius: 7px; color: var(--sc-accent); background: color-mix(in srgb, var(--sc-accent) 14%, transparent); }
+.hs-list li.is-supervisor > .hs-item strong { font-weight: 600; }
+.hs-under { color: var(--sc-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-bind { flex: 0 0 100%; display: flex; gap: 5px; padding: 2px 6px 6px 22px; box-sizing: border-box; }
+.session-cockpit .hs-bind select { flex: 1; min-width: 0; height: 22px; border: 1px solid var(--sc-border); border-radius: 4px; background: var(--sc-panel); color: var(--sc-text); font-size: 11px; }
+.session-cockpit .hs-bind button { height: 22px; padding: 0 8px; font-size: 11px; }
+
+/* What a session registered that it waits for; a mark for parts that ship as a preview */
+.hs-wait { display: inline-flex; align-items: center; gap: 4px; color: var(--sc-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-wait.overdue { color: #e0a23c; }
+.hs-preview { padding: 0 4px; border: 1px solid var(--sc-border); border-radius: 7px; color: var(--sc-muted); font-size: 9px; font-weight: 500; }
+.hs-slack-warning { margin: 4px 0 6px; padding: 6px 8px; border: 1px solid #e0a23c; border-radius: 6px; color: var(--sc-text); font-size: 11px; line-height: 1.45; }
+.hs-slack-warning b { font-weight: 600; }

@@ -667,6 +667,20 @@ pub const RUNNER: Unit = Unit { label: LAUNCH_LABEL, flag: "--runner", name: "ru
 /// units, or has stopped them. The app shows its question on this text.
 pub const NOT_ALLOWED: &str = "Background processes are not allowed";
 
+/// Whether this process may install, start, replace or remove the background
+/// units for the folder a socket lives in. Only the app's own config folder
+/// qualifies, and never a test: a harness opened in a temporary folder once
+/// replaced the person's running runner with a test binary, which ended every
+/// hosted session.
+fn may_manage(socket: &Path) -> bool {
+    socket.parent().is_some_and(own_folder)
+}
+
+/// The app's own config folder, outside tests.
+fn own_folder(dir: &Path) -> bool {
+    !cfg!(test) && crate::get_config_dir().ok().as_deref() == Some(dir)
+}
+
 fn consent_file(dir: &Path) -> PathBuf {
     dir.join("background.state")
 }
@@ -674,7 +688,8 @@ fn consent_file(dir: &Path) -> PathBuf {
 /// What the person decided about the background units kept in `dir`:
 /// allowed, stopped, or nothing yet.
 pub fn consent(dir: &Path) -> Option<bool> {
-    decision(dir, installed(&RUNNER))
+    // Units installed by an earlier version count as allowed for the app's own folder only
+    decision(dir, own_folder(dir) && installed(&RUNNER))
 }
 
 fn decision(dir: &Path, installed: bool) -> Option<bool> {
@@ -756,7 +771,7 @@ pub fn stop_unit(socket: &Path, unit: &Unit, remove: bool) -> Result<(), String>
             None => false,
             Some(running) => running.is_none() || running == pid,
         };
-        if ours {
+        if ours && may_manage(socket) {
             let _ = std::process::Command::new("launchctl").args(["bootout", &service]).output();
         }
     }
@@ -783,7 +798,7 @@ pub fn stop_unit(socket: &Path, unit: &Unit, remove: bool) -> Result<(), String>
     if std::fs::symlink_metadata(socket).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())) {
         let _ = std::fs::remove_file(socket);
     }
-    if remove {
+    if remove && may_manage(socket) {
         if let Some(plist) = plist_path(unit).filter(|p| p.exists()) {
             std::fs::remove_file(&plist).map_err(|e| format!("{}: {e}", plist.display()))?;
         }
@@ -816,7 +831,8 @@ pub fn ensure_unit(socket: &Path, unit: &Unit, protocol: u32) -> Result<Value, S
     if let Ok(h) = hello(socket) {
         return check_protocol(h, unit, protocol);
     }
-    if socket.parent().and_then(consent) != Some(true) {
+    // Before anything is read or written about consent: another folder has no say over the units
+    if !may_manage(socket) || socket.parent().and_then(consent) != Some(true) {
         return Err(NOT_ALLOWED.into());
     }
     start(socket, unit)?;
@@ -885,8 +901,13 @@ fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     let service = format!("{domain}/{}", unit.label);
     if std::fs::read_to_string(&plist).ok().as_deref() != Some(content.as_str()) {
-        // Another build (dev or release) registered itself; it isn't running, or
-        // `ensure` would have connected. Re-register this executable.
+        // Another build (dev or release) registered itself. It did not answer on
+        // this socket, but it may be running for another folder with sessions
+        // of its own: a running unit is never taken away from under them.
+        if let Some(Some(pid)) = launchd_pid(&service) {
+            return Err(format!("The {} is already run by another copy of Agent MCR (pid {pid}). Quit that copy and stop its background processes first.", unit.name));
+        }
+        // Registered and not running: re-register this executable.
         let _ = Command::new("launchctl").args(["bootout", &service]).output();
         std::fs::write(&plist, &content).map_err(|e| e.to_string())?;
     }
@@ -1117,4 +1138,30 @@ mod tests {
         }
         assert_eq!(Client::connect(&socket).unwrap().call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0, "nothing was started");
     }
+    /// A unit is installed, started, replaced or removed only for the app's
+    /// own config folder, and never from a test. Without this, a harness in a
+    /// temporary folder rewrote the real LaunchAgent to run a test binary.
+    #[test]
+    fn another_folder_or_a_test_never_touches_the_background_units() {
+        let dir = std::env::temp_dir().join(format!("mcr-units-{}", random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("runner.sock");
+        let real = plist_path(&RUNNER).and_then(|p| std::fs::read(p).ok());
+        assert!(!may_manage(&socket));
+        // Even with consent recorded in that folder, nothing is started
+        set_consent(&dir, true).unwrap();
+        assert_eq!(ensure(&socket).unwrap_err(), NOT_ALLOWED);
+        assert_eq!(ensure_unit(&dir.join("harness.sock"), &RUNNER, PROTOCOL).unwrap_err(), NOT_ALLOWED);
+        // Stopping and removing leave the real unit's file as it was
+        stop_unit(&socket, &RUNNER, true).unwrap();
+        assert_eq!(plist_path(&RUNNER).and_then(|p| std::fs::read(p).ok()), real);
+        // No consent is written into a folder just because the real units are installed
+        let fresh = dir.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        assert_eq!(ensure(&fresh.join("runner.sock")).unwrap_err(), NOT_ALLOWED);
+        assert_eq!(consent(&fresh), None);
+        assert!(!consent_file(&fresh).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

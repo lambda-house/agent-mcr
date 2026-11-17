@@ -111,7 +111,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         ))}
         <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><History size={13}/> Journal</button>
         <button type="button" aria-current={view === 'board' ? 'page' : undefined} onClick={() => setView('board')} title="What sessions reported to you, and the notes they left for each other"><ClipboardList size={13}/> Board</button>
-        <button type="button" aria-current={view === 'slack' ? 'page' : undefined} onClick={() => setView('slack')} title="Slack: what is listened to, what sessions may post, and posts that wait for your approval"><MessageSquare size={13}/> Slack{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</button>
+        <button type="button" aria-current={view === 'slack' ? 'page' : undefined} onClick={() => setView('slack')} title="Slack: what is listened to, what sessions may post, and posts that wait for your approval"><MessageSquare size={13}/> Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</button>
       </nav>
       <div className="sc-top-actions">
         <button onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"><Settings size={14}/></button>

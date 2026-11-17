@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, Folder, FolderOpen, History, MoreHorizontal, Play, Plus, Radar, RotateCw, Search, Terminal, X } from 'lucide-react';
+import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Folder, FolderOpen, History, Hourglass, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@teob/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import { BackgroundGate } from './Background';
 import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, tildePath, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, executorsBelow, formatUntil, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -17,6 +17,7 @@ import '../styles/harness.css';
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const base = (path: string) => path.split('/').filter(Boolean).pop() || path;
 const PINNED_KEY = 'hs-dirs';
+const START: [string, string][] = [['claude', 'Claude Code'], ['codex', 'Codex']];
 /** Folders with only history shown before "more" is asked for. */
 const HISTORY_FOLDERS = 6;
 
@@ -115,6 +116,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const pin = (next: string[]) => { setPinned(next); try { localStorage.setItem(PINNED_KEY, JSON.stringify(next)); } catch { /* not kept */ } };
   const [allHistory, setAllHistory] = useState(false);
   const [earlierOpen, setEarlierOpen] = useState(() => new Set<string>());
+  // The session being connected to a supervisor: its row shows the chooser
+  const [binding, setBinding] = useState('');
   // The usage pane beside the terminal: open or closed is this viewer's preference
   const [stats, setStats] = useState(() => { try { return localStorage.getItem('hs-stats') === '1'; } catch { return false; } });
   const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
@@ -381,7 +384,20 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       if (!fresh.resumed) setError(`${sessionLabel(h)} had no saved conversation to continue: it started fresh in the same folder.`);
     }).catch(e => { setError(err(e)); void refresh(); });
   };
+  /** A new session that works for `h`, in its folder */
+  const startExecutor = async (h: Hosted, profile: string) => {
+    setStarting(true); setError('');
+    try { const x = await harnessApi.spawn(profile, h.cwd, 120, 32, undefined, h.id); await refresh(); select(x.id); loadResumable(); }
+    catch (e) { setError(err(e)); }
+    finally { setStarting(false); }
+  };
+  const connect_to = (id: string, supervisorId: string | null) => { setBinding(''); act(async () => { await harnessApi.bind(id, supervisorId); }); };
+  const isAgent = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');
   const actions = (h: Hosted): Action[] => [
+    // Any agent session can have executors; the Supervisor sees everything already
+    ...(isAgent(h) && !isSupervisor(h) ? START.map(([profile, what]) => ({ label: `New executor (${what}) · Preview`, icon: <CornerDownRight size={13}/>, run: () => void startExecutor(h, profile) })) : []),
+    ...(!h.exit && !isSupervisor(h) && !h.harness?.supervisor ? [{ label: 'Connect to supervisor…', icon: <Link2 size={13}/>, run: () => setBinding(h.id) }] : []),
+    ...(!h.exit && h.harness?.supervisor ? [{ label: 'Detach from supervisor', icon: <Unlink size={13}/>, run: () => connect_to(h.id, null) }] : []),
     { label: 'Copy reference', icon: <Copy size={13}/>, run: () => copyReference(h) },
     ...(canRestart(h) ? [{ label: 'Restart (reload settings)', icon: <RotateCw size={13}/>, run: () => restart(h) }] : []),
     { label: h.exit ? 'Remove from the list' : 'Close session', icon: <X size={13}/>, run: () => close(h) },
@@ -421,8 +437,16 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     };
   };
   const supervisorSummary = supervisor ? sessionSummary(supervisor, Date.now()) : null;
-  const row = (h: Hosted) => {
+  const row = ({ session: h, depth, executors, elsewhere }: RelationRow) => {
     const state = hostedState(h);
+    const role = executors ? 'is-supervisor' : '';
+    const works = h.harness?.supervisor ? 'is-executor' : '';
+    // Sessions it could work for: live agents, not itself and not below it
+    const below = binding === h.id ? executorsBelow(h.id, hosted) : null;
+    const candidates = below ? hosted.filter(x => isAgent(x) && !isSupervisor(x) && x.id !== h.id && !below.has(x.id)) : [];
+    // Its own folder first, then the others; each by title
+    const choices = supervisorChoices(h, candidates);
+    const choice = (x: Hosted, withFolder: boolean) => <option key={x.id} value={x.id}>{sessionLabel(x)}{withFolder ? ` · ${shortPath(tildePath(x.cwd, home))}` : ''}</option>;
     const label = sessionLabel(h);
     const detail = h.exit
       ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
@@ -430,20 +454,39 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     const subs = (h.subagents ?? []).filter(a => !a.finished);
     const shells = h.exit ? [] : h.shells ?? [];
     const summary = sessionSummary(h, Date.now());
-    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now())].filter(Boolean).join(' ')}>
+    return <li key={h.id} style={depth ? { ['--level' as string]: Math.min(depth, 4) } : undefined} data-depth={depth || undefined}
+      className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now()), role, works, depth ? 'hs-nested' : ''].filter(Boolean).join(' ')}>
       <button className="hs-item" onClick={() => select(h.id)}
         draggable={!h.exit} onDragStart={e => { e.dataTransfer.setData(SESSION_DRAG_TYPE, h.id); e.dataTransfer.setData('text/plain', sessionReference(h, titles)); e.dataTransfer.effectAllowed = 'copy'; }}
         title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}${h.exit ? '' : '\nDrag into a terminal to point its agent at this session'}`}>
         <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
         <span className="hs-item-text">
-          <strong title={label}><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}</strong>
+          <strong title={label}>
+            {works && <span className="hs-rel executor" title={`Executor of ${names.get(h.harness?.supervisor ?? '') ?? 'a session'}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
+            <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}
+            {executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
+          </strong>
+          {elsewhere && <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>}
           <SessionMetrics hosted={h} data={metrics}/>
           {detail && <small>{detail}</small>}
           {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
+          {!h.exit && (h.waits ?? []).map(w => <small key={w.id} className={`hs-wait${w.overdue ? ' overdue' : ''}`}
+            title={`Registered by the session ${formatAge(w.since)}: ${w.kind}${w.ref ? ` · ${w.ref}` : ''}\n${w.overdue ? `Expected to be over ${formatAge(w.expectBy)}${w.escalated ? `; ${w.escalated === 'operator' ? 'you were' : 'its supervisor was'} told` : ''}` : `Expected to be over ${formatUntil(w.expectBy)}`}`}>
+            <Hourglass size={10}/> waits for {w.on}{w.overdue ? ' · late' : ''}</small>)}
           {summary && <small className="hs-status" title={summary.full || undefined}>{summary.lead && <span className="hs-lead">{summary.lead}</span>}{summary.text && <span>{summary.text}</span>}</small>}
         </span>
       </button>
       <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
+      {binding === h.id && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
+        <select aria-label="Supervisor" autoFocus defaultValue="" onChange={e => { if (e.target.value) connect_to(h.id, e.target.value); }}>
+          <option value="" disabled>{candidates.length ? 'Works for…' : 'No other agent session is running'}</option>
+          {/* Two groups stand in for a separator, which a native select does not draw in every WebKit; one group alone needs no heading */}
+          {choices.here.length > 0 && choices.elsewhere.length > 0
+            ? <><optgroup label="This folder">{choices.here.map(x => choice(x, false))}</optgroup><optgroup label="Other folders">{choices.elsewhere.map(x => choice(x, true))}</optgroup></>
+            : [...choices.here.map(x => choice(x, false)), ...choices.elsewhere.map(x => choice(x, true))]}
+        </select>
+        <button type="button" onClick={() => setBinding('')}>Cancel</button>
+      </form>}
       {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
         {shells.map(sh => {
           const now = Date.now();
@@ -611,7 +654,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
             </header>
-            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{d.sessions.map(row)}</ul>}
+            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(row)}</ul>}
             {d.earlier.length > 0 && <div className="hs-earlier">
               <button type="button" className="hs-earlier-toggle" aria-expanded={open} onClick={() => setEarlierOpen(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>
                 {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<History size={11}/> Earlier · {d.earlier.length} · last {formatAge(d.earlier[0].modified)}
@@ -649,7 +692,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       selectSession: select,
       openSupervisor: () => void openSupervisor(),
       startSession: start,
-      renderSessionRow: row,
+      renderSessionRow: (h: Hosted) => row({ session: h, depth: 0, executors: 0 }),
       openNewAgentInDir: (dir: string) => { setCwd(dir); setNewAgentOpen(true); },
       renderSupervisorMenu: (sup: Hosted) => <RowMenu label="the supervisor" actions={actions(sup)}/>,
     },

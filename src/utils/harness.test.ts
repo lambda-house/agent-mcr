@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gist, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted } from './harness';
+import { gist, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -71,5 +71,66 @@ describe('session reference', () => {
     const named = (name: string) => sessionReference(hosted({ meta: { label: 'Claude Code', profile: 'claude', name } } as Partial<Hosted>));
     expect(named('Fixing tests')).toMatch(/^mcr:\S+ 'Fixing tests'$/);
     expect(named('a $(rm -rf ~) `id` \\ "b" \'c\'\nrm\u001b[0m')).toMatch(/^mcr:\S+ 'a \(rm -rf ~\) id {2}b crm\[0m'$/);
+  });
+});
+
+describe('supervisors and executors', () => {
+  const session = (id: string, cwd: string, supervisor?: string): Hosted => ({
+    id, pid: 1, argv: ['claude'], cwd, started: 1, cols: 120, rows: 32, title: '', lastOutput: 1, exit: null,
+    meta: { profile: 'claude', label: 'Claude Code' }, harness: { profile: 'claude', state: 'idle', name: id, supervisor } as Hosted['harness'],
+  });
+
+  it('lists a folder as trees: two supervisors, a three-level chain and an independent session', () => {
+    const all = [
+      session('lead', '/w'), session('solo', '/w'), session('worker', '/w', 'lead'), session('second', '/w'),
+      session('helper', '/w', 'worker'), session('aide', '/w', 'second'), session('remote', '/other', 'lead'),
+    ];
+    const rows = relationRows(all.filter(h => h.cwd === '/w'), all);
+    expect(rows.map(r => `${r.session.id}:${r.depth}`)).toEqual(['lead:0', 'worker:1', 'helper:2', 'solo:0', 'second:0', 'aide:1']);
+    // An executor in another folder counts for its supervisor, and names it where it is listed
+    expect(rows[0].executors).toBe(2);
+    expect(rows.find(r => r.session.id === 'solo')?.executors).toBe(0);
+    const elsewhere = relationRows(all.filter(h => h.cwd === '/other'), all);
+    expect(elsewhere.map(r => [r.session.id, r.depth, r.elsewhere?.id])).toEqual([['remote', 0, 'lead']]);
+  });
+
+  it('keeps every session when a relation points nowhere or in a circle', () => {
+    const all = [session('a', '/w', 'b'), session('b', '/w', 'a'), session('c', '/w', 'gone')];
+    expect(relationRows(all, all).map(r => r.session.id).sort()).toEqual(['a', 'b', 'c']);
+    expect([...executorsBelow('a', all)].sort()).toEqual(['a', 'b']);
+  });
+
+  it('knows who is below a session, so it is not offered as its supervisor', () => {
+    const all = [session('lead', '/w'), session('worker', '/w', 'lead'), session('helper', '/w', 'worker'), session('solo', '/w')];
+    expect([...executorsBelow('lead', all)].sort()).toEqual(['helper', 'worker']);
+    expect(executorsBelow('solo', all).size).toBe(0);
+  });
+});
+
+describe('choosing a supervisor', () => {
+  const session = (id: string, cwd: string, name: string): Hosted => ({
+    id, pid: 1, argv: ['claude'], cwd, started: 1, cols: 120, rows: 32, title: '', lastOutput: 1, exit: null,
+    meta: { profile: 'claude', label: 'Claude Code' }, harness: { profile: 'claude', state: 'idle', name } as Hosted['harness'],
+  });
+  const me = session('me', '/w', 'Me');
+  const ids = (list: Hosted[]) => list.map(h => h.id);
+
+  it('offers the sessions of the same folder first, each group by title without regard to case', () => {
+    const { here, elsewhere } = supervisorChoices(me, [
+      session('z', '/other', 'zebra'), session('b', '/w', 'beta'), session('a', '/other', 'Alpha'), session('c', '/w', 'Charlie'), session('d', '/w', 'alpha'),
+    ]);
+    expect(ids(here)).toEqual(['d', 'b', 'c']);
+    expect(ids(elsewhere)).toEqual(['a', 'z']);
+  });
+
+  it('breaks a tie of titles by folder, then by id', () => {
+    const { elsewhere } = supervisorChoices(me, [session('k2', '/b', 'Same'), session('k1', '/b', 'same'), session('k3', '/a', 'SAME')]);
+    expect(ids(elsewhere)).toEqual(['k3', 'k1', 'k2']);
+  });
+
+  it('leaves a group empty when nothing belongs in it', () => {
+    expect(supervisorChoices(me, [session('a', '/other', 'A')])).toEqual({ here: [], elsewhere: [expect.objectContaining({ id: 'a' })] });
+    expect(supervisorChoices(me, [session('a', '/w', 'A')]).elsewhere).toEqual([]);
+    expect(supervisorChoices(me, [])).toEqual({ here: [], elsewhere: [] });
   });
 });

@@ -271,6 +271,8 @@ pub async fn harness_ack(id: String, since: Option<u64>) -> Result<(), String> {
     blocking(move || service(json!({"op": "ack", "id": id, "since": since})).map(drop)).await
 }
 
+// One argument per field the page sends: Tauri passes them by name
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn harness_spawn(
     profile: String,
@@ -278,9 +280,15 @@ pub async fn harness_spawn(
     cols: u16,
     rows: u16,
     resume: Option<String>,
+    supervisor: Option<String>,
     access: State<'_, AccessState>,
     sessions: State<'_, SessionState>,
 ) -> Result<Value, String> {
+    // The session the new one works for (MCR-41): an id the service checks
+    let supervisor = supervisor.filter(|s| !s.is_empty());
+    if let Some(id) = &supervisor {
+        valid_id(id)?;
+    }
     // Resuming: the service takes the agent and the folder from the transcript itself
     if let Some(id) = resume.filter(|r| !r.is_empty()) {
         if !access.access.lock().map(|a| a.session_workspace).unwrap_or(false) {
@@ -299,7 +307,37 @@ pub async fn harness_spawn(
     if !known {
         return Err("Start sessions in a folder you opened, your home folder, or a folder an agent worked in".into());
     }
-    blocking(move || service(json!({"op": "create", "profile": profile, "cwd": dir.display().to_string(), "cols": cols, "rows": rows}))).await
+    blocking(move || service(json!({"op": "create", "profile": profile, "cwd": dir.display().to_string(), "cols": cols, "rows": rows, "supervisor": supervisor, "role": if supervisor.is_some() { "executor" } else { "" }}))).await
+}
+
+/// Connect a running session to a supervising one, or detach it (`supervisor` empty).
+/// Connecting gives the supervising session tools over the other, so the person is asked.
+#[tauri::command]
+pub async fn harness_bind(app: tauri::AppHandle, id: String, supervisor: Option<String>) -> Result<Value, String> {
+    valid_id(&id)?;
+    let supervisor = supervisor.filter(|s| !s.is_empty());
+    if let Some(up) = &supervisor {
+        valid_id(up)?;
+    }
+    blocking(move || {
+        if let Some(up) = &supervisor {
+            let sessions = service(json!({"op": "sessions"}))?;
+            // Names are chosen by agents: the folder and the id say which session it really is
+            let name = |id: &str| {
+                sessions["sessions"].as_array().and_then(|all| all.iter().find(|s| s["id"] == id)).map(|s| {
+                    let h = &s["harness"];
+                    let name = h["name"].as_str().filter(|n| !n.is_empty()).or(h["title"].as_str().filter(|n| !n.is_empty())).unwrap_or("unnamed");
+                    format!("\u{201c}{name}\u{201d}\n    {} \u{00b7} {id}", s["cwd"].as_str().unwrap_or(""))
+                }).unwrap_or_else(|| id.to_string())
+            };
+            let message = format!("{}\n\nwill supervise\n\n{}\n\nIt can give it tasks, read its terminal and its results, and gets its reports. It cannot type into it or answer its permission prompts.", name(up), name(&id));
+            if !confirmed(&app, "Connect to this supervisor?", message, "Connect", false) {
+                return service(json!({"op": "sessions"})).map(|_| Value::Null);
+            }
+        }
+        service(json!({"op": "bind", "id": id, "supervisor": supervisor}))
+    })
+    .await
 }
 
 /// Open the hosted supervisor session (the running one, or a new one).

@@ -20,6 +20,8 @@ export interface Tracked {
   status?: string;
   /** The part it plays, in its own words or the supervisor's */
   role?: string;
+  /** The session it works for (id): that one gives it tasks and reads its results */
+  supervisor?: string | null;
 }
 /** A subagent a Claude session started, as its files show it (activity, not verified liveness). */
 export interface Subagent { id: string; description: string; agentType: string; model: string; started: number; lastActivity: number; finished?: boolean }
@@ -47,6 +49,15 @@ export interface Hosted {
   shells?: RunningShell[];
   /** Subagents active in the last hour, newest first */
   subagents?: Subagent[];
+  /** What it registered that it waits for outside itself, oldest first */
+  waits?: SessionWait[];
+}
+/** Something outside a session that it waits for (its `wait_register` tool). */
+export interface SessionWait {
+  id: string; kind: 'pipeline' | 'integration' | 'human' | 'peer' | 'timer' | 'other'; on: string; ref: string;
+  since: number; expectBy: number; overdue: boolean;
+  /** Who was told that it runs late */
+  escalated: 'supervisor' | 'operator' | null;
 }
 /** An earlier Claude or Codex session that can continue in the harness. */
 export interface Resumable {
@@ -112,7 +123,11 @@ export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
 }
 
 /** The Slack connector as the harness service reports it (decision D14). No token is in it. */
-export interface SlackConnection { team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number }
+export interface SlackConnection {
+  team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number;
+  /** Permissions of the manifest that the bot lacks */
+  missingScopes?: string[];
+}
 export type SlackListen = 'off' | 'mentions' | 'all';
 export type SlackPosting = 'never' | 'approve' | 'thread' | 'auto';
 export interface SlackChannel {
@@ -130,6 +145,10 @@ export interface SlackReceived {
 }
 export interface SlackStatus {
   connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;
+  /** When Slack last accepted the connection, and what arrived since the service started */
+  connectedAt?: number; eventsSeen?: number; actionsSeen?: number;
+  /** Frames of any kind from Slack, the kind of the last one, and the last event that was not kept (type and why, never its text) */
+  envelopesSeen?: number; lastEnvelope?: string; lastDropped?: string;
   channels: SlackChannel[]; users: Record<string, string>; posts: SlackPost[]; received: SlackReceived[];
   audit: { at: number; kind: string; text: string }[];
   counts: { sentWithoutApproval: number; refusedApprovals: number; deliveredFromStrangers: number; held: number; waiting: number };
@@ -166,7 +185,10 @@ export const harnessApi = {
   /** Ends every session and both processes after a native dialog; resolves to whether it was done */
   stopBackground: (uninstall: boolean) => invoke<boolean>('harness_background_stop', { uninstall }),
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
-  spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume }),
+  /** `supervisor`: the session the new one works for, as its executor */
+  spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string, supervisor?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume, supervisor: supervisor ?? null }),
+  /** Connect a session to a supervising one (asked in a native dialog; null when the person said no), or detach it */
+  bind: (id: string, supervisor: string | null) => invoke<Hosted | null>('harness_bind', { id, supervisor }),
   /** The hosted supervisor session: the running one, or a new one */
   /** Asks in a native dialog before turning it on; resolves to the setting as it is now */
   outsideSupervisors: (on: boolean) => invoke<boolean>('harness_outside_supervisors', { on }),
@@ -321,6 +343,61 @@ export function shellHealth(sh: RunningShell, now: number): 'active' | 'quiet' |
 }
 
 /** A folder as a section of the Live list: what runs in it, and what ran in it before. */
+/** A session's place among supervisors and executors, inside one folder's list. */
+export interface RelationRow {
+  session: Hosted;
+  /** Levels of supervisor above it that are shown in the same folder */
+  depth: number;
+  /** Live sessions that work for it, in any folder */
+  executors: number;
+  /** Its supervisor, when that one is listed in another folder */
+  elsewhere?: Hosted;
+}
+
+/**
+ * The sessions of one folder in tree order: each supervisor followed by its
+ * executors, and theirs. A session whose supervisor sits in another folder
+ * stays at the top level here and names it. `all` is every hosted session.
+ */
+export function relationRows(inFolder: Hosted[], all: Hosted[]): RelationRow[] {
+  const here = new Set(inFolder.map(h => h.id));
+  const above = (h: Hosted) => h.harness?.supervisor || '';
+  const count = (id: string) => all.filter(h => !h.exit && above(h) === id).length;
+  const out: RelationRow[] = [];
+  const seen = new Set<string>();
+  const add = (h: Hosted, depth: number) => {
+    if (seen.has(h.id)) return;
+    seen.add(h.id);
+    const up = above(h);
+    out.push({ session: h, depth, executors: count(h.id), elsewhere: up && !here.has(up) ? all.find(x => x.id === up) : undefined });
+    inFolder.filter(c => above(c) === h.id).forEach(c => add(c, depth + 1));
+  };
+  inFolder.filter(h => !here.has(above(h))).forEach(h => add(h, 0));
+  // Never lose a row to a relation that makes no sense
+  inFolder.forEach(h => add(h, 0));
+  return out;
+}
+
+/**
+ * The sessions offered as supervisor for `session`, in the order of the
+ * chooser: those in its own folder first, then the others; each group by the
+ * title shown, A to Z without regard to case, then by folder, then by id.
+ */
+export function supervisorChoices(session: Hosted, candidates: Hosted[]): { here: Hosted[]; elsewhere: Hosted[] } {
+  const title = (h: Hosted) => hostedLabel(h).toLowerCase();
+  const order = (a: Hosted, b: Hosted) => title(a).localeCompare(title(b)) || a.cwd.localeCompare(b.cwd) || a.id.localeCompare(b.id);
+  const sorted = [...candidates].sort(order);
+  return { here: sorted.filter(h => h.cwd === session.cwd), elsewhere: sorted.filter(h => h.cwd !== session.cwd) };
+}
+
+/** The sessions below one: its executors and theirs (ids). */
+export function executorsBelow(id: string, all: Hosted[]): Set<string> {
+  const below = new Set<string>();
+  const walk = (up: string) => all.filter(h => h.harness?.supervisor === up && !below.has(h.id)).forEach(h => { below.add(h.id); walk(h.id); });
+  walk(id);
+  return below;
+}
+
 export interface DirSection { path: string; sessions: Hosted[]; earlier: Resumable[]; pinned: boolean; latest: number }
 
 /**
