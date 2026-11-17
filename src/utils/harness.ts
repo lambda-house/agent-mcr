@@ -12,6 +12,8 @@ export interface Attention { kind: 'permission' | 'assessment' | 'notification';
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';
   since: number; precise: boolean; agentSession: string | null; attention: Attention | null; lastMessage: string | null;
+  /** When its last turn ended with `lastMessage` */
+  lastMessageAt?: number;
   /** False when `name` is the title the agent gave the session, not a name someone chose */
   named?: boolean;
   /** What the agent says it is doing (its `set_status` tool) */
@@ -118,6 +120,8 @@ export const harnessApi = {
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
   /** What sessions reported to the person, and the live notes of the bulletin board */
   board: () => invoke<Board>('harness_board'),
+  /** A note from the person; without a folder it is for every session */
+  postNote: (text: string, hours: number, folder?: string) => invoke<void>('harness_note_post', { text, hours, folder: folder || null }),
   removeNote: (note: string) => invoke<void>('harness_note_remove', { note }),
   /** The person looked at a session's notification */
   ack: (id: string, since?: number) => invoke<void>('harness_ack', { id, since }),
@@ -186,38 +190,21 @@ export function pastedImage(data: DataTransfer | null): File | null {
 /** A subagent that wrote to its transcript this recently counts as active. */
 export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;
 
+
+/** The drag type of a session row; its text/plain data is the session's reference. */
+export const SESSION_DRAG_TYPE = 'application/x-mcr-session';
+
 /**
- * The list in groups: sessions that exchanged messages or run in the same
- * folder stand together, in the place of the first of them. A session with
- * neither is a group of one.
+ * A pointer to a session, to paste or drop into another one: `mcr:<id>` is
+ * what the mcr tools take as `to` (hosted agents are told so, `PEER_NOTE`);
+ * the name after it is for the reader. The name can be set by an agent (a
+ * terminal title, a name the supervisor chose) and the pointer may be dropped
+ * into a shell: it goes in single quotes, without anything a shell would
+ * expand or that would end the quotes or the line.
  */
-export function groupSessions(list: Hosted[]): Hosted[][] {
-  const live = new Map(list.filter(h => !h.exit).map(h => [h.id, h]));
-  const seen = new Set<string>();
-  const groups: Hosted[][] = [];
-  for (const h of list) {
-    if (seen.has(h.id)) continue;
-    const members = new Set<string>([h.id]);
-    const queue = h.exit ? [] : [h];
-    for (let next = queue.shift(); next; next = queue.shift()) {
-      const linked = [...(next.peers ?? []), ...[...live.values()].filter(x => x.cwd === next.cwd).map(x => x.id)];
-      for (const id of linked) {
-        const peer = live.get(id);
-        if (peer && !members.has(id)) { members.add(id); queue.push(peer); }
-      }
-    }
-    members.forEach(id => seen.add(id));
-    groups.push(list.filter(x => members.has(x.id)));
-  }
-  return groups;
-}
-
-const KIND: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', antigravity: 'Antigravity', shell: 'shell' };
-
-/** What to paste into another session so its agent can reach this one. */
 export function sessionReference(h: Hosted, titles: Record<string, string> = {}): string {
-  const kind = KIND[h.harness?.profile || h.meta.profile || ''] ?? 'agent';
-  return `Agent MCR session "${hostedLabel(h, titles)}" (${kind}, id ${h.id}, pid ${h.pid ?? 'unknown'}, folder ${h.cwd}). Reach it with the mcr tools: ask or send_message with to "${h.id}".`;
+  const name = hostedLabel(h, titles).replace(/[\u0000-\u001f\u007f-\u009f'"`$\\]/g, '').trim();
+  return `mcr:${h.id} '${name}'`;
 }
 
 /** A session whose agent can be ended and started again on the same conversation. */
@@ -229,6 +216,35 @@ export function runningFor(started: number, now: number): string {
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** The first thing a message says, as one plain line: no Markdown marks, at most `max` characters. */
+export function gist(message: string, max = 220): string {
+  const line = message.split('\n').map(l => l.trim()).find(l => l && !/^(```|---|\|[-\s|:]+\|?$)/.test(l)) ?? '';
+  const plain = line.replace(/^(#{1,6}|[-*+]|\d+[.)]|>)\s+/, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/(\*\*|__|`)/g, '').trim();
+  return plain.length > max ? `${plain.slice(0, max - 1).trimEnd()}…` : plain;
+}
+
+/**
+ * What a live session is doing, or what it finished with, for its row.
+ * `lead` says since when; `text` is the agent's own status while it works,
+ * and when its turn has ended, how its last message begins (its status when
+ * it left no message). `full` is the whole of both, for a tooltip.
+ */
+export function sessionSummary(h: Hosted, now: number): { lead: string; text: string; full: string } | null {
+  const t = h.harness;
+  if (h.exit || !t) return null;
+  const status = t.status?.trim() ?? '';
+  const last = t.lastMessage?.trim() ?? '';
+  const full = [status && `Status: ${status}`, last && `Last message:\n${last}`].filter(Boolean).join('\n\n');
+  if (t.state === 'working') return { lead: `Working ${runningFor(t.since, now)}`, text: status, full };
+  if (t.state === 'idle' || t.state === 'waiting') {
+    const ended = t.lastMessageAt || t.since;
+    const text = gist(last) || status;
+    if (!text) return null;
+    return { lead: last ? `Done ${runningFor(ended, now)} ago` : `Idle ${runningFor(ended, now)}`, text, full };
+  }
+  return status ? { lead: '', text: status, full } : null;
 }
 
 /** A shell whose processor time has not moved for this long is shown as quiet. */

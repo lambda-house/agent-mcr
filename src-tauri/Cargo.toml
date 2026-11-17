@@ -1,6 +1,6 @@
 [package]
 name = "agent-mcr"
-version = "0.1.0"
+version = "0.1.1"
 description = "Agent Mission Control Room"
 authors = ["Lambda House"]
 license = "MIT"

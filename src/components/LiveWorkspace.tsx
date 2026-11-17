@@ -5,7 +5,8 @@ import { Button, Dialog } from '@teob/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
-import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, sessionReference, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
+import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, tildePath, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -17,6 +18,13 @@ const base = (path: string) => path.split('/').filter(Boolean).pop() || path;
 const PINNED_KEY = 'hs-dirs';
 /** Folders with only history shown before "more" is asked for. */
 const HISTORY_FOLDERS = 6;
+
+const LIST_WIDTH_KEY = 'hs-list-width';
+/** The session list is never narrower than this, and leaves the terminal at least as much. */
+export const LIST_MIN_WIDTH = 200;
+const storedWidth = (): number | null => {
+  try { const v = Number(localStorage.getItem(LIST_WIDTH_KEY)); return v >= LIST_MIN_WIDTH ? v : null; } catch { return null; }
+};
 
 interface Action { label: string; icon: React.ReactNode; run: () => void }
 
@@ -67,6 +75,16 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   onSearch?: (directory: string) => void;
 }) {
   const sessionLabel = (h: Hosted) => hostedLabel(h, titles);
+  const metrics = useSessionMetrics(active);
+  // Null: the default width, a share of the window
+  const [listWidth, setListWidth] = useState<number | null>(storedWidth);
+  const resizeList = (x: number | null, handle?: HTMLElement) => {
+    const live = handle?.closest<HTMLElement>('.hs-live')?.getBoundingClientRect();
+    const width = x === null || !live ? null
+      : Math.round(Math.max(LIST_MIN_WIDTH, Math.min(x - live.left, live.width - LIST_MIN_WIDTH)));
+    setListWidth(width);
+    try { if (width) localStorage.setItem(LIST_WIDTH_KEY, String(width)); else localStorage.removeItem(LIST_WIDTH_KEY); } catch { /* not kept */ }
+  };
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
   const [error, setError] = useState('');
@@ -362,7 +380,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     setCwd('');
   };
   const home = status?.home ?? '';
-  const shortPath = (p: string) => home && p.startsWith(`${home}/`) ? `~/${p.slice(home.length + 1)}` : p === home ? '~' : p;
   const sections = useMemo(() => directorySections(sorted.filter(h => !h.exit), resumable.filter(r => !r.cwd.endsWith('/agent-mcr/supervisor')), pinned), [sorted, resumable, pinned]);
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
@@ -389,6 +406,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       chips: tags.slice(0, 3),
     };
   };
+  const supervisorSummary = supervisor ? sessionSummary(supervisor, Date.now()) : null;
   const row = (h: Hosted) => {
     const state = hostedState(h);
     const label = sessionLabel(h);
@@ -397,14 +415,18 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', referenced === h.id ? 'reference copied' : ''].filter(Boolean).join(' · ');
     const subs = (h.subagents ?? []).filter(a => !a.finished);
     const shells = h.exit ? [] : h.shells ?? [];
-    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : ''].filter(Boolean).join(' ')}>
-      <button className="hs-item" onClick={() => select(h.id)} title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}`}>
+    const summary = sessionSummary(h, Date.now());
+    return <li key={h.id} className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now())].filter(Boolean).join(' ')}>
+      <button className="hs-item" onClick={() => select(h.id)}
+        draggable={!h.exit} onDragStart={e => { e.dataTransfer.setData(SESSION_DRAG_TYPE, h.id); e.dataTransfer.setData('text/plain', sessionReference(h, titles)); e.dataTransfer.effectAllowed = 'copy'; }}
+        title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}${h.exit ? '' : '\nDrag into a terminal to point its agent at this session'}`}>
         <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
         <span className="hs-item-text">
           <strong title={label}><AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}</strong>
+          <SessionMetrics hosted={h} data={metrics}/>
           {detail && <small>{detail}</small>}
           {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
-          {!h.exit && h.harness?.status && <small className="hs-status">{h.harness.status}</small>}
+          {summary && <small className="hs-status" title={summary.full || undefined}>{summary.lead && <span className="hs-lead">{summary.lead}</span>}{summary.text && <span>{summary.text}</span>}</small>}
         </span>
       </button>
       <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
@@ -531,6 +553,11 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
 
   const defaultSidebar = () => (
     <aside className="hs-list" aria-label="Hosted sessions">
+      <div className="hs-list-resizer" role="separator" aria-orientation="vertical" aria-label="Session list width"
+        title="Drag to resize the list, double-click for the default width"
+        onPointerDown={e => { if (e.button === 0) { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); } }}
+        onPointerMove={e => { if (e.currentTarget.hasPointerCapture(e.pointerId)) resizeList(e.clientX, e.currentTarget); }}
+        onDoubleClick={() => resizeList(null)}/>
       {error && <div className="hs-error" role="alert">{error}</div>}
       {pluginRegistry.getSidebarSections().map(section => (
         <div key={section.id} className="hs-plugin-sidebar-section">
@@ -545,7 +572,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
             <strong>{supervisor ? 'Supervisor' : 'Open supervisor'}{supervisor && <span className={`hs-dot ${hostedState(supervisor)}`} aria-label={STATE_LABEL[hostedState(supervisor)]}/>}</strong>
             {supervisor && referenced === supervisor.id && <small>reference copied</small>}
             {supervisor && needsYou(supervisor) && <small className="hs-needs">{supervisor.harness?.attention?.text}</small>}
-            {supervisor?.harness?.status && <small className="hs-status">{supervisor.harness.status}</small>}
+            {supervisorSummary && <small className="hs-status" title={supervisorSummary.full || undefined}>{supervisorSummary.lead && <span className="hs-lead">{supervisorSummary.lead}</span>}{supervisorSummary.text && <span>{supervisorSummary.text}</span>}</small>}
           </span>
         </button>
         {supervisor && <RowMenu label="Actions for the supervisor" actions={actions(supervisor)}/>}
@@ -558,11 +585,11 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         actions={waiting.map(h => ({ label: `${isSupervisor(h) ? 'Supervisor' : sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
       <ul className="hs-dirs">
         {shown.map(d => {
-          const name = d.path.split('/').filter(Boolean).pop() ?? d.path;
+          const name = tildePath(d.path, home);
           const open = earlierOpen.has(d.path);
-          return <li key={d.path} className={`hs-dir${d.sessions.length ? ' live' : ''}`}>
+          return <li key={d.path} className={`hs-dir${d.sessions.some(h => !h.exit) ? ' live' : ''}`} aria-label={`Folder ${d.path}`}>
             <header className="hs-dir-head">
-              <span className="hs-dir-path" title={d.path}>{shortPath(d.path)}</span>
+              <span className="hs-dir-path" title={d.path}>{shortPath(name)}</span>
               <span className="hs-dir-rule"/>
               <RowMenu className="hs-dir-tools" label={`Start a session in ${d.path}`} title={`Start a session in ${name}`} icon={<Plus size={13}/>} disabled={!status?.profiles.length || starting}
                 actions={(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) }))}/>
@@ -614,7 +641,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     },
   };
 
-  return <div className="hs-live">
+  return <div className="hs-live" style={listWidth ? { gridTemplateColumns: `${listWidth}px minmax(0, 1fr)` } : undefined}>
     {sidebarOverride ? sidebarOverride({ controller: sidebarController, defaultRender: defaultSidebar }) : defaultSidebar()}
     {newAgentOverride ? newAgentOverride({ open: newAgentOpen, onClose: closeNewAgent, controller, defaultRender: defaultNewAgent }) : defaultNewAgent()}
     <main className="hs-terminals">
@@ -808,7 +835,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               const el = slotEls[id];
               if (!el) return null;
               const isVisible = visibleSessions.has(id);
-              return createPortal(<TerminalPane key={id} id={id} active={active && isVisible}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} active={active && isVisible} onQuit={() => { closing.current.add(id); void refresh(); }}/>, el, id);
             })}
           </>
         );

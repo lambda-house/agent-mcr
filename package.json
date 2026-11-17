@@ -1,6 +1,6 @@
 {
   "name": "agent-mcr",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Markdown Document Viewer",
   "type": "module",
   "scripts": {
