@@ -65,10 +65,11 @@ mod win {
         AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetLengthSid,
         GetSecurityDescriptorControl, GetTokenInformation, InitializeSecurityDescriptor,
         IsValidSid, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-        SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+        SetSecurityDescriptorOwner, TokenOwner, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
         OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_INFORMATION_CLASS,
+        TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, FindClose, FindFirstFileW, FILE_ALL_ACCESS,
@@ -108,7 +109,54 @@ mod win {
         OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    fn current_user_sid() -> Result<Vec<u8>, String> {
+    struct TokenSids {
+        user: Vec<u8>,
+        default_owner: Vec<u8>,
+    }
+
+    fn query_token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<Vec<u8>, String> {
+        let mut needed: u32 = 0;
+        // SAFETY: probing buffer size.
+        unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return Err("Cannot query token SID size".into());
+        }
+        let mut buf = vec![0u8; needed as usize];
+        // SAFETY: `buf` has `needed` bytes.
+        if unsafe {
+            GetTokenInformation(token, class, buf.as_mut_ptr().cast(), needed, &mut needed)
+        } == 0
+        {
+            return Err("Cannot query token SID".into());
+        }
+        let sid = match class {
+            c if c == TokenUser => {
+                if (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
+                    return Err("Invalid token user buffer".into());
+                }
+                // SAFETY: `buf` holds a `TOKEN_USER` (read_unaligned avoids Vec<u8> alignment assumption).
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_USER>()) }.User.Sid
+            }
+            c if c == TokenOwner => {
+                if (needed as usize) < std::mem::size_of::<TOKEN_OWNER>() {
+                    return Err("Invalid token owner buffer".into());
+                }
+                // SAFETY: `buf` holds a `TOKEN_OWNER` (read_unaligned avoids Vec<u8> alignment assumption).
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_OWNER>()) }.Owner
+            }
+            _ => return Err("Unsupported token information class".into()),
+        };
+        // SAFETY: checking SID validity and length.
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err("Invalid token SID".into());
+        }
+        // SAFETY: `sid` is valid.
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        // SAFETY: `sid` points to `len` readable bytes.
+        Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec())
+    }
+
+    fn current_token_sids() -> Result<TokenSids, String> {
         let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: pseudo-handle for current process; `token` is valid for writes.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
@@ -117,33 +165,10 @@ mod win {
             return Err("Cannot open current process token".into());
         }
         let _token = Handle(token);
-        let mut needed: u32 = 0;
-        // SAFETY: probing buffer size.
-        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
-        if needed == 0 {
-            return Err("Cannot query current user SID size".into());
-        }
-        let mut buf = vec![0u8; needed as usize];
-        // SAFETY: `buf` has `needed` bytes.
-        if unsafe {
-            GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), needed, &mut needed)
-        } == 0
-        {
-            return Err("Cannot query current user SID".into());
-        }
-        if (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
-            return Err("Invalid token user buffer".into());
-        }
-        // SAFETY: `buf` holds a `TOKEN_USER` (read_unaligned avoids Vec<u8> alignment assumption).
-        let sid = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_USER>()) }.User.Sid;
-        // SAFETY: checking SID validity and length.
-        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-            return Err("Invalid current user SID".into());
-        }
-        // SAFETY: `sid` is valid.
-        let len = unsafe { GetLengthSid(sid) } as usize;
-        // SAFETY: `sid` points to `len` readable bytes.
-        Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec())
+        Ok(TokenSids {
+            user: query_token_sid(token, TokenUser)?,
+            default_owner: query_token_sid(token, TokenOwner)?,
+        })
     }
 
     pub fn is_af_unix_socket(path: &Path) -> bool {
@@ -161,7 +186,7 @@ mod win {
             && data.dwReserved0 == IO_REPARSE_TAG_AF_UNIX
     }
 
-    fn create_private_dir(path: &Path, user_sid: &mut [u8]) -> Result<(), String> {
+    fn create_private_dir(path: &Path, sids: &mut TokenSids) -> Result<(), String> {
         let ea = EXPLICIT_ACCESS_W {
             grfAccessPermissions: FILE_ALL_ACCESS,
             grfAccessMode: GRANT_ACCESS,
@@ -171,7 +196,7 @@ mod win {
                 MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
                 TrusteeForm: TRUSTEE_IS_SID,
                 TrusteeType: TRUSTEE_IS_USER,
-                ptstrName: user_sid.as_mut_ptr().cast(),
+                ptstrName: sids.user.as_mut_ptr().cast(),
             },
         };
         let mut acl: *mut ACL = std::ptr::null_mut();
@@ -189,8 +214,8 @@ mod win {
         if unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0 {
             return Err(format!("{}: cannot initialize security descriptor", path.display()));
         }
-        // SAFETY: `sd_ptr` and `user_sid` are valid.
-        if unsafe { SetSecurityDescriptorOwner(sd_ptr, user_sid.as_mut_ptr().cast(), 0) } == 0 {
+        // SAFETY: `sd_ptr` and `sids.user` are valid.
+        if unsafe { SetSecurityDescriptorOwner(sd_ptr, sids.user.as_mut_ptr().cast(), 0) } == 0 {
             return Err(format!("{}: cannot set security descriptor owner", path.display()));
         }
         // SAFETY: `sd_ptr` and `acl` are valid.
@@ -215,14 +240,14 @@ mod win {
         if unsafe { CreateDirectoryW(wide.as_ptr(), &sa) } == 0 {
             let err = unsafe { GetLastError() };
             if err == ERROR_ALREADY_EXISTS {
-                return verify_private(path, true, user_sid);
+                return verify_private(path, true, sids);
             }
             return Err(format!("{}: cannot create directory (error {err})", path.display()));
         }
         Ok(())
     }
 
-    fn verify_private(path: &Path, is_dir: bool, user_sid: &mut [u8]) -> Result<(), String> {
+    fn verify_private(path: &Path, is_dir: bool, sids: &mut TokenSids) -> Result<(), String> {
         let meta = std::fs::symlink_metadata(path)
             .map_err(|e| format!("{}: cannot inspect metadata: {e}", path.display()))?;
         let attrs = meta.file_attributes();
@@ -258,12 +283,16 @@ mod win {
         }
         let _sd = LocalMem(sd);
 
-        // SAFETY: checking owner SID validity and equality with current user.
+        // SAFETY: checking owner SID validity and equality with current user or token's default owner.
         let owner_ok = !owner.is_null()
             && unsafe { IsValidSid(owner) } != 0
-            && unsafe { EqualSid(owner, user_sid.as_mut_ptr().cast()) } != 0;
+            && (unsafe { EqualSid(owner, sids.user.as_mut_ptr().cast()) } != 0
+                || unsafe { EqualSid(owner, sids.default_owner.as_mut_ptr().cast()) } != 0);
         if !owner_ok {
-            return Err(format!("{}: owner is not the current user", path.display()));
+            return Err(format!(
+                "{}: owner is not the current user or token default owner",
+                path.display()
+            ));
         }
 
         let mut control: u16 = 0;
@@ -314,7 +343,7 @@ mod win {
             let sid = (&ace.SidStart as *const u32).cast_mut().cast();
             // SAFETY: `sid` is inside the ACE.
             if unsafe { IsValidSid(sid) } == 0
-                || unsafe { EqualSid(sid, user_sid.as_mut_ptr().cast()) } == 0
+                || unsafe { EqualSid(sid, sids.user.as_mut_ptr().cast()) } == 0
             {
                 return Err(format!("{}: DACL grants access to another principal", path.display()));
             }
@@ -329,21 +358,21 @@ mod win {
     }
 
     pub fn private_dir(path: &Path) -> Result<(), String> {
-        let mut user_sid = current_user_sid()?;
+        let mut sids = current_token_sids()?;
         if std::fs::symlink_metadata(path).is_ok() {
-            return verify_private(path, true, &mut user_sid);
+            return verify_private(path, true, &mut sids);
         }
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && std::fs::symlink_metadata(parent).is_err() {
                 private_dir(parent)?;
             }
         }
-        create_private_dir(path, &mut user_sid)
+        create_private_dir(path, &mut sids)
     }
 
     pub fn private_file(path: &Path) -> Result<(), String> {
-        let mut user_sid = current_user_sid()?;
-        verify_private(path, false, &mut user_sid)
+        let mut sids = current_token_sids()?;
+        verify_private(path, false, &mut sids)
     }
 
     #[cfg(test)]
@@ -366,7 +395,7 @@ mod win {
             let dir = temp_root("ok");
             private_dir(&dir).unwrap();
 
-            let mut user_sid = current_user_sid().unwrap();
+            let mut sids = current_token_sids().unwrap();
             let wide = to_wide(&dir);
             let mut owner: *mut std::ffi::c_void = std::ptr::null_mut();
             let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -385,7 +414,7 @@ mod win {
             };
             assert_eq!(rc, ERROR_SUCCESS);
             let _sd = LocalMem(sd);
-            assert_ne!(unsafe { EqualSid(owner, user_sid.as_mut_ptr().cast()) }, 0);
+            assert_ne!(unsafe { EqualSid(owner, sids.user.as_mut_ptr().cast()) }, 0);
             let mut control: u16 = 0;
             let mut rev: u32 = 0;
             assert_ne!(unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut rev) }, 0);
@@ -414,6 +443,35 @@ mod win {
             let child = dir.join("secret.txt");
             std::fs::write(&child, b"ok").unwrap();
             private_file(&child).unwrap();
+
+            // Owner = another SID is refused.
+            let mut world_sid = vec![0u8; 68];
+            let mut world_len = world_sid.len() as u32;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        WinWorldSid,
+                        std::ptr::null_mut(),
+                        world_sid.as_mut_ptr().cast(),
+                        &mut world_len,
+                    )
+                },
+                0
+            );
+            world_sid.truncate(world_len as usize);
+            let mut foreign = TokenSids {
+                user: world_sid.clone(),
+                default_owner: world_sid,
+            };
+            assert!(verify_private(&dir, true, &mut foreign).is_err());
+            assert!(verify_private(&child, false, &mut foreign).is_err());
+
+            // Owner = token default owner (even if different from user) is accepted when DACL matches user.
+            let mut default_only = TokenSids {
+                user: sids.user.clone(),
+                default_owner: sids.default_owner.clone(),
+            };
+            assert!(verify_private(&child, false, &mut default_only).is_ok());
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -430,7 +488,7 @@ mod win {
                 unsafe { CreateWellKnownSid(world_type, std::ptr::null_mut(), world_sid.as_mut_ptr().cast(), &mut len) },
                 0
             );
-            let mut user_sid = current_user_sid().unwrap();
+            let mut user_sid = current_token_sids().unwrap().user;
             let no_inherit = temp_root("no-inherit");
             private_dir(&no_inherit).unwrap();
             let ea_no_inherit = EXPLICIT_ACCESS_W {
