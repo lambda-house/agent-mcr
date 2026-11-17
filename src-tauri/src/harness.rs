@@ -2449,16 +2449,17 @@ impl Harness {
         }
     }
 
-    fn allows_terminal_write(&self, who: &Caller) -> Result<(), String> {
-        if let Caller::Session { id, .. } = who {
-            if lock(&self.store).sessions.get(id).is_some_and(|t| t.profile != "claude") {
-                return Err("Refused: terminal_write is only available to a Claude supervisor (which asks the operator for permission). Use task_assign or ask the operator to type into the terminal.".into());
-            }
+    fn allows_terminal_write(&self, who: &Caller, cli: bool) -> Result<(), String> {
+        if cli {
+            return Err("Refused: terminal_write is unavailable through the CLI; ask the operator to use the terminal or an MCP client that asks for approval.".into());
         }
-        Ok(())
+        match who {
+            Caller::Session { id, .. } if lock(&self.store).sessions.get(id).is_some_and(|t| t.profile == "claude") => Ok(()),
+            _ => Err("Refused: terminal_write is only available to a hosted Claude supervisor (which asks the operator for permission). Use task_assign or ask the operator to type into the terminal.".into()),
+        }
     }
 
-    fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
+    fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream, cli: bool) -> std::io::Result<()> {
         // Only the Supervisor session has these tools. An agent outside the
         // harness gets them when the operator allowed that, and not otherwise:
         // a worker's process that left its session looks like an outside one.
@@ -2481,7 +2482,7 @@ impl Harness {
                     return Err(why.into());
                 }
                 if name == "terminal_write" {
-                    self.allows_terminal_write(&who)?;
+                    self.allows_terminal_write(&who, cli)?;
                 }
                 self.tool(name, &args)
             };
@@ -2507,7 +2508,7 @@ impl Harness {
                 return writeln!(writer, "{}", json!({"error": "Invalid request"}));
             };
             if req["op"] == "supervise" {
-                return self.supervise(reader, writer);
+                return self.supervise(reader, writer, req["cli"] == true);
             }
             if req["op"] == "agent" {
                 return self.agent(reader, writer, req["cli"] != true);
@@ -3554,9 +3555,13 @@ mod tests {
             s.sessions.insert("sup-codex".into(), Tracked { name: "sup".into(), profile: "codex".into(), ..Tracked::default() });
             s.sessions.insert("sup-pi".into(), Tracked { name: "sup".into(), profile: "pi".into(), ..Tracked::default() });
         });
-        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }).is_ok());
-        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }).is_err());
-        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-pi".into(), supervisor: true }).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, false).is_ok());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, true).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-pi".into(), supervisor: true }, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "unknown".into(), supervisor: true }, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Outside, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Unknown, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
