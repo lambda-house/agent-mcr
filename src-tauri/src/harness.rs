@@ -3195,90 +3195,124 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_cmd_line_preserves_argv_through_cmd_and_npm_shim() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-        let exe = std::env::current_exe().unwrap();
-        let find_probe = || {
-            let mut candidates = Vec::new();
-            if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+            let exe = std::env::current_exe().unwrap();
+            let find_probe = || {
+                let mut candidates = Vec::new();
+                if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+                    candidates.push(
+                        std::path::PathBuf::from(target_dir)
+                            .join("debug")
+                            .join("examples")
+                            .join("argv_probe.exe"),
+                    );
+                }
+                if let Some(p) = exe.parent().and_then(|p| p.parent()) {
+                    candidates.push(p.join("examples").join("argv_probe.exe"));
+                }
+                for ancestor in exe.ancestors() {
+                    if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
+                        candidates.push(ancestor.join("debug").join("examples").join("argv_probe.exe"));
+                    }
+                }
                 candidates.push(
-                    std::path::PathBuf::from(target_dir)
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("target")
                         .join("debug")
                         .join("examples")
                         .join("argv_probe.exe"),
                 );
+                candidates.into_iter().find(|p| p.is_file())
+            };
+            let probe = find_probe().unwrap_or_else(|| {
+                let status = std::process::Command::new("cargo")
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .args(["build", "--example", "argv_probe"])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "failed to build argv_probe example");
+                find_probe().expect("argv_probe.exe missing after cargo build --example argv_probe")
+            });
+            assert!(probe.is_file(), "argv_probe.exe missing at {}", probe.display());
+
+            let dir = std::env::temp_dir().join(format!("mcr-probe-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let probe_copy = dir.join("argv_probe.exe");
+            std::fs::copy(&probe, &probe_copy).unwrap();
+            let shim = dir.join("argv_probe.cmd");
+            std::fs::write(&shim, "@\"%~dp0argv_probe.exe\" %*\r\n").unwrap();
+
+            let payload = vec![
+                "".to_string(),
+                "hello world".to_string(),
+                "héllo 世界".to_string(),
+                "C:\\dir with space\\".to_string(),
+                "a & b | c < d > e ^ f (g) !h!".to_string(),
+            ];
+
+            for prog in [&probe_copy, &shim] {
+                let mut full = vec![prog.display().to_string()];
+                full.extend(payload.iter().cloned());
+                let line = cmd_line(&full).unwrap();
+                let pair = native_pty_system()
+                    .openpty(PtySize { rows: 24, cols: 512, pixel_width: 0, pixel_height: 0 })
+                    .unwrap();
+                let mut cmd = CommandBuilder::new("cmd.exe");
+                cmd.args(["/d", "/v:off", "/c", "%AMCR_LAUNCH%"]);
+                cmd.env("AMCR_LAUNCH", &line);
+                let mut child = pair.slave.spawn_command(cmd).unwrap();
+                drop(pair.slave);
+                let mut reader = pair.master.try_clone_reader().unwrap();
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let captured_bg = captured.clone();
+                let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => captured_bg.lock().unwrap().extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = eof_tx.send(());
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        drop(pair.master);
+                        let partial = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+                        panic!("cmd timed out for {}; read so far: {partial:?}", prog.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                drop(pair.master);
+                let _ = eof_rx.recv_timeout(Duration::from_secs(5));
+                let raw = captured.lock().unwrap().clone();
+                assert!(status.success(), "cmd failed for {} (output: {:?})", prog.display(), String::from_utf8_lossy(&raw));
+                let text = String::from_utf8_lossy(&raw);
+                let json_line = text
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| l.starts_with('[') && l.ends_with(']'))
+                    .unwrap_or_else(|| panic!("no JSON argv line in ConPTY output for {}: {text:?}", prog.display()));
+                let got: Vec<String> = serde_json::from_str(json_line).unwrap();
+                assert_eq!(got, payload, "argv mismatch via {}", prog.display());
             }
-            if let Some(p) = exe.parent().and_then(|p| p.parent()) {
-                candidates.push(p.join("examples").join("argv_probe.exe"));
-            }
-            for ancestor in exe.ancestors() {
-                if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
-                    candidates.push(ancestor.join("debug").join("examples").join("argv_probe.exe"));
-                }
-            }
-            candidates.push(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("debug")
-                    .join("examples")
-                    .join("argv_probe.exe"),
-            );
-            candidates.into_iter().find(|p| p.is_file())
-        };
-        let probe = find_probe().unwrap_or_else(|| {
-            let status = std::process::Command::new("cargo")
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .args(["build", "--example", "argv_probe"])
-                .status()
-                .unwrap();
-            assert!(status.success(), "failed to build argv_probe example");
-            find_probe().expect("argv_probe.exe missing after cargo build --example argv_probe")
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = done_tx.send(());
         });
-        assert!(probe.is_file(), "argv_probe.exe missing at {}", probe.display());
-
-        let dir = std::env::temp_dir().join(format!("mcr-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let probe_copy = dir.join("argv_probe.exe");
-        std::fs::copy(&probe, &probe_copy).unwrap();
-        let shim = dir.join("argv_probe.cmd");
-        std::fs::write(&shim, "@\"%~dp0argv_probe.exe\" %*\r\n").unwrap();
-
-        let payload = vec![
-            "".to_string(),
-            "hello world".to_string(),
-            "héllo 世界".to_string(),
-            "C:\\dir with space\\".to_string(),
-            "a & b | c < d > e ^ f (g) !h!".to_string(),
-        ];
-
-        for prog in [&probe_copy, &shim] {
-            let mut full = vec![prog.display().to_string()];
-            full.extend(payload.iter().cloned());
-            let line = cmd_line(&full).unwrap();
-            let pair = native_pty_system()
-                .openpty(PtySize { rows: 24, cols: 512, pixel_width: 0, pixel_height: 0 })
-                .unwrap();
-            let mut cmd = CommandBuilder::new("cmd.exe");
-            cmd.args(["/d", "/v:off", "/c", "%AMCR_LAUNCH%"]);
-            cmd.env("AMCR_LAUNCH", &line);
-            let mut child = pair.slave.spawn_command(cmd).unwrap();
-            drop(pair.slave);
-            let mut reader = pair.master.try_clone_reader().unwrap();
-            let status = child.wait().unwrap();
-            drop(pair.master);
-            assert!(status.success(), "cmd failed for {}", prog.display());
-            let mut raw = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut reader, &mut raw);
-            let text = String::from_utf8_lossy(&raw);
-            let json_line = text
-                .lines()
-                .map(str::trim)
-                .find(|l| l.starts_with('[') && l.ends_with(']'))
-                .unwrap_or_else(|| panic!("no JSON argv line in ConPTY output for {}: {text:?}", prog.display()));
-            let got: Vec<String> = serde_json::from_str(json_line).unwrap();
-            assert_eq!(got, payload, "argv mismatch via {}", prog.display());
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("windows_cmd_line_preserves_argv_through_cmd_and_npm_shim timed out");
     }
 
     #[test]
