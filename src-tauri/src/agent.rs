@@ -407,24 +407,63 @@ fn project_root(name: &str, windows: bool) -> Option<(String, &str)> {
     }
 }
 
-fn decode_project_dir(name: &str) -> Option<PathBuf> {
-    fn encode(s: &str) -> String {
-        s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+/// How Claude Code names a project's folder under `~/.claude/projects`: the
+/// project's path with every character other than a letter or digit replaced by `-`.
+fn encode_project_dir(path: &str) -> String {
+    path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// The folder a project's own transcripts say they ran in. Nothing outside
+/// `~/.claude` is touched to find it, and the folder is not checked on disk.
+fn project_dir_from_transcripts(project: &Path, name: &str) -> Option<PathBuf> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut transcripts: Vec<PathBuf> = fs::read_dir(project).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect();
+    transcripts.sort_by_key(|p| std::cmp::Reverse(modified_ms(p)));
+    for transcript in transcripts.into_iter().take(5) {
+        let Ok(file) = fs::File::open(&transcript) else { continue };
+        // The folder is on one of the first records
+        for line in BufReader::new(file.take(512 * 1024)).lines().map_while(Result::ok).take(40) {
+            let cwd = serde_json::from_str::<serde_json::Value>(&line).ok().and_then(|v| v["cwd"].as_str().map(str::to_owned));
+            // A session can move into a subfolder; only the folder the project is named after counts
+            if let Some(cwd) = cwd.filter(|cwd| encode_project_dir(cwd) == name) {
+                return Some(PathBuf::from(cwd));
+            }
+        }
     }
-    fn walk(dir: &Path, rest: &str, budget: &mut usize) -> Option<PathBuf> {
+    None
+}
+
+/// Folders macOS guards with a permission prompt, and other disks. The app has
+/// no business listing them to work out a project's name.
+pub(crate) fn guarded(dir: &Path, home: Option<&Path>) -> bool {
+    if dir.starts_with("/Volumes") || dir.starts_with("/Network") {
+        return true;
+    }
+    let Some(inside) = home.and_then(|h| dir.strip_prefix(h).ok()) else { return false };
+    ["Downloads", "Desktop", "Documents", "Pictures", "Movies", "Music", "Library/CloudStorage", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers"].iter().any(|g| inside.starts_with(g))
+}
+
+/// Folder that a `~/.claude/projects/<name>` entry is about, for a project
+/// whose transcripts are gone. The name can't be reversed by string replacement
+/// alone, so the file system is walked and each folder's encoded name matched:
+/// only entries whose name fits are looked at, and guarded folders are never listed.
+fn decode_project_dir(name: &str, home: Option<&Path>) -> Option<PathBuf> {
+    fn walk(dir: &Path, rest: &str, budget: &mut usize, home: Option<&Path>) -> Option<PathBuf> {
         if rest.is_empty() {
             return Some(dir.to_path_buf());
         }
-        if *budget == 0 {
+        if *budget == 0 || guarded(dir, home) {
             return None;
         }
         *budget -= 1;
         let entries = fs::read_dir(dir).ok()?;
         let mut candidates: Vec<(String, PathBuf)> = entries
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .map(|e| (encode(&e.file_name().to_string_lossy()), e.path()))
+            // By name first: an entry that can't be on the way is never examined
+            .map(|e| (encode_project_dir(&e.file_name().to_string_lossy()), e))
             .filter(|(enc, _)| !enc.is_empty() && rest.starts_with(enc.as_str()))
+            .filter(|(_, e)| !guarded(&e.path(), home) && e.path().is_dir())
+            .map(|(enc, e)| (enc, e.path()))
             .collect();
         // Longest match first: `mdviewer-mj` before `mdviewer`
         candidates.sort_by_key(|c| std::cmp::Reverse(c.0.len()));
@@ -434,7 +473,7 @@ fn decode_project_dir(name: &str) -> Option<PathBuf> {
                 return Some(path);
             }
             if let Some(next) = after.strip_prefix('-') {
-                if let Some(found) = walk(&path, next, budget) {
+                if let Some(found) = walk(&path, next, budget, home) {
                     return Some(found);
                 }
             }
@@ -443,7 +482,7 @@ fn decode_project_dir(name: &str) -> Option<PathBuf> {
     }
     let mut budget = 200;
     let (root, rest) = project_root(name, cfg!(windows))?;
-    walk(Path::new(&root), rest, &mut budget)
+    walk(Path::new(&root), rest, &mut budget, home)
 }
 
 /// Agent files under a folder the user opened: `CLAUDE.md`, `AGENTS.md`,
@@ -531,7 +570,7 @@ fn scan_user(out: &mut Vec<AgentEntry>) {
                 continue;
             }
             let name = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let about = decode_project_dir(&name);
+            let about = project_dir_from_transcripts(&project, &name).or_else(|| decode_project_dir(&name, dirs::home_dir().as_deref()));
             let label = about.as_deref().map(display_path).unwrap_or(name);
             for file in files {
                 let mut entry = make_entry(&file, Kind::Memory, label.clone(), "user");
@@ -966,8 +1005,47 @@ mod tests {
         let root = canonicalize(&root).unwrap();
         let encoded: String = root.join("my-app").join("web_ui").to_string_lossy()
             .chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-        assert_eq!(decode_project_dir(&encoded), Some(root.join("my-app").join("web_ui")));
-        assert_eq!(decode_project_dir(&format!("{}-nope", encoded)), None);
+        assert_eq!(decode_project_dir(&encoded, None), Some(root.join("my-app").join("web_ui")));
+        assert_eq!(decode_project_dir(&format!("{}-nope", encoded), None), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// MCR-42: working out a project's folder must not touch the neighbours of
+    /// a cloud-storage folder, nor list Downloads, Desktop or Documents.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_folder_is_found_without_touching_guarded_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("mdviewer-guarded-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let cloud = home.join("Library").join("CloudStorage");
+        let project = cloud.join("Dropbox-Me").join("notes");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(home.join("Documents").join("book")).unwrap();
+        fs::create_dir_all(home.join("work").join("app")).unwrap();
+        let home = canonicalize(&home).unwrap();
+        let project = home.join("Library/CloudStorage/Dropbox-Me/notes");
+        let encoded = |p: &Path| encode_project_dir(&p.to_string_lossy());
+
+        // The transcript names the folder: found with the whole home unreadable
+        let claude = home.join(".claude/projects").join(encoded(&project));
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("a.jsonl"), format!("{{\"type\":\"summary\"}}\n{{\"cwd\":\"{}/sub\"}}\n{{\"cwd\":\"{}\"}}\n", project.display(), project.display())).unwrap();
+        assert_eq!(project_dir_from_transcripts(&claude, &encoded(&project)), Some(project.clone()));
+        assert_eq!(project_dir_from_transcripts(&claude, "-some-other-name"), None);
+
+        // Without transcripts the walk refuses guarded folders: the cloud folder and Documents stay unlisted
+        assert!(guarded(&home.join("Library/CloudStorage"), Some(&home)) && guarded(&home.join("Documents/book"), Some(&home)) && guarded(Path::new("/Volumes/Disk"), Some(&home)));
+        assert!(!guarded(&home.join("work"), Some(&home)) && !guarded(&home.join("Library"), Some(&home)));
+        assert_eq!(decode_project_dir(&encoded(&project), Some(&home)), None);
+        assert_eq!(decode_project_dir(&encoded(&home.join("Documents/book")), Some(&home)), None);
+
+        // A folder with no permissions next to the way is never examined: the walk still finds its target
+        let sibling = home.join("work").join("other");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(decode_project_dir(&encoded(&home.join("work/app")), Some(&home)), Some(home.join("work/app")));
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&home);
     }
 }

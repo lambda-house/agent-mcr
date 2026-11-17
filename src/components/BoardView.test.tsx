@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BoardView from './BoardView';
 import { formatUntil, harnessApi, openReports, type Board, type Hosted } from '../utils/harness';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), board: vi.fn(), removeNote: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), board: vi.fn(), postNote: vi.fn(), removeNote: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 
@@ -54,6 +54,23 @@ describe('Board view', () => {
     const done = [...host.querySelectorAll('.hs-board-filter button')].find(b => b.textContent === 'Done') as HTMLButtonElement;
     await act(async () => done.click());
     expect([...host.querySelectorAll('section[aria-label="Reports"] .hs-board-text')].map(e => e.textContent)).toEqual(['Merged', 'Tests pass']);
+  });
+
+  it('posts a note of the person for a folder sessions run in', async () => {
+    vi.mocked(harnessApi.postNote).mockResolvedValue();
+    await act(async () => root.render(<BoardView active onOpen={() => {}}/>)); await flush();
+    const form = host.querySelector('form[aria-label="Leave a note"]') as HTMLFormElement;
+    const post = form.querySelector('button[type="submit"]') as HTMLButtonElement;
+    expect(post.disabled).toBe(true);
+    const type = (element: HTMLTextAreaElement | HTMLSelectElement, value: string, event: string) => {
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value')!.set!.call(element, value);
+      element.dispatchEvent(new Event(event, { bubbles: true }));
+    };
+    await act(async () => type(form.querySelector('textarea')!, 'Do not push today', 'input'));
+    await act(async () => type(form.querySelector('select[aria-label="Who reads it"]')!, '/Users/me/repo', 'change'));
+    await act(async () => post.click()); await flush();
+    expect(harnessApi.postNote).toHaveBeenCalledWith('Do not push today', 24, '/Users/me/repo');
+    expect(form.querySelector('textarea')!.value).toBe('');
   });
 
   it('removes a note only on the second click', async () => {

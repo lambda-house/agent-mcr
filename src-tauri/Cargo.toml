@@ -1,6 +1,6 @@
 [package]
 name = "agent-mcr"
-version = "0.1.0"
+version = "0.1.1"
 description = "Agent Mission Control Room"
 authors = ["Lambda House"]
 license = "MIT"
@@ -28,12 +28,15 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 portable-pty = "0.9"
 libc = "0.2"
 vt100 = "0.18.1"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
+security-framework = "3.7.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 glib-sys = "0.22.9"

@@ -6,10 +6,8 @@ These files and directories are isolated from upstream core files:
 
 - `src/plugins/` — Plugin SDK (`sdk.ts`, `usePlugins.ts`, `index.ts`) and plugins:
   - `src/plugins/layouts/` — split panes in Live: preset bar, split and close buttons (core keeps the pane tree)
-  - `src/plugins/command-panel/` — Cmd+K palette
-  - `src/plugins/teob-theme/` — @teob/ui tokens, the agent-mcr bridge and local overrides (`overrides.css`)
+  - `src/plugins/command-panel/` — Cmd+S palette
 - `src/utils/paneLayout.ts` + `src/utils/paneLayout.test.ts`
-- `@teob/ui` (npm dependency)
 
 ## 2. Core integration points (small hooks in upstream files)
 

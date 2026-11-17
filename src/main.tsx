@@ -11,6 +11,7 @@ import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
 import './styles/index.css';
+import './styles/ui.css';
 import { pluginRegistry, usePluginVersion } from './plugins';
 
 // Apply the persisted theme before the first paint (no dark flash in light

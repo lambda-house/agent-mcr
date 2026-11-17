@@ -10,10 +10,8 @@ describe('plugin system', () => {
 
   it('auto-discovers built-in plugins', () => {
     const ids = pluginRegistry.listPlugins().map(p => p.id);
-    expect(ids).toContain('teob-theme');
     expect(ids).toContain('command-panel');
     expect(pluginRegistry.getGlobalOverlays().some(o => o.id === 'command-panel')).toBe(true);
-    expect(pluginRegistry.getAppWrappers().some(w => w.id === 'teob-providers')).toBe(true);
   });
 
   it('registers, toggles, and cleans up extension points and events', () => {

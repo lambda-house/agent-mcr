@@ -13,11 +13,11 @@ How it is built: [ARCHITECTURE.md](ARCHITECTURE.md). The design it grows towards
 
 ## Status
 
-Pre-release (0.1.0): no published builds. Windows support still needs validation on a real Windows machine. The app does not update itself.
+Pre-release (0.1.1): macOS on Apple Silicon; Windows support still needs validation on a real Windows machine. Builds are on the [releases page](https://github.com/lambda-house/agent-mcr/releases); they are not signed with a Developer ID and not notarized, so macOS asks you to allow the first launch (System Settings → Privacy & Security → Open Anyway). The app does not update itself.
 
 ## Build and run
 
-Needs Node.js, Rust and read access to the private `teob-cc/teob-ui` repository on GitHub: `@teob/ui` is installed from it over HTTPS, pinned to a commit (signing in with `gh auth login` is enough).
+Needs Node.js and Rust.
 
 On macOS, install the Xcode command-line tools:
 
@@ -40,9 +40,26 @@ cd src-tauri
 cargo test
 ```
 
-The Windows installer is unsigned; SmartScreen may warn. Its WebView2 bootstrapper downloads the runtime when needed. CI also needs the `TEOB_UI_SSH_KEY` repository secret to install the private dependency.
+The Windows installer is unsigned; SmartScreen may warn. Its WebView2 bootstrapper downloads the runtime when needed.
 
 The app opens on **Sessions**. Reading transcripts is switched on in the app, after a native confirmation.
+
+## Background processes
+
+Hosted agents keep running when the app quits, because they don't run inside it. Two processes of the same binary do that work: the **runner** holds the terminals, the **harness service** tracks sessions and gives agents their tools. macOS starts them through two files in `~/Library/LaunchAgents` (`cc.lambdahouse.agent-mcr.runner.plist` and `…harness.plist`). They listen on sockets private to your user, never on the network, and exit ten minutes after the last session ends.
+
+- The app asks before it installs or starts them. Nothing else can: an outside supervisor is refused until you have allowed them.
+- **Settings → Harnesses** has **Background**: what runs, since when, from which files.
+- **Stop everything** there ends every session and both processes. They stay off until you allow them again.
+- Quit (menu or Cmd-Q) tells you how many sessions keep running and offers to stop them. Quitting from the Dock doesn't ask.
+
+To uninstall: **Remove background items** in the same panel, or from a terminal
+
+```bash
+'/Applications/Agent MCR.app/Contents/MacOS/agent-mcr' --stop-background --uninstall
+```
+
+then move the app to the Trash. Session history and settings stay in `~/Library/Application Support/agent-mcr`; delete that folder to remove them too.
 
 ## Supervising from an outside agent
 

@@ -17,11 +17,20 @@ impl Default for HarnessPreferences {
 
 impl HarnessPreferences {
     pub fn load(dir: &Path) -> Result<Self, String> {
-        match std::fs::read(dir.join("harness-preferences.json")) {
+        let path = dir.join("harness-preferences.json");
+        match std::fs::read(&path) {
             Ok(bytes) => {
-                let prefs: Self = serde_json::from_slice(&bytes).map_err(|e| format!("Invalid harness preferences: {e}"))?;
-                prefs.validate()?;
-                Ok(prefs)
+                let parsed = serde_json::from_slice::<Self>(&bytes)
+                    .map_err(|e| format!("Invalid harness preferences: {e}"))
+                    .and_then(|prefs| prefs.validate().map(|()| prefs));
+                match parsed {
+                    Ok(prefs) => Ok(prefs),
+                    Err(e) => {
+                        eprintln!("{e}; falling back to default harness preferences");
+                        let _ = std::fs::rename(&path, dir.join("harness-preferences.json.corrupt"));
+                        Ok(Self::default())
+                    }
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(format!("Cannot read harness preferences: {e}")),
@@ -92,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_preferences_and_refuses_corrupt_files() {
+    fn persists_preferences_and_falls_back_on_corrupt_files() {
         let dir = std::env::temp_dir().join(format!("mcr-prefs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(HarnessPreferences::load(&dir).unwrap(), HarnessPreferences::default());
@@ -100,7 +109,13 @@ mod tests {
         prefs.save(&dir).unwrap();
         assert_eq!(HarnessPreferences::load(&dir).unwrap(), prefs);
         std::fs::write(dir.join("harness-preferences.json"), b"broken").unwrap();
-        assert!(HarnessPreferences::load(&dir).is_err());
+        assert_eq!(HarnessPreferences::load(&dir).unwrap(), HarnessPreferences::default());
+        assert!(!dir.join("harness-preferences.json").exists());
+        assert_eq!(std::fs::read(dir.join("harness-preferences.json.corrupt")).unwrap(), b"broken");
+        std::fs::write(dir.join("harness-preferences.json"), br#"{"enabledProfiles":["unknown"],"supervisorProfile":"claude"}"#).unwrap();
+        assert_eq!(HarnessPreferences::load(&dir).unwrap(), HarnessPreferences::default());
+        assert!(!dir.join("harness-preferences.json").exists());
+        assert!(dir.join("harness-preferences.json.corrupt").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

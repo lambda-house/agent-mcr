@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { family, formatSessionTitle, origin, within, matchesActivity, sessionTree, directoryTree, matchesSession, sumUsage, totalTokens, type Session } from './sessions';
+import { family, formatSessionTitle, origin, within, matchesActivity, sessionTree, directoryTree, matchesSession, sumUsage, totalTokens, cacheState, type Session } from './sessions';
 const s = (id: string, parentId: string | null = null, provider: 'codex' | 'claude' = 'codex') => ({ id, parentId, provider, cwd: '/work/it\'s repo', title: 'Fix CORE-123', name: '', model: 'model-a', tickets: ['CORE-123'], tools: { shell: 1 }, usage: { input: 100, cached: 70, cacheWrite: 5, output: 20, reasoning: 6 } } as unknown as Session);
 describe('session landscape', () => {
   it('names sessions from cleaned titles, user requests, tickets and projects', () => {
@@ -45,5 +45,23 @@ describe('hierarchy, location and activity', () => {
     expect(matchesActivity(x,{activeMinutes:30,inactiveMinutes:5,now:700000})).toBe(true);
     expect(matchesActivity(x,{activeMinutes:5,inactiveMinutes:30,now:700000})).toBe(false);
     expect(origin({...x,origin:'human',forkedFrom:'earlier'})).toBe('human');
+  });
+});
+
+describe('cacheState', () => {
+  const at = 1_000_000_000;
+  const of = (provider: string, context: object) => ({ provider, context } as unknown as Session);
+  it('follows the recorded lifetime', () => {
+    const s = of('claude', { cacheTtl: 300, cacheAt: at });
+    expect(cacheState(s, at + 60_000)).toMatchObject({ warm: true, cooling: false, assumed: false, until: at + 300_000 });
+    expect(cacheState(s, at + 290_000)).toMatchObject({ warm: true, cooling: true });
+    expect(cacheState(s, at + 301_000)).toMatchObject({ warm: false, assumed: false });
+  });
+  it('assumes an hour for Codex, which records none, and nothing for other agents', () => {
+    const s = of('codex', { cacheAt: at });
+    expect(cacheState(s, at + 600_000)).toMatchObject({ warm: true, assumed: true, ttl: 3600 });
+    expect(cacheState(s, at + 2 * 3600_000)).toMatchObject({ warm: false, assumed: true });
+    expect(cacheState(of('claude', { cacheAt: at }), at)).toBeNull();
+    expect(cacheState(of('codex', {}), at)).toBeNull();
   });
 });

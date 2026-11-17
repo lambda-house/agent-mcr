@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
-import { SettingRow } from '@teob/ui';
-import { harnessApi, type HarnessStatus, type HarnessPreferences } from '../utils/harness';
+import { SettingRow } from '@/ui';
+import { HARNESS_PREFERENCES_CHANGED, harnessApi, type HarnessStatus, type HarnessPreferences } from '../utils/harness';
+import { BackgroundPanel } from './Background';
 
 export default function HarnessSettingsSection() {
   const [prefs, setPrefs] = useState<HarnessPreferences | null>(null);
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [copied, setCopied] = useState(false);
+  const [backgroundOpen, setBackgroundOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -48,6 +50,10 @@ export default function HarnessSettingsSection() {
           {prefs.profiles.filter(p => p.canSupervise && prefs.enabledProfiles.includes(p.id)).map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
         </select>
       }/>
+      <SettingRow label="Background processes" description="Runner and harness service keep sessions alive when the app closes." control={
+        <button type="button" aria-expanded={backgroundOpen} onClick={() => setBackgroundOpen(open => !open)}>{backgroundOpen ? 'Hide' : 'Manage…'}</button>
+      }/>
+      {backgroundOpen && <BackgroundPanel onStopped={() => { setBackgroundOpen(false); setStatus(null); window.dispatchEvent(new Event(HARNESS_PREFERENCES_CHANGED)); }}/>}
     </div>}
     {prefs?.profiles.some(p => p.canSupervise && !p.taskTracking) && <p className="settings-section-description">Automatic task tracking is unavailable for {prefs.profiles.filter(p => p.canSupervise && !p.taskTracking).map(p => p.label).join(', ')}.</p>}
   </div>;
