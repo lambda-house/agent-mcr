@@ -179,8 +179,14 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
       </form> : <>
         <div className="hs-slack-state">
           <span className={`hs-dot ${status.link === 'connected' ? 'idle' : status.link === 'off' ? 'past' : status.link === 'refused' ? 'failed' : 'working'}`} aria-hidden/>
-          <span>{LINK[status.link]}{status.lastEvent ? ` · last event ${formatAge(status.lastEvent)}` : ''}{status.linkError ? ` · ${status.linkError}` : ''}</span>
+          <span>{LINK[status.link]}{status.lastEvent ? ` · last event ${formatAge(status.lastEvent)}` : ''}{status.link === 'connected' ? ` · ${status.eventsSeen ?? 0} event${status.eventsSeen === 1 ? '' : 's'} received` : ''}{status.linkError ? ` · ${status.linkError}` : ''}</span>
         </div>
+        {(c.missingScopes?.length ?? 0) > 0 && <p className="hs-slack-warning" role="alert">
+          The Slack app lacks {c.missingScopes!.length === 1 ? 'a permission' : 'permissions'} this needs: <b>{c.missingScopes!.join(', ')}</b>. Add {c.missingScopes!.length === 1 ? 'it' : 'them'} in the Slack app under OAuth &amp; Permissions &gt; Bot Token Scopes, reinstall the app to the workspace, then press Channels. Or recreate the app from docs/slack-app-manifest.yaml.
+        </p>}
+        {status.link === 'connected' && !status.eventsSeen && channels.some(ch => ch.member && ch.listen !== 'off') && <p className="hs-slack-warning">
+          Connected, but Slack has sent no event yet. If you wrote in a listened channel and nothing shows under Received, the Slack app is not subscribed to events: in the Slack app open Event Subscriptions, turn it on, and under "Subscribe to bot events" add <b>message.channels</b>, <b>message.groups</b>, <b>app_mention</b> and <b>member_joined_channel</b>; Socket Mode must be on. Save, and reinstall the app if Slack asks.
+        </p>}
         <label className="hs-slack-toggle"><input type="checkbox" checked={status.enabled} disabled={busy} onChange={e => run(() => slackApi.enable(e.target.checked))}/>
           Slack is on <small>Off: nothing is received, nothing is sent, and posts that wait are cancelled</small></label>
         <label className="hs-slack-toggle"><input type="checkbox" checked={c.approveInSlack} disabled={busy} onChange={e => run(() => slackApi.approval(e.target.checked))}/>

@@ -112,7 +112,11 @@ export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
 }
 
 /** The Slack connector as the harness service reports it (decision D14). No token is in it. */
-export interface SlackConnection { team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number }
+export interface SlackConnection {
+  team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number;
+  /** Permissions of the manifest that the bot lacks */
+  missingScopes?: string[];
+}
 export type SlackListen = 'off' | 'mentions' | 'all';
 export type SlackPosting = 'never' | 'approve' | 'thread' | 'auto';
 export interface SlackChannel {
@@ -130,6 +134,8 @@ export interface SlackReceived {
 }
 export interface SlackStatus {
   connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;
+  /** When Slack last accepted the connection, and what arrived since the service started */
+  connectedAt?: number; eventsSeen?: number; actionsSeen?: number;
   channels: SlackChannel[]; users: Record<string, string>; posts: SlackPost[]; received: SlackReceived[];
   audit: { at: number; kind: string; text: string }[];
   counts: { sentWithoutApproval: number; refusedApprovals: number; deliveredFromStrangers: number; held: number; waiting: number };

@@ -28,6 +28,8 @@ const PAGE: usize = 15;
 /// History pages read per channel when catching up; the rest is counted as skipped
 const CATCH_UP_PAGES: usize = 3;
 const KEYCHAIN_SERVICE: &str = "cc.lambdahouse.agent-mcr.slack";
+/// What the bot token must be allowed to do (docs/slack-app-manifest.yaml)
+const SCOPES: [&str; 8] = ["app_mentions:read", "channels:history", "channels:read", "groups:history", "groups:read", "chat:write", "im:write", "users:read"];
 
 /// Why a call to Slack did not succeed.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +71,15 @@ impl Web for Https {
         let pairs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let sent = self.0.post(&format!("https://slack.com/api/{method}")).set("Authorization", &format!("Bearer {token}")).send_form(&pairs);
         let body: Value = match sent {
-            Ok(response) => response.into_json().map_err(|e| Fail::Transport(e.to_string()))?,
+            Ok(response) => {
+                // What the token may do, as Slack says with every answer
+                let scopes = response.header("x-oauth-scopes").map(str::to_owned);
+                let mut body: Value = response.into_json().map_err(|e| Fail::Transport(e.to_string()))?;
+                if let Some(scopes) = scopes {
+                    body["_scopes"] = json!(scopes);
+                }
+                body
+            }
             Err(ureq::Error::Status(429, response)) => return Err(Fail::Limited(response.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(60))),
             Err(ureq::Error::Status(code, _)) if code >= 500 => return Err(Fail::Transport(format!("HTTP {code}"))),
             Err(ureq::Error::Status(code, _)) => return Err(Fail::Refused(format!("HTTP {code}"))),
@@ -78,9 +88,11 @@ impl Web for Https {
         if body["ok"] == true {
             return Ok(body);
         }
+        // Slack names the permission a refused call lacked
+        let needed = body["needed"].as_str().map(|n| format!(" (needs the scope {n})")).unwrap_or_default();
         match body["error"].as_str().unwrap_or("unknown error") {
             "ratelimited" | "rate_limited" => Err(Fail::Limited(60)),
-            e => Err(Fail::Refused(e.to_string())),
+            e => Err(Fail::Refused(format!("{e}{needed}"))),
         }
     }
 }
@@ -148,6 +160,8 @@ pub struct Connection {
     pub operator_name: String,
     pub approve_in_slack: bool,
     pub connected: u64,
+    /// Scopes of the manifest that the bot token lacks, as Slack reported them
+    pub missing_scopes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -315,6 +329,10 @@ struct Link {
     state: String,
     error: String,
     last_event: u64,
+    /// When Slack last said hello, and what arrived since the service started
+    connected_at: u64,
+    events: u64,
+    actions: u64,
     catch_up_after: u64,
 }
 
@@ -429,6 +447,9 @@ impl Slack {
             "link": if state.connection.is_none() || !state.enabled { "off" } else { link.state.as_str() },
             "linkError": link.error,
             "lastEvent": link.last_event,
+            "connectedAt": link.connected_at,
+            "eventsSeen": link.events,
+            "actionsSeen": link.actions,
             "channels": channels,
             "users": state.users,
             "posts": posts.iter().rev().take(60).map(|p| { let mut v = json!(p); v["channelName"] = json!(name(&p.channel)); v }).collect::<Vec<_>>(),
@@ -471,7 +492,10 @@ impl Slack {
         if user["is_bot"] == true || user["deleted"] == true {
             return Err("That member ID is a bot or a removed account, not you".into());
         }
+        let granted: Vec<&str> = who["_scopes"].as_str().unwrap_or("").split(',').map(str::trim).collect();
+        let missing: Vec<&str> = if who["_scopes"].is_null() { Vec::new() } else { SCOPES.iter().filter(|s| !granted.contains(s)).copied().collect() };
         Ok(json!({
+            "missingScopes": missing,
             "team": who["team"], "teamId": who["team_id"], "url": who["url"], "botUser": who["user_id"], "botName": who["user"],
             "operator": user["id"], "operatorName": user["real_name"].as_str().filter(|n| !n.is_empty()).or(user["name"].as_str()).unwrap_or(""),
         }))
@@ -494,7 +518,7 @@ impl Slack {
                 s.received.clear();
                 s.users.clear();
             }
-            s.connection = Some(Connection { team: text("team"), team_id: text("teamId"), url: text("url"), bot_user: text("botUser"), bot_name: text("botName"), operator: text("operator"), operator_name: text("operatorName"), approve_in_slack: true, connected: now_ms() });
+            s.connection = Some(Connection { team: text("team"), team_id: text("teamId"), url: text("url"), bot_user: text("botUser"), bot_name: text("botName"), operator: text("operator"), operator_name: text("operatorName"), approve_in_slack: true, connected: now_ms(), missing_scopes: found["missingScopes"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default() });
             s.users.insert(text("operator"), text("operatorName"));
             s.enabled = true;
             s.log("connected", format!("{} as {}; operator {}", text("team"), text("botName"), text("operatorName")));
@@ -558,6 +582,18 @@ impl Slack {
 
     /// The channels the bot is a member of. Policies of known channels are kept.
     pub fn refresh_channels(&self) -> Result<(), String> {
+        // The app's permissions may have changed since it was connected
+        if let Ok(who) = self.api("auth.test", &[]) {
+            if let Some(scopes) = who["_scopes"].as_str() {
+                let granted: Vec<&str> = scopes.split(',').map(str::trim).collect();
+                let missing: Vec<String> = SCOPES.iter().filter(|s| !granted.contains(s)).map(|s| s.to_string()).collect();
+                self.update(|s| {
+                    if let Some(c) = &mut s.connection {
+                        c.missing_scopes = missing;
+                    }
+                });
+            }
+        }
         let mut found: Vec<(String, String, bool)> = Vec::new();
         let mut cursor = String::new();
         for _ in 0..10 {
@@ -824,7 +860,16 @@ impl Slack {
                         more = false;
                         break;
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        // Said once per channel and reason, not on every reconnect
+                        let line = format!("#{}: the channel could not be read ({e})", c.name);
+                        self.update(|s| {
+                            if !s.audit.iter().rev().take(40).any(|a| a.text == line) {
+                                s.log("failed", line);
+                            }
+                        });
+                        break;
+                    }
                 }
             }
             if more {
@@ -1424,7 +1469,11 @@ impl Slack {
             match envelope["type"].as_str().unwrap_or("") {
                 "hello" => {
                     self.set_link("connected", "");
-                    lock(&self.link).last_event = now_ms();
+                    {
+                        let mut link = lock(&self.link);
+                        link.last_event = now_ms();
+                        link.connected_at = now_ms();
+                    }
                     // Whatever arrived while nothing listened
                     self.catch_up.store(true, Ordering::SeqCst);
                     self.wake.notify_all();
@@ -1434,7 +1483,11 @@ impl Slack {
                     return if envelope["reason"] == "link_disabled" { Err("Slack refused: Socket Mode is switched off for the app".into()) } else { Ok(()) };
                 }
                 kind @ ("events_api" | "interactive") => {
-                    lock(&self.link).last_event = now_ms();
+                    {
+                        let mut link = lock(&self.link);
+                        link.last_event = now_ms();
+                        if kind == "events_api" { link.events += 1 } else { link.actions += 1 }
+                    }
                     let payload = &envelope["payload"];
                     let mut ack = || match envelope["envelope_id"].as_str() {
                         Some(id) => socket.send(Message::text(json!({ "envelope_id": id }).to_string())).map_err(|e| format!("Slack was not reached: {e}")),

@@ -281,3 +281,5 @@
 .hs-wait { display: inline-flex; align-items: center; gap: 4px; color: var(--sc-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hs-wait.overdue { color: #e0a23c; }
 .hs-preview { padding: 0 4px; border: 1px solid var(--sc-border); border-radius: 7px; color: var(--sc-muted); font-size: 9px; font-weight: 500; }
+.hs-slack-warning { margin: 4px 0 6px; padding: 6px 8px; border: 1px solid #e0a23c; border-radius: 6px; color: var(--sc-text); font-size: 11px; line-height: 1.45; }
+.hs-slack-warning b { font-weight: 600; }
