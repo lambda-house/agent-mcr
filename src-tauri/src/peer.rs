@@ -12,6 +12,17 @@ use crate::ipc::Stream;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
+/// Parses `WSAIoctl(SIO_AF_UNIX_GETPEERPID)` output.
+/// On Windows, `afunix.sys` writes the `ULONG` pid into the zero-initialized
+/// output buffer and returns `rc = 0` while leaving `bytes_returned = 0`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_peer_pid(rc: i32, bytes_returned: u32, peer_pid: u32) -> Option<i32> {
+    if rc != 0 || (bytes_returned != 0 && bytes_returned != std::mem::size_of::<u32>() as u32) {
+        return None;
+    }
+    i32::try_from(peer_pid).ok().filter(|&p| p > 0)
+}
+
 /// Result of walking a peer's process ancestry against live session roots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ancestry {
@@ -203,10 +214,7 @@ mod win {
                 None,
             )
         };
-        if rc != 0 || bytes_returned != std::mem::size_of::<u32>() as u32 {
-            return None;
-        }
-        i32::try_from(peer_pid).ok().filter(|&p| p > 0)
+        super::parse_peer_pid(rc, bytes_returned, peer_pid)
     }
 
     fn process_user_sid(process: HANDLE) -> Option<Vec<u8>> {
@@ -552,33 +560,6 @@ mod tests {
     fn a_connection_from_this_process_is_recognised() {
         let accepted_at = accept_time();
         let (a, _b) = stream_pair();
-        #[cfg(windows)]
-        if !same_user(&a) {
-            use std::os::windows::io::AsRawSocket;
-            use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAIoctl, SOCKET};
-            let probe = |s: &Stream| {
-                let mut out = [0u64; 2];
-                let mut bytes: u32 = 0;
-                let rc = unsafe {
-                    WSAIoctl(
-                        s.as_raw_socket() as SOCKET,
-                        0x5800_0100,
-                        std::ptr::null(),
-                        0,
-                        out.as_mut_ptr().cast(),
-                        std::mem::size_of_val(&out) as u32,
-                        &mut bytes,
-                        std::ptr::null_mut(),
-                        None,
-                    )
-                };
-                let wsa = unsafe { WSAGetLastError() };
-                (rc, bytes, out[0], wsa)
-            };
-            let pa = probe(&a);
-            let pb = probe(&_b);
-            panic!("same_user(&a) false: a={pa:?} b={pb:?} pid(&a)={:?}", pid(&a));
-        }
         assert!(same_user(&a));
         assert_eq!(pid(&a), Some(std::process::id() as i32));
         assert!(is_this_program(&a));
@@ -593,5 +574,14 @@ mod tests {
         assert_eq!(ancestor_among(me, &[up]), Ancestry::Found(up));
         assert_eq!(peer.ancestor_among(&[up]), Ancestry::Found(up));
         assert_eq!(ancestor_among(me, &[]), Ancestry::Outside);
+    }
+
+    #[test]
+    fn parse_peer_pid_handles_afunix_bytes_returned() {
+        assert_eq!(parse_peer_pid(0, 0, 0), None);
+        assert_eq!(parse_peer_pid(0, 0, 6528), Some(6528));
+        assert_eq!(parse_peer_pid(0, 4, 6528), Some(6528));
+        assert_eq!(parse_peer_pid(-1, 4, 6528), None);
+        assert_eq!(parse_peer_pid(0, 2, 6528), None);
     }
 }
