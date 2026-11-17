@@ -242,7 +242,7 @@
 
 .cmd-list {
   overscroll-behavior: contain;
-  padding: 8px;
+  padding: var(--sp-2, 8px) var(--sp-3, 12px);
 }
 
 .cmd-preview {
