@@ -124,8 +124,8 @@ pub async fn harness_background_allow(app: tauri::AppHandle) -> Result<bool, Str
     blocking(move || {
         let dir = config_dir()?;
         if runner::consent(&dir) != Some(true) {
-            let message = "Agent MCR runs your agents in two background processes of its own, so they keep working when you close or update the app:\n\n\u{2022} the runner holds the terminals\n\u{2022} the harness service tracks sessions and gives agents their tools\n\nmacOS starts them through two files in ~/Library/LaunchAgents and may show a \"Background Items Added\" notice. They listen only on sockets private to your user, never on the network, and exit on their own ten minutes after the last session ends.\n\nYou can see, stop and remove them at any time under Background in the Live view.";
-            if !confirmed(&app, "Let Agent MCR run in the background?", message.to_string(), "Allow", false) {
+            let message = format!("Agent MCR runs your agents in two background processes of its own, so they keep working when you close or update the app:\n\n\u{2022} the runner holds the terminals\n\u{2022} the harness service tracks sessions and gives agents their tools\n\n{start} They listen only on sockets private to your user, never on the network, and exit on their own ten minutes after the last session ends.\n\nYou can see, stop and remove them at any time under Background in the Live view.", start = if cfg!(windows) { "They are ordinary processes of your user that Agent MCR starts itself; nothing is installed in Windows." } else { "macOS starts them through two files in ~/Library/LaunchAgents and may show a \"Background Items Added\" notice." });
+            if !confirmed(&app, "Let Agent MCR run in the background?", message, "Allow", false) {
                 return Ok(false);
             }
             runner::set_consent(&dir, true)?;
@@ -147,7 +147,9 @@ pub async fn harness_background_stop(app: tauri::AppHandle, uninstall: bool) -> 
             1 => "1 running session will be ended; unsaved work in it is lost.".to_string(),
             n => format!("{n} running sessions will be ended; unsaved work in them is lost."),
         };
-        let (title, rest, ok) = if uninstall {
+        let (title, rest, ok) = if uninstall && cfg!(windows) {
+            ("Remove Agent MCR's background items?", "The runner and the harness service are stopped and Agent MCR forgets that you allowed them; nothing was installed in Windows. Session history and settings stay; to remove those too, delete %LOCALAPPDATA%\\agent-mcr after quitting.", "Stop and Remove")
+        } else if uninstall {
             ("Remove Agent MCR's background items?", "The runner and the harness service are stopped and their two files in ~/Library/LaunchAgents are removed. Session history and settings stay; to remove those too, delete ~/Library/Application Support/agent-mcr after quitting.", "Stop and Remove")
         } else {
             ("Stop all sessions and background processes?", "The runner and the harness service are stopped. Nothing starts them again until you allow it here.", "Stop Everything")

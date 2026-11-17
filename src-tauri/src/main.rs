@@ -1196,7 +1196,7 @@ fn main() {
         Some("--stop-background") => {
             let uninstall = std::env::args().nth(2).as_deref() == Some("--uninstall");
             match get_config_dir().map_err(|e| e.message).and_then(|dir| harness::stop_background(&dir, true, uninstall)) {
-                Ok(()) => println!("{}", if uninstall { "Sessions ended, background processes stopped, LaunchAgent files removed." } else { "Sessions ended, background processes stopped. They start again when you allow it in the app." }),
+                Ok(()) => println!("{}", if uninstall { if cfg!(windows) { "Sessions ended, background processes stopped, permission forgotten." } else { "Sessions ended, background processes stopped, LaunchAgent files removed." } } else { "Sessions ended, background processes stopped. They start again when you allow it in the app." }),
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(1);

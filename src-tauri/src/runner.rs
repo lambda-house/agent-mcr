@@ -993,8 +993,8 @@ fn is_socket_file(file_type: std::fs::FileType) -> bool {
 pub fn unit_status(socket: &Path, unit: &Unit) -> Value {
     let hello = Client::connect(socket).and_then(|mut c| c.call(json!({"op": "hello"}))).ok();
     let pid = hello.as_ref().and_then(|h| h["pid"].as_i64());
-    // When it started, as `ps` prints it
-    let since = pid.and_then(|pid| std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok())
+    // When it started, as `ps` prints it (Windows has no `ps`: unknown there)
+    let since = pid.filter(|_| cfg!(unix)).and_then(|pid| std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty());
     json!({
