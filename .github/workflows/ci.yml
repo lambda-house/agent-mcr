@@ -33,6 +33,11 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      # @teob/ui is a private git dependency (ssh in package-lock.json): read-only deploy key on teob-cc/teob-ui
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TEOB_UI_DEPLOY_KEY }}
+
       - run: npm ci
 
       - name: Typecheck and build frontend
