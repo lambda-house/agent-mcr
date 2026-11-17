@@ -239,6 +239,8 @@ pub struct Post {
     pub dm_channel: Option<String>,
     pub dm_ts: Option<String>,
     pub dm_tried: bool,
+    /// When the approval message is tried again after Slack was not reached
+    pub dm_retry_at: u64,
     /// The approval message shows the decision
     pub dm_closed: bool,
     /// The session was told the outcome
@@ -1116,7 +1118,7 @@ impl Slack {
         for p in posts {
             match p.state.as_str() {
                 // Ask the operator in Slack as well
-                "waiting" if connection.approve_in_slack && !p.dm_tried && p.not_before <= now => {
+                "waiting" if connection.approve_in_slack && !p.dm_tried && p.dm_retry_at <= now => {
                     let sent = self.api("conversations.open", &[("users", connection.operator.clone())]).and_then(|dm| {
                         let channel = dm["channel"]["id"].as_str().unwrap_or("").to_string();
                         let blocks = Self::approval_blocks(&p, &p.channel, None).to_string();
@@ -1127,7 +1129,7 @@ impl Slack {
                             // Not reached or asked to wait: again in a while. A refusal will not change
                             stored.dm_tried = !matches!(sent, Err(Fail::Transport(_)) | Err(Fail::Limited(_)));
                             if !stored.dm_tried {
-                                stored.not_before = now_ms() + 30_000;
+                                stored.dm_retry_at = now_ms() + 30_000;
                             }
                             match &sent {
                                 Ok((channel, ts)) => {
@@ -1264,8 +1266,9 @@ impl Slack {
     /// Whether a post with an unknown outcome is in the channel. It is never
     /// sent again. Only a search that Slack answered can say "not there".
     fn settle(&self, host: &dyn Host, p: &Post) -> bool {
-        // The post, if Slack took it, lies in this window whatever came after
-        let window = [("oldest", format!("{}.000000", (p.attempted / 1000).saturating_sub(5))), ("latest", format!("{}.000000", p.attempted / 1000 + 120)), ("limit", PAGE.to_string()), ("include_all_metadata", "true".to_string())];
+        // The post, if Slack took it, lies in this window whatever came after. The
+        // margins allow for this Mac's clock differing from Slack's
+        let window = [("oldest", format!("{}.000000", (p.attempted / 1000).saturating_sub(60))), ("latest", format!("{}.000000", p.attempted / 1000 + 120)), ("limit", PAGE.to_string()), ("include_all_metadata", "true".to_string())];
         let (mut cursor, mut found, mut checked) = (String::new(), None, Ok(()));
         for _ in 0..40 {
             let mut params = vec![("channel", p.channel.clone())];
@@ -1463,8 +1466,19 @@ fn dial(url: &str) -> Result<Socket, String> {
     let unreached = |e: &dyn std::fmt::Display| format!("Slack was not reached: {e}");
     let host = url.strip_prefix("wss://").and_then(|rest| rest.split(['/', '?']).next()).filter(|h| !h.is_empty()).ok_or("Slack gave no usable address")?;
     let address = if host.contains(':') { host.to_string() } else { format!("{host}:443") };
-    let address = address.to_socket_addrs().map_err(|e| unreached(&e))?.next().ok_or("Slack's address did not resolve")?;
-    let stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)).map_err(|e| unreached(&e))?;
+    // The first address (often IPv6) may be unreachable where another works
+    let mut last = "Slack's address did not resolve".to_string();
+    let mut connected = None;
+    for address in address.to_socket_addrs().map_err(|e| unreached(&e))? {
+        match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(e) => last = unreached(&e),
+        }
+    }
+    let stream = connected.ok_or(last)?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| unreached(&e))?;
     stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| unreached(&e))?;
     let (socket, _) = tungstenite::client_tls(url, stream.try_clone().map_err(|e| unreached(&e))?).map_err(|e| unreached(&e))?;
