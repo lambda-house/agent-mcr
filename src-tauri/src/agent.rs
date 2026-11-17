@@ -436,6 +436,10 @@ fn project_dir_from_transcripts(project: &Path, name: &str) -> Option<PathBuf> {
 /// Folders macOS guards with a permission prompt, and other disks. The app has
 /// no business listing them to work out a project's name.
 pub(crate) fn guarded(dir: &Path, home: Option<&Path>) -> bool {
+    // The permission prompts are macOS's; Windows lists these folders freely
+    if cfg!(windows) {
+        return false;
+    }
     if dir.starts_with("/Volumes") || dir.starts_with("/Network") {
         return true;
     }

@@ -373,8 +373,9 @@ pub async fn slack_connect(app: tauri::AppHandle, bot: String, app_token: String
         let found = service(json!({"op": "slack_probe", "bot": bot, "app": app_token, "operator": operator}))?;
         let text = |key: &str| found[key].as_str().unwrap_or("").to_string();
         let message = format!(
-            "Workspace: {}\nBot: {}\n\n{} ({}) is recorded as you. Only this Slack user's button presses can approve or deny a post, and this is the first sender whose messages reach a session.\n\nThe two tokens are kept in the macOS Keychain on this Mac and are shown to no agent. Nothing is listened to and nothing can be posted until you set a channel's policy.",
-            text("team"), text("botName"), text("operatorName"), text("operator")
+            "Workspace: {}\nBot: {}\n\n{} ({}) is recorded as you. Only this Slack user's button presses can approve or deny a post, and this is the first sender whose messages reach a session.\n\nThe two tokens are kept in {store} on this computer and are shown to no agent. Nothing is listened to and nothing can be posted until you set a channel's policy.",
+            text("team"), text("botName"), text("operatorName"), text("operator"),
+            store = if cfg!(windows) { "Windows Credential Manager" } else { "the macOS Keychain" }
         );
         if !confirmed(&app, "Connect Slack?", message, "Connect", false) {
             return Ok(Value::Null);
@@ -387,7 +388,7 @@ pub async fn slack_connect(app: tauri::AppHandle, bot: String, app_token: String
 #[tauri::command]
 pub async fn slack_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
     blocking(move || {
-        if !confirmed(&app, "Disconnect Slack?", "The tokens are removed from the Keychain, listening stops and posts that wait are cancelled. Channel policies are kept for the next time.".to_string(), "Disconnect", true) {
+        if !confirmed(&app, "Disconnect Slack?", "The tokens are removed from the secret store, listening stops and posts that wait are cancelled. Channel policies are kept for the next time.".to_string(), "Disconnect", true) {
             return service(json!({"op": "slack"}));
         }
         service(json!({"op": "slack_disconnect"}))
