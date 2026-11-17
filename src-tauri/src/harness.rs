@@ -3174,19 +3174,42 @@ mod tests {
     fn windows_cmd_line_preserves_argv_through_cmd_and_npm_shim() {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         let exe = std::env::current_exe().unwrap();
-        let probe = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("examples").join("argv_probe.exe"))
-            .filter(|p| p.is_file())
-            .unwrap_or_else(|| {
-                let status = std::process::Command::new("cargo")
-                    .args(["build", "--example", "argv_probe"])
-                    .status()
-                    .unwrap();
-                assert!(status.success(), "failed to build argv_probe example");
-                exe.parent().unwrap().parent().unwrap().join("examples").join("argv_probe.exe")
-            });
+        let find_probe = || {
+            let mut candidates = Vec::new();
+            if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+                candidates.push(
+                    std::path::PathBuf::from(target_dir)
+                        .join("debug")
+                        .join("examples")
+                        .join("argv_probe.exe"),
+                );
+            }
+            if let Some(p) = exe.parent().and_then(|p| p.parent()) {
+                candidates.push(p.join("examples").join("argv_probe.exe"));
+            }
+            for ancestor in exe.ancestors() {
+                if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    candidates.push(ancestor.join("debug").join("examples").join("argv_probe.exe"));
+                }
+            }
+            candidates.push(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("debug")
+                    .join("examples")
+                    .join("argv_probe.exe"),
+            );
+            candidates.into_iter().find(|p| p.is_file())
+        };
+        let probe = find_probe().unwrap_or_else(|| {
+            let status = std::process::Command::new("cargo")
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .args(["build", "--example", "argv_probe"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build argv_probe example");
+            find_probe().expect("argv_probe.exe missing after cargo build --example argv_probe")
+        });
         assert!(probe.is_file(), "argv_probe.exe missing at {}", probe.display());
 
         let dir = std::env::temp_dir().join(format!("mcr-probe-{}", std::process::id()));

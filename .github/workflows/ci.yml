@@ -100,6 +100,9 @@ jobs:
       - name: Lint Rust backend
         working-directory: src-tauri
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build Rust examples
+        working-directory: src-tauri
+        run: cargo build --locked --examples
       - name: Test Rust backend
         if: ${{ !cancelled() }}
         timeout-minutes: 10
