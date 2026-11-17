@@ -47,6 +47,15 @@ export interface Hosted {
   shells?: RunningShell[];
   /** Subagents active in the last hour, newest first */
   subagents?: Subagent[];
+  /** What it registered that it waits for outside itself, oldest first */
+  waits?: SessionWait[];
+}
+/** Something outside a session that it waits for (its `wait_register` tool). */
+export interface SessionWait {
+  id: string; kind: 'pipeline' | 'integration' | 'human' | 'peer' | 'timer' | 'other'; on: string; ref: string;
+  since: number; expectBy: number; overdue: boolean;
+  /** Who was told that it runs late */
+  escalated: 'supervisor' | 'operator' | null;
 }
 /** An earlier Claude or Codex session that can continue in the harness. */
 export interface Resumable { agent: 'claude' | 'codex'; id: string; cwd: string; modified: number }

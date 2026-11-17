@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Link2, Network, Terminal, Unlink, FolderOpen, FolderPlus, History, MoreHorizontal, Plus, Radar, RotateCw, Search, X } from 'lucide-react';
+import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Hourglass, Link2, Network, Terminal, Unlink, FolderOpen, FolderPlus, History, MoreHorizontal, Plus, Radar, RotateCw, Search, X } from 'lucide-react';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import { BackgroundGate, BackgroundPanel } from './Background';
 import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, executorsBelow, relationRows, type RelationRow, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, executorsBelow, formatUntil, relationRows, type RelationRow, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
@@ -188,7 +188,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const isAgent = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');
   const actions = (h: Hosted): Action[] => [
     // Any agent session can have executors; the Supervisor sees everything already
-    ...(isAgent(h) && !isSupervisor(h) ? START.map(([profile, what]) => ({ label: `New executor (${what})`, icon: <CornerDownRight size={13}/>, run: () => void startExecutor(h, profile) })) : []),
+    ...(isAgent(h) && !isSupervisor(h) ? START.map(([profile, what]) => ({ label: `New executor (${what}) · Preview`, icon: <CornerDownRight size={13}/>, run: () => void startExecutor(h, profile) })) : []),
     ...(!h.exit && !isSupervisor(h) && !h.harness?.supervisor ? [{ label: 'Connect to supervisor…', icon: <Link2 size={13}/>, run: () => setBinding(h.id) }] : []),
     ...(!h.exit && h.harness?.supervisor ? [{ label: 'Detach from supervisor', icon: <Unlink size={13}/>, run: () => connect_to(h.id, null) }] : []),
     { label: 'Copy reference', icon: <Copy size={13}/>, run: () => copyReference(h) },
@@ -233,6 +233,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           <SessionMetrics hosted={h} data={metrics}/>
           {detail && <small>{detail}</small>}
           {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
+          {!h.exit && (h.waits ?? []).map(w => <small key={w.id} className={`hs-wait${w.overdue ? ' overdue' : ''}`}
+            title={`Registered by the session ${formatAge(w.since)}: ${w.kind}${w.ref ? ` · ${w.ref}` : ''}\n${w.overdue ? `Expected to be over ${formatAge(w.expectBy)}${w.escalated ? `; ${w.escalated === 'operator' ? 'you were' : 'its supervisor was'} told` : ''}` : `Expected to be over ${formatUntil(w.expectBy)}`}`}>
+            <Hourglass size={10}/> waits for {w.on}{w.overdue ? ' · late' : ''}</small>)}
           {summary && <small className="hs-status" title={summary.full || undefined}>{summary.lead && <span className="hs-lead">{summary.lead}</span>}{summary.text && <span>{summary.text}</span>}</small>}
         </span>
       </button>

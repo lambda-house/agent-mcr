@@ -276,3 +276,8 @@
 .hs-bind { flex: 0 0 100%; display: flex; gap: 5px; padding: 2px 6px 6px 22px; box-sizing: border-box; }
 .session-cockpit .hs-bind select { flex: 1; min-width: 0; height: 22px; border: 1px solid var(--sc-border); border-radius: 4px; background: var(--sc-panel); color: var(--sc-text); font-size: 11px; }
 .session-cockpit .hs-bind button { height: 22px; padding: 0 8px; font-size: 11px; }
+
+/* What a session registered that it waits for; a mark for parts that ship as a preview */
+.hs-wait { display: inline-flex; align-items: center; gap: 4px; color: var(--sc-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-wait.overdue { color: #e0a23c; }
+.hs-preview { padding: 0 4px; border: 1px solid var(--sc-border); border-radius: 7px; color: var(--sc-muted); font-size: 9px; font-weight: 500; }
