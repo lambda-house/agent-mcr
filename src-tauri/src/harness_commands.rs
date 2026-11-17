@@ -71,8 +71,29 @@ pub async fn harness_status() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn harness_preferences(preferences: Option<crate::harness_preferences::HarnessPreferences>) -> Result<Value, String> {
-    blocking(move || service(json!({"op": "harness_preferences", "preferences": preferences}))).await
+pub async fn harness_preferences(app: tauri::AppHandle, preferences: Option<crate::harness_preferences::HarnessPreferences>) -> Result<Value, String> {
+    blocking(move || {
+        if let Some(next) = &preferences {
+            let current = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
+            if next.supervisor_profile != current.supervisor_profile {
+                if let Some(profile) = next.supervisor_profile.as_deref() {
+                    let label = crate::agents::profiles().into_iter().find(|p| p.id == profile).map(|p| p.label).unwrap_or(profile);
+                    let message = format!(
+                        "Use {label} for the next Supervisor session?\n\nThe Supervisor session can create, inspect, and manage agent sessions in Agent MCR. Only choose a harness you trust with those tools."
+                    );
+                    if !confirmed(&app, "Change Supervisor harness?", message, "Change Supervisor", true) {
+                        return Ok(json!({
+                            "profiles": crate::agents::profiles(),
+                            "enabledProfiles": current.enabled_profiles,
+                            "supervisorProfile": current.supervisor_profile,
+                        }));
+                    }
+                }
+            }
+        }
+        service(json!({"op": "harness_preferences", "preferences": preferences}))
+    })
+    .await
 }
 
 /// The background processes and whether the person allowed them. Starts nothing.

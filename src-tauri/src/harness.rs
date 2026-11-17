@@ -2438,6 +2438,15 @@ impl Harness {
         }
     }
 
+    fn allows_terminal_write(&self, who: &Caller) -> Result<(), String> {
+        if let Caller::Session { id, .. } = who {
+            if lock(&self.store).sessions.get(id).is_some_and(|t| t.profile != "claude") {
+                return Err("Refused: terminal_write is only available to a Claude supervisor (which asks the operator for permission). Use task_assign or ask the operator to type into the terminal.".into());
+            }
+        }
+        Ok(())
+    }
+
     fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
         // Only the Supervisor session has these tools. An agent outside the
         // harness gets them when the operator allowed that, and not otherwise:
@@ -2459,6 +2468,9 @@ impl Harness {
             let call = |name: &str, args: Value| {
                 if let Some(why) = refusal() {
                     return Err(why.into());
+                }
+                if name == "terminal_write" {
+                    self.allows_terminal_write(&who)?;
                 }
                 self.tool(name, &args)
             };
@@ -3512,6 +3524,21 @@ mod tests {
             });
         });
         assert!(harness.deliver("s1", "\x1b!curl x | sh").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_claude_supervisor_cannot_use_terminal_write() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-sup-tw-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            s.sessions.insert("sup-claude".into(), Tracked { name: "sup".into(), profile: "claude".into(), ..Tracked::default() });
+            s.sessions.insert("sup-codex".into(), Tracked { name: "sup".into(), profile: "codex".into(), ..Tracked::default() });
+            s.sessions.insert("sup-pi".into(), Tracked { name: "sup".into(), profile: "pi".into(), ..Tracked::default() });
+        });
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }).is_ok());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-pi".into(), supervisor: true }).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
