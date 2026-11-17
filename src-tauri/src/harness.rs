@@ -3266,16 +3266,29 @@ mod tests {
                 let mut child = pair.slave.spawn_command(cmd).unwrap();
                 drop(pair.slave);
                 let mut reader = pair.master.try_clone_reader().unwrap();
+                let mut writer = pair.master.take_writer().unwrap();
                 let captured = Arc::new(Mutex::new(Vec::new()));
                 let captured_bg = captured.clone();
                 let (eof_tx, eof_rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    use std::io::Read;
+                    use std::io::{Read, Write};
                     let mut buf = [0u8; 4096];
+                    let mut dsr_scan_from = 0usize;
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
-                            Ok(n) => captured_bg.lock().unwrap().extend_from_slice(&buf[..n]),
+                            Ok(n) => {
+                                let mut guard = captured_bg.lock().unwrap();
+                                guard.extend_from_slice(&buf[..n]);
+                                while let Some(pos) = guard[dsr_scan_from..]
+                                    .windows(4)
+                                    .position(|w| w == b"\x1b[6n")
+                                {
+                                    let _ = writer.write_all(b"\x1b[1;1R");
+                                    let _ = writer.flush();
+                                    dsr_scan_from += pos + 4;
+                                }
+                            }
                         }
                     }
                     let _ = eof_tx.send(());

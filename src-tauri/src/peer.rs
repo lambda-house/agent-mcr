@@ -161,10 +161,10 @@ mod win {
         ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
     }
 
-    struct Handle(HANDLE);
+    pub(super) struct Handle(pub(super) HANDLE);
 
     impl Handle {
-        fn open_process(pid: u32) -> Option<Self> {
+        pub(super) fn open_process(pid: u32) -> Option<Self> {
             // SAFETY: OpenProcess returns null on failure.
             let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -295,7 +295,7 @@ mod win {
         }
     }
 
-    fn same_user_handle(peer_proc: &Handle) -> bool {
+    pub(super) fn same_user_handle(peer_proc: &Handle) -> bool {
         let Some(mut theirs) = process_user_sid(peer_proc.0) else {
             return false;
         };
@@ -311,7 +311,7 @@ mod win {
         }
     }
 
-    fn creation_time(process: HANDLE) -> Option<u64> {
+    pub(super) fn creation_time(process: HANDLE) -> Option<u64> {
         // SAFETY: zeroed FILETIME is valid.
         let mut created: FILETIME = unsafe { std::mem::zeroed() };
         let mut exit: FILETIME = unsafe { std::mem::zeroed() };
@@ -552,6 +552,21 @@ mod tests {
     fn a_connection_from_this_process_is_recognised() {
         let accepted_at = accept_time();
         let (a, _b) = stream_pair();
+        #[cfg(windows)]
+        if !same_user(&a) {
+            let pid_res = pid(&a);
+            let wsa_err = unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() };
+            let open_res = pid_res
+                .and_then(|p| u32::try_from(p).ok())
+                .and_then(win::Handle::open_process);
+            let win_err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            let created = open_res.as_ref().and_then(|h| win::creation_time(h.0));
+            let same_h = open_res.as_ref().map(win::same_user_handle);
+            panic!(
+                "same_user(&a) false: pid={pid_res:?} wsa_err={wsa_err} open={} win_err={win_err} created={created:?} accepted_at={accepted_at} same_user_handle={same_h:?}",
+                open_res.is_some()
+            );
+        }
         assert!(same_user(&a));
         assert_eq!(pid(&a), Some(std::process::id() as i32));
         assert!(is_this_program(&a));
