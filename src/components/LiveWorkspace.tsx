@@ -5,7 +5,7 @@ import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import { BackgroundGate, BackgroundPanel } from './Background';
 import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, executorsBelow, formatUntil, relationRows, type RelationRow, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, executorsBelow, formatUntil, relationRows, supervisorChoices, type RelationRow, shortPath, tildePath, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, STATE_LABEL, subagentActive, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
@@ -210,6 +210,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     // Sessions it could work for: live agents, not itself and not below it
     const below = binding === h.id ? executorsBelow(h.id, hosted) : null;
     const candidates = below ? hosted.filter(x => isAgent(x) && !isSupervisor(x) && x.id !== h.id && !below.has(x.id)) : [];
+    // Its own folder first, then the others; each by title
+    const choices = supervisorChoices(h, candidates);
+    const choice = (x: Hosted, withFolder: boolean) => <option key={x.id} value={x.id}>{hostedLabel(x)}{withFolder ? ` · ${shortPath(tildePath(x.cwd, home))}` : ''}</option>;
     const label = hostedLabel(h);
     const detail = h.exit
       ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
@@ -243,7 +246,10 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       {binding === h.id && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
         <select aria-label="Supervisor" autoFocus defaultValue="" onChange={e => { if (e.target.value) connect_to(h.id, e.target.value); }}>
           <option value="" disabled>{candidates.length ? 'Works for…' : 'No other agent session is running'}</option>
-          {candidates.map(x => <option key={x.id} value={x.id}>{hostedLabel(x)} · {shortPath(tildePath(x.cwd, home))}</option>)}
+          {/* Two groups stand in for a separator, which a native select does not draw in every WebKit; one group alone needs no heading */}
+          {choices.here.length > 0 && choices.elsewhere.length > 0
+            ? <><optgroup label="This folder">{choices.here.map(x => choice(x, false))}</optgroup><optgroup label="Other folders">{choices.elsewhere.map(x => choice(x, true))}</optgroup></>
+            : [...choices.here.map(x => choice(x, false)), ...choices.elsewhere.map(x => choice(x, true))]}
         </select>
         <button type="button" onClick={() => setBinding('')}>Cancel</button>
       </form>}

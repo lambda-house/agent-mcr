@@ -343,6 +343,18 @@ export function relationRows(inFolder: Hosted[], all: Hosted[]): RelationRow[] {
   return out;
 }
 
+/**
+ * The sessions offered as supervisor for `session`, in the order of the
+ * chooser: those in its own folder first, then the others; each group by the
+ * title shown, A to Z without regard to case, then by folder, then by id.
+ */
+export function supervisorChoices(session: Hosted, candidates: Hosted[]): { here: Hosted[]; elsewhere: Hosted[] } {
+  const title = (h: Hosted) => hostedLabel(h).toLowerCase();
+  const order = (a: Hosted, b: Hosted) => title(a).localeCompare(title(b)) || a.cwd.localeCompare(b.cwd) || a.id.localeCompare(b.id);
+  const sorted = [...candidates].sort(order);
+  return { here: sorted.filter(h => h.cwd === session.cwd), elsewhere: sorted.filter(h => h.cwd !== session.cwd) };
+}
+
 /** The sessions below one: its executors and theirs (ids). */
 export function executorsBelow(id: string, all: Hosted[]): Set<string> {
   const below = new Set<string>();
