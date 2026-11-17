@@ -44,4 +44,27 @@ describe('Command panel', () => {
     expect(onOpenLive).toHaveBeenCalledWith('h1');
     expect(onSelectSession).not.toHaveBeenCalled();
   });
+
+  it('does not capture Ctrl+K while the terminal has focus', async () => {
+    const onOpenChange = vi.fn();
+    await act(async () => root.render(<SessionCommandPanel open={false} hideTrigger onOpenChange={onOpenChange} enabled sessions={[]}
+      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
+    const term = document.createElement('div');
+    term.className = 'hs-terminal';
+    const textarea = document.createElement('textarea');
+    term.appendChild(textarea);
+    host.appendChild(term);
+    textarea.focus();
+
+    await act(async () => {
+      textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(onOpenChange).not.toHaveBeenCalled();
+
+    textarea.blur();
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(onOpenChange).toHaveBeenCalledWith(true);
+  });
 });

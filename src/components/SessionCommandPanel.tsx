@@ -115,6 +115,10 @@ export default function SessionCommandPanel({
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        const inTerminal =
+          (event.target instanceof Element && event.target.closest('.hs-terminal, .xterm') !== null) ||
+          (document.activeElement?.closest('.hs-terminal, .xterm') ?? null) !== null;
+        if (event.ctrlKey && !event.metaKey && inTerminal) return;
         event.preventDefault();
         onOpenChange(!open);
       }
