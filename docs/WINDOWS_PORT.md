@@ -63,6 +63,10 @@ Update: Codex usage ran out; the Codex reviewer and executor B ended after B's t
 - File ownership, to keep merges small: `harness.rs`, `runner.rs`, `peer.rs`, `ipc.rs`, `agents*`, `session_mcp.rs`, `session_analysis_commands.rs`, `Cargo.toml`/`Cargo.lock` belong to A. `agent.rs`, `sessions.rs`, `session_memory.rs`, `src/`, `tauri.conf.json`, `package.json`, `.github/`, `CLAUDE.md`, `README.md`, `docs/SESSION_ANALYSIS_MCP.md`, `docs/AGENT_HARNESS_DESIGN.md` belong to B. `main.rs` is shared: A owns `get_config_dir` and the `--runner`/`--harness`/`--mcp` branches; B owns `session_folders`, the Access path checks (W8) and the `tauri::Builder` run error path (W10). `docs/WINDOWS_PORT.md`: the planner edits the plan; A writes only under "Wine findings". A needed change in a file the other owns goes to the planner, who hands it to the owner. B collects doc notes from A's commits for W12.
 - Merges (operator decision): W12 (docs) comes last: when A reports W7, B merges `windows-port` into `windows-port-b` and writes the docs against the merged code. Then, A merges `windows-port-b` into `windows-port` once and runs the full gate. No other intermediate merges.
 
+## Remotes
+
+`ci`: private repo `vadimchirkov/agent-mcr-windows`, where CI runs; executor A pushes `windows-port` there. `origin` (`lambda-house/agent-mcr`) has branch `windows-port`, first pushed by the Supervisor at 951dbb9 (operator decision, 2026-11-17); only the Supervisor or the operator updates it. Executors never push to `origin`.
+
 ## Tasks
 
 | Id | Goal | Files | Acceptance |
