@@ -2,10 +2,13 @@ import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type R
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
 import { Badge, DescList, Kbd, ScrollArea, StatusDot, cx } from '@teob/ui';
-import { compact, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
+import { cacheState, compact, contextWindow, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
+import { harnessApi, hostedLabel, hostedState, runningFor, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { TopTabPlugin } from '../plugins/sdk';
 import AgentMark from './AgentMark';
+import { SessionFigures } from './SessionMetrics';
+import '../styles/harness.css';
 import '../styles/command-panel.css';
 
 export interface SessionCommandPanelProps {
@@ -17,6 +20,8 @@ export interface SessionCommandPanelProps {
   directory: string;
   onClearDirectory: () => void;
   onSelectSession: (key: string) => void;
+  /** Show a hosted session in Live */
+  onOpenLive?: (hostedId: string) => void;
   onNavigateView: (viewId: string) => void;
   onOpenSettings: () => void;
   onRefresh: () => void;
@@ -24,7 +29,7 @@ export interface SessionCommandPanelProps {
   topTabs: TopTabPlugin[];
 }
 
-type QuickFilter = 'all' | 'codex' | 'claude' | 'working';
+type QuickFilter = 'all' | 'live' | 'codex' | 'claude' | 'working';
 
 interface CommandEntry {
   id: string;
@@ -35,15 +40,37 @@ interface CommandEntry {
   provider?: string;
   status?: string;
   session?: Session;
+  /** The hosted session running this conversation now */
+  live?: Hosted;
   kind: 'session' | 'nav' | 'action';
   onRun: () => void;
 }
 
 function statusClass(status?: string): string {
   if (status === 'working') return 'cmd-status cmd-status--working';
+  if (status === 'waiting') return 'cmd-status cmd-status--waiting';
   if (status === 'stale') return 'cmd-status cmd-status--stale';
   if (status === 'interrupted') return 'cmd-status cmd-status--interrupted';
   return 'cmd-status cmd-status--idle';
+}
+
+/** The harness's state for a hosted conversation; the index's guess from the transcript otherwise. */
+const rowStatus = (s: Session, live?: Hosted) => live ? hostedState(live) : s.status;
+const statusText = (status: string, live?: Hosted) => live ? STATE_LABEL[hostedState(live)] : status;
+
+/** Context and cache spelled out for the preview; the row shows them as bare figures. */
+function contextDetail(s: Session): string {
+  const c = s.context;
+  if (!c || c.now <= 0) return 'Not recorded yet';
+  const limit = contextWindow(s);
+  const of = limit ? ` of ${compact(limit.size)}${limit.assumed ? ' (assumed)' : ''} · ${Math.round(100 * c.now / limit.size)}%` : '';
+  return `${compact(c.now)}${of}${c.compactions ? ` · ${c.compactions} compaction${c.compactions > 1 ? 's' : ''}` : ''}`;
+}
+function cacheDetail(s: Session, now: number): string | null {
+  const cache = cacheState(s, now);
+  if (!cache) return null;
+  if (cache.warm) return `${cache.assumed ? 'Probably warm' : 'Warm'} for ${runningFor(now, cache.until)}`;
+  return cache.assumed ? 'Unknown (Codex records no lifetime)' : `Cold for ${runningFor(cache.until, now)}`;
 }
 
 export default function SessionCommandPanel({
@@ -55,12 +82,23 @@ export default function SessionCommandPanel({
   directory,
   onClearDirectory,
   onSelectSession,
+  onOpenLive,
   onNavigateView,
   onOpenSettings,
   onRefresh,
   onEnableAccess,
   topTabs,
 }: SessionCommandPanelProps) {
+  // Hosted sessions, asked for each time the panel opens: their names and states win over the index's
+  const [hosted, setHosted] = useState<Hosted[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    harnessApi.list().then(list => { if (live) setHosted(list); }).catch(() => { if (live) setHosted([]); });
+    return () => { live = false; };
+  }, [open]);
+  const liveByKey = useMemo(() => new Map(hosted.filter(h => !h.exit && h.harness?.agentSession)
+    .map(h => [`${h.harness?.profile || h.meta.profile}:${h.harness!.agentSession}`, h])), [hosted]);
   const [query, setQuery] = useState('');
   const [quickFilter, setQuickFilter] = useState<QuickFilter>('all');
   const [active, setActive] = useState(0);
@@ -102,11 +140,12 @@ export default function SessionCommandPanel({
   const counts = useMemo(
     () => ({
       all: scopedSessions.length,
+      live: scopedSessions.filter((s) => liveByKey.has(sessionKey(s))).length,
       codex: scopedSessions.filter((s) => s.provider === 'codex').length,
       claude: scopedSessions.filter((s) => s.provider === 'claude').length,
-      working: scopedSessions.filter((s) => s.status === 'working').length,
+      working: scopedSessions.filter((s) => rowStatus(s, liveByKey.get(sessionKey(s))) === 'working').length,
     }),
-    [scopedSessions],
+    [scopedSessions, liveByKey],
   );
 
   const items = useMemo<CommandEntry[]>(() => {
@@ -116,16 +155,22 @@ export default function SessionCommandPanel({
     if (enabled) {
       const matchingSessions = scopedSessions
         .filter((s) => {
+          const live = liveByKey.get(sessionKey(s));
+          if (quickFilter === 'live' && !live) return false;
           if (quickFilter === 'codex' && s.provider !== 'codex') return false;
           if (quickFilter === 'claude' && s.provider !== 'claude') return false;
-          if (quickFilter === 'working' && s.status !== 'working') return false;
-          return matchesSession(s, query);
+          if (quickFilter === 'working' && rowStatus(s, live) !== 'working') return false;
+          // A hosted session is found by the name it has in Live too
+          return matchesSession(s, query) || (!!live && !!query.trim() && hostedLabel(live).toLowerCase().includes(query.trim().toLowerCase()));
         })
+        // Running conversations first; the order is otherwise the index's
+        .sort((a, b) => Number(liveByKey.has(sessionKey(b))) - Number(liveByKey.has(sessionKey(a))))
         .slice(0, 30);
 
       for (const s of matchingSessions) {
         const key = sessionKey(s);
-        const title = formatSessionTitle(s);
+        const live = liveByKey.get(key);
+        const title = live ? hostedLabel(live, { [s.id]: formatSessionTitle(s) }) : formatSessionTitle(s);
         const folder = s.cwd ? s.cwd.replace(/^\/(Users|home)\/[^/]+/, '~') : '';
         const age = s.modified ? formatAge(s.modified) : '';
         const metaParts = [folder, s.model, age].filter(Boolean);
@@ -135,11 +180,13 @@ export default function SessionCommandPanel({
           label: title,
           sub: metaParts.join(' · '),
           provider: s.provider,
-          status: s.status,
+          status: rowStatus(s, live),
           session: s,
+          live,
           kind: 'session',
           onRun: () => {
-            onSelectSession(key);
+            if (live && onOpenLive) onOpenLive(live.id);
+            else onSelectSession(key);
             close();
           },
         });
@@ -237,10 +284,12 @@ export default function SessionCommandPanel({
   }, [
     enabled,
     scopedSessions,
+    liveByKey,
     quickFilter,
     query,
     topTabs,
     onSelectSession,
+    onOpenLive,
     onNavigateView,
     onOpenSettings,
     onRefresh,
@@ -355,7 +404,7 @@ export default function SessionCommandPanel({
 
               <div className="cmd-subbar">
                 <div className="cmd-pills" role="group" aria-label="Quick filter">
-                  {(['all', 'codex', 'claude', 'working'] as QuickFilter[]).map((f) => (
+                  {(['all', 'live', 'codex', 'claude', 'working'] as QuickFilter[]).map((f) => (
                     <button
                       key={f}
                       type="button"
@@ -366,10 +415,11 @@ export default function SessionCommandPanel({
                       }}
                     >
                       {f === 'working' && <StatusDot tone="success" size="sm" />}
+                      {f === 'live' && <span className="hs-dot running" aria-hidden="true" />}
                       {f === 'codex' && <AgentMark profile="codex" size={12} />}
                       {f === 'claude' && <AgentMark profile="claude" size={12} />}
                       <span>
-                        {f === 'all' ? 'All' : f === 'working' ? 'Working' : f === 'codex' ? 'Codex' : 'Claude'}
+                        {f === 'all' ? 'All' : f === 'live' ? 'In Live' : f === 'working' ? 'Working' : f === 'codex' ? 'Codex' : 'Claude'}
                       </span>
                       {enabled && <span className="cmd-pill__count">{counts[f]}</span>}
                     </button>
@@ -445,10 +495,11 @@ export default function SessionCommandPanel({
                                 {item.sub && <span className="cmd-item__sub">{item.sub}</span>}
                               </span>
                               <span className="cmd-item__right">
+                                {item.session && <SessionFigures session={item.session} />}
                                 {item.status && (
-                                  <span className={statusClass(item.status)}>
-                                    {item.status === 'working' && <StatusDot tone="success" size="sm" />}
-                                    {item.status}
+                                  <span className={cx(statusClass(item.status), item.live && 'cmd-status--live')} title={item.live ? 'Running in Live: the harness reports this state' : 'Guessed from the transcript'}>
+                                    {item.live ? <span className={`hs-dot ${item.status}`} aria-hidden="true" /> : item.status === 'working' && <StatusDot tone="success" size="sm" />}
+                                    {item.session ? statusText(item.status, item.live) : item.status}
                                   </span>
                                 )}
                                 {item.hint && <span className="cmd-item__hint">{item.hint}</span>}
@@ -477,14 +528,20 @@ export default function SessionCommandPanel({
                           <AgentMark profile={activeItem.session.provider} size={15} />
                           {activeItem.session.provider}
                         </span>
-                        <span className={statusClass(activeItem.session.status)}>
-                          {activeItem.session.status === 'working' && <StatusDot tone="success" size="sm" />}
-                          {activeItem.session.status}
+                        <span className={cx(statusClass(activeItem.status), activeItem.live && 'cmd-status--live')}>
+                          {activeItem.live ? <span className={`hs-dot ${activeItem.status}`} aria-hidden="true" /> : activeItem.status === 'working' && <StatusDot tone="success" size="sm" />}
+                          {activeItem.live ? `In Live · ${statusText(activeItem.status ?? '', activeItem.live)}` : activeItem.status}
                         </span>
                       </div>
-                      <h3 className="cmd-preview__title">{formatSessionTitle(activeItem.session)}</h3>
+                      <h3 className="cmd-preview__title">{activeItem.label}</h3>
+                      {activeItem.live?.harness?.status && <p className="cmd-preview__status">{activeItem.live.harness.status}</p>}
+                      {activeItem.live?.harness?.attention && <p className="cmd-preview__status cmd-preview__status--needs">{activeItem.live.harness.attention.text}</p>}
+                      <SessionFigures session={activeItem.session} />
                       <DescList
                         items={[
+                          ...(activeItem.label !== formatSessionTitle(activeItem.session)
+                            ? [{ label: 'Started as', value: formatSessionTitle(activeItem.session) }]
+                            : []),
                           {
                             label: 'Workspace',
                             value: activeItem.session.cwd
@@ -498,6 +555,8 @@ export default function SessionCommandPanel({
                               ? `${activeItem.session.model}${activeItem.session.effort ? ` · ${activeItem.session.effort}` : ''}`
                               : 'Unknown',
                           },
+                          { label: 'Context', value: contextDetail(activeItem.session) },
+                          ...(cacheDetail(activeItem.session, Date.now()) ? [{ label: 'Cache', value: cacheDetail(activeItem.session, Date.now()) }] : []),
                           {
                             label: 'Tokens',
                             value: activeItem.session.usageKnown
@@ -526,7 +585,7 @@ export default function SessionCommandPanel({
                         </div>
                       )}
                       <div className="cmd-preview__footer">
-                        <Kbd>↵</Kbd> Open session inspector
+                        <Kbd>↵</Kbd> {activeItem.live && onOpenLive ? 'Show in Live' : 'Open session inspector'}
                       </div>
                     </>
                   ) : activeItem ? (

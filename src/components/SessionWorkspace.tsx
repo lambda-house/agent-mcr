@@ -124,6 +124,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       directory,
       onClearDirectory: () => setDirectory(''),
       onSelectSession: (key) => { setSelected(key); setView('history'); },
+      onOpenLive: (id) => { setFocus({ id, at: Date.now() }); setView('live'); },
       onNavigateView: (viewId) => setView(viewId),
       onOpenSettings: () => useStore.getState().setSettingsOpen(true),
       onRefresh: () => void refresh(),

@@ -150,6 +150,8 @@ export interface GlobalOverlayContext {
   directory: string;
   onClearDirectory: () => void;
   onSelectSession: (key: string) => void;
+  /** Show a hosted session in Live */
+  onOpenLive?: (hostedId: string) => void;
   onNavigateView: (viewId: string) => void;
   onOpenSettings: () => void;
   onRefresh: () => void;
