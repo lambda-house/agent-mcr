@@ -114,11 +114,7 @@ export default function SessionCommandPanel({
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
-        const inTerminal =
-          (event.target instanceof Element && event.target.closest('.hs-terminal, .xterm') !== null) ||
-          (document.activeElement?.closest('.hs-terminal, .xterm') ?? null) !== null;
-        if (event.ctrlKey && !event.metaKey && inTerminal) return;
+      if (event.metaKey && !event.ctrlKey && !event.altKey && event.key.toLowerCase() === 's') {
         event.preventDefault();
         onOpenChange(!open);
       }
@@ -345,13 +341,13 @@ export default function SessionCommandPanel({
         <button
           type="button"
           className="cmd-trigger-btn"
-          aria-keyshortcuts="Meta+K"
+          aria-keyshortcuts="Meta+S"
           onClick={() => onOpenChange(true)}
-          title="Search sessions & commands (⌘K)"
+          title="Search sessions & commands (⌘S)"
         >
           <Search size={13} aria-hidden="true" />
           <span className="cmd-trigger-btn__label">Search</span>
-          <Kbd>⌘K</Kbd>
+          <Kbd>⌘S</Kbd>
         </button>
       )}
 

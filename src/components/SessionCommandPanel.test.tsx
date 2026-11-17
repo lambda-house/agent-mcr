@@ -45,7 +45,7 @@ describe('Command panel', () => {
     expect(onSelectSession).not.toHaveBeenCalled();
   });
 
-  it('does not capture Ctrl+K while the terminal has focus', async () => {
+  it('opens on Cmd+S even while the terminal has focus, and leaves Ctrl+K and Ctrl+S alone', async () => {
     const onOpenChange = vi.fn();
     await act(async () => root.render(<SessionCommandPanel open={false} hideTrigger onOpenChange={onOpenChange} enabled sessions={[]}
       directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
@@ -56,15 +56,21 @@ describe('Command panel', () => {
     host.appendChild(term);
     textarea.focus();
 
+    const ctrlK = new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true });
+    const ctrlS = new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true, cancelable: true });
     await act(async () => {
-      textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+      textarea.dispatchEvent(ctrlK);
+      textarea.dispatchEvent(ctrlS);
     });
     expect(onOpenChange).not.toHaveBeenCalled();
+    expect(ctrlK.defaultPrevented).toBe(false);
+    expect(ctrlS.defaultPrevented).toBe(false);
 
-    textarea.blur();
+    const cmdS = new KeyboardEvent('keydown', { key: 's', metaKey: true, bubbles: true, cancelable: true });
     await act(async () => {
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+      textarea.dispatchEvent(cmdS);
     });
+    expect(cmdS.defaultPrevented).toBe(true);
     expect(onOpenChange).toHaveBeenCalledWith(true);
   });
 });
