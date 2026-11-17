@@ -3311,12 +3311,18 @@ mod tests {
                 let _ = eof_rx.recv_timeout(Duration::from_secs(5));
                 let raw = captured.lock().unwrap().clone();
                 assert!(status.success(), "cmd failed for {} (output: {:?})", prog.display(), String::from_utf8_lossy(&raw));
-                let text = String::from_utf8_lossy(&raw);
+                let mut parser = vt100::Parser::new(
+                    std::num::NonZeroU16::new(24).unwrap(),
+                    std::num::NonZeroU16::new(512).unwrap(),
+                    0,
+                );
+                parser.process(&raw);
+                let text = parser.screen().contents();
                 let json_line = text
                     .lines()
                     .map(str::trim)
                     .find(|l| l.starts_with('[') && l.ends_with(']'))
-                    .unwrap_or_else(|| panic!("no JSON argv line in ConPTY output for {}: {text:?}", prog.display()));
+                    .unwrap_or_else(|| panic!("no JSON argv line in ConPTY output for {}: {text:?} (raw: {:?})", prog.display(), String::from_utf8_lossy(&raw)));
                 let got: Vec<String> = serde_json::from_str(json_line).unwrap();
                 assert_eq!(got, payload, "argv mismatch via {}", prog.display());
             }

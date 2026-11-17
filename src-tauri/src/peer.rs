@@ -554,18 +554,30 @@ mod tests {
         let (a, _b) = stream_pair();
         #[cfg(windows)]
         if !same_user(&a) {
-            let pid_res = pid(&a);
-            let wsa_err = unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() };
-            let open_res = pid_res
-                .and_then(|p| u32::try_from(p).ok())
-                .and_then(win::Handle::open_process);
-            let win_err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-            let created = open_res.as_ref().and_then(|h| win::creation_time(h.0));
-            let same_h = open_res.as_ref().map(win::same_user_handle);
-            panic!(
-                "same_user(&a) false: pid={pid_res:?} wsa_err={wsa_err} open={} win_err={win_err} created={created:?} accepted_at={accepted_at} same_user_handle={same_h:?}",
-                open_res.is_some()
-            );
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAIoctl, SOCKET};
+            let probe = |s: &Stream| {
+                let mut out = [0u64; 2];
+                let mut bytes: u32 = 0;
+                let rc = unsafe {
+                    WSAIoctl(
+                        s.as_raw_socket() as SOCKET,
+                        0x5800_0100,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr().cast(),
+                        std::mem::size_of_val(&out) as u32,
+                        &mut bytes,
+                        std::ptr::null_mut(),
+                        None,
+                    )
+                };
+                let wsa = unsafe { WSAGetLastError() };
+                (rc, bytes, out[0], wsa)
+            };
+            let pa = probe(&a);
+            let pb = probe(&_b);
+            panic!("same_user(&a) false: a={pa:?} b={pb:?} pid(&a)={:?}", pid(&a));
         }
         assert!(same_user(&a));
         assert_eq!(pid(&a), Some(std::process::id() as i32));
