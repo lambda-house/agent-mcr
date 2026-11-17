@@ -294,13 +294,15 @@ pub async fn harness_bind(app: tauri::AppHandle, id: String, supervisor: Option<
     blocking(move || {
         if let Some(up) = &supervisor {
             let sessions = service(json!({"op": "sessions"}))?;
+            // Names are chosen by agents: the folder and the id say which session it really is
             let name = |id: &str| {
                 sessions["sessions"].as_array().and_then(|all| all.iter().find(|s| s["id"] == id)).map(|s| {
                     let h = &s["harness"];
-                    h["name"].as_str().filter(|n| !n.is_empty()).or(h["title"].as_str().filter(|n| !n.is_empty())).unwrap_or(id).to_string()
+                    let name = h["name"].as_str().filter(|n| !n.is_empty()).or(h["title"].as_str().filter(|n| !n.is_empty())).unwrap_or("unnamed");
+                    format!("\u{201c}{name}\u{201d}\n    {} \u{00b7} {id}", s["cwd"].as_str().unwrap_or(""))
                 }).unwrap_or_else(|| id.to_string())
             };
-            let message = format!("\u{201c}{}\u{201d} will supervise \u{201c}{}\u{201d}: it can give it tasks, read its terminal and its results, and gets its reports. It cannot type into it or answer its permission prompts.", name(up), name(&id));
+            let message = format!("{}\n\nwill supervise\n\n{}\n\nIt can give it tasks, read its terminal and its results, and gets its reports. It cannot type into it or answer its permission prompts.", name(up), name(&id));
             if !confirmed(&app, "Connect to this supervisor?", message, "Connect", false) {
                 return service(json!({"op": "sessions"})).map(|_| Value::Null);
             }

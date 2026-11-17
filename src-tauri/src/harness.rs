@@ -30,7 +30,6 @@ const MAX_LIVE: usize = 40;
 /// Levels of supervisor above a session, and executors one session may have
 const MAX_DEPTH: usize = 5;
 const MAX_EXECUTORS: usize = 12;
-const MAX_LINKS: usize = 500;
 const MAX_TASKS: usize = 500;
 const MAX_TEXT: usize = 200_000;
 const MAX_WAIT: u64 = 600;
@@ -756,9 +755,6 @@ struct Store {
     /// The operator lets agents outside the harness use the supervisor tools
     #[serde(default)]
     outside_supervisors: bool,
-    /// Executor's conversation → its supervisor's conversation, so the
-    /// relation survives a restart or a resume of either, when ids change
-    links: BTreeMap<String, String>,
     /// Connected `mcr` bridges per session; `Tracked.tools` follows it
     #[serde(skip)]
     bridges: BTreeMap<String, usize>,
@@ -829,52 +825,21 @@ impl Store {
                 return Err(format!("Refused: that session already has {MAX_EXECUTORS} executors"));
             }
         }
-        let conversation = self.sessions.get(child).and_then(|t| t.agent_session.clone());
-        if let (None, Some(conversation)) = (supervisor, conversation) {
-            // Detached on purpose: a later restart must not bring the relation back
-            self.links.remove(&conversation);
-        }
         if let Some(t) = self.sessions.get_mut(child) {
             t.supervisor = supervisor.map(str::to_owned);
         }
-        self.sync_links();
         Ok(())
     }
 
-    /// Keep the relation across ids that change: remember it by conversation,
-    /// and restore it when a restarted or resumed session appears.
-    fn sync_links(&mut self) {
-        let ids: Vec<String> = self.sessions.keys().cloned().collect();
-        // A supervisor that is gone: its executors are on their own until it comes back
-        for id in &ids {
-            let gone = self.sessions[id].supervisor.as_ref().is_some_and(|up| !self.sessions.contains_key(up));
-            if gone {
-                if let Some(t) = self.sessions.get_mut(id) {
-                    t.supervisor = None;
-                }
+    /// A supervisor that is gone leaves its executors independent. The
+    /// relation is never brought back by itself: a restart carries it over to
+    /// the new id (`Harness::restart`), anything else is the operator's to redo.
+    fn drop_dangling(&mut self) {
+        let gone: Vec<String> = self.sessions.iter().filter(|(_, t)| t.supervisor.as_ref().is_some_and(|up| !self.sessions.contains_key(up))).map(|(id, _)| id.clone()).collect();
+        for id in gone {
+            if let Some(t) = self.sessions.get_mut(&id) {
+                t.supervisor = None;
             }
-        }
-        let by_conversation: BTreeMap<String, String> = self.sessions.iter().filter_map(|(id, t)| Some((t.agent_session.clone()?, id.clone()))).collect();
-        for id in &ids {
-            let t = &self.sessions[id];
-            let Some(conversation) = t.agent_session.clone() else { continue };
-            match &t.supervisor {
-                Some(up) => {
-                    if let Some(theirs) = self.sessions.get(up).and_then(|u| u.agent_session.clone()) {
-                        self.links.insert(conversation, theirs);
-                    }
-                }
-                None => {
-                    let back = self.links.get(&conversation).and_then(|theirs| by_conversation.get(theirs)).filter(|up| *up != id && !self.under(id, up)).cloned();
-                    if let (Some(up), Some(t)) = (back, self.sessions.get_mut(id)) {
-                        t.supervisor = Some(up);
-                    }
-                }
-            }
-        }
-        while self.links.len() > MAX_LINKS {
-            let Some(old) = self.links.keys().find(|k| !by_conversation.contains_key(*k)).or(self.links.keys().next()).cloned() else { break };
-            self.links.remove(&old);
         }
     }
 
@@ -1046,7 +1011,7 @@ impl Store {
 
     fn trim(&mut self) {
         let now = now_ms();
-        self.sync_links();
+        self.drop_dangling();
         self.notes.retain(|_, n| n.expires > now);
         while self.messages.len() > MAX_MESSAGES {
             let Some(oldest) = self.messages.values().min_by_key(|m| (m.read == 0, m.created)).map(|m| m.id.clone()) else { break };
@@ -1900,7 +1865,8 @@ impl Harness {
             }
             for task in &out {
                 if s.sessions.contains_key(&task.by) {
-                    let result = task.result.clone().unwrap_or_default();
+                    // No longer its executor: it learns that the task ended, not what the session said
+                    let result = if s.under(&task.by, &task.session) { task.result.clone().unwrap_or_default() } else { String::new() };
                     let text = format!("Task {} that you gave this session is {}.{}", task.id, task.state, if result.is_empty() { String::new() } else { format!(" Its last message:\n{}", result.chars().take(MAX_MESSAGE_TEXT - 200).collect::<String>()) });
                     s.post(Message { from: task.session.clone(), to: task.by.clone(), text, ..Message::default() });
                 }
@@ -2057,7 +2023,9 @@ impl Harness {
                 }
                 let report = self.update(|s| s.report(me, kind, &said))?;
                 // Its supervisor reads it too (MCR-41); the operator's mark is unchanged
-                if let Some(up) = lock(&self.store).sessions.get(me).and_then(|t| t.supervisor.clone()) {
+                // Bound first: a guard in the `if let` would be held while `update` locks again
+                let above = lock(&self.store).sessions.get(me).and_then(|t| t.supervisor.clone());
+                if let Some(up) = above {
                     let what = if kind == "needs_human" { "reports that it needs the operator" } else { "reports a piece of work done" };
                     self.update(|s| {
                         s.post(Message { from: me.into(), to: up.clone(), text: format!("Your executor {what}:\n{said}"), ..Message::default() });
@@ -2177,8 +2145,20 @@ impl Harness {
                 if let Some(task) = args["task"].as_str() {
                     plain_prompt(task)?;
                 }
+                // In its own folder or below: starting an agent anywhere else is the operator's action in the app
+                let home = mine["cwd"].as_str().unwrap_or("");
+                let cwd = match args["cwd"].as_str().filter(|c| !c.is_empty()) {
+                    Some(wanted) => {
+                        let dir = dunce::canonicalize(wanted).map_err(|e| format!("{wanted}: {e}"))?;
+                        if home.is_empty() || !dir.starts_with(home) {
+                            return Err(format!("Refused: an executor starts in your folder ({home}) or below it. For another folder, ask the operator to start it in the app and connect it to you."));
+                        }
+                        dir.display().to_string()
+                    }
+                    None => home.to_string(),
+                };
                 let created = self.create_as(&json!({
-                    "profile": profile, "cwd": args["cwd"].as_str().filter(|c| !c.is_empty()).or(mine["cwd"].as_str()), "name": args["name"], "role": args["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("executor"),
+                    "profile": profile, "cwd": cwd, "name": args["name"], "role": args["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("executor"),
                     "task": args["task"], "supervisor": me, "by": me,
                 }), false)?;
                 let mut out = Self::brief(&created);
@@ -2188,11 +2168,12 @@ impl Harness {
             }
             "task_assign" => {
                 let session = self.mine(me, text("session")?)?;
-                self.tool("task_assign", &json!({"session": session, "text": text("text")?, "by": me}))?
+                self.assign_checked(&session, text("text")?, me)?
             }
             "task_status" | "task_wait" => {
                 let task = lock(&self.store).tasks.get(text("task")?).cloned().ok_or("No such task")?;
-                if task.by != me && !lock(&self.store).under(me, &task.session) {
+                // Also a task it gave itself is closed to it once the session is no longer its executor
+                if !lock(&self.store).under(me, &task.session) {
                     return Err("Refused: that task belongs to a session that is not one of your executors".into());
                 }
                 self.tool(name, args)?
@@ -2274,6 +2255,22 @@ impl Harness {
         };
         bridged(-1);
         result
+    }
+
+    /// A task from a supervisor: for an agent, in words, and never while the
+    /// session waits on the operator (D6). `by` is the hosted session that
+    /// assigns it, known from its process, or empty.
+    fn assign_checked(&self, session: &str, text: &str, by: &str) -> Result<Value, String> {
+        let s = self.session(session)?;
+        if s["harness"]["attention"]["kind"] == "permission" {
+            return Err(format!("Refused: the session is waiting for the operator ({}). Only the human answers permission prompts.", s["harness"]["attention"]["text"].as_str().unwrap_or("a prompt")));
+        }
+        // In a shell the text would run as a command, with nobody asked
+        if !adapter(s["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
+            return Err("Refused: tasks are for agent sessions. In a shell the text would run as a command; use terminal_write, which asks the operator.".into());
+        }
+        plain_prompt(text)?;
+        self.assign(session, text, by).map(|t| json!(t))
     }
 
     fn assign(&self, session: &str, text: &str, by: &str) -> Result<Task, String> {
@@ -2573,11 +2570,6 @@ impl Harness {
                 out
             }),
             "session_resumable" => self.control(&json!({"op": "resumable", "days": args["days"]})),
-            "session_bind" => self.bind(text("session")?, args["supervisor"].as_str().filter(|s| !s.is_empty())).map(|s| {
-                let mut out = Self::brief(&s);
-                out["supervisor"] = s["harness"]["supervisor"].clone();
-                out
-            }),
             "session_result" => {
                 let s = self.session(text("session")?)?;
                 Ok(json!({ "session": s["id"], "state": s["harness"]["state"], "lastMessage": s["harness"]["lastMessage"], "at": s["harness"]["lastMessageAt"] }))
@@ -2585,12 +2577,7 @@ impl Harness {
             "task_assign" => {
                 let session = text("session")?;
                 refuse_if_waiting(session)?;
-                // In a shell the text would run as a command, with nobody asked
-                if !adapter(self.session(session)?["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
-                    return Err("Refused: tasks are for agent sessions. In a shell the text would run as a command; use terminal_write, which asks the operator.".into());
-                }
-                plain_prompt(text("text")?)?;
-                self.assign(session, text("text")?, args["by"].as_str().unwrap_or("")).map(|t| json!(t))
+                self.assign_checked(session, text("text")?, "")
             }
             "task_status" | "task_wait" => {
                 let id = text("task")?.to_string();
@@ -2859,7 +2846,6 @@ fn supervisor_tools() -> Value {
             "resume": {"type": "string", "description": "Id of the earlier session to continue"},
             "supervisor": {"type": "string", "description": "Id of the running agent session it works for: that session then has the task tools over it"},
         }), &[]),
-        tool("session_bind", "Put a running session under another running agent session as its executor, or make it independent again. The supervising session gets task_assign, task_wait, session_status, session_result and terminal_read for its executors and theirs.", json!({"session": session, "supervisor": {"type": "string", "description": "Id of the supervising session; leave out to detach"}}), &["session"]),
         tool("session_resumable", "Earlier top-level Claude and Codex sessions that can be resumed here: agent, id, folder, last change. A session changed in the last minutes may still be open in another terminal; ask the operator to close it there first.", json!({"days": {"type": "integer", "description": "How far back to look (default 3)"}}), &[]),
         tool("session_result", "The last message the agent ended a turn with.", json!({"session": session}), &["session"]),
         tool("task_assign", "Give a session a task. It is typed in when the session is idle; until then it is queued. Returns the task; follow it with task_wait.", json!({"session": session, "text": {"type": "string", "description": "The prompt"}}), &["session", "text"]),
@@ -2913,7 +2899,7 @@ fn agent_tools() -> Value {
         tool("bulletin_remove", "Take back a note of yours that is no longer true.", json!({"note": {"type": "string", "description": "Note id from bulletin_read"}}), &["note"], false),
         tool("executor_create", "Start a new agent session that works for you: your executor. The operator sees it under your session. It starts in your folder with your agent kind unless you say otherwise. Give it a first task here or later with task_assign. Use it for work that should run next to yours with its own context; not for a quick question (ask a peer) or a subtask your own subagents can do.", json!({
             "profile": {"type": "string", "description": "claude or codex (default: your own)"},
-            "cwd": {"type": "string", "description": "Working folder, absolute path (default: your own)"},
+            "cwd": {"type": "string", "description": "Working folder: your own (default) or a folder below it, absolute path"},
             "name": {"type": "string", "description": "A short name shown to the operator"},
             "role": {"type": "string", "description": "Its part, in a few words"},
             "task": {"type": "string", "description": "First prompt for it"},
@@ -3404,23 +3390,43 @@ mod tests {
         assert_eq!(store.chain("c"), ["b", "a"]);
         // No circle, no self, nobody unknown
         assert!(store.bind("a", Some("c")).is_err() && store.bind("a", Some("a")).is_err() && store.bind("a", Some("zz")).is_err());
-        // The supervisor restarts under a new id with the same conversation: its executor finds it again
+        // A supervisor that is gone leaves its executors independent, and coming back does not attach them again
         let a = store.sessions.remove("a").unwrap();
-        store.sessions.insert("a2".into(), Tracked { supervisor: None, ..a });
-        store.trim();
-        assert_eq!(store.sessions["b"].supervisor.as_deref(), Some("a2"));
-        // So does an executor that comes back under a new id
-        let c = store.sessions.remove("c").unwrap();
-        store.sessions.insert("c2".into(), Tracked { supervisor: None, ..c });
-        store.trim();
-        assert_eq!(store.chain("c2"), ["b", "a2"]);
-        // Detached on purpose stays detached; a supervisor that is gone leaves its executors on their own
-        store.bind("c2", None).unwrap();
-        store.trim();
-        assert_eq!(store.sessions["c2"].supervisor, None);
-        store.sessions.remove("a2");
         store.trim();
         assert_eq!(store.sessions["b"].supervisor, None);
+        assert_eq!(store.chain("c"), ["b"]);
+        store.sessions.insert("a2".into(), a);
+        store.trim();
+        assert_eq!(store.sessions["b"].supervisor, None);
+        store.bind("c", None).unwrap();
+        assert_eq!(store.sessions["c"].supervisor, None);
+    }
+
+    /// The store's mutex is not re-entrant: a tool that takes it twice hangs the whole service.
+    #[test]
+    fn an_executors_report_reaches_its_supervisor_without_blocking_the_service() {
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Arc::new(Harness::open(&dir));
+        harness.update(|s| {
+            s.sessions.insert("up".into(), Tracked { name: "Lead".into(), ..Tracked::default() });
+            s.sessions.insert("ex".into(), Tracked { name: "Worker".into(), supervisor: Some("up".into()), ..Tracked::default() });
+        });
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = harness.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(worker.agent_tool("ex", "report", &json!({"kind": "done", "text": "tests pass"})));
+        });
+        let out = result.recv_timeout(Duration::from_secs(10)).expect("the report tool never returned: the store lock is held twice").unwrap();
+        assert_eq!(out["kind"], "done");
+        let store = lock(&harness.store);
+        let inbox: Vec<&Message> = store.messages.values().filter(|m| m.to == "up").collect();
+        assert_eq!(inbox.len(), 1);
+        assert!(inbox[0].from == "ex" && inbox[0].text.contains("tests pass"));
+        // The operator's mark is unchanged
+        assert_eq!(store.sessions["ex"].attention.as_ref().and_then(|a| a.report.as_deref()), Some("done"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
