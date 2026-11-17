@@ -64,14 +64,14 @@ describe('Live workspace', () => {
     expect([...host.querySelectorAll('[role="menuitem"]')].map(b => b.textContent?.trim())).toEqual(['Copy reference', 'Restart (reload settings)', 'Close session']);
     await act(async () => item('Copy reference').click()); await flush();
     // A pointer, not a paragraph: the id the mcr tools take, and the name for the reader
-    expect(copy.mock.calls[0][0]).toBe('mcr:r1 "Fixing tests"');
+    expect(copy.mock.calls[0][0]).toBe("mcr:r1 'Fixing tests'");
     // The same pointer travels with a row dragged into a terminal; an ended session has nothing to point at
     const data = new Map<string, string>();
     const drag = new Event('dragstart', { bubbles: true });
     Object.assign(drag, { dataTransfer: { setData: (type: string, value: string) => data.set(type, value) } });
     const [live, gone] = [...host.querySelectorAll('.hs-dir .hs-item')] as HTMLButtonElement[];
     await act(async () => { live.dispatchEvent(drag); });
-    expect([...data]).toEqual([['application/x-mcr-session', 'r1'], ['text/plain', 'mcr:r1 "Fixing tests"']]);
+    expect([...data]).toEqual([['application/x-mcr-session', 'r1'], ['text/plain', "mcr:r1 'Fixing tests'"]]);
     expect([live.getAttribute('draggable'), gone.getAttribute('draggable')]).toEqual(['true', 'false']);
     expect(host.querySelector('[role="menu"]')).toBeNull();
     // Restart: the conversation continues under a new id, which takes the old one's place

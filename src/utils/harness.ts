@@ -175,10 +175,14 @@ export const SESSION_DRAG_TYPE = 'application/x-mcr-session';
 /**
  * A pointer to a session, to paste or drop into another one: `mcr:<id>` is
  * what the mcr tools take as `to` (hosted agents are told so, `PEER_NOTE`);
- * the name after it is for the reader.
+ * the name after it is for the reader. The name can be set by an agent (a
+ * terminal title, a name the supervisor chose) and the pointer may be dropped
+ * into a shell: it goes in single quotes, without anything a shell would
+ * expand or that would end the quotes or the line.
  */
 export function sessionReference(h: Hosted): string {
-  return `mcr:${h.id} "${hostedLabel(h).replace(/"/g, "'")}"`;
+  const name = hostedLabel(h).replace(/[\u0000-\u001f\u007f-\u009f'"`$\\]/g, '').trim();
+  return `mcr:${h.id} '${name}'`;
 }
 
 /** A session whose agent can be ended and started again on the same conversation. */

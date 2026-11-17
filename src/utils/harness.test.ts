@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gist, hostedLabel, hostedState, pastedImage, sessionSummary, shellQuote, type Hosted } from './harness';
+import { gist, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -54,5 +54,13 @@ describe('harness helpers', () => {
     expect(hostedState(hosted({ harness: { ...tracked, state: 'unknown' } }))).toBe('running');
     expect(hostedState(hosted({ harness: { ...tracked, state: 'working' }, exit: { code: 0, signal: null, at: 1 } }))).toBe('exited');
     expect(hostedLabel(hosted({ meta: { label: 'Claude Code' }, harness: { ...tracked, state: 'idle' } }))).toBe('reviewer');
+  });
+});
+
+describe('session reference', () => {
+  it('carries nothing a shell would run or that ends the quotes or the line', () => {
+    const named = (name: string) => sessionReference(hosted({ meta: { label: 'Claude Code', profile: 'claude', name } } as Partial<Hosted>));
+    expect(named('Fixing tests')).toMatch(/^mcr:\S+ 'Fixing tests'$/);
+    expect(named('a $(rm -rf ~) `id` \\ "b" \'c\'\nrm\u001b[0m')).toMatch(/^mcr:\S+ 'a \(rm -rf ~\) id {2}b crm\[0m'$/);
   });
 });

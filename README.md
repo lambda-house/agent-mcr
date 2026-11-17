@@ -13,7 +13,7 @@ How it is built: [ARCHITECTURE.md](ARCHITECTURE.md). The design it grows towards
 
 ## Status
 
-Pre-release (0.1.0): macOS on Apple Silicon only. Builds are on the [releases page](https://github.com/lambda-house/agent-mcr/releases); they are not signed with a Developer ID and not notarized, so macOS asks you to allow the first launch (System Settings → Privacy & Security → Open Anyway). The app does not update itself.
+Pre-release (0.1.1): macOS on Apple Silicon only. Builds are on the [releases page](https://github.com/lambda-house/agent-mcr/releases); they are not signed with a Developer ID and not notarized, so macOS asks you to allow the first launch (System Settings → Privacy & Security → Open Anyway). The app does not update itself.
 
 ## Build and run
 

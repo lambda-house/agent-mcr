@@ -129,7 +129,8 @@ export default function TerminalPane({ id, active, onQuit }: {
       if (!dragged(e)) return;
       e.preventDefault(); e.stopPropagation();
       const reference = e.dataTransfer?.getData('text/plain');
-      if (reference) { t.paste(`${reference} `); t.focus(); }
+      // Typed tasks are checked for a leading !, # or /; this always starts with the pointer
+      if (reference?.startsWith('mcr:')) { t.paste(`${reference} `); t.focus(); }
     };
     element.addEventListener('dragover', onDragOver, true);
     element.addEventListener('drop', onDrop, true);
