@@ -247,10 +247,35 @@ fn valid_id(id: &str) -> bool {
 }
 
 pub fn random_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let mut bytes = [0u8; 16];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
-        bytes[..8].copy_from_slice(&now_ms().to_le_bytes());
+    #[cfg(unix)]
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok();
+    #[cfg(windows)]
+    let ok = {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        // SAFETY: `bytes` is a 16-byte writable buffer; system-preferred RNG needs no handle.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        status == 0
+    };
+    #[cfg(not(any(unix, windows)))]
+    let ok = false;
+    if !ok {
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&seq.to_le_bytes());
         bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+        bytes[12..16].copy_from_slice(&(now_ms() as u32).to_le_bytes());
     }
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1227,5 +1252,15 @@ mod tests {
             assert!(ask(op).contains("Refused"), "{op}");
         }
         assert_eq!(Client::connect(&socket).unwrap().call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0, "nothing was started");
+    }
+
+    #[test]
+    fn random_id_is_unique_across_rapid_calls() {
+        let mut prefixes = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let id = random_id();
+            assert_eq!(id.len(), 32);
+            assert!(prefixes.insert(id[..10].to_string()), "duplicate random_id prefix");
+        }
     }
 }

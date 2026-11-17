@@ -936,18 +936,41 @@ impl Note {
     }
 }
 
+fn folder_parts(path: &str) -> (bool, Vec<String>) {
+    let bytes = path.as_bytes();
+    let is_windows = path.starts_with(r"\\")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    let trimmed = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    };
+    let parts = trimmed
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .map(|p| if is_windows { p.to_ascii_lowercase() } else { p.to_string() })
+        .collect();
+    (is_windows, parts)
+}
+
 /// How the folder `theirs` lies to `mine`: `same`, `below` (inside mine) or
 /// `above` (it contains mine). Nothing when they are apart or one is unknown.
 pub fn folder_relation(mine: &str, theirs: &str) -> Option<&'static str> {
     if mine.is_empty() || theirs.is_empty() {
         return None;
     }
-    let (mine, theirs) = (Path::new(mine), Path::new(theirs));
+    let (mine_win, mine) = folder_parts(mine);
+    let (theirs_win, theirs) = folder_parts(theirs);
+    if mine_win != theirs_win || mine.is_empty() || theirs.is_empty() {
+        return None;
+    }
     if mine == theirs {
         Some("same")
-    } else if theirs.starts_with(mine) {
+    } else if theirs.starts_with(&mine) {
         Some("below")
-    } else if mine.starts_with(theirs) {
+    } else if mine.starts_with(&theirs) {
         Some("above")
     } else {
         None
@@ -3299,7 +3322,10 @@ mod tests {
             assert_eq!(&argv[1..4], &["-l", "-i", "-c"]);
         }
         let hooks = claude_settings("/Apps/Agent MCR.app/agent-mcr", false);
+        #[cfg(unix)]
         assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "'/Apps/Agent MCR.app/agent-mcr' --harness-hook Stop");
+        #[cfg(windows)]
+        assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "\"/Apps/Agent MCR.app/agent-mcr\" --harness-hook Stop");
     }
 
     fn store_with(session: &str, state: &str) -> Store {
@@ -3499,6 +3525,10 @@ mod tests {
         assert_eq!(folder_relation("/w/app/src", "/w/app"), Some("above"));
         assert_eq!(folder_relation("/w/app", "/w/application"), None);
         assert_eq!(folder_relation("", "/w/app"), None);
+        assert_eq!(folder_relation(r"C:\Work\App", r"\\?\c:\work\app\src"), Some("below"));
+        assert_eq!(folder_relation(r"C:\Work\App", "C:/work/app/"), Some("same"));
+        assert_eq!(folder_relation(r"C:\Work\App\src", r"c:\work\app"), Some("above"));
+        assert_eq!(folder_relation(r"C:\Work\App", r"D:\Work\App"), None);
 
         let mut s = store_with("a", "working");
         s.sessions.get_mut("a").unwrap().cwd = "/w/app".into();
