@@ -327,15 +327,33 @@ pub async fn slack_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
     .await
 }
 
-/// The off switch. Turning it off needs no question.
+/// The off switch. Turning it off needs no question; turning it on again does.
 #[tauri::command]
-pub async fn slack_enable(on: bool) -> Result<Value, String> {
-    blocking(move || service(json!({"op": "slack_enable", "on": on}))).await
+pub async fn slack_enable(app: tauri::AppHandle, on: bool) -> Result<Value, String> {
+    blocking(move || {
+        if on && !confirmed(&app, "Switch Slack on again?", "Channels are listened to and sessions can post again, each under the policy you set for it. Messages that arrived meanwhile are read back.".to_string(), "Switch On", false) {
+            return service(json!({"op": "slack"}));
+        }
+        service(json!({"op": "slack_enable", "on": on}))
+    })
+    .await
 }
 
+/// Approval in Slack makes the person's Slack account a second place where posts are approved.
 #[tauri::command]
-pub async fn slack_approval(on: bool) -> Result<Value, String> {
-    blocking(move || service(json!({"op": "slack_approval", "on": on}))).await
+pub async fn slack_approval(app: tauri::AppHandle, on: bool) -> Result<Value, String> {
+    blocking(move || {
+        if on {
+            let now = service(json!({"op": "slack"}))?;
+            let who = now["connection"]["operatorName"].as_str().unwrap_or("you").to_string();
+            let message = format!("The bot will send {who} a direct message with Approve and Deny for every post that waits. Whoever controls that Slack account can then approve posts. The text of each post that waits is kept in that direct message, also when it is denied.");
+            if !confirmed(&app, "Approve posts in Slack too?", message, "Allow", true) {
+                return Ok(now);
+            }
+        }
+        service(json!({"op": "slack_approval", "on": on}))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -360,6 +378,19 @@ pub async fn slack_policy(app: tauri::AppHandle, channel: String, policy: Value)
             };
             if !confirmed(&app, "Post without your approval?", what, "Allow", true) {
                 return Ok(now);
+            }
+        }
+        // Where posts go without approval, more sessions posting or another session answering is asked about too
+        let posting = policy["posting"].as_str().or(current["posting"].as_str()).unwrap_or("never");
+        if posting == "auto" || posting == "thread" {
+            let had: Vec<&str> = current["posters"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+            let more = policy["posters"].as_array().is_some_and(|a| a.iter().filter_map(|v| v.as_str()).any(|p| !had.contains(&p)));
+            let other = policy["route"].as_str().is_some_and(|kind| kind != "none" && (current["route"]["kind"] != kind || (kind == "session" && current["route"]["session"] != policy["session"])));
+            if more || other {
+                let what = if more { "More sessions" } else { "Another session" };
+                if !confirmed(&app, "Let it post without your approval?", format!("{what} will be able to post to #{name} without asking you: this channel's policy sends posts {}.", if posting == "auto" { "at once" } else { "in threads at once" }), "Allow", true) {
+                    return Ok(now);
+                }
             }
         }
         let operator = now["connection"]["operator"].as_str().unwrap_or("");

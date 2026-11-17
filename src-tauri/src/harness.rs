@@ -2379,7 +2379,7 @@ impl Harness {
                 self.update(|s| s.notes.remove(id)).map(|_| json!({ "removed": id })).ok_or_else(|| format!("No note {id}"))
             }
             // Read only: the supervisor can't approve a post or change a policy (D6, D14)
-            "slack_status" => Ok(self.slack.status()),
+            "slack_status" => Ok(self.slack.status_for_agents()),
             "attention_list" => Ok(json!({ "waiting": self.attention()? })),
             "attention_wait" => {
                 // Wakes on any change, then looks again
