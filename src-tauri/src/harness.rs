@@ -2220,8 +2220,19 @@ impl Harness {
                 let running: BTreeSet<String> =
                     self.sessions()?.iter().filter(|s| s["exit"].is_null()).filter_map(|s| s["harness"]["agentSession"].as_str().map(str::to_owned)).collect();
                 let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
-                let list: Vec<Resumable> =
-                    resumable(&home, now_ms().saturating_sub(days * 86_400_000), 200).into_iter().filter(|r| !running.contains(&r.id) && prefs.require_enabled(r.agent).is_ok()).collect();
+                let allowed = has_session_workspace(&self.dir);
+                let list: Vec<Resumable> = resumable(&home, now_ms().saturating_sub(days * 86_400_000), 200)
+                    .into_iter()
+                    .filter(|r| !running.contains(&r.id) && prefs.require_enabled(r.agent).is_ok())
+                    .map(|mut r| {
+                        if !allowed {
+                            r.title = None;
+                            r.role = None;
+                            r.tags.clear();
+                        }
+                        r
+                    })
+                    .collect();
                 Ok(json!({ "sessions": list }))
             }
             // The Slack connector, as the app sees and steers it. Only the app gets here (see `handle`)
@@ -2599,6 +2610,13 @@ fn terminal_input(input: &str, submit: bool) -> (String, bool) {
         }
     }
     (input.to_string(), submit)
+}
+
+fn has_session_workspace(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("access.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|v| v["session_workspace"] == true)
 }
 
 fn plain_prompt(text: &str) -> Result<(), String> {
@@ -3539,6 +3557,18 @@ mod tests {
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }).is_ok());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }).is_err());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-pi".into(), supervisor: true }).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_workspace_permission_gates_resumable_titles() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-sw-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!has_session_workspace(&dir));
+        std::fs::write(dir.join("access.json"), r#"{"session_workspace":false}"#).unwrap();
+        assert!(!has_session_workspace(&dir));
+        std::fs::write(dir.join("access.json"), r#"{"session_workspace":true}"#).unwrap();
+        assert!(has_session_workspace(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
