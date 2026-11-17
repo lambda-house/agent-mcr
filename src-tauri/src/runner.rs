@@ -169,6 +169,48 @@ impl Scanner {
     }
 }
 
+struct DsrScanner {
+    matched: usize,
+}
+
+impl DsrScanner {
+    const NEEDLE: &'static [u8] = b"\x1b[6n";
+
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        let mut count = 0;
+        for &b in bytes {
+            if b == Self::NEEDLE[self.matched] {
+                self.matched += 1;
+                if self.matched == Self::NEEDLE.len() {
+                    count += 1;
+                    self.matched = 0;
+                }
+            } else {
+                self.matched = usize::from(b == Self::NEEDLE[0]);
+            }
+        }
+        count
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn handle_dsr(
+    dsr: &mut DsrScanner,
+    chunk: &[u8],
+    has_views: bool,
+    writer: &Mutex<Option<Box<dyn Write + Send>>>,
+) {
+    let count = dsr.feed(chunk);
+    if count > 0 && !has_views {
+        if let Some(w) = lock(writer).as_mut() {
+            for _ in 0..count {
+                let _ = w.write_all(b"\x1b[1;1R");
+            }
+            let _ = w.flush();
+        }
+    }
+}
+
 struct Output {
     ring: VecDeque<u8>,
     views: Vec<SyncSender<Arc<[u8]>>>,
@@ -402,6 +444,8 @@ impl Runner {
     fn pump(&self, session: &Session, mut reader: Box<dyn Read + Send>) {
         let id = lock(&session.info).id.clone();
         let mut buf = vec![0u8; 64 * 1024];
+        #[cfg(windows)]
+        let mut dsr = DsrScanner { matched: 0 };
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -409,12 +453,14 @@ impl Runner {
             };
             let chunk: Arc<[u8]> = Arc::from(&buf[..n]);
             let mut signals = Vec::new();
+            let has_views;
             {
                 let mut out = lock(&session.output);
                 out.ring.extend(chunk.iter());
                 let excess = out.ring.len().saturating_sub(SCROLLBACK);
                 out.ring.drain(..excess);
                 out.views.retain(|v| v.try_send(chunk.clone()).is_ok());
+                has_views = !out.views.is_empty();
                 out.scanner.feed(&chunk, &mut signals);
                 let now = now_ms();
                 // Agents ring often; one bell event per second per session is enough
@@ -429,6 +475,10 @@ impl Runner {
                     keep
                 });
             }
+            #[cfg(windows)]
+            handle_dsr(&mut dsr, &chunk, has_views, &session.writer);
+            #[cfg(not(windows))]
+            let _ = has_views;
             lock(&session.info).last_output = now_ms();
             for signal in signals {
                 match signal {
@@ -1262,5 +1312,41 @@ mod tests {
             assert_eq!(id.len(), 32);
             assert!(prefixes.insert(id[..10].to_string()), "duplicate random_id prefix");
         }
+    }
+
+    #[test]
+    fn dsr_handles_split_chunks_and_view_attachment() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let writer: Mutex<Option<Box<dyn Write + Send>>> =
+            Mutex::new(Some(Box::new(sink.clone())));
+        let mut dsr = DsrScanner { matched: 0 };
+
+        // Split across read chunks without a view attached -> answered once.
+        handle_dsr(&mut dsr, b"hello\x1b[", false, &writer);
+        assert!(sink.0.lock().unwrap().is_empty());
+        handle_dsr(&mut dsr, b"6nworld", false, &writer);
+        assert_eq!(&*sink.0.lock().unwrap(), b"\x1b[1;1R");
+
+        // Preceding ESC before ESC[6n still matches.
+        sink.0.lock().unwrap().clear();
+        handle_dsr(&mut dsr, b"\x1b\x1b[6n", false, &writer);
+        assert_eq!(&*sink.0.lock().unwrap(), b"\x1b[1;1R");
+
+        // With a view attached -> runner does not answer.
+        sink.0.lock().unwrap().clear();
+        handle_dsr(&mut dsr, b"\x1b[6n", true, &writer);
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 }
