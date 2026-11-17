@@ -5,7 +5,10 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import HarnessSettingsSection from './HarnessSettingsSection';
 import { harnessApi, type HarnessPreferences } from '../utils/harness';
 
-vi.mock('../utils/harness', () => ({ harnessApi: { status: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({
+  ...await importOriginal<object>(),
+  harnessApi: { status: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn(), background: vi.fn(), stopBackground: vi.fn() },
+}));
 const prefs: HarnessPreferences = {
   profiles: ['claude', 'codex', 'antigravity', 'pi', 'opencode', 'shell'].map(id => ({ id, label: id === 'shell' ? 'Terminal' : id, command: id === 'shell' ? '' : id, optional: ['antigravity', 'pi', 'opencode'].includes(id), canSupervise: id !== 'shell', taskTracking: ['claude', 'codex'].includes(id) })),
   enabledProfiles: ['claude', 'shell'], supervisorProfile: 'claude',
@@ -64,4 +67,27 @@ it('uses adapter capabilities for supervisor choices and labels optional plugins
   expect(host.textContent).toContain('Optional plugin · pi');
   expect(host.textContent).toContain('Built in · claude');
   expect([...(host.querySelector('select') as HTMLSelectElement).options].map(o => o.value)).toEqual(['', 'claude']);
+});
+
+it('shows background processes and stops all of them from Settings', async () => {
+  vi.mocked(harnessApi.background).mockResolvedValue({
+    consent: 'allowed',
+    sessions: 1,
+    units: [
+      { name: 'runner', label: 'x.runner', plist: '/Users/me/Library/LaunchAgents/x.runner.plist', installed: true, running: true, pid: 7, since: 'Sun Nov 15 14:51:17 2026', version: '0.1.1', exe: '/x' },
+      { name: 'harness service', label: 'x.harness', plist: '/Users/me/Library/LaunchAgents/x.harness.plist', installed: true, running: false, pid: null, since: null, version: null, exe: null },
+    ],
+  });
+  vi.mocked(harnessApi.stopBackground).mockResolvedValue(true);
+  await act(async () => root.render(<HarnessSettingsSection/>)); await flush();
+  const manage = [...host.querySelectorAll('button')].find(b => b.textContent === 'Manage…') as HTMLButtonElement;
+  await act(async () => manage.click()); await flush();
+  const panel = host.querySelector('.hs-background') as HTMLElement;
+  expect([...panel.querySelectorAll('dd')].map(d => d.textContent)).toEqual([
+    'pid 7 · 0.1.1 · since Sun Nov 15 14:51:17 2026', '~/Library/LaunchAgents/x.runner.plist', 'not running', '~/Library/LaunchAgents/x.harness.plist',
+  ]);
+  const stop = [...panel.querySelectorAll('button')].find(b => b.textContent === 'Stop everything…') as HTMLButtonElement;
+  await act(async () => stop.click()); await flush();
+  expect(harnessApi.stopBackground).toHaveBeenCalledWith(false);
+  expect(host.querySelector('.hs-background')).toBeNull();
 });

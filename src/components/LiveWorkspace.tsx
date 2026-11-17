@@ -5,7 +5,7 @@ import { Button, Dialog } from '@teob/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
-import { BackgroundGate, BackgroundPanel } from './Background';
+import { BackgroundGate } from './Background';
 import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
 import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, tildePath, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
@@ -89,7 +89,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   // The background processes are not allowed: never asked ('new'), or stopped by the person
   const [gate, setGate] = useState<'new' | 'stopped' | null>(null);
-  const [background, setBackground] = useState(false);
   const [hosted, setHosted] = useState<Hosted[]>([]);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState('');
@@ -125,7 +124,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
 
   // Nothing runs and nothing may be started: the list gives way to the question
   const closed = useCallback(() => {
-    setStatus(null); setHosted([]); setOpened([]); setSelected(''); setBackground(false); setError('');
+    setStatus(null); setHosted([]); setOpened([]); setSelected(''); setError('');
     harnessApi.background().then(b => { if (mounted.current) setGate(b.consent === 'stopped' ? 'stopped' : 'new'); }).catch(() => { if (mounted.current) setGate('new'); });
   }, []);
   const connect = useCallback(() => {
@@ -323,7 +322,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     window.addEventListener('mouseup', onUp);
   };
   useEffect(() => { if (focus?.id) select(focus.id); }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
-  const running = useMemo(() => hosted.filter(h => !h.exit).length, [hosted]);
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
   // Rows keep their place: running ones in the order they were started, ended ones after them.
@@ -633,14 +631,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       </ul>
       {sections.length > shown.length && <button type="button" className="hs-more-folders" onClick={() => setAllHistory(true)}>{sections.length - shown.length} more folders with history</button>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
-      {background && status && <BackgroundPanel onStopped={closed}/>}
-      <footer className="hs-footer">
-        {status
-          ? <button type="button" aria-expanded={background} title="What runs in the background, and how to stop it" onClick={() => setBackground(b => !b)}>{`Runner pid ${status.runner.pid} · ${running} running`}</button>
-          : <span>{gate ? 'Nothing runs in the background' : 'Connecting to the runner…'}</span>}
-        {status?.supervisorCommand && <button title={`Copy the command that gives an outside Claude Code the supervisor tools:\n${status.supervisorCommand}`} aria-label="Copy supervisor setup command" onClick={() => { void navigator.clipboard.writeText(status.supervisorCommand ?? '').then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }).catch(e => setError(err(e))); }}><Copy size={12}/> {copied ? 'Copied' : 'Supervisor'}</button>}
-        {status && <label className="hs-outside" title="Off: only the Supervisor session here has the supervisor tools. On: an agent you run outside Agent MCR and connected with the supervisor command has them too."><input type="checkbox" checked={!!status.outsideSupervisors} onChange={e => { void harnessApi.outsideSupervisors(e.target.checked).then(on => setStatus(s => s && { ...s, outsideSupervisors: on })).catch(x => setError(err(x))); }}/> outside agents</label>}
-      </footer>
     </aside>
   );
 
