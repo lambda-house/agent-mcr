@@ -1539,11 +1539,7 @@ impl Harness {
     fn create(&self, req: &Value) -> Result<Value, String> {
         // Who assigns and who created is known from the caller's process, never from
         // what the app or a supervisor sends: only `executor_create` sets it
-        let mut req = req.clone();
-        if let Some(fields) = req.as_object_mut() {
-            fields.remove("by");
-        }
-        self.create_as(&req, false)
+        self.create_as(&without_assigner(req), false)
     }
 
     /// End a session's agent and continue its conversation in a new process,
@@ -3043,6 +3039,16 @@ impl Harness {
     }
 }
 
+/// A request to create a session as the app or a supervisor sent it, without
+/// the field that names an assigning session.
+fn without_assigner(req: &Value) -> Value {
+    let mut req = req.clone();
+    if let Some(fields) = req.as_object_mut() {
+        fields.remove("by");
+    }
+    req
+}
+
 impl slack::Host for Harness {
     fn peers(&self) -> Vec<slack::Peer> {
         self.sessions()
@@ -3804,13 +3810,8 @@ mod tests {
 
     #[test]
     fn what_the_app_or_a_supervisor_sends_names_no_creator_or_assigner() {
-        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let harness = Harness::open(&dir);
-        // `create` fails here for want of a runner, after it has dropped `by` from the request
-        let _ = harness.create(&json!({"profile": "claude", "cwd": dir.display().to_string(), "supervisor": "x", "by": "x"}));
-        assert!(lock(&harness.store).sessions.values().all(|t| t.created_by.is_none()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let sent = json!({"profile": "claude", "cwd": "/w", "supervisor": "x", "by": "x", "task": "do it"});
+        assert_eq!(without_assigner(&sent), json!({"profile": "claude", "cwd": "/w", "supervisor": "x", "task": "do it"}));
     }
 
     #[test]
