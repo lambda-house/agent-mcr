@@ -13,20 +13,42 @@ use std::{
 
 pub const MAX_MESSAGE: u64 = 1024 * 1024;
 pub fn read_frame(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
+    read_frame_with_abort(reader, || false)
+}
+fn read_frame_with_abort(
+    reader: &mut impl BufRead,
+    aborted: impl Fn() -> bool,
+) -> Result<Option<Value>, String> {
     let mut line = Vec::new();
-    reader
-        .take(MAX_MESSAGE + 1)
-        .read_until(b'\n', &mut line)
-        .map_err(|e| e.to_string())?;
-    if line.is_empty() {
-        return Ok(None);
+    loop {
+        if aborted() {
+            return Ok(None);
+        }
+        let remaining = (MAX_MESSAGE + 1).saturating_sub(line.len() as u64);
+        match reader.by_ref().take(remaining).read_until(b'\n', &mut line) {
+            Ok(0) => {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                return Err("Oversized or incomplete MCP frame".into());
+            }
+            Ok(_) => {
+                if line.len() as u64 > MAX_MESSAGE || line.last() != Some(&b'\n') {
+                    return Err("Oversized or incomplete MCP frame".into());
+                }
+                return serde_json::from_slice(&line)
+                    .map(Some)
+                    .map_err(|e| format!("Invalid JSON: {e}"));
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
     }
-    if line.len() as u64 > MAX_MESSAGE || line.last() != Some(&b'\n') {
-        return Err("Oversized or incomplete MCP frame".into());
-    }
-    serde_json::from_slice(&line)
-        .map(Some)
-        .map_err(|e| format!("Invalid JSON: {e}"))
 }
 /// What one MCP server on this transport offers.
 pub struct Server {
@@ -169,6 +191,7 @@ pub struct Service {
     path: Mutex<Option<PathBuf>>,
     error: Mutex<Option<String>>,
     sockets: Mutex<std::collections::BTreeMap<u64, crate::ipc::Stream>>,
+    generation: std::sync::atomic::AtomicU64,
 }
 impl Service {
     pub fn status(&self) -> Value {
@@ -179,6 +202,8 @@ impl Service {
     }
     pub fn revoke(&self) {
         *self.grant.lock().unwrap() = Grant::default();
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         for stream in self.sockets.lock().unwrap().values() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
@@ -286,12 +311,18 @@ impl Service {
         index: Arc<Mutex<Index>>,
         client_id: u64,
     ) {
+        let start_gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
         let _ = writer.set_write_timeout(Some(std::time::Duration::from_secs(10)));
         if let Ok(copy) = writer.try_clone() {
+            // On Windows AF_UNIX, shutdown() does not unblock a thread already in recv().
+            #[cfg(windows)]
+            let _ = copy.set_read_timeout(Some(std::time::Duration::from_millis(100)));
             let mut reader = BufReader::new(copy);
             let mut protocol = Protocol::default();
             loop {
-                let v = match read_frame(&mut reader) {
+                let v = match read_frame_with_abort(&mut reader, || {
+                    self.generation.load(std::sync::atomic::Ordering::Acquire) != start_gen
+                }) {
                     Ok(Some(v)) => v,
                     Ok(None) => break,
                     Err(e) if e.starts_with("Invalid JSON:") => {
@@ -473,52 +504,59 @@ mod socket_tests {
 
     #[test]
     fn live_socket_protocol_and_revocation() {
-        let dir = short_temp_dir("p");
-        let service = Arc::new(Service::default());
-        *service.grant.lock().unwrap() = Grant {
-            enabled: true,
-            ..Grant::default()
-        };
-        let (mut client, server) = stream_pair(&dir);
-        client
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dir = short_temp_dir("p");
+            let service = Arc::new(Service::default());
+            *service.grant.lock().unwrap() = Grant {
+                enabled: true,
+                ..Grant::default()
+            };
+            let (mut client, server) = stream_pair(&dir);
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            service
+                .sockets
+                .lock()
+                .unwrap()
+                .insert(1, server.try_clone().unwrap());
+            let s = service.clone();
+            let worker = std::thread::spawn(move || {
+                s.serve_stream(server, Arc::new(Mutex::new(Index::default())), 1)
+            });
+            let mut read = BufReader::new(client.try_clone().unwrap());
+            writeln!(client, "not json").unwrap();
+            assert_eq!(
+                read_frame(&mut read).unwrap().unwrap()["error"]["code"],
+                -32700
+            );
+            writeln!(client,"{}",json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"socket-test"},"capabilities":{}}})).unwrap();
+            assert_eq!(
+                read_frame(&mut read).unwrap().unwrap()["result"]["serverInfo"]["name"],
+                "agent-mcr-analysis"
+            );
+            writeln!(
+                client,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
             .unwrap();
-        service
-            .sockets
-            .lock()
-            .unwrap()
-            .insert(1, server.try_clone().unwrap());
-        let s = service.clone();
-        let worker = std::thread::spawn(move || {
-            s.serve_stream(server, Arc::new(Mutex::new(Index::default())), 1)
+            writeln!(client,"{}",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analysis_status"}})).unwrap();
+            assert_eq!(
+                read_frame(&mut read).unwrap().unwrap()["result"]["isError"],
+                false
+            );
+            service.revoke();
+            assert!(read_frame(&mut read).unwrap().is_none());
+            worker.join().unwrap();
+            assert!(service.status()["clients"].as_array().unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = done_tx.send(());
         });
-        let mut read = BufReader::new(client.try_clone().unwrap());
-        writeln!(client, "not json").unwrap();
-        assert_eq!(
-            read_frame(&mut read).unwrap().unwrap()["error"]["code"],
-            -32700
-        );
-        writeln!(client,"{}",json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"socket-test"},"capabilities":{}}})).unwrap();
-        assert_eq!(
-            read_frame(&mut read).unwrap().unwrap()["result"]["serverInfo"]["name"],
-            "agent-mcr-analysis"
-        );
-        writeln!(
-            client,
-            "{}",
-            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        )
-        .unwrap();
-        writeln!(client,"{}",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analysis_status"}})).unwrap();
-        assert_eq!(
-            read_frame(&mut read).unwrap().unwrap()["result"]["isError"],
-            false
-        );
-        service.revoke();
-        assert!(read_frame(&mut read).unwrap().is_none());
-        worker.join().unwrap();
-        assert!(service.status()["clients"].as_array().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("live_socket_protocol_and_revocation timed out");
     }
 
     #[test]
