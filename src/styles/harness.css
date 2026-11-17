@@ -142,6 +142,22 @@
 .session-cockpit .hs-more-folders { margin: 2px 8px 8px; padding: 3px 8px; border: 0; background: transparent; color: var(--sc-muted); font-size: 11px; justify-content: flex-start; }
 .hs-outside { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; }
 .hs-outside input { margin: 0; }
+/* Background processes: the question before they start, and what runs with its off switch */
+.hs-gate { display: flex; flex-direction: column; gap: 8px; margin: 10px; padding: 12px; border: 1px solid var(--sc-border); border-radius: 6px; background: var(--sc-card); font-size: 12px; line-height: 1.45; }
+.hs-gate strong { font-size: 13px; }
+.hs-gate p { margin: 0; color: var(--sc-muted); }
+.hs-gate b { font-weight: 600; color: var(--sc-text); }
+.hs-gate code { font-size: 11px; }
+.session-cockpit .hs-gate button { align-self: flex-start; margin-top: 2px; }
+.hs-background { padding: 8px 10px; border-top: 1px solid var(--sc-border); background: var(--sc-card); font-size: 11px; line-height: 1.4; }
+.hs-background p { margin: 0 0 6px; color: var(--sc-muted); }
+.hs-background dl { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.hs-background dt { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.hs-background dd { margin: 0 0 0 14px; color: var(--sc-muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.hs-background-file { font-family: "SF Mono", Menlo, monospace; font-size: 10px; }
+.hs-background-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.session-cockpit .hs-background-actions button { height: 22px; padding: 0 8px; font-size: 11px; }
+.session-cockpit .hs-background-actions button:hover { border-color: #c15b5b; color: #e8a0a0; }
 
 /* Session telemetry stays readable independently of the activity dot. */
 .hs-metrics { display: flex; align-items: center; gap: 7px; margin: 3px 0 1px; overflow: hidden; color: var(--sc-muted); font-size: 10px; font-variant-numeric: tabular-nums; line-height: 1.5; }

@@ -29,6 +29,23 @@ cd src-tauri && cargo test
 
 The app opens on **Sessions**. Reading transcripts is switched on in the app, after a native confirmation.
 
+## Background processes
+
+Hosted agents keep running when the app quits, because they don't run inside it. Two processes of the same binary do that work: the **runner** holds the terminals, the **harness service** tracks sessions and gives agents their tools. macOS starts them through two files in `~/Library/LaunchAgents` (`cc.lambdahouse.agent-mcr.runner.plist` and `…harness.plist`). They listen on sockets private to your user, never on the network, and exit ten minutes after the last session ends.
+
+- The app asks before it installs or starts them. Nothing else can: an outside supervisor is refused until you have allowed them.
+- The footer of the Live view opens **Background**: what runs, since when, from which files.
+- **Stop everything** there ends every session and both processes. They stay off until you allow them again.
+- Quit (menu or Cmd-Q) tells you how many sessions keep running and offers to stop them. Quitting from the Dock doesn't ask.
+
+To uninstall: **Remove background items** in the same panel, or from a terminal
+
+```bash
+'/Applications/Agent MCR.app/Contents/MacOS/agent-mcr' --stop-background --uninstall
+```
+
+then move the app to the Trash. Session history and settings stay in `~/Library/Application Support/agent-mcr`; delete that folder to remove them too.
+
 ## Supervising from an outside agent
 
 Give one Claude Code session outside the app the supervisor tools (the **Supervisor** button in the Live view copies this command with the right path):

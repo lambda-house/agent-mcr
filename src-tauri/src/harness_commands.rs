@@ -68,6 +68,117 @@ pub async fn harness_status() -> Result<Value, String> {
     .await
 }
 
+/// The background processes and whether the person allowed them. Starts nothing.
+#[tauri::command]
+pub async fn harness_background() -> Result<Value, String> {
+    blocking(|| Ok(harness::background(&config_dir()?))).await
+}
+
+fn confirmed(app: &tauri::AppHandle, title: &str, message: String, ok: &str, warn: bool) -> bool {
+    use tauri::Manager;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let mut dialog = app
+        .dialog()
+        .message(message)
+        .title(title)
+        .kind(if warn { MessageDialogKind::Warning } else { MessageDialogKind::Info })
+        .buttons(MessageDialogButtons::OkCancelCustom(ok.to_string(), "Cancel".to_string()));
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.parent(&window);
+    }
+    dialog.blocking_show()
+}
+
+/// Allow the runner and the harness service to be installed and started.
+/// Asked in a native dialog, never granted by the page alone.
+#[tauri::command]
+pub async fn harness_background_allow(app: tauri::AppHandle) -> Result<bool, String> {
+    blocking(move || {
+        let dir = config_dir()?;
+        if runner::consent(&dir) != Some(true) {
+            let message = "Agent MCR runs your agents in two background processes of its own, so they keep working when you close or update the app:\n\n\u{2022} the runner holds the terminals\n\u{2022} the harness service tracks sessions and gives agents their tools\n\nmacOS starts them through two files in ~/Library/LaunchAgents and may show a \"Background Items Added\" notice. They listen only on sockets private to your user, never on the network, and exit on their own ten minutes after the last session ends.\n\nYou can see, stop and remove them at any time under Background in the Live view.";
+            if !confirmed(&app, "Let Agent MCR run in the background?", message.to_string(), "Allow", false) {
+                return Ok(false);
+            }
+            runner::set_consent(&dir, true)?;
+        }
+        Ok(true)
+    })
+    .await
+}
+
+/// The person's off switch: end every session and both background processes;
+/// with `uninstall`, remove their LaunchAgent files as well.
+#[tauri::command]
+pub async fn harness_background_stop(app: tauri::AppHandle, uninstall: bool) -> Result<bool, String> {
+    blocking(move || {
+        let dir = config_dir()?;
+        let live = harness::live_sessions(&dir).len();
+        let sessions = match live {
+            0 => "No session is running.".to_string(),
+            1 => "1 running session will be ended; unsaved work in it is lost.".to_string(),
+            n => format!("{n} running sessions will be ended; unsaved work in them is lost."),
+        };
+        let (title, rest, ok) = if uninstall {
+            ("Remove Agent MCR's background items?", "The runner and the harness service are stopped and their two files in ~/Library/LaunchAgents are removed. Session history and settings stay; to remove those too, delete ~/Library/Application Support/agent-mcr after quitting.", "Stop and Remove")
+        } else {
+            ("Stop all sessions and background processes?", "The runner and the harness service are stopped. Nothing starts them again until you allow it here.", "Stop Everything")
+        };
+        if !confirmed(&app, title, format!("{sessions}\n\n{rest}"), ok, true) {
+            return Ok(false);
+        }
+        harness::stop_background(&dir, true, uninstall)?;
+        Ok(true)
+    })
+    .await
+}
+
+/// Quit from the menu. Sessions keep running by design: say so when there are
+/// any, and offer to stop them. Nothing is asked when none runs.
+pub fn quit(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use tauri::Manager;
+        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
+        const KEEP: &str = "Quit";
+        const STOP: &str = "Quit and Stop Them";
+        let dir = config_dir().ok();
+        let live = dir.as_deref().map(|d| harness::live_sessions(d).len()).unwrap_or(0);
+        if live > 0 {
+            let message = format!(
+                "{} in the background after Agent MCR quits. Open the app again to see {}.",
+                if live == 1 { "1 session keeps running".to_string() } else { format!("{live} sessions keep running") },
+                if live == 1 { "it" } else { "them" }
+            );
+            let mut dialog = app
+                .dialog()
+                .message(message)
+                .title("Quit Agent MCR?")
+                .kind(MessageDialogKind::Info)
+                .buttons(MessageDialogButtons::YesNoCancelCustom(KEEP.to_string(), STOP.to_string(), "Cancel".to_string()));
+            if let Some(window) = app.get_webview_window("main") {
+                dialog = dialog.parent(&window);
+            }
+            match dialog.blocking_show_with_result() {
+                MessageDialogResult::Yes => {}
+                MessageDialogResult::Custom(choice) if choice == KEEP => {}
+                MessageDialogResult::No => stop_for_quit(dir.as_deref()),
+                MessageDialogResult::Custom(choice) if choice == STOP => stop_for_quit(dir.as_deref()),
+                _ => return,
+            }
+        }
+        app.exit(0);
+    });
+}
+
+/// The permission to run in the background stays: the next launch starts as usual.
+fn stop_for_quit(dir: Option<&std::path::Path>) {
+    if let Some(dir) = dir {
+        if let Err(e) = harness::stop_background(dir, false, false) {
+            eprintln!("{e}");
+        }
+    }
+}
+
 /// Let agents outside the harness use the supervisor tools, or stop that.
 /// Turning it on is confirmed in a native dialog, never by the page alone.
 #[tauri::command]

@@ -1064,6 +1064,64 @@ pub fn ensure(dir: &Path) -> Result<Value, String> {
     runner::ensure_unit(&socket(dir), &SERVICE, PROTOCOL)
 }
 
+/// Sessions the runner hosts that have not ended. Starts nothing.
+pub fn live_sessions(dir: &Path) -> Vec<String> {
+    Client::connect(&runner_socket(dir))
+        .and_then(|mut c| c.call(json!({"op": "list"})))
+        .ok()
+        .and_then(|list| list["sessions"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| s["exit"].is_null())
+        .filter_map(|s| s["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The background units and the person's decision about them. Starts nothing.
+pub fn background(dir: &Path) -> Value {
+    json!({
+        "consent": match runner::consent(dir) { Some(true) => "allowed", Some(false) => "stopped", None => "new" },
+        "units": [runner::unit_status(&runner_socket(dir), &runner::RUNNER), runner::unit_status(&socket(dir), &SERVICE)],
+        "sessions": live_sessions(dir).len(),
+    })
+}
+
+/// The person's off switch: end every hosted session, then the service and
+/// the runner. With `stay_stopped` nothing starts them again until the person
+/// allows it; with `uninstall` their LaunchAgent files go too and the next
+/// start asks as if for the first time.
+pub fn stop_background(dir: &Path, stay_stopped: bool, uninstall: bool) -> Result<(), String> {
+    // First, so that nothing restarts a unit while it is being stopped
+    if stay_stopped || uninstall {
+        runner::set_consent(dir, false)?;
+    }
+    let runner_socket = runner_socket(dir);
+    let signal = |name: &str| {
+        for id in live_sessions(dir) {
+            let _ = Client::connect(&runner_socket).and_then(|mut c| c.call(json!({"op": "signal", "id": id, "signal": name})));
+        }
+    };
+    // Hang-up is what closing a terminal sends: agents save and leave on it
+    signal("HUP");
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while !live_sessions(dir).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    signal("KILL");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !live_sessions(dir).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The service first: it would start the runner again
+    let service = runner::stop_unit(&socket(dir), &SERVICE, uninstall);
+    let runner = runner::stop_unit(&runner_socket, &runner::RUNNER, uninstall);
+    service.and(runner)?;
+    if uninstall {
+        runner::clear_consent(dir);
+    }
+    Ok(())
+}
+
 /// One request to the service.
 pub fn call(dir: &Path, req: Value) -> Result<Value, String> {
     ensure(dir)?;

@@ -1094,7 +1094,10 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     let app_menu = SubmenuBuilder::new(handle, "Agent MCR")
         .about(None).separator().services().separator()
-        .hide().hide_others().separator().quit().build()?;
+        .hide().hide_others().separator()
+        // Not the system's own Quit item: sessions keep running after it, which the person is told
+        .item(&tauri::menu::MenuItemBuilder::with_id("app.quit", "Quit Agent MCR").accelerator("Cmd+Q").build(handle)?)
+        .build()?;
 
     let file = SubmenuBuilder::new(handle, "File")
         .text("file.save", "Save File")
@@ -1116,6 +1119,7 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
     let menu = menu.item(&app_menu);
     app.set_menu(menu.items(&[&file, &edit, &window, &help]).build()?)?;
     app.on_menu_event(|app, event| match event.id().0.as_str() {
+        "app.quit" => harness_commands::quit(app.clone()),
         "help.docs" => {
             let _ = app.opener().open_url("https://github.com/lambda-house/agent-mcr#readme", None::<&str>);
         }
@@ -1183,6 +1187,18 @@ fn main() {
             }
             return;
         }
+        // The off switch without the app: `agent-mcr --stop-background [--uninstall]`
+        Some("--stop-background") => {
+            let uninstall = std::env::args().nth(2).as_deref() == Some("--uninstall");
+            match get_config_dir().map_err(|e| e.message).and_then(|dir| harness::stop_background(&dir, true, uninstall)) {
+                Ok(()) => println!("{}", if uninstall { "Sessions ended, background processes stopped, LaunchAgent files removed." } else { "Sessions ended, background processes stopped. They start again when you allow it in the app." }),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Some("--harness-tool") => {
             let result = get_config_dir()
                 .map_err(|e| e.message)
@@ -1240,6 +1256,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             harness_commands::harness_status,
+            harness_commands::harness_background,
+            harness_commands::harness_background_allow,
+            harness_commands::harness_background_stop,
             harness_commands::harness_list,
             harness_commands::harness_spawn,
             harness_commands::harness_supervisor,

@@ -56,6 +56,16 @@ export interface HarnessStatus {
   outsideSupervisors?: boolean;
 }
 
+/** One of the app's two background processes, as found without starting it. */
+export interface BackgroundUnit {
+  name: 'runner' | 'harness service'; label: string; plist: string | null; installed: boolean;
+  running: boolean; pid: number | null; since: string | null; version: string | null; exe: string | null;
+}
+/** `consent`: the person allowed the background processes, stopped them, or was never asked. */
+export interface Background { consent: 'allowed' | 'stopped' | 'new'; units: BackgroundUnit[]; sessions: number }
+/** The backend's answer while the background processes are not allowed (`runner::NOT_ALLOWED`). */
+export const notAllowed = (e: unknown) => String(e instanceof Error ? e.message : e).includes('Background processes are not allowed');
+
 /** What an agent told the person with its `report` tool. */
 export interface Report { id: string; session: string; name: string; cwd: string; kind: 'needs_human' | 'done'; text: string; created: number }
 /** A note on the bulletin board, read by sessions until it expires. */
@@ -92,6 +102,12 @@ export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
 
 export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
+  /** The background processes and the person's decision about them; starts nothing */
+  background: () => invoke<Background>('harness_background'),
+  /** Asks in a native dialog; resolves to whether they are allowed now */
+  allowBackground: () => invoke<boolean>('harness_background_allow'),
+  /** Ends every session and both processes after a native dialog; resolves to whether it was done */
+  stopBackground: (uninstall: boolean) => invoke<boolean>('harness_background_stop', { uninstall }),
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume }),
   /** The hosted supervisor session: the running one, or a new one */
