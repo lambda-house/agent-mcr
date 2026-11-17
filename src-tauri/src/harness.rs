@@ -2153,6 +2153,10 @@ impl Harness {
                         if home.is_empty() || !dir.starts_with(home) {
                             return Err(format!("Refused: an executor starts in your folder ({home}) or below it. For another folder, ask the operator to start it in the app and connect it to you."));
                         }
+                        // A session in the home folder must not reach Downloads or cloud storage this way (MCR-42)
+                        if dir.as_path() != Path::new(home) && crate::agent::guarded(&dir, dirs::home_dir().as_deref()) {
+                            return Err("Refused: that folder is one macOS guards (Downloads, Documents, cloud storage and the like). The operator starts sessions there in the app.".into());
+                        }
                         dir.display().to_string()
                     }
                     None => home.to_string(),
