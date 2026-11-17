@@ -183,3 +183,15 @@ Cross-clippy and Mac tests prove that Windows code compiles and that the pure fu
 14. ACL: the config dir's DACL has only the user (`icacls`); a second, non-admin Windows user cannot connect to `runner.sock`, `harness.sock` or the analysis socket, nor read `harness-state.json`. A config dir whose DACL was widened by hand makes the service refuse to start.
 15. Launch quoting on real Windows: the `argv_probe` integration test passes; a folder and a user name containing `&`, `^` and a trailing space launch correctly.
 16. A user name with a space and one with non-ASCII letters (paths in config dir and argv).
+
+## Caller states on Windows (peer.rs, read 2026-11-17, not run on Windows)
+
+`Peer::ancestor_among` walks parents with `CreateToolhelp32Snapshot`, checking each parent's creation time against the child's (Windows does not re-parent orphans and reuses PIDs). The runner (`Runner::trusts`) and the service (`Harness::who`, control ops) require `Outside` plus `is_this_program`.
+
+Before this fix `Outside` was reached only at a pid of 4 or below. A parent that had exited (`explorer.exe` → `userinit.exe` is the usual end of a user's chain), could not be opened, or had a later creation time all gave `Unknown`. So an app started from Explorer would likely have been classed `Unknown` and refused by its own runner and service, and nothing was Outside in practice. This is inferred from the code, not observed.
+
+Now a recorded parent that is gone (`ERROR_INVALID_PARAMETER`), not openable by this user (`ERROR_ACCESS_DENIED`), reused (created after the child) or recorded as 0 ends the walk as `Outside`, the same as reaching launchd on Unix. Any other error, a failed snapshot, or the process itself missing from the snapshot stays `Unknown` and is refused. `Found` is unchanged.
+
+Residual, same as on macOS: an orphan left by a hosted session whose parent exited is `Outside` and passes if it is this program's executable and the same user. Not a wall between same-user programs (D5a, D13).
+
+Needs a real Windows machine or CI: start the app from Explorer and from a terminal, check that the app reaches the runner (`hello`, `list`, `spawn`) and the service; from a hosted session run `agent-mcr --harness-tool whoami` and check it is a `Session`, not `Outside`; check a process started by a hosted session that outlives its parent gets `Outside` only for control ops it still cannot pass (`is_this_program`).

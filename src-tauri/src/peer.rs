@@ -37,9 +37,21 @@ pub enum Ancestry {
 /// unknown and the caller is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unreadable {
-    #[cfg_attr(windows, allow(dead_code))]
     Foreign,
     Failed,
+}
+
+/// What a failed `OpenProcess` on a recorded parent means. Windows does not
+/// re-parent orphans: a parent that is gone (`ERROR_INVALID_PARAMETER`, 87) or
+/// that this user may not open (`ERROR_ACCESS_DENIED`, 5: another account's or
+/// elevated) cannot be a session's process, so the walk ends outside, as it
+/// does on Unix at launchd. Any other error stays unknown.
+#[cfg(any(windows, test))]
+fn open_error(code: u32) -> Unreadable {
+    match code {
+        5 | 87 => Unreadable::Foreign,
+        _ => Unreadable::Failed,
+    }
 }
 
 /// Pure ancestry walk: `step(pid)` returns `Ok(Some(ppid))`, `Ok(None)` at a
@@ -237,12 +249,18 @@ mod win {
 
     impl Handle {
         pub(super) fn open_process(pid: u32) -> Option<Self> {
+            Self::open_process_code(pid).ok()
+        }
+
+        /// As `open_process`, with the Win32 error code when it fails.
+        pub(super) fn open_process_code(pid: u32) -> Result<Self, u32> {
             // SAFETY: OpenProcess returns null on failure.
             let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                None
+                // SAFETY: plain call, read right after the failure
+                Err(unsafe { GetLastError() })
             } else {
-                Some(Self(handle))
+                Ok(Self(handle))
             }
         }
     }
@@ -356,8 +374,7 @@ mod win {
                 if cur_pid <= 4 {
                     return Ok(None);
                 }
-                let (up_pid, _up_handle, up_created) =
-                    parent_with_handle(cur_pid, cur_created).ok_or(super::Unreadable::Failed)?;
+                let (up_pid, _up_handle, up_created) = parent_with_handle(cur_pid, cur_created)?;
                 cur_created = up_created;
                 Ok(Some(up_pid))
             })
@@ -395,13 +412,14 @@ mod win {
         Some(((created.dwHighDateTime as u64) << 32) | (created.dwLowDateTime as u64))
     }
 
-    fn parent_with_handle(pid: i32, child_created: u64) -> Option<(i32, Handle, u64)> {
-        let child_pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
+    fn parent_with_handle(pid: i32, child_created: u64) -> Result<(i32, Handle, u64), super::Unreadable> {
+        use super::Unreadable::{Failed, Foreign};
+        let child_pid = u32::try_from(pid).ok().filter(|&p| p > 0).ok_or(Failed)?;
 
         // SAFETY: plain snapshot syscall.
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snap.is_null() || snap == INVALID_HANDLE_VALUE {
-            return None;
+            return Err(Failed);
         }
         let _snap = Handle(snap);
 
@@ -410,7 +428,7 @@ mod win {
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         // SAFETY: `snap` is a valid process snapshot and `entry.dwSize` is set.
         if unsafe { Process32FirstW(snap, &mut entry) } == 0 {
-            return None;
+            return Err(Failed);
         }
         let mut ppid = None;
         loop {
@@ -423,15 +441,21 @@ mod win {
                 break;
             }
         }
-        let ppid = ppid.filter(|&p| p != 0 && p != child_pid)?;
-        // Windows reuses PIDs and does not re-parent orphans: verify the candidate parent started strictly before the child.
-        let parent_proc = Handle::open_process(ppid)?;
-        let parent_created = creation_time(parent_proc.0)?;
-        if !super::created_before(parent_created, child_created) {
-            return None;
+        // This process itself is not in the snapshot: it may still be ours
+        let ppid = ppid.ok_or(Failed)?;
+        // No parent recorded: the root of the tree
+        if ppid == 0 || ppid == child_pid {
+            return Err(Foreign);
         }
-        let ppid_i32 = i32::try_from(ppid).ok().filter(|&p| p > 0)?;
-        Some((ppid_i32, parent_proc, parent_created))
+        let parent_proc = Handle::open_process_code(ppid).map_err(super::open_error)?;
+        let parent_created = creation_time(parent_proc.0).ok_or(Failed)?;
+        // Windows reuses PIDs and does not re-parent orphans: a parent that started
+        // after the child is not its parent, whose real one has gone
+        if !super::created_before(parent_created, child_created) {
+            return Err(Foreign);
+        }
+        let ppid_i32 = i32::try_from(ppid).ok().filter(|&p| p > 0).ok_or(Failed)?;
+        Ok((ppid_i32, parent_proc, parent_created))
     }
 
     #[cfg(all(windows, test))]
@@ -439,7 +463,7 @@ mod win {
         let child_pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
         let child_proc = Handle::open_process(child_pid)?;
         let child_created = creation_time(child_proc.0)?;
-        parent_with_handle(pid, child_created).map(|(p, _, _)| p)
+        parent_with_handle(pid, child_created).ok().map(|(p, _, _)| p)
     }
 
     fn program_handle(handle: &Handle) -> Option<PathBuf> {
@@ -620,6 +644,13 @@ mod tests {
         assert_eq!(walk_ancestry(10, &[99], |_| Err(Unreadable::Foreign)), Ancestry::Outside);
         // Exceeds 32-step depth limit -> Unknown
         assert_eq!(walk_ancestry(100, &[999], |p| Ok(Some(p + 1))), Ancestry::Unknown);
+    }
+
+    #[test]
+    fn a_gone_or_forbidden_parent_is_outside_and_other_errors_unknown() {
+        assert_eq!(open_error(87), Unreadable::Foreign);
+        assert_eq!(open_error(5), Unreadable::Foreign);
+        assert_eq!(open_error(1), Unreadable::Failed);
     }
 
     #[cfg(unix)]
