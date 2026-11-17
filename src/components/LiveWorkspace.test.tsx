@@ -6,7 +6,7 @@ import LiveWorkspace from './LiveWorkspace';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type Hosted } from '../utils/harness';
 import { pickDirectory } from '../utils/tauri';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), ack: vi.fn(), supervisor: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // Terminals need a real canvas; the pane itself is exercised in the app
@@ -85,7 +85,7 @@ describe('Live workspace', () => {
     expect(rows().map(li => li.textContent).join(' ')).not.toMatch(/pid|output|running/);
     expect(host.querySelector('.hs-dot.running')?.getAttribute('aria-label')).toBe('running');
     expect(host.textContent).not.toContain('exited with 0');
-    expect(host.textContent).not.toContain('Runner pid');
+    expect(rows().map(li => li.textContent).join(' ')).not.toContain('Runner pid');
     expect(host.textContent).not.toContain('Completed');
   });
 
@@ -348,5 +348,44 @@ describe('Live workspace', () => {
     await act(async () => button('Start a session in /work/repo').click());
     await act(async () => (host.querySelector('[role="menuitem"]') as HTMLButtonElement).click()); await flush();
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('Start sessions in a folder you opened');
+  });
+
+  it('asks before anything runs in the background, and starts once allowed', async () => {
+    const status = await harnessApi.status();
+    vi.mocked(harnessApi.status).mockRejectedValueOnce(new Error('Background processes are not allowed'));
+    vi.mocked(harnessApi.background).mockResolvedValue({ consent: 'new', units: [], sessions: 0 });
+    vi.mocked(harnessApi.allowBackground).mockResolvedValue(true);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const gate = host.querySelector('.hs-gate') as HTMLElement;
+    expect(gate.textContent).toContain('Nothing is installed or started until you allow it');
+    expect(harnessApi.list).not.toHaveBeenCalled();
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    vi.mocked(harnessApi.status).mockResolvedValue(status);
+    await act(async () => (gate.querySelector('button') as HTMLButtonElement).click()); await flush();
+    expect(harnessApi.allowBackground).toHaveBeenCalled();
+    expect(host.querySelector('.hs-gate')).toBeNull();
+    expect(host.textContent).toContain('Runner pid 7 · 1 running');
+  });
+
+  it('shows what runs in the background and stops all of it', async () => {
+    vi.mocked(harnessApi.background).mockResolvedValue({ consent: 'allowed', sessions: 1, units: [
+      { name: 'runner', label: 'x.runner', plist: '/Users/me/Library/LaunchAgents/x.runner.plist', installed: true, running: true, pid: 7, since: 'Sun Nov 15 14:51:17 2026', version: '0.1.1', exe: '/x' },
+      { name: 'harness service', label: 'x.harness', plist: '/Users/me/Library/LaunchAgents/x.harness.plist', installed: true, running: false, pid: null, since: null, version: null, exe: null },
+    ] });
+    vi.mocked(harnessApi.stopBackground).mockResolvedValue(true);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={['/work/repo']}/>)); await flush();
+    const footer = [...host.querySelectorAll('.hs-footer button')].find(b => b.textContent?.includes('Runner pid')) as HTMLButtonElement;
+    await act(async () => footer.click()); await flush();
+    const panel = host.querySelector('.hs-background') as HTMLElement;
+    expect([...panel.querySelectorAll('dd')].map(d => d.textContent)).toEqual([
+      'pid 7 · 0.1.1 · since Sun Nov 15 14:51:17 2026', '~/Library/LaunchAgents/x.runner.plist', 'not running', '~/Library/LaunchAgents/x.harness.plist']);
+    // Stopped: the sessions are gone and the list gives way to the question
+    vi.mocked(harnessApi.background).mockResolvedValue({ consent: 'stopped', units: [], sessions: 0 });
+    const stop = [...panel.querySelectorAll('button')].find(b => b.textContent === 'Stop everything…') as HTMLButtonElement;
+    await act(async () => stop.click()); await flush();
+    expect(harnessApi.stopBackground).toHaveBeenCalledWith(false);
+    expect(rows()).toEqual([]);
+    expect(host.querySelector('.hs-gate')?.textContent).toContain('Sessions and background processes are stopped');
+    expect(host.querySelector('.hs-background')).toBeNull();
   });
 });

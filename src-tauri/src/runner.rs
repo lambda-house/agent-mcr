@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -663,11 +663,161 @@ pub struct Unit {
 
 pub const RUNNER: Unit = Unit { label: LAUNCH_LABEL, flag: "--runner", name: "runner" };
 
+/// What `ensure_unit` answers while the person has not allowed the background
+/// units, or has stopped them. The app shows its question on this text.
+pub const NOT_ALLOWED: &str = "Background processes are not allowed";
+
+fn consent_file(dir: &Path) -> PathBuf {
+    dir.join("background.state")
+}
+
+/// What the person decided about the background units kept in `dir`:
+/// allowed, stopped, or nothing yet.
+pub fn consent(dir: &Path) -> Option<bool> {
+    decision(dir, installed(&RUNNER))
+}
+
+fn decision(dir: &Path, installed: bool) -> Option<bool> {
+    match std::fs::read_to_string(consent_file(dir)).ok().as_deref().map(str::trim) {
+        Some("allowed") => Some(true),
+        Some(_) => Some(false),
+        // Installed by a version that did not ask: the person has been running them
+        None if installed => {
+            let _ = set_consent(dir, true);
+            Some(true)
+        }
+        None => None,
+    }
+}
+
+/// Record the person's decision. Only ever called after a native dialog, or
+/// by their own stop: nothing an agent or the page says sets it.
+pub fn set_consent(dir: &Path, allowed: bool) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    std::fs::write(consent_file(dir), if allowed { "allowed\n" } else { "stopped\n" }).map_err(|e| e.to_string())
+}
+
+/// Forget the decision (uninstall): the next start asks again.
+pub fn clear_consent(dir: &Path) {
+    let _ = std::fs::remove_file(consent_file(dir));
+}
+
+/// The unit's LaunchAgent file; none on systems without launchd.
+pub fn plist_path(unit: &Unit) -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    dirs::home_dir().map(|h| h.join("Library/LaunchAgents").join(format!("{}.plist", unit.label)))
+}
+
+pub fn installed(unit: &Unit) -> bool {
+    plist_path(unit).is_some_and(|p| p.exists())
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+/// What is known of a unit without starting it.
+pub fn unit_status(socket: &Path, unit: &Unit) -> Value {
+    let hello = Client::connect(socket).and_then(|mut c| c.call(json!({"op": "hello"}))).ok();
+    let pid = hello.as_ref().and_then(|h| h["pid"].as_i64());
+    // When it started, as `ps` prints it
+    let since = pid.and_then(|pid| std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    json!({
+        "name": unit.name,
+        "label": unit.label,
+        "plist": plist_path(unit).map(|p| p.display().to_string()),
+        "installed": installed(unit),
+        "running": hello.is_some(),
+        "pid": pid,
+        "since": since,
+        "version": hello.as_ref().map(|h| h["version"].clone()),
+        "exe": hello.as_ref().map(|h| h["exe"].clone()),
+    })
+}
+
+/// Stop a unit: launchd is told to let it go, and the process is ended. Its
+/// LaunchAgent file stays unless `remove` is set. Processes the unit started
+/// are not touched: end sessions first.
+pub fn stop_unit(socket: &Path, unit: &Unit, remove: bool) -> Result<(), String> {
+    let pid = Client::connect(socket).and_then(|mut c| c.call(json!({"op": "hello"}))).ok().and_then(|h| h["pid"].as_i64()).map(|p| p as i32);
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: getuid has no preconditions
+        let service = format!("gui/{}/{}", unsafe { libc::getuid() }, unit.label);
+        // The label may be held by another copy of the app with its own
+        // sessions (a build with another config folder): only what launchd
+        // runs as this very process, or holds without running, is let go
+        let ours = match launchd_pid(&service) {
+            None => false,
+            Some(running) => running.is_none() || running == pid,
+        };
+        if ours {
+            let _ = std::process::Command::new("launchctl").args(["bootout", &service]).output();
+        }
+    }
+    if let Some(pid) = pid {
+        let ended = |wait: Duration| {
+            let deadline = Instant::now() + wait;
+            while alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            !alive(pid)
+        };
+        if !ended(Duration::from_millis(500)) {
+            // SAFETY: the pid is the one the unit itself reported a moment ago
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            if !ended(Duration::from_secs(3)) {
+                // SAFETY: as above
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                if !ended(Duration::from_secs(2)) {
+                    return Err(format!("The {} (pid {pid}) did not stop", unit.name));
+                }
+            }
+        }
+    }
+    if std::fs::symlink_metadata(socket).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())) {
+        let _ = std::fs::remove_file(socket);
+    }
+    if remove {
+        if let Some(plist) = plist_path(unit).filter(|p| p.exists()) {
+            std::fs::remove_file(&plist).map_err(|e| format!("{}: {e}", plist.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The process launchd runs for a service: `None` when the service is not
+/// registered, `Some(None)` when it is registered and not running.
+#[cfg(target_os = "macos")]
+fn launchd_pid(service: &str) -> Option<Option<i32>> {
+    let out = std::process::Command::new("launchctl").args(["print", service]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(printed_pid(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The `pid = N` line of `launchctl print`, at the service's own level.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn printed_pid(text: &str) -> Option<i32> {
+    text.lines().find_map(|l| l.strip_prefix("\tpid = ").and_then(|p| p.trim().parse().ok()))
+}
+
 /// Connect to a unit's socket, starting the unit if needed. Returns its `hello`.
+/// A unit that is not running is started only when the person allowed
+/// background processes (`consent`).
 pub fn ensure_unit(socket: &Path, unit: &Unit, protocol: u32) -> Result<Value, String> {
     let hello = |socket: &Path| Client::connect(socket).and_then(|mut c| c.call(json!({"op": "hello"})));
     if let Ok(h) = hello(socket) {
         return check_protocol(h, unit, protocol);
+    }
+    if socket.parent().and_then(consent) != Some(true) {
+        return Err(NOT_ALLOWED.into());
     }
     start(socket, unit)?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -781,6 +931,35 @@ mod tests {
         let dir = std::path::PathBuf::from(format!("/tmp/amcr-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("r.sock")
+    }
+
+    #[test]
+    fn units_start_only_after_the_person_allowed_them() {
+        let socket = temp_socket("consent");
+        let dir = socket.parent().unwrap();
+        assert_eq!(decision(dir, false), None, "nothing decided on a fresh install");
+        // Nothing listens and nothing was allowed: refused before anything is started
+        let unit = Unit { label: "cc.lambdahouse.agent-mcr.test-never-installed", flag: "--none", name: "test unit" };
+        if !installed(&RUNNER) {
+            assert_eq!(ensure_unit(&socket, &unit, PROTOCOL).unwrap_err(), NOT_ALLOWED);
+        }
+        set_consent(dir, false).unwrap();
+        assert_eq!(decision(dir, true), Some(false), "a stop holds although the units are installed");
+        assert_eq!(ensure_unit(&socket, &unit, PROTOCOL).unwrap_err(), NOT_ALLOWED);
+        set_consent(dir, true).unwrap();
+        assert_eq!(consent(dir), Some(true));
+        clear_consent(dir);
+        // Units installed by a version that did not ask count as allowed, once
+        assert_eq!(decision(dir, true), Some(true));
+        assert_eq!(decision(dir, false), Some(true));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_pid_launchd_runs_is_read_at_the_service_level() {
+        let printed = "gui/501/x = {\n\tactive count = 1\n\tstate = running\n\tpid = 36842\n\tendpoints = {\n\t\tpid = 7\n\t}\n}\n";
+        assert_eq!(printed_pid(printed), Some(36842));
+        assert_eq!(printed_pid("gui/501/x = {\n\tstate = not running\n}\n"), None);
     }
 
     fn serve_in_background(socket: &Path) {

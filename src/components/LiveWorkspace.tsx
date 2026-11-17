@@ -5,8 +5,9 @@ import { Button, Dialog } from '@teob/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
+import { BackgroundGate, BackgroundPanel } from './Background';
 import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, tildePath, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedLabel, hostedState, isSupervisor, maybeOpenElsewhere, notAllowed, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, tildePath, type HarnessStatus, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -86,6 +87,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     try { if (width) localStorage.setItem(LIST_WIDTH_KEY, String(width)); else localStorage.removeItem(LIST_WIDTH_KEY); } catch { /* not kept */ }
   };
   const [status, setStatus] = useState<HarnessStatus | null>(null);
+  // The background processes are not allowed: never asked ('new'), or stopped by the person
+  const [gate, setGate] = useState<'new' | 'stopped' | null>(null);
+  const [background, setBackground] = useState(false);
   const [hosted, setHosted] = useState<Hosted[]>([]);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState('');
@@ -119,25 +123,36 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const closing = useRef(new Set<string>());
   const mounted = useRef(true);
 
+  // Nothing runs and nothing may be started: the list gives way to the question
+  const closed = useCallback(() => {
+    setStatus(null); setHosted([]); setOpened([]); setSelected(''); setBackground(false); setError('');
+    harnessApi.background().then(b => { if (mounted.current) setGate(b.consent === 'stopped' ? 'stopped' : 'new'); }).catch(() => { if (mounted.current) setGate('new'); });
+  }, []);
+  const connect = useCallback(() => {
+    harnessApi.status().then(s => {
+      if (!Array.isArray(s.profiles)) throw new Error('An older harness service returned no launch profiles. Update the app and restart the harness service.');
+      if (mounted.current) {
+        setStatus(s);
+        setGate(null);
+        setError('');
+        setCwd(c => c || s.home);
+        setProfile(p => s.profiles.some(next => next.id === p) ? p : s.profiles[0]?.id ?? '');
+      }
+    }).catch(e => { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); });
+  }, [closed]);
   const refresh = useCallback(async () => {
     try { const list = await harnessApi.list(); if (mounted.current) { setHosted(list); setError(''); } }
-    catch (e) { if (mounted.current) setError(err(e)); }
-  }, []);
+    catch (e) { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); }
+  }, [closed]);
 
   useEffect(() => {
     mounted.current = true;
     if (!isTauri()) { setError('Open the desktop app to host agent terminals.'); return; }
-    const updateStatus = () => {
-      harnessApi.status().then(s => {
-        if (!Array.isArray(s.profiles)) throw new Error('An older harness service returned no launch profiles. Update the app and restart the harness service.');
-        if (mounted.current) { setStatus(s); setCwd(c => c || s.home); setProfile(p => s.profiles.some(next => next.id === p) ? p : s.profiles[0]?.id ?? ''); }
-      }).catch(e => { if (mounted.current) setError(err(e)); });
-    };
-    updateStatus();
-    window.addEventListener(HARNESS_PREFERENCES_CHANGED, updateStatus);
-    window.addEventListener('focus', updateStatus);
-    return () => { mounted.current = false; window.removeEventListener(HARNESS_PREFERENCES_CHANGED, updateStatus); window.removeEventListener('focus', updateStatus); };
-  }, []);
+    connect();
+    window.addEventListener(HARNESS_PREFERENCES_CHANGED, connect);
+    window.addEventListener('focus', connect);
+    return () => { mounted.current = false; window.removeEventListener(HARNESS_PREFERENCES_CHANGED, connect); window.removeEventListener('focus', connect); };
+  }, [connect]);
   useEffect(() => {
     if (!active || !status) return;
     void refresh();
@@ -308,6 +323,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     window.addEventListener('mouseup', onUp);
   };
   useEffect(() => { if (focus?.id) select(focus.id); }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
+  const running = useMemo(() => hosted.filter(h => !h.exit).length, [hosted]);
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
   // Rows keep their place: running ones in the order they were started, ended ones after them.
@@ -583,6 +599,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       <RowMenu className="hs-notifications-wrap" buttonClassName="hs-notifications" label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
         icon={<><BellRing size={14}/> Notifications{waiting.length > 0 && ` · ${waiting.length}`}</>}
         actions={waiting.map(h => ({ label: `${isSupervisor(h) ? 'Supervisor' : sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
+      {gate && <BackgroundGate stopped={gate === 'stopped'} onAllowed={connect}/>}
       <ul className="hs-dirs">
         {shown.map(d => {
           const name = tildePath(d.path, home);
@@ -616,7 +633,14 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       </ul>
       {sections.length > shown.length && <button type="button" className="hs-more-folders" onClick={() => setAllHistory(true)}>{sections.length - shown.length} more folders with history</button>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
-
+      {background && status && <BackgroundPanel onStopped={closed}/>}
+      <footer className="hs-footer">
+        {status
+          ? <button type="button" aria-expanded={background} title="What runs in the background, and how to stop it" onClick={() => setBackground(b => !b)}>{`Runner pid ${status.runner.pid} · ${running} running`}</button>
+          : <span>{gate ? 'Nothing runs in the background' : 'Connecting to the runner…'}</span>}
+        {status?.supervisorCommand && <button title={`Copy the command that gives an outside Claude Code the supervisor tools:\n${status.supervisorCommand}`} aria-label="Copy supervisor setup command" onClick={() => { void navigator.clipboard.writeText(status.supervisorCommand ?? '').then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }).catch(e => setError(err(e))); }}><Copy size={12}/> {copied ? 'Copied' : 'Supervisor'}</button>}
+        {status && <label className="hs-outside" title="Off: only the Supervisor session here has the supervisor tools. On: an agent you run outside Agent MCR and connected with the supervisor command has them too."><input type="checkbox" checked={!!status.outsideSupervisors} onChange={e => { void harnessApi.outsideSupervisors(e.target.checked).then(on => setStatus(s => s && { ...s, outsideSupervisors: on })).catch(x => setError(err(x))); }}/> outside agents</label>}
+      </footer>
     </aside>
   );
 

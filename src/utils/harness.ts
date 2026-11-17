@@ -67,6 +67,16 @@ export interface HarnessStatus {
   outsideSupervisors?: boolean;
 }
 
+/** One of the app's two background processes, as found without starting it. */
+export interface BackgroundUnit {
+  name: 'runner' | 'harness service'; label: string; plist: string | null; installed: boolean;
+  running: boolean; pid: number | null; since: string | null; version: string | null; exe: string | null;
+}
+/** `consent`: the person allowed the background processes, stopped them, or was never asked. */
+export interface Background { consent: 'allowed' | 'stopped' | 'new'; units: BackgroundUnit[]; sessions: number }
+/** The backend's answer while the background processes are not allowed (`runner::NOT_ALLOWED`). */
+export const notAllowed = (e: unknown) => String(e instanceof Error ? e.message : e).includes('Background processes are not allowed');
+
 /** What an agent told the person with its `report` tool. */
 export interface Report { id: string; session: string; name: string; cwd: string; kind: 'needs_human' | 'done'; text: string; created: number }
 /** A note on the bulletin board, read by sessions until it expires. */
@@ -101,6 +111,46 @@ export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
   return open;
 }
 
+/** The Slack connector as the harness service reports it (decision D14). No token is in it. */
+export interface SlackConnection { team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number }
+export type SlackListen = 'off' | 'mentions' | 'all';
+export type SlackPosting = 'never' | 'approve' | 'thread' | 'auto';
+export interface SlackChannel {
+  id: string; name: string; private: boolean; member: boolean; listen: SlackListen; senders: string[];
+  route: { kind: 'none' | 'session' | 'supervisor'; session: string }; posting: SlackPosting; posters: string[]; skipped: boolean;
+}
+export type SlackPostState = 'waiting' | 'approved' | 'sending' | 'sent' | 'denied' | 'cancelled' | 'failed' | 'unknown';
+export interface SlackPost {
+  id: string; session: string; sessionName: string; channel: string; channelName: string; threadTs?: string | null; text: string;
+  state: SlackPostState; created: number; decided: number; allowedBy: string; reason?: string | null; link?: string | null;
+}
+export interface SlackReceived {
+  key: string; channel: string; channelName: string; user: string; userName: string; text: string; at: number;
+  caughtUp: boolean; session?: string | null; held?: string | null;
+}
+export interface SlackStatus {
+  connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;
+  channels: SlackChannel[]; users: Record<string, string>; posts: SlackPost[]; received: SlackReceived[];
+  audit: { at: number; kind: string; text: string }[];
+  counts: { sentWithoutApproval: number; refusedApprovals: number; deliveredFromStrangers: number; held: number; waiting: number };
+}
+export type SlackPolicy = Partial<{ listen: SlackListen; posting: SlackPosting; route: 'none' | 'session' | 'supervisor'; session: string; senders: string[]; posters: string[] }>;
+export const SLACK_POSTING: Record<SlackPosting, string> = {
+  never: 'Never', approve: 'Ask me each time', thread: 'Thread replies at once, the rest asks', auto: 'At once, without asking',
+};
+
+export const slackApi = {
+  status: () => invoke<SlackStatus>('slack_status'),
+  /** Null when the person said no in the native dialog */
+  connect: (bot: string, appToken: string, operator: string) => invoke<SlackStatus | null>('slack_connect', { bot, appToken, operator }),
+  disconnect: () => invoke<SlackStatus>('slack_disconnect'),
+  enable: (on: boolean) => invoke<SlackStatus>('slack_enable', { on }),
+  approval: (on: boolean) => invoke<SlackStatus>('slack_approval', { on }),
+  refresh: () => invoke<SlackStatus>('slack_refresh'),
+  policy: (channel: string, policy: SlackPolicy) => invoke<SlackStatus>('slack_policy', { channel, policy }),
+  decide: (post: string, approve: boolean, text?: string, reason?: string) => invoke<SlackStatus>('slack_decide', { post, approve, text: text ?? null, reason: reason || null }),
+};
+
 export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
   preferences: () => invoke<HarnessPreferences>('harness_preferences'),
@@ -109,6 +159,12 @@ export const harnessApi = {
     window.dispatchEvent(new Event(HARNESS_PREFERENCES_CHANGED));
     return result;
   },
+  /** The background processes and the person's decision about them; starts nothing */
+  background: () => invoke<Background>('harness_background'),
+  /** Asks in a native dialog; resolves to whether they are allowed now */
+  allowBackground: () => invoke<boolean>('harness_background_allow'),
+  /** Ends every session and both processes after a native dialog; resolves to whether it was done */
+  stopBackground: (uninstall: boolean) => invoke<boolean>('harness_background_stop', { uninstall }),
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume }),
   /** The hosted supervisor session: the running one, or a new one */

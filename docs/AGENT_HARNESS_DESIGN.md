@@ -1,6 +1,6 @@
 # Local agent harness: architecture
 
-**Status:** design, revision 5 (2026-11-13); built so far: see "What is built" below. Decisions D1–D12 are signed (below). Home: `lambda-house/agent-mcr` (Agent Mission Control Room), a private repository carrying mdviewer-mj's history; viewer fixes merge from `upstream` (`lambda-house/mdviewer-mj`). Derived with the Outside-In method: every mechanism cites the requirement it serves (traceability map at the end).
+**Status:** design, revision 5 (2026-11-13); built so far: see "What is built" below. Decisions D1–D12 and D14 are signed (below). Home: `lambda-house/agent-mcr` (Agent Mission Control Room), a private repository carrying mdviewer-mj's history; viewer fixes merge from `upstream` (`lambda-house/mdviewer-mj`). Derived with the Outside-In method: every mechanism cites the requirement it serves (traceability map at the end).
 
 **Goal.** MDViewer becomes the local harness for a group of coding agents. It runs their terminals and connects them to each other, to infrastructure tools (Atlassian now, TEOB memory later) and to two kinds of supervisor: the human operator in the app, and an external agent that creates sessions and assigns them tasks. It must not depend on any one agent.
 
@@ -22,6 +22,7 @@
 | D10 | The harness is built in a separate repository: `lambda-house/agent-mcr` (private), with mdviewer-mj's history and mdviewer-mj as `upstream`. MDViewer itself stays a Markdown viewer | 2026-11-13 |
 | D11 | agentgateway is a prerequisite installed with Homebrew, found on `PATH` or configured, with a version check | 2026-11-13 |
 | D12 | Local builds are the gate: `npm run build`, `npm test`, `cargo clippy --all-targets` and `cargo test` on the Mac. GitHub CI stays Linux-only and checks what compiles there; macOS-only modules are behind `cfg(target_os = "macos")` | 2026-11-13 |
+| D14 | Slack is connected natively by the harness service (MCR-26), after 1.0. Amends D3a for Slack only: the Slack bot token and app-level token are held on this Mac, in the macOS Keychain. Posts go out as a bot, never as the user. A post that its channel's policy does not allow automatically is approved by the operator only (D6 extended), in the app or in a Slack direct message from the bot. D13 is reserved for the store-app decision of MCR-16 | 2026-11-17 |
 
 ### What is built (revision 5)
 
@@ -311,6 +312,199 @@ Zero-tolerance counts, shown in the harness panel: rows shown live without a liv
 - The **runner** is named by R1, R5 and R10. A runner crash ends agents, so the runner stays small and rarely changes.
 - The **task tracker** is named by R13 and by R7 through `ask`/`listen`. Whether a turn has finished comes from the adapter's signal, so a missed Stop hook stalls both kinds of task.
 - The **adapter state signal** is named by R1, R7, R13 and R16. One missed hook makes a session look busy, stalls its tasks and hides it from the attention queue all at once. That's why the attention processor also reads BEL/OSC 9 from the terminal stream and raises a *guessed* "stalled" item after 10 minutes: a second, independent path for the promise you care most about.
+
+## Slack connector (D14, MCR-26)
+
+**Status:** first version built on 2026-11-17 for an end-to-end test on the owner's workspace; not yet run against Slack (see "What is built"). Ships after 1.0. Tasks: MCR-27 to MCR-40.
+
+### What is built
+
+| Part | State |
+|---|---|
+| Connect flow: tokens checked with Slack, native confirmation, tokens in the Keychain, disconnect | Built; not run live |
+| Socket Mode connection in the harness service: store, acknowledge, deliver; reconnect; off switch | Built; the Web API side is tested against a fake, the WebSocket loop only compiles until the live run |
+| Channel policies in the app (Slack tab): listen, senders, route, posting, who may post | Built |
+| Routing to a session or the Supervisor as inbox data; threads stay with their session | Built, tested |
+| Catch-up of channels after a reconnect | Built, tested |
+| Harness tools `slack_channels`, `slack_reply`, `slack_post`, `slack_post_status`, `slack_thread`; supervisor tool `slack_status` | Built, tested |
+| Approval in the app (approve, edit then approve, deny with a reason) and in Slack (Approve, Deny) | Built, tested |
+| Sending as the bot, at most once, with the outcome told to the session | Built, tested |
+
+What differs from this design for now, and why:
+
+| Design | Now | Closes with |
+|---|---|---|
+| Slack classes in `harness.sqlite`; 30 days of messages | `slack-state.json`, rewritten atomically before any change is acted on; the last 2,000 messages and 500 posts | MCR-30 |
+| A pending post is an attention item in the attention list, repeated while unanswered | A badge on the Slack tab, the card in the Slack view and one macOS notification | MCR-35 |
+| Route to a new session from a launch profile | Not built: a session or the Supervisor | MCR-32 |
+| Catch-up of followed threads; a count of skipped messages | Channels only; "older messages were skipped" without a number | MCR-33 |
+| A list of sessions or profiles that may post | The routed session and replies in its threads, or every session (the service takes a list; the app offers these two) | MCR-31 |
+| User mentions for channel members by policy | Agent text mentions nobody | MCR-37 |
+| Deny with a reason in Slack | Deny without a reason; reasons are given in the app | MCR-36 |
+| A fake Socket Mode server in the tests | The connection loop is checked in the live run only | MCR-29 |
+| A post tool may return a task (Tasks extension) | It returns an id; the outcome arrives in the inbox | D2 gap, as for the other tools |
+| The connector works while the app is closed | True while a session runs. The harness service exits ten minutes after the last session ends, and with it the connection; what arrived meanwhile is caught up at the next start, within the catch-up bound | Owner decision if listening without sessions is wanted |
+
+**Goal.** Hosted sessions receive messages from chosen Slack channels and post replies or new messages to chosen channels. The operator sets, per channel, what is listened to, whose messages reach a session, and what may be posted. A post that policy does not allow automatically waits for the operator.
+
+### Facts the design depends on
+
+Checked against Slack's documentation (docs.slack.dev, slack.com/terms-of-service/api) on 2026-11-17.
+
+| Fact | Consequence here |
+|---|---|
+| **Socket Mode**: an app-level token (`xapp-`, scope `connections:write`) calls `apps.connections.open` and gets a temporary `wss://` URL. No public endpoint. Up to 10 connections. Slack ends connections itself: `warning` about 10 s ahead, `refresh_requested` every few hours without warning, `link_disabled` when Socket Mode is switched off | One connection. Reconnecting is routine, not an error. `link_disabled` is shown as *refused* |
+| Every envelope must be acknowledged by its `envelope_id`. The Socket Mode guide gives no deadline; the 3 s figure comes from the Events API page and Slack's SDK guides. Slack retries unacknowledged events (about at once, after 1 min, after 5 min); `retry_attempt` may be missing | Store, then acknowledge, well inside 3 s. Deduplicate by event id, never by the retry fields |
+| Events sent while no connection is open are not documented as replayed; the Events API is "best-effort" and drops events more than 2 hours late | Catch-up from history after every reconnect is required, not optional |
+| Interactivity (button presses, modals) arrives over the same connection. `views.open` works; its `trigger_id` expires in 3 s and is single-use | Approval in Slack needs no public URL. A "deny with reason" modal must be opened right after the acknowledgement |
+| Bot events cover only channels the bot is a member of: `message.channels` (`channels:history`), `message.groups` (`groups:history`), `app_mention` (`app_mentions:read`), `member_joined_channel` for membership | The operator invites the bot to each channel; the Slack panel lists exactly those |
+| `chat.postMessage` needs `chat:write`; the bot must be a member (we don't ask for `chat:write.public`). `thread_ts` replies in a thread. A per-message name or icon needs `chat:write.customize`. No idempotency key exists. About 1 message/s per channel, several hundred per minute per workspace | The session's name goes into the message text, not a custom username. Duplicate protection is ours (pending-post states, history lookup) |
+| A direct message to a user: the method reference and the sending guide disagree on posting to a `U…` id. The documented path is `conversations.open` (`im:write`), then post to the `D…` id | Approval messages use `conversations.open` |
+| Mentions are `<!here>`, `<!channel>`, `<!everyone>`, `<@U…>`, `<!subteam^…>`. Escaping `&`, `<`, `>` neutralises them in `text`. Plain `@here` in top-level `text` is parsed only with `link_names=1`. **In Block Kit mrkdwn objects auto-parsing is on by default** (`verbatim: false`) | Agent text is escaped, sent without `link_names`, and every block that carries agent text sets `verbatim: true`. That includes the approval message |
+| `conversations.history` and `conversations.replies` are Tier 3 (50+/min) for internal customer-built apps. Since 2025-05-29 (existing installs: 2026-03-03) commercially distributed apps outside the Marketplace get Tier 1: 1 request/min and at most 15 messages per call | See "Distribution status" below: catch-up is sized for Tier 1 |
+| Socket Mode apps are not allowed in the Slack Marketplace | No way from here to a listed app without a hosted relay |
+| Bot tokens don't expire unless token rotation is on, and rotation can't be switched off again. The manifest can set Socket Mode, interactivity, bot events and scopes; the app-level token is created by hand in the app's settings | The manifest leaves rotation off. Connecting takes two pasted tokens |
+| From 2027-02-17 Slack answers 403 to a GET or HEAD request that has a body | The HTTP client sends arguments in the query string or uses POST |
+| Slack's API terms (2025-10-10) forbid training an LLM on API data and bulk export, for applications offered outside one's own organisation. Nothing found against passing channel messages to a model at inference time in an internal app | Stated in the setup guide (MCR-39); see "Distribution status" |
+
+**Distribution status (open, MCR-40).** The owner's own workspace with an app he created is an internal customer-built app: Tier 3 limits, internal terms. When TEOB HQ ships the manifest as a template to other people, Slack's terms name "a custom Application or Application template" connected to a commercial product, which may put every user's app under the commercial-distribution rules: Tier 1 history limits and the outside-organisation data terms. This reading is ours, not Slack's. Until it is settled, the design must work at Tier 1, and no setup guide for other users is published.
+
+### Outside
+
+| Client | What it does | Tolerances |
+|---|---|---|
+| **Operator in the app** | Connects Slack, sets channel policies, approves, edits or denies posts, switches the connector off | A post waiting for approval is as visible as a permission prompt. The off switch works at once. No post leaves without the approval its policy requires |
+| **Operator in Slack** (phone or desktop, app closed) | Writes to listened channels; approves or denies a post from the bot's direct message | Approving in Slack does exactly what approving in the app does, for the exact text shown |
+| **Other people in a listened channel** | Write messages | Their messages reach a session only when the operator put them on the channel's sender list |
+| **Hosted agent** | Receives routed messages in its inbox; asks to reply or post | A post request is accepted with an id or refused with a typed reason, never "maybe". It is told the outcome |
+| **Supervisor** | Reads Slack state, pending posts and the audit | Cannot approve, cannot change policies (D6 extended) |
+| **Slack** | Delivers events over Socket Mode, accepts posts | Its limits and outages. A missed acknowledgement is retried by Slack; events sent while disconnected are not replayed |
+
+What a client still gets when something fails:
+
+| Failure | Operator | Hosted agent |
+|---|---|---|
+| Slack unreachable, or the Mac asleep | Connector shown *reconnecting*, with the time of the last event | Post requests are still accepted and wait (*pending but signalled*); nothing is delivered |
+| Reconnect after a gap | Missed messages are caught up from channel history, marked with their original time; beyond the bound, a count of skipped messages per channel (*correct but late*, then *absent but signalled*) | Same |
+| Token revoked or the app removed | Connector shown *refused*, attention item | Posts fail with a typed reason |
+| Routed session ended | Message kept, shown as undelivered | — |
+| Post outcome unknown (timeout after sending) | Shown as *outcome unknown* until the channel's history settles it | Told "outcome unknown", then the settled result |
+| Harness service restart | Pending posts and policies survive | Tools fail for seconds |
+
+### Load
+
+All figures **assumed**; one workspace, one operator.
+
+| Figure | Value | Used at |
+|---|---|---|
+| Listened channels | ≤ 20 | catch-up cost after a reconnect |
+| Followed threads at a time | ≤ 20 | catch-up cost |
+| Incoming messages | ≤ 2,000/day, bursts ≤ 5/s | store size, routing rate limits |
+| Posts by agents | ≤ 200/day, ≤ 1/min per session | approval load on the operator, Slack's posting limit |
+| Stored message bodies | 30 days or 50,000 messages, whichever is less | retention |
+
+Slack's posting limit is about one message per second per channel, three orders of magnitude above this load. Catch-up is where Slack binds. At Tier 1, one history call per minute returns at most 15 messages: 20 channels and 20 threads take 40 minutes for one page each, and a channel that got 150 messages during a night takes 10 calls. So catch-up reads the newest page of each channel first, round-robin, and stops at a bound per channel (default 45 messages or 12 hours); the rest is counted as skipped. At Tier 3 the same catch-up takes seconds. The other binding limit is the operator's attention: at more than a few approvals per hour a channel should move to an automatic policy or stop being a target. One node suffices.
+
+### Data
+
+| Data class | Source of truth | Write acknowledgement | Invariants |
+|---|---|---|---|
+| **Slack tokens** (bot, app-level) | macOS Keychain | Completion | Never in the harness store, the app's store, exports, logs, the audit, tool results or an agent's environment |
+| **Connection record**: workspace, bot user, operator's Slack user, Slack approval on/off | Harness store | Completion | The operator's Slack user is set only in the app, after a native confirmation |
+| **Channel policies** | Harness store | Completion | Changed only from the app. Defaults: listen off, senders = the operator, posting never |
+| **Received events** | Harness store | **Receipt**, before the envelope is acknowledged to Slack | One row per Slack event id. Bounded retention |
+| **Channel cursors**: last seen timestamp per channel and per followed thread | Harness store | Completion | Only moves forward |
+| **Pending posts**: session, channel, thread, exact text, text hash, state, who decided, where | Harness store | **Receipt** on request; every state change is stored before it is acted on | States: waiting → approved → sent, or denied, cancelled, failed, outcome unknown. A post is sent at most once. An approval is valid only for the stored hash |
+| **Audit**: routed message, approval, denial, post, refused approval | Harness store | Receipt | Text is referenced by hash; no tokens |
+
+The harness store is still `harness-state.json`, rewritten whole. Slack events and pending posts need receipts, queries and bounded retention, which is the trigger this document already names for `harness.sqlite`. The Slack classes are the first tables of `harness.sqlite`; the existing JSON classes move under their own task.
+
+### Runtime and channels
+
+The connector is a module of the **harness service**. It is never part of the runner (the runner holds no policy and no network) and never part of the app (it must work with the app closed). It holds one Socket Mode WebSocket and calls Slack's Web API over HTTPS. The service's sockets and threads are blocking, so the connector uses blocking clients on its own threads: `tungstenite` for the WebSocket and `ureq` for HTTPS, both on `rustls`; `security-framework` for the Keychain. None of them enters the runner's code path. Versions are pinned when MCR-29 adds them.
+
+| Edge | Sync | Guarantee / ordering | Backpressure | Departure |
+|---|---|---|---|---|
+| **S1** Slack → service (Socket Mode events and button presses) | async | At least once from Slack; exactly once into the store by event id; ordered per channel by Slack timestamp | Events are stored first and routed after; routing is rate-limited per channel and per session, with a visible "held back" count | Reconnect with backoff; catch-up from history (S3) |
+| **S2** service → Slack (posts, approval messages, message updates) | sync, HTTPS | At most once per pending post | One queue per channel, about one post per second | Timeout → *outcome unknown* → settled from history, never a blind retry |
+| **S3** service → Slack (history for catch-up and thread reads) | sync, HTTPS | Ordered per channel | One call per minute when the app is on Tier 1, otherwise Tier 3; a single queue for all history calls, newest page of each channel first; bounded depth | A 429 answer is obeyed by its `Retry-After` |
+| **S4** service → session inbox | existing message path (E6) | Receipt | Existing limits | Session ended: message stays undelivered and visible |
+| **S5** agent → harness MCP (`slack_*` tools) | sync, receipt | Caller from peer credentials | Rate limit per session | A pending post outlives the agent's connection |
+| **S6** app → service (policies, approve / edit / deny, off switch) | sync | — | — | — |
+
+**Harness tools** (hosted sessions): `slack_channels` (where this session may post, and under which policy), `slack_reply(message, text)`, `slack_post(channel, text)`, `slack_post_status(id)`, `slack_thread(message)` (more of a thread the session was addressed in, bounded, untrusted). A post tool stores a pending post and returns its id at once; it never blocks on the operator. With the Tasks extension it may return a task that completes on the decision. The outcome reaches the session through its inbox. **Supervisor tools:** `slack_status`, pending posts, audit: read only.
+
+**Incoming message.** Stored event → channel policy (listen mode, sender list) → route → inbox message carrying channel, sender name, thread, permalink, original time and text, labelled *untrusted data from Slack* → the existing wake-up (`listen` task, or the fixed notice for agents without Tasks; the notice never contains Slack text). A thread stays with the session that got its first message. Routes in the first version: one session, the Supervisor, a new session from a launch profile (the message is its first inbox item, never argv). Routing to a group waits for D9.
+
+**Outgoing post.** Request → typed refusal or pending post → policy: *never* (refused), *approve each*, *automatic for replies in a thread where an allowed sender addressed this session*, *automatic* → sent as the bot with the session's name, link previews off → outcome to the session and the audit. Text only. Agent text is escaped, sent without `link_names` and with `verbatim: true` in every block, so it cannot mention anyone. A channel's policy can allow user mentions for members of that channel; broadcast mentions stay off in the first version.
+
+**Approval.** Two paths, same effect, first decision wins:
+
+- **App:** a card with session, channel, thread and the exact text. Approve, edit then approve, or deny with a reason.
+- **Slack:** the bot opens its direct message with the operator (`conversations.open`) and posts the same content and two buttons there. The press comes back over the same WebSocket. The service accepts it only when Slack names the recorded operator as the acting user, the pending post is still waiting, and the hash carried by the button equals the stored one. After a decision the direct message is rewritten without buttons. Editing stays in the app in the first version.
+
+A pending post is an attention item of its own kind. Today a session carries at most one attention item; posts need a list beside it, shown in the same attention view. Priority: permission > question > ended unexpectedly > **post approval** > stalled > turn finished: a waiting post blocks nobody's process, since the tool has already returned.
+
+### Trust
+
+| Boundary | Risk | Enforcement |
+|---|---|---|
+| **Slack channel → agent** | Prompt injection: anyone who can write in a listened channel instructs an agent that has a shell as the user | Per-channel sender list, default the operator only; other messages are stored and shown, never delivered. Bot messages are never routed. Delivered text is data labelled untrusted. The session's own permission mode still gates what it does |
+| **Agent → Slack channel** | Exfiltration of anything the agent has read; spam; impersonation | Default posting *never*. Per-channel list of sessions that may post. Approval shows the exact text. Automatic policies are a confirmed choice per channel. Posts carry the session's name. Rate limit per session |
+| **Approval** | Something other than the operator approves | Only two paths are accepted: the app's control connection, and a Slack button press by the recorded operator for the stored hash. The Supervisor, peers and hosted sessions are refused. Policies and the operator's Slack user change only in the app |
+| **Slack account as an approval path** | Whoever controls the operator's Slack account approves posts | It can approve or deny posts and nothing else: no permission prompts, no terminal input, no policy changes. It can be switched off in the app |
+| **Approval message** | The text of a post leaves the Mac before it is approved | The operator's direct message with the bot holds the text of every post that waited, denied ones included. Accepted with D14; switching Slack approval off removes it |
+| **Tokens** | An agent posts or reads directly with the bot token | Keychain only; never returned by any tool or written to a log |
+| **Loops** | Two bots answering each other; an agent answering itself | Bot messages and the bot's own posts are never routed; rate limits per channel and session |
+
+The finding of section 05 holds here too. A **hostile** hosted agent runs as the same OS user: it can reach the service's socket, and with the user's login Keychain unlocked it may be able to read the tokens the service stored. The enforcement above binds cooperative agents and gives correct attribution. MCR-38 states what a Keychain access control list on the items does and does not add.
+
+### Failure: how each promise is reached
+
+| Promise | Mechanism | Test |
+|---|---|---|
+| No post without the approval its policy requires | The sender takes only pending posts in state *approved* or allowed by policy; the approval paths are the only writers of *approved* | Approval from the Supervisor surface refused; zero-tolerance count |
+| An approval covers the exact text | Hash stored with the pending post, carried by the Slack button, compared on every decision | Edit after approval voids it; replayed button payload refused |
+| A post is sent at most once | State stored before sending; on a timeout the post becomes *outcome unknown* and is looked up in history before anything else | Fake server accepts, then drops the connection: one message |
+| An event reaches a session once | Event id is the store's key; the envelope is acknowledged after the write | Duplicate and retried envelopes |
+| Messages sent while disconnected arrive | Catch-up from the channel cursors after every reconnect and service start, bounded; skipped counts shown | Sleep and wake with the fake server |
+| A stranger's message reaches no session | Sender list checked in the service before routing | Message from a user outside the list |
+| The connector can't hurt sessions | Own threads, own store tables; every call to it from the session path is non-blocking | Connector panics and hangs under test; sessions and tasks continue |
+| Off means off | The switch stops the WebSocket, cancels waiting posts with a typed reason and empties the send queues before it returns | Post approved, switch turned off before sending: not sent |
+
+### Operations
+
+Zero-tolerance counts added to the harness panel: **posts sent without the approval their policy required** · **approvals accepted from anything but the app or the recorded operator in Slack** · **Slack events acknowledged but not stored** · **messages delivered to a session from a sender outside the channel's list**. The Slack panel shows the connector's state, the last event's time, held-back and skipped counts, pending posts and the audit. Flags: connecting Slack is a permission flag (native confirmation, like the harness grant); the off switch and "approval in Slack" are operations toggles.
+
+### Traceability
+
+| Requirement (testable) | Mechanism | Verified by |
+|---|---|---|
+| S-R1 Messages from chosen channels and senders reach the routed session, with the app closed | connector in the service, policies, routing, existing wake-up | live: the operator's message wakes a Claude Code and a Codex session |
+| S-R2 Nothing from other channels or senders reaches a session | policy check before routing | sender and channel tests |
+| S-R3 Agents reply in threads and post to chosen channels as a bot | `slack_reply`, `slack_post`, sender | live post with the session's name |
+| S-R4 The operator controls listening and posting per channel, and can stop everything at once | policies, off switch | policy tests; off-switch test |
+| S-R5 Only the operator approves, in the app or in Slack, and only the exact text | two approval paths, hash, refusals | refusal tests; zero-tolerance counts stay 0 |
+| S-R6 Credentials stay on this Mac and away from agents | Keychain, no token in any output | search of the config dir, logs and tool results |
+| S-R7 No message is lost or duplicated without a signal | receipt before ack, event id, catch-up, skipped counts | fake-server tests |
+| S-R8 A post is never sent twice | pending-post states, history lookup | timeout test |
+
+**Coupling.** The pending-post state machine is named by S-R3, S-R5 and S-R8: it gets the most tests, including a service stop between every pair of steps. The policy check is named by S-R1, S-R2 and S-R4. The connector adds one requirement to the harness service (network access and a secret) and none to the runner.
+
+### Delivery order
+
+MCR-27 design → MCR-28 connect and Keychain → MCR-29 connector → MCR-30 store → MCR-31 policies UI → MCR-32 routing → MCR-33 catch-up → MCR-34 tools → MCR-35 approval in the app → MCR-36 approval in Slack → MCR-37 sending → MCR-38 security review and live run → MCR-39 release fit. MCR-40 (distribution status under Slack's terms) gates MCR-39's setup guide, not the owner's own use. Listening is usable after MCR-33, before any post can be sent.
+
+### Risk register (Slack)
+
+| Assumption | Decision it supports | How to settle it |
+|---|---|---|
+| The harness service can use the Keychain and the network as a LaunchAgent, and as the helper outside the store (MCR-16, MCR-19) | D14 | Spike in MCR-28 |
+| A Keychain access control list keeps other processes of the same user from reading the tokens without a prompt | Token row of the trust table | MCR-38 |
+| The load figures | Retention, approval load | Measure after a month of use |
+| Apps created from our manifest count as internal customer-built apps | Tier 3 history limits; the terms that apply to users' data | MCR-40: read the terms with the owner, ask Slack if unclear. The design holds at Tier 1 either way |
+| The acknowledgement deadline in Socket Mode is 3 s | Store before acknowledging | Measure store latency in MCR-29; it is a local write |
+| The operator answers approvals within minutes | "approve each" as a usable policy | Watch the age of pending posts; otherwise prefer the thread-reply policy |
 
 ## Engineering defaults
 
