@@ -31,12 +31,23 @@ pub enum Ancestry {
     Unknown,
 }
 
+/// Why a process's parent could not be read. `Foreign`: the process cannot be
+/// inside a session's tree (another user's, or already gone and reparented),
+/// so the walk ends outside. `Failed`: it could be inside, so the answer stays
+/// unknown and the caller is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreadable {
+    #[cfg_attr(windows, allow(dead_code))]
+    Foreign,
+    Failed,
+}
+
 /// Pure ancestry walk: `step(pid)` returns `Ok(Some(ppid))`, `Ok(None)` at a
-/// clean OS root, or `Err(())` when a link cannot be opened or fails checks.
+/// clean OS root, or `Err` when a link cannot be opened or fails checks.
 fn walk_ancestry(
     mut pid: i32,
     roots: &[i32],
-    mut step: impl FnMut(i32) -> Result<Option<i32>, ()>,
+    mut step: impl FnMut(i32) -> Result<Option<i32>, Unreadable>,
 ) -> Ancestry {
     for _ in 0..32 {
         if roots.contains(&pid) {
@@ -45,10 +56,60 @@ fn walk_ancestry(
         match step(pid) {
             Ok(Some(up)) if up > 1 => pid = up,
             Ok(_) => return Ancestry::Outside,
-            Err(()) => return Ancestry::Unknown,
+            Err(Unreadable::Foreign) => return Ancestry::Outside,
+            Err(Unreadable::Failed) => return Ancestry::Unknown,
         }
     }
     Ancestry::Unknown
+}
+
+/// Who owns a process, for telling an unreadable foreign process (`login` is
+/// root's: macOS refuses `proc_pidinfo` on it) from a failure on our own.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Gone,
+    Me,
+    Other,
+}
+
+/// One step up the tree on Unix. Sessions run as this user, so a process whose
+/// parent cannot be read is only "unknown" when it is ours and still there.
+#[cfg(unix)]
+fn unix_step(pid: i32, parent: impl Fn(i32) -> Option<i32>, owner: impl Fn(i32) -> Owner) -> Result<Option<i32>, Unreadable> {
+    match parent(pid) {
+        Some(up) => Ok(Some(up)),
+        None => Err(match owner(pid) {
+            Owner::Me => Unreadable::Failed,
+            Owner::Gone | Owner::Other => Unreadable::Foreign,
+        }),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn owner(pid: i32) -> Owner {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions
+    let me = unsafe { libc::geteuid() };
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(m) if m.uid() == me => Owner::Me,
+        Ok(_) => Owner::Other,
+        Err(_) => Owner::Gone,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn owner(pid: i32) -> Owner {
+    // SAFETY: geteuid has no preconditions
+    let me = unsafe { libc::geteuid() };
+    // `ps` reads any process, which proc_pidinfo does not for root's
+    let uid = std::process::Command::new("ps").args(["-o", "uid=", "-p", &pid.to_string()]).output().ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok());
+    match uid {
+        None => Owner::Gone,
+        Some(uid) if uid == me => Owner::Me,
+        Some(_) => Owner::Other,
+    }
 }
 
 /// Whether `created` is strictly earlier than `bound` (guards against PID reuse).
@@ -296,7 +357,7 @@ mod win {
                     return Ok(None);
                 }
                 let (up_pid, _up_handle, up_created) =
-                    parent_with_handle(cur_pid, cur_created).ok_or(())?;
+                    parent_with_handle(cur_pid, cur_created).ok_or(super::Unreadable::Failed)?;
                 cur_created = up_created;
                 Ok(Some(up_pid))
             })
@@ -435,7 +496,7 @@ impl Peer {
     }
 
     pub fn ancestor_among(&self, roots: &[i32]) -> Ancestry {
-        walk_ancestry(self.pid, roots, |p| parent(p).ok_or(()).map(Some))
+        walk_ancestry(self.pid, roots, |p| unix_step(p, parent, owner))
     }
 }
 
@@ -510,7 +571,10 @@ pub fn is_this_program(stream: &Stream) -> bool {
 /// The first of `roots` that `pid` is, or descends from.
 #[cfg(test)]
 pub fn ancestor_among(pid: i32, roots: &[i32]) -> Ancestry {
-    walk_ancestry(pid, roots, |p| parent(p).ok_or(()).map(Some))
+    #[cfg(unix)]
+    return walk_ancestry(pid, roots, |p| unix_step(p, parent, owner));
+    #[cfg(windows)]
+    walk_ancestry(pid, roots, |p| parent(p).ok_or(Unreadable::Failed).map(Some))
 }
 
 #[cfg(test)]
@@ -551,9 +615,29 @@ mod tests {
         // Hits session root -> Found
         assert_eq!(walk_ancestry(10, &[5], |p| Ok(Some(p - 5))), Ancestry::Found(5));
         // Unreadable or failed creation-time check -> Unknown (never Outside)
-        assert_eq!(walk_ancestry(10, &[99], |_| Err(())), Ancestry::Unknown);
+        assert_eq!(walk_ancestry(10, &[99], |_| Err(Unreadable::Failed)), Ancestry::Unknown);
+        // A foreign or vanished process in the chain is outside
+        assert_eq!(walk_ancestry(10, &[99], |_| Err(Unreadable::Foreign)), Ancestry::Outside);
         // Exceeds 32-step depth limit -> Unknown
         assert_eq!(walk_ancestry(100, &[999], |p| Ok(Some(p + 1))), Ancestry::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_walk_tells_root_owned_from_failures_inside_the_tree() {
+        // 50 (ours) -> 40 (login, root's: parent unreadable); 99 is a session root never reached
+        let parents = |p: i32| match p { 50 => Some(40), _ => None };
+        let owner = |p: i32| match p { 40 => Owner::Other, _ => Owner::Me };
+        assert_eq!(walk_ancestry(50, &[99], |p| unix_step(p, parents, owner)), Ancestry::Outside);
+        // Our own process with an unreadable parent could be inside: unknown
+        let owner = |_: i32| Owner::Me;
+        assert_eq!(walk_ancestry(50, &[99], |p| unix_step(p, parents, owner)), Ancestry::Unknown);
+        // An ancestor that has gone (reparented) is outside
+        let owner = |_: i32| Owner::Gone;
+        assert_eq!(walk_ancestry(50, &[99], |p| unix_step(p, parents, owner)), Ancestry::Outside);
+        // Normal descent reaches the session root
+        let parents = |p: i32| Some(p - 10);
+        assert_eq!(walk_ancestry(50, &[30], |p| unix_step(p, parents, owner)), Ancestry::Found(30));
     }
 
     #[test]
