@@ -313,6 +313,11 @@ pub trait Adapter: Sync {
     fn question(&self, _screen: &str) -> Option<String> {
         None
     }
+    /// Whether a notification the agent sent to its terminal says that it
+    /// waits for an approval (for agents that report no prompts through hooks)
+    fn announces_approval(&self, body: &str) -> bool {
+        body.to_lowercase().contains("approv")
+    }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Signal("INT")
     }
@@ -394,7 +399,11 @@ impl Adapter for Claude {
         true
     }
     fn question(&self, screen: &str) -> Option<String> {
-        asked(screen, |l| l.starts_with("Do you want to") || l.starts_with("Do you trust") || l.starts_with("Is this a project you"))
+        const TRUST: &str = "Is this a project you created or one you trust?";
+        asked(screen, |l| l.starts_with("Do you want to") || l.starts_with("Do you trust") || l.contains(TRUST)).or_else(|| {
+            // The folder question at start, whose answers are not numbered in every version
+            (screen.contains(TRUST) && screen.contains("Yes, I trust this folder")).then(|| TRUST.to_string())
+        })
     }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Key("\x1b")
@@ -441,11 +450,7 @@ impl Adapter for Codex {
         if l.resume.is_some() {
             cmd += " resume";
         }
-        // Codex tells its terminal about an approval request only while the
-        // pane is out of focus, and a pane nobody opened never says it is:
-        // always, and as OSC 9, which the runner finds (MCR-71)
-        let notifications = format!("-c tui.notifications=true -c {} -c {}", sh("tui.notification_condition=\"always\""), sh("tui.notification_method=\"osc9\""));
-        cmd += &format!(" {flags} -c {} {notifications} {tools}", sh(&notify));
+        cmd += &format!(" {flags} -c {} -c tui.notifications=true {tools}", sh(&notify));
         if l.supervisor {
             cmd += &format!(" -c {} -c {}", sh(&format!("mcp_servers.supervisor.command={}", json!(l.exe))), sh("mcp_servers.supervisor.args=[\"--supervise\"]"));
         }
@@ -467,11 +472,18 @@ impl Adapter for Codex {
         screen.contains("for shortcuts") && screen.lines().any(|l| l.starts_with('\u{203a}'))
     }
     /// Codex sets "[ ! ] Action Required" as the title while it waits for an answer
+    /// (after a glyph that blinks, before the folder). Nothing else: a
+    /// conversation may be titled with these words and more
     fn title_asks(&self, title: &str) -> Option<bool> {
-        Some(title.contains("Action Required"))
+        Some(title.trim_start_matches(|c: char| !c.is_alphanumeric()).split(" | ").next().unwrap_or("").trim() == "Action Required")
+    }
+    /// The wording of codex-cli 0.170; a turn's last message is announced the
+    /// same way and may hold any word
+    fn announces_approval(&self, body: &str) -> bool {
+        body.starts_with("Approval requested")
     }
     fn question(&self, screen: &str) -> Option<String> {
-        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust")).or_else(|| {
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?")).or_else(|| {
             // The folder question at start (0.170 wording), whose answers may not be numbered
             let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
             (!self.at_prompt(screen)).then(|| trust.chars().filter(|c| !c.is_control()).take(300).collect())
@@ -599,6 +611,14 @@ mod tests {
         assert_eq!(codex.title_asks("[ ! ] Action Required | teob-ai"), Some(true));
         assert_eq!(codex.title_asks("[ . ] Action Required | teob-ai"), Some(true));
         assert_eq!(codex.title_asks("\u{2807} Memory answer grounding | teob-ai"), Some(false));
+        // A conversation's own title may hold the words
+        assert_eq!(codex.title_asks("Action Required review | teob-ai"), Some(false));
+        assert_eq!(codex.title_asks("Review of Action Required"), Some(false));
+        assert_eq!(codex.title_asks("Action Required"), Some(true));
+        // What Codex announces to its terminal: an approval by its form, never by a word in a last message
+        assert!(codex.announces_approval("Approval requested: git push") && codex.announces_approval("Approval requested by reviewer"));
+        assert!(!codex.announces_approval("Done. The change is approved and merged.") && !codex.announces_approval("Agent turn complete"));
+        assert!(adapter("antigravity").announces_approval("Needs your approval"));
         // Claude Code's title says nothing about prompts: its hooks do
         assert_eq!(adapter("claude").title_asks("\u{2733} Action Required"), None);
         assert_eq!(adapter("shell").title_asks("Action Required"), None);
@@ -612,6 +632,8 @@ mod tests {
         // The folder question at start, in the newer and the older wording
         assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n  Yes, continue\n  No, quit\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
         assert_eq!(codex.question("Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, quit").as_deref(), Some("Do you trust the contents of this directory?"));
+        // As seen on 2026-11-18 (codex-cli 0.170): numbered answers
+        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
         assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
         // Long commands are cut, and control characters never get into a notice
         let long = format!("Would you like to run the following command?\n$ echo {}\u{7}\n1. Yes, proceed (y)", "x".repeat(600));
@@ -624,6 +646,11 @@ mod tests {
         let edit = "Do you want to make this edit to main.rs?\n\u{276f} 1. Yes\n  2. Yes, allow all edits during this session\n  3. No";
         assert_eq!(claude.question(edit).as_deref(), Some("Do you want to make this edit to main.rs?"));
         assert_eq!(claude.question("> Do you want to know more?\n"), None);
+        // The folder question at start as seen on 2026-11-18, with and without numbers
+        let safety = "Quick safety check: Is this a project you created or one you trust?\n\n/Users/x/work\n\n\u{276f} 1. Yes, I trust this folder\n  2. No, exit\n";
+        assert_eq!(claude.question(safety).as_deref(), Some("Quick safety check: Is this a project you created or one you trust? /Users/x/work"));
+        assert_eq!(claude.question("Quick safety check: Is this a project you created or one you trust?\n\n  No, exit\n\u{276f} Yes, I trust this folder\n").as_deref(), Some("Is this a project you created or one you trust?"));
+        assert_eq!(claude.question("\u{23fa} I asked: Is this a project you created or one you trust?\n"), None);
         assert_eq!(adapter("shell").question(screen), None);
         assert!(matches!(adapter("antigravity").interrupt(), Interrupt::Key("\x1b")));
         let agy_cmd = command_line(&Launch { profile: "antigravity", task: Some("hi"), ..Default::default() }).unwrap();
