@@ -98,6 +98,26 @@ describe('Slack view', () => {
     expect(connection).toContain('could not be saved on this Mac (No space left on device (os error 28)). Nothing is sent or delivered');
   });
 
+  it('says once that approval in Slack was switched off, until the person sets the switch', async () => {
+    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    expect(host.textContent).not.toContain('Approval in Slack was switched off');
+    expect(host.textContent).toContain('Off unless you switch it on: posts are approved here.');
+    await act(async () => root.unmount()); root = createRoot(host);
+    const off = { ...status, connection: { ...status.connection!, approveInSlack: false, approvalReset: true } };
+    vi.mocked(slackApi.status).mockResolvedValue(off);
+    vi.mocked(slackApi.approval).mockResolvedValue({ ...off, connection: { ...off.connection, approvalReset: false } });
+    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    const connection = host.querySelector('section[aria-label="Slack connection and channels"]')!;
+    expect(connection.textContent).toContain('Approval in Slack was switched off. It had been on since you connected, without you choosing it');
+    expect(connection.textContent).toContain('Posts are now approved here only');
+    expect(connection.querySelector<HTMLInputElement>('.hs-slack-toggle input[type="checkbox"]:not(:checked)')).not.toBeNull();
+    // With approval in Slack off, the head of the waiting list names the app only
+    expect(host.textContent).not.toContain('here or in your direct messages with the bot');
+    await act(async () => button('Keep it off').click()); await flush();
+    expect(slackApi.approval).toHaveBeenCalledWith(false);
+    expect(host.textContent).not.toContain('Approval in Slack was switched off');
+  });
+
   it('offers only the connect form while nothing is connected', async () => {
     vi.mocked(slackApi.status).mockResolvedValue({ ...status, connection: null, enabled: false, link: 'off', channels: [], posts: [], received: [], counts: { ...status.counts, waiting: 0, held: 0 } });
     await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();

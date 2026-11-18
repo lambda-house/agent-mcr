@@ -167,7 +167,15 @@ pub struct Connection {
     /// The one Slack user who may approve posts in Slack; set in the app only
     pub operator: String,
     pub operator_name: String,
+    /// Posts that wait are also put to the operator in a direct message with
+    /// buttons. Off until the operator switches it on (owner, 2026-11-18)
     pub approve_in_slack: bool,
+    /// `approve_in_slack` was set under that rule. A record without this mark is
+    /// from a build that switched it on at connect, with nobody choosing it
+    pub approval_chosen: bool,
+    /// It was on in such a record and was switched off when the record was
+    /// loaded: the app says so until the operator sets the switch
+    pub approval_reset: bool,
     pub connected: u64,
     /// Scopes of the manifest that the bot token lacks, as Slack reported them
     pub missing_scopes: Vec<String>,
@@ -417,6 +425,17 @@ impl Slack {
 
     fn with(dir: &Path, web: Box<dyn Web>, vault: Box<dyn Vault>, settle_after: u64) -> Self {
         let mut state: State = std::fs::read(dir.join("slack-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // Approval in Slack used to be on from connect. Nobody chose that, so it goes off,
+        // once; `work` closes the approval messages that are still open in Slack. Like
+        // the change below this is written with the next change of the state
+        if let Some(c) = state.connection.as_mut().filter(|c| !c.approval_chosen) {
+            c.approval_chosen = true;
+            if c.approve_in_slack {
+                c.approve_in_slack = false;
+                c.approval_reset = true;
+                state.log("policy", "Approval in Slack switched off: it was on since connecting without having been chosen. Posts are approved in the app until it is switched on there".into());
+            }
+        }
         // The service stopped between sending and Slack's answer: the outcome is not known
         for p in state.posts.values_mut().filter(|p| p.state == "sending") {
             p.state = "unknown".into();
@@ -574,7 +593,7 @@ impl Slack {
                 s.received.clear();
                 s.users.clear();
             }
-            s.connection = Some(Connection { team: text("team"), team_id: text("teamId"), url: text("url"), bot_user: text("botUser"), bot_name: text("botName"), operator: text("operator"), operator_name: text("operatorName"), approve_in_slack: true, connected: now_ms(), missing_scopes: found["missingScopes"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default() });
+            s.connection = Some(Connection { team: text("team"), team_id: text("teamId"), url: text("url"), bot_user: text("botUser"), bot_name: text("botName"), operator: text("operator"), operator_name: text("operatorName"), approve_in_slack: false, approval_chosen: true, approval_reset: false, connected: now_ms(), missing_scopes: found["missingScopes"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default() });
             s.users.insert(text("operator"), text("operatorName"));
             s.enabled = true;
             s.log("connected", format!("{} as {}; operator {}", text("team"), text("botName"), text("operatorName")));
@@ -612,6 +631,15 @@ impl Slack {
         self.update(|s| {
             if let Some(c) = &mut s.connection {
                 c.approve_in_slack = on;
+                // The operator's own choice, either way
+                c.approval_chosen = true;
+                c.approval_reset = false;
+            }
+            if on {
+                // Posts that wait are put to the operator in Slack again, each in a new message
+                for p in s.posts.values_mut().filter(|p| p.state == "waiting" && (p.dm_closed || p.dm_ts.is_none())) {
+                    (p.dm_channel, p.dm_ts, p.dm_tried, p.dm_closed, p.dm_retry_at) = (None, None, false, false, 0);
+                }
             }
             s.log("policy", format!("Approval in Slack switched {}", if on { "on" } else { "off" }));
         });
@@ -1250,6 +1278,7 @@ impl Slack {
     /// stands above this line (`approval_blocks`), and nothing follows it.
     fn decided_line(p: &Post) -> String {
         match (p.state.as_str(), p.allowed_by.as_str()) {
+            ("waiting", _) => "Approval in Slack is switched off. This post still waits: decide it in the app.".to_string(),
             ("denied", _) => "Denied.".to_string(),
             ("cancelled", _) => format!("Cancelled: {}", p.reason.clone().unwrap_or_default()),
             (_, "slack") => "Approved here.".to_string(),
@@ -1346,8 +1375,9 @@ impl Slack {
                 }
                 _ => {}
             }
-            // The approval message shows what was decided, without buttons
-            if let (false, Some(channel), Some(ts), false) = (p.state == "waiting", &p.dm_channel, &p.dm_ts, p.dm_closed) {
+            // The approval message shows what was decided, without buttons. With approval in
+            // Slack off its buttons decide nothing, so it is closed while the post still waits
+            if let (false, Some(channel), Some(ts), false) = (p.state == "waiting" && connection.approve_in_slack, &p.dm_channel, &p.dm_ts, p.dm_closed) {
                 let what = Self::decided_line(&p);
                 let closed = self.api("chat.update", &[("channel", channel.clone()), ("ts", ts.clone()), ("text", what.clone()), ("blocks", Self::approval_blocks(&p, &p.channel, Some(&what)).to_string())]);
                 // A refusal will not change on a second try
@@ -1790,6 +1820,8 @@ mod tests {
         let web = Arc::new(FakeWeb::default());
         let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
         slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
+        // Off from connect; the tests of approval in Slack are about a connection where the operator switched it on
+        slack.set_slack_approval(true);
         slack.set_policy("C1", &json!({"listen": "all", "route": "session", "session": "s1", "posting": posting})).unwrap();
         slack.update(|s| s.channels.get_mut("C1").unwrap().cursor = "1.000000".into());
         (dir, slack, web, FakeHost::default())
@@ -2152,6 +2184,84 @@ mod tests {
         // A channel the bot left is not listed, and a route that is not listened to is no source
         slack.set_policy("C1", &json!({"posting": "never", "listen": "off"})).unwrap();
         assert!(seen("s1").is_empty());
+    }
+
+    #[test]
+    fn approval_in_slack_is_off_until_the_operator_switches_it_on() {
+        let dir = tempdir::Dir::new();
+        let web = Arc::new(FakeWeb::default());
+        let host = FakeHost::default();
+        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
+        slack.set_policy("C1", &json!({"listen": "all", "route": "session", "session": "s1", "posting": "approve"})).unwrap();
+        // A new connection: off, and nothing to tell about it
+        let c = slack.status()["connection"].clone();
+        assert_eq!((c["approveInSlack"].as_bool(), c["approvalReset"].as_bool()), (Some(false), Some(false)));
+        // A post that waits is put to the operator in the app only: nothing goes to a direct message
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "kept here"}));
+        while slack.work(&host) {}
+        assert_eq!((web.count("conversations.open"), web.count("chat.postMessage")), (0, 0));
+        assert_eq!(lock(&host.notices).len(), 1);
+        // A press of a button from before is refused and counted, also the operator's own
+        slack.on_action(&host, &press("UOP", "post_approve", &p));
+        assert_eq!(post_of(&slack, &p.id).state, "waiting");
+        assert_eq!(slack.status()["counts"]["refusedApprovals"], 1);
+        // Switched on by the operator: the post that waits is asked about in Slack, and it stays on after a restart
+        slack.set_slack_approval(true);
+        while slack.work(&host) {}
+        assert_eq!((web.count("conversations.open"), web.count("chat.postMessage")), (1, 1));
+        assert_eq!(web.last("chat.postMessage")[0].1, "D1");
+        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let c = again.status()["connection"].clone();
+        assert_eq!((c["approveInSlack"].as_bool(), c["approvalReset"].as_bool()), (Some(true), Some(false)));
+        assert!(!lock(&again.state).audit.iter().any(|a| a.text.contains("without having been chosen")));
+    }
+
+    #[test]
+    fn a_connection_made_before_the_choice_existed_has_approval_in_slack_switched_off_once() {
+        let (dir, slack, web, host) = connected("approve");
+        // A post waits with its approval message open in the operator's direct messages
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "asked before"}));
+        slack.work(&host);
+        assert!(post_of(&slack, &p.id).dm_ts.is_some());
+        // The state file as an earlier build left it: on, and no mark that anyone chose it
+        let path = dir.path().join("slack-state.json");
+        let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old["connection"]["approveInSlack"], true);
+        old["connection"].as_object_mut().unwrap().remove("approvalChosen");
+        old["connection"].as_object_mut().unwrap().remove("approvalReset");
+        std::fs::write(&path, old.to_string()).unwrap();
+        let vault = Memory::default();
+        vault.set("bot", "xoxb-1").unwrap();
+        let loaded = Slack::with(dir.path(), Box::new(web.clone()), Box::new(vault), 0);
+        // Off, with the notice for the app and one line in the audit
+        let c = loaded.status()["connection"].clone();
+        assert_eq!((c["approveInSlack"].as_bool(), c["approvalReset"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(lock(&loaded.state).audit.iter().filter(|a| a.text.contains("without having been chosen")).count(), 1);
+        // The open approval message is closed without buttons; the post keeps waiting for the app
+        let (opened, posted) = (web.count("conversations.open"), web.count("chat.postMessage"));
+        while loaded.work(&host) {}
+        assert_eq!(web.count("chat.update"), 1);
+        let blocks: Value = serde_json::from_str(&web.last("chat.update").iter().find(|(k, _)| k == "blocks").unwrap().1).unwrap();
+        assert!(blocks.as_array().unwrap().iter().all(|b| b["type"] != "actions"));
+        assert_eq!(blocks.as_array().unwrap().last().unwrap()["elements"][0]["text"], "Approval in Slack is switched off. This post still waits: decide it in the app.");
+        let waiting = post_of(&loaded, &p.id);
+        assert_eq!((waiting.state.as_str(), waiting.dm_closed), ("waiting", true));
+        assert_eq!((web.count("conversations.open"), web.count("chat.postMessage")), (opened, posted));
+        // The button of the closed message decides nothing; the app does
+        loaded.on_action(&host, &press("UOP", "post_approve", &p));
+        assert_eq!(post_of(&loaded, &p.id).state, "waiting");
+        loaded.decide_in_app(&host, &p.id, true, None, None).unwrap();
+        while loaded.work(&host) {}
+        assert_eq!((post_of(&loaded, &p.id).state.as_str(), web.count("chat.update")), ("sent", 1));
+        // It is switched off once: a restart leaves it as it is and says it once
+        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        assert_eq!(again.status()["connection"]["approvalReset"], true);
+        assert_eq!(lock(&again.state).audit.iter().filter(|a| a.text.contains("without having been chosen")).count(), 1);
+        // The operator's choice, either way, ends the notice
+        again.set_slack_approval(false);
+        let c = again.status()["connection"].clone();
+        assert_eq!((c["approveInSlack"].as_bool(), c["approvalReset"].as_bool()), (Some(false), Some(false)));
     }
 
     #[test]

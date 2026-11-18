@@ -196,6 +196,8 @@ export function reportGroups(reports: Report[], hosted: Hosted[]): ReportGroup[]
 /** The Slack connector as the harness service reports it (decision D14). No token is in it. */
 export interface SlackConnection {
   team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number;
+  /** Approval in Slack was on without having been chosen and the service switched it off; shown until the person sets the switch */
+  approvalReset?: boolean;
   /** Permissions of the manifest that the bot lacks */
   missingScopes?: string[];
 }
