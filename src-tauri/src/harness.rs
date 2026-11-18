@@ -80,6 +80,7 @@ A peer in your folder may be changing the same files. Take its role into account
 
 ## Supervisors and executors
 - A session can work for another: `list_peers` marks `your supervisor` and `your executor`, and `whoami` lists both.
+- `overview` shows you and your executor tree, including open tasks, waits, reports and attention. The Supervisor surface sees all trees.
 - With executors, you direct them: `task_assign` gives one a task, `task_wait` or your inbox tells you when it ends, `session_status`, `session_result` and `terminal_read` show where it stands. These work on your executors and theirs, on nobody else.
 - `executor_create` starts a new session that works for you. Use it for work that needs its own context and runs next to yours; the operator sees it under your session. You cannot answer an executor's permission prompts.
 - As an executor, do the tasks your supervisor gives you and `report` as usual: your reports reach your supervisor and the operator.
@@ -126,6 +127,7 @@ Call it when you judge it necessary; nobody has to ask.
 - A status report is not for every step: one line on what you are doing now is `set_status`. And it is not a wait: when you depend on something outside your session, call `wait_register`. A status text that says "waiting for CI" tells nobody when to look; a registered wait is followed up when it runs late.
 - Don't report progress that needs nobody ("still working"): that is `set_status`. Reports are refused after 6 in ten minutes.
 - A report does not replace your answer in the terminal: write the full account there, and the short form in the report.
+- Supervisors can use `overview` for the latest open report and attention in each session of their tree.
 - The supervisor session reads reports too (`reports_list`), so a report is also how you report back on a task it gave you.
 
 ## Bulletin board: what later sessions must know
@@ -603,6 +605,8 @@ pub struct Tracked {
     pub last_message_at: u64,
     /// What the agent says it is doing (`set_status`)
     pub status: String,
+    /// Last set_status text update; zero means unknown for older saved state.
+    pub status_since: u64,
     /// Its agent connected to the harness tools (the `mcr` MCP server)
     pub tools: bool,
     /// What the agent calls the session in its terminal title, when that says
@@ -1241,6 +1245,136 @@ impl Store {
     }
 }
 
+/// A cursor is resolved before filtering, so it can refer to a different session.
+fn list_since(value: &Value, now: u64, entries: impl Iterator<Item = (String, u64)>) -> Result<(u64, Option<String>), String> {
+    if value.is_null() {
+        return Ok((0, None));
+    }
+    if let Some(minutes) = value.as_f64().filter(|n| n.is_finite() && *n >= 0.0) {
+        return Ok((now.saturating_sub((minutes * 60_000.0) as u64), None));
+    }
+    if let Some(id) = value.as_str() {
+        return entries.into_iter().find(|(key, _)| key == id).map(|(_, at)| (at, Some(id.into()))).ok_or_else(|| format!("Unknown since id {id}; it may have expired. Use minutes instead."));
+    }
+    Err("since must be nonnegative minutes or an existing id".into())
+}
+
+fn after_since(at: u64, id: &str, since: &(u64, Option<String>)) -> bool {
+    match &since.1 {
+        Some(cursor) => (at, id) > (since.0, cursor.as_str()),
+        None => at >= since.0,
+    }
+}
+
+fn age_seconds(now: u64, at: u64) -> Value {
+    if at == 0 { Value::Null } else { json!(now.saturating_sub(at) / 1000) }
+}
+
+fn short_text(text: &str, chars: usize) -> String {
+    text.chars().take(chars).collect()
+}
+
+impl Store {
+    // Matches the Board's openReports rule: one active mark, latest matching report.
+    fn open_report(&self, session: &str) -> Option<&Report> {
+        let tracked = self.sessions.get(session).filter(|t| t.state != "exited")?;
+        let kind = tracked.attention.as_ref()?.report.as_deref()?;
+        self.reports.iter().rev().find(|r| r.session == session && r.kind == kind)
+    }
+
+    fn list_messages(&self, args: &Value, now: u64) -> Result<Value, String> {
+        let since = list_since(&args["since"], now, self.messages.values().map(|m| (m.id.clone(), m.created)))?;
+        let pair = match args.get("pair") {
+            None => None,
+            Some(Value::Array(p)) if p.len() == 2 && p.iter().all(Value::is_string) => Some((p[0].as_str().unwrap(), p[1].as_str().unwrap())),
+            _ => return Err("pair must contain two session ids".into()),
+        };
+        let session = args["session"].as_str().filter(|s| !s.is_empty());
+        let mut list: Vec<&Message> = self.messages.values().filter(|m| {
+            session.is_none_or(|s| m.from == s || m.to == s)
+                && pair.is_none_or(|(a, b)| (m.from == a && m.to == b) || (m.from == b && m.to == a))
+                && after_since(m.created, &m.id, &since)
+        }).collect();
+        list.sort_by(|a, b| (a.created, &a.id).cmp(&(b.created, &b.id)));
+        let from = list.len().saturating_sub(args["limit"].as_u64().unwrap_or(50).clamp(1, 500) as usize);
+        let list = &list[from..];
+        let brief = match args.get("brief") {
+            None => (list.len() > 20).then_some(48),
+            Some(Value::Bool(on)) => on.then_some(48),
+            Some(n) => Some(n.as_u64().filter(|n| (1..=500).contains(n)).ok_or("brief must be a boolean or 1..500 characters")? as usize),
+        };
+        let Some(chars) = brief else { return Ok(json!({"messages": list})); };
+        let mut names = BTreeMap::new();
+        let rows: Vec<Value> = list.iter().map(|m| {
+            names.insert(&m.from, &m.from_name);
+            names.insert(&m.to, &m.to_name);
+            json!([m.id, m.from, m.to, age_seconds(now, m.created), m.read != 0, m.expects_reply, m.answered, short_text(&m.text, chars), m.text.chars().count() > chars])
+        }).collect();
+        Ok(json!({"columns": ["id", "from", "to", "ageSeconds", "read", "expectsReply", "answered", "text", "truncated"], "sessions": names, "messages": rows}))
+    }
+
+    fn list_reports(&self, args: &Value, now: u64) -> Result<Value, String> {
+        let since = list_since(&args["since"], now, self.reports.iter().map(|r| (r.id.clone(), r.created)))?;
+        let session = args["session"].as_str().filter(|s| !s.is_empty());
+        let kind = args["kind"].as_str();
+        if kind.is_some_and(|k| !["needs_human", "done", "status"].contains(&k)) {
+            return Err("kind must be needs_human, done or status".into());
+        }
+        let open = match args.get("open") {
+            None => None,
+            Some(Value::Bool(b)) => Some(*b),
+            _ => return Err("open must be a boolean".into()),
+        };
+        let mut list: Vec<&Report> = self.reports.iter().filter(|r| {
+            session.is_none_or(|s| r.session == s) && kind.is_none_or(|k| r.kind == k)
+                && after_since(r.created, &r.id, &since)
+                && open.is_none_or(|want| self.open_report(&r.session).is_some_and(|o| o.id == r.id) == want)
+        }).collect();
+        list.sort_by(|a, b| (a.created, &a.id).cmp(&(b.created, &b.id)));
+        let from = list.len().saturating_sub(args["limit"].as_u64().unwrap_or(50).clamp(1, 500) as usize);
+        Ok(json!({"reports": &list[from..]}))
+    }
+
+    fn overview(&self, sessions: &[Value], caller: Option<&str>, now: u64) -> Value {
+        let visible: BTreeMap<&str, &Value> = sessions.iter().filter(|s| s["exit"].is_null()).filter_map(|s| {
+            let id = s["id"].as_str()?;
+            caller.is_none_or(|me| me == id || self.under(me, id)).then_some((id, s))
+        }).collect();
+        let mut roots: Vec<&str> = visible.keys().copied().filter(|id| {
+            self.sessions.get(*id).and_then(|t| t.supervisor.as_deref()).is_none_or(|up| !visible.contains_key(up))
+        }).collect();
+        // Groups first, independent sessions last; stable ordering within each.
+        roots.sort_by_key(|id| (!self.executors(id).iter().any(|e| visible.contains_key(e.as_str())), *id));
+        json!({"sessions": roots.iter().map(|id| self.overview_node(id, &visible, now, MAX_DEPTH + 1)).collect::<Vec<_>>()})
+    }
+
+    fn overview_node(&self, id: &str, visible: &BTreeMap<&str, &Value>, now: u64, remaining: usize) -> Value {
+        let s = visible[id];
+        let h = &s["harness"];
+        let attention = &h["attention"];
+        let tasks: Vec<Value> = self.tasks.values().filter(|t| t.session == id && t.open()).map(|t| json!({
+            "id": t.id, "state": t.state, "text": short_text(&t.text, 160), "ageSeconds": age_seconds(now, t.created),
+        })).collect();
+        let waits: Vec<Value> = self.open_waits(id).iter().map(|w| json!({
+            "id": w.id, "kind": w.kind, "on": w.on, "ref": w.reference, "ageSeconds": age_seconds(now, w.created),
+            "dueInSeconds": (i128::from(w.expect_by) - i128::from(now)) / 1000,
+            "overdue": w.expect_by <= now, "escalated": w.escalated,
+        })).collect();
+        let children: Vec<Value> = if remaining == 0 { Vec::new() } else {
+            self.executors(id).iter().filter(|e| visible.contains_key(e.as_str())).map(|e| self.overview_node(e, visible, now, remaining - 1)).collect()
+        };
+        json!({
+            "id": id, "name": h["name"], "role": if s["meta"]["role"] == "supervisor" { json!("supervisor") } else { h["role"].clone() },
+            "profile": h["profile"], "folder": s["cwd"], "state": h["state"], "stateAgeSeconds": age_seconds(now, h["since"].as_u64().unwrap_or(0)),
+            "stateFromHooks": h["precise"] == true && h["hooked"] == true, "status": h["status"], "statusAgeSeconds": age_seconds(now, h["statusSince"].as_u64().unwrap_or(0)),
+            "openTasks": tasks, "unreadMessages": self.unread(id), "waits": waits,
+            "lastOpenReport": self.open_report(id).map(|r| json!({"id": r.id, "kind": r.kind, "text": short_text(&r.text, 240), "ageSeconds": age_seconds(now, r.created)})),
+            "attention": if attention.is_null() { Value::Null } else { json!({"kind": attention["kind"], "text": short_text(attention["text"].as_str().unwrap_or(""), 240), "ageSeconds": age_seconds(now, attention["since"].as_u64().unwrap_or(0))}) },
+            "needsOperator": !attention.is_null() && attention["kind"] != "notification", "executors": children,
+        })
+    }
+}
+
 /// Reports the app lists, newest last.
 const BOARD_REPORTS: usize = 200;
 
@@ -1817,9 +1951,10 @@ impl Harness {
             }
             // Its reports too: the next status report replaces the one from before the restart
             s.move_reports(id, &new_id);
-            let (status, role, above) = s.sessions.get(id).map(|t| (t.status.clone(), t.role.clone(), t.supervisor.clone())).unwrap_or_default();
+            let (status, status_since, role, above) = s.sessions.get(id).map(|t| (t.status.clone(), t.status_since, t.role.clone(), t.supervisor.clone())).unwrap_or_default();
             if let Some(t) = s.sessions.get_mut(&new_id) {
                 t.status = status;
+                t.status_since = status_since;
                 t.role = role;
                 t.supervisor = above;
             }
@@ -2372,6 +2507,10 @@ impl Harness {
     fn agent_tool(&self, me: &str, name: &str, args: &Value) -> Result<Value, String> {
         let text = |key: &str| args[key].as_str().ok_or_else(|| format!("{key} is required"));
         let mut out = match name {
+            "overview" => {
+                let sessions = self.sessions()?;
+                lock(&self.store).overview(&sessions, Some(me), now_ms())
+            }
             "whoami" => {
                 let mut out = Self::brief(&self.session(me)?);
                 let store = lock(&self.store);
@@ -2549,6 +2688,7 @@ impl Harness {
                     let t = s.sessions.get_mut(me)?;
                     if let Some(status) = status {
                         t.status = status;
+                        t.status_since = now_ms();
                     }
                     if let Some(role) = role {
                         t.role = role;
@@ -3201,6 +3341,10 @@ impl Harness {
         };
         match name {
             "profiles_list" => Ok(json!({ "profiles": crate::harness_preferences::HarnessPreferences::load(&self.dir)?.profiles() })),
+            "overview" => {
+                let sessions = self.sessions()?;
+                Ok(lock(&self.store).overview(&sessions, None, now_ms()))
+            }
             "session_list" => Ok(json!({ "sessions": self.sessions()?.iter().map(Self::brief).collect::<Vec<_>>() })),
             "session_status" => {
                 let s = self.session(text("session")?)?;
@@ -3294,20 +3438,8 @@ impl Harness {
                 self.runner(json!({"op": "forget", "id": text("session")?}))?;
                 Ok(json!({ "forgotten": true }))
             }
-            "messages_list" => {
-                let session = args["session"].as_str().filter(|s| !s.is_empty());
-                let mut list: Vec<Message> =
-                    lock(&self.store).messages.values().filter(|m| session.is_none_or(|s| m.from == s || m.to == s)).cloned().collect();
-                list.sort_by_key(|m| m.created);
-                let from = list.len().saturating_sub(args["limit"].as_u64().unwrap_or(50).clamp(1, 500) as usize);
-                Ok(json!({ "messages": list.split_off(from) }))
-            }
-            "reports_list" => {
-                let session = args["session"].as_str().filter(|s| !s.is_empty());
-                let mut list: Vec<Report> = lock(&self.store).reports.iter().filter(|r| session.is_none_or(|s| r.session == s)).cloned().collect();
-                let from = list.len().saturating_sub(args["limit"].as_u64().unwrap_or(50).clamp(1, 500) as usize);
-                Ok(json!({ "reports": list.split_off(from) }))
-            }
+            "messages_list" => lock(&self.store).list_messages(args, now_ms()),
+            "reports_list" => lock(&self.store).list_reports(args, now_ms()),
             "bulletin_list" => {
                 let now = now_ms();
                 let mut notes: Vec<Note> = lock(&self.store).notes.values().filter(|n| n.expires > now).cloned().collect();
@@ -3572,6 +3704,7 @@ fn supervisor_tools() -> Value {
     let session = json!({"type": "string", "description": "Session id from session_list"});
     let wait = json!({"type": "integer", "description": "How long to wait, in seconds (default 50, at most 600)"});
     json!({ "tools": [
+        tool("overview", "All live supervisor/executor trees, then independent sessions: state and status ages in seconds (null when unknown), open tasks, unread messages, waits, latest open report and attention.", json!({}), &[]),
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
         tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
@@ -3594,10 +3727,10 @@ fn supervisor_tools() -> Value {
         tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}}), &["session"]),
         tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
         tool("session_forget", "Drop an ended session and its terminal output.", json!({"session": session}), &["session"]),
-        tool("messages_list", "What hosted sessions told each other through the harness tools (newest last): sender, receiver, text, whether it was read and answered.", json!({"session": {"type": "string", "description": "Only messages to or from this session id"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
+        tool("messages_list", "Messages, newest last. Full objects for small lists; brief returns compact rows with columns and a session-name dictionary. Text is cut at Unicode characters; truncated is explicit. Filters apply before limit.", json!({"session": {"type": "string"}, "pair": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2, "description": "Both directions between exactly these two session ids"}, "since": {"type": ["number", "string"], "description": "Last N minutes (number), or strictly after a message id (string); unknown ids are errors"}, "brief": {"type": ["boolean", "integer"], "description": "First N characters (1..500), true = 48, false = full text. Defaults to 48 above 20 returned messages"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
         tool("attention_list", "Sessions with something for the human operator: a prompt they wait on (kind permission), or their own report (`report` is needs_human or done).", json!({}), &[]),
         tool("attention_wait", "Wait until some session has something for the operator (a prompt, or a report that it needs them or finished a piece of work) or the time is up.", json!({"timeout_seconds": wait}), &[]),
-        tool("reports_list", "What sessions reported with their report tool (newest last): needs_human (it cannot go on without the operator) or done (a piece of work is complete), with the text.", json!({"session": {"type": "string", "description": "Only reports of this session id"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
+        tool("reports_list", "Reports (needs_human, done or status), newest last, filtered before limit. Status entries remain in history; the Board shows the latest. Open means the latest report matching the session's current report attention mark (the same rule as the Board); cleared or superseded marks are not open.", json!({"session": {"type": "string"}, "since": {"type": ["number", "string"], "description": "Last N minutes (number), or strictly after a report id (string)"}, "kind": {"type": "string", "enum": ["needs_human", "done", "status"]}, "open": {"type": "boolean", "description": "true: only open; false: only closed; omitted: all"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
         tool("bulletin_list", "Every live note on the bulletin board: who left it, for which folder, when it expires.", json!({}), &[]),
         tool("bulletin_post", "Leave a note that sessions read when they start and while it lasts. With `cwd` it is for sessions in that folder, its subfolders and the folders above; without, for every session.", json!({"text": {"type": "string"}, "expires_hours": {"type": "integer", "description": "How long it stays true: 1 to 336"}, "cwd": {"type": "string", "description": "Folder it is about (absolute path)"}}), &["text", "expires_hours"]),
         tool("bulletin_remove", "Take a note off the bulletin board.", json!({"note": {"type": "string", "description": "Note id from bulletin_list"}}), &["note"]),
@@ -3624,6 +3757,7 @@ fn agent_tools() -> Value {
     let to = json!({"type": "string", "description": "The peer's name, id or mcr:<id> pointer (see list_peers)"});
     let mut tools = vec![
         tool("guide", "The working rules for sessions that see each other here: when and how to reach a peer, and what a message from a peer is. Read it before your first message to a peer.", json!({}), &[], true),
+        tool("overview", "Your session and its executor tree only: state and status ages in seconds, open tasks, unread messages, waits, latest open report and attention. Unknown ages are null.", json!({}), &[], true),
         tool("whoami", "This session as the harness knows it: id, name, agent kind, folder, state.", json!({}), &[], true),
         tool("list_peers", "The other running agent sessions on this machine: id, name, agent kind (claude, codex, shell), folder, state, role and what they say they are doing. Sessions in your folder come first: `folder` is same, below (a subfolder of yours) or above (it contains yours). Call it when you start and before you change shared files.", json!({"same_folder": {"type": "boolean", "description": "Only the sessions in your folder, below it or above it"}}), &[], true),
         tool("send_message", "Leave a message in a peer's inbox. The peer is told when it is idle. No reply is expected; use ask for a question.", json!({"to": to, "text": {"type": "string"}}), &["to", "text"], false),
@@ -4012,6 +4146,149 @@ mod tests {
         assert_eq!(&argv[1..4], &["-l", "-i", "-c"]);
         let hooks = claude_settings("/Apps/Agent MCR.app/agent-mcr", false);
         assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "'/Apps/Agent MCR.app/agent-mcr' --harness-hook Stop");
+    }
+
+    #[test]
+    fn supervision_message_filters_and_compact_budget() {
+        let mut s = Store::default();
+        for i in 0..100 {
+            let id = format!("m{i:010}");
+            s.messages.insert(id.clone(), Message { id, from: "0123456789ab".into(), to: "abcdef012345".into(), from_name: "Supervisor".into(), to_name: "Executor".into(), text: "Review this change and verify the full result. ".repeat(200), created: 1000 + i * 1000, ..Message::default() });
+        }
+        let brief = s.list_messages(&json!({"limit": 100, "brief": true}), 101000).unwrap();
+        assert_eq!(brief["messages"].as_array().unwrap().len(), 100);
+        // Conservative size proxy, not a tokenizer measurement: compact ASCII JSON <20 KB.
+        assert!(brief.to_string().len() < 20_000, "{} bytes", brief.to_string().len());
+        assert_eq!(brief["messages"][0][8], true);
+        assert_eq!(s.list_messages(&json!({"limit": 100}), 101000).unwrap(), brief);
+        let full = s.list_messages(&json!({"limit": 1, "brief": false}), 101000).unwrap();
+        assert_eq!(full["messages"][0]["id"], "m0000000099");
+        assert!(full["messages"][0]["text"].as_str().unwrap().len() > 500);
+        let recent = s.list_messages(&json!({"since": 1, "limit": 100}), 101000).unwrap();
+        assert_eq!(recent["messages"].as_array().unwrap().len(), 60);
+        let pair = s.list_messages(&json!({"pair": ["abcdef012345", "0123456789ab"], "since": "m0000000097", "brief": 3}), 101000).unwrap();
+        assert_eq!(pair["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(pair["messages"][0][7], "Rev");
+        assert!(s.list_messages(&json!({"pair": ["other", "0123456789ab"]}), 101000).unwrap()["messages"].as_array().unwrap().is_empty());
+        assert!(s.list_messages(&json!({"session": "other"}), 101000).unwrap()["messages"].as_array().unwrap().is_empty());
+        for args in [json!({"since": "expired"}), json!({"since": -1}), json!({"brief": 0}), json!({"pair": ["a"]})] {
+            assert!(s.list_messages(&args, 101000).is_err());
+        }
+        s.messages.get_mut("m0000000099").unwrap().text = "🦀é中end".into();
+        assert_eq!(s.list_messages(&json!({"limit": 1, "brief": 3}), 101000).unwrap()["messages"][0][7], "🦀é中");
+        // Ties use id ordering, so a cursor never silently repeats its own row.
+        s.messages.get_mut("m0000000099").unwrap().created = 99000;
+        assert_eq!(s.list_messages(&json!({"since": "m0000000098"}), 101000).unwrap()["messages"][0]["id"], "m0000000099");
+    }
+
+    #[test]
+    fn supervision_report_filters_follow_the_board_mark() {
+        let mut s = store_with("a", "working");
+        for (id, kind, at) in [("r1", "needs_human", 1000), ("r2", "done", 30000), ("r3", "done", 60000), ("r4", "status", 90000)] {
+            s.reports.push(Report { id: id.into(), session: "a".into(), kind: kind.into(), created: at, ..Report::default() });
+        }
+        s.sessions.get_mut("a").unwrap().attention = Some(Attention { kind: "notification".into(), text: "done".into(), since: 60000, report: Some("done".into()), ..Attention::default() });
+        assert_eq!(s.list_reports(&json!({"open": true}), 100000).unwrap()["reports"][0]["id"], "r3");
+        assert_eq!(s.list_reports(&json!({"open": false}), 100000).unwrap()["reports"].as_array().unwrap().len(), 3);
+        assert_eq!(s.list_reports(&json!({"since": 1, "kind": "done"}), 100000).unwrap()["reports"][0]["id"], "r3");
+        assert_eq!(s.list_reports(&json!({"since": "r3", "kind": "status"}), 100000).unwrap()["reports"][0]["id"], "r4");
+        assert_eq!(s.list_reports(&json!({"kind": "done", "limit": 1}), 100000).unwrap()["reports"][0]["id"], "r3");
+        assert!(s.list_reports(&json!({"session": "other"}), 100000).unwrap()["reports"].as_array().unwrap().is_empty());
+        for args in [json!({"since": "expired"}), json!({"kind": "bad"}), json!({"open": "yes"})] {
+            assert!(s.list_reports(&args, 100000).is_err());
+        }
+        s.sessions.get_mut("a").unwrap().attention = None;
+        assert!(s.list_reports(&json!({"open": true}), 100000).unwrap()["reports"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn supervision_overview_scopes_trees_and_summarizes_work() {
+        let mut s = store_with("z-root", "working");
+        for id in ["child", "grandchild", "a-independent", "ended"] {
+            s.sessions.insert(id.into(), Tracked { name: id.into(), profile: "codex".into(), state: "working".into(), since: 1000, precise: true, hooked: true, status: "testing".into(), status_since: 2000, ..Tracked::default() });
+        }
+        s.bind("child", Some("z-root")).unwrap();
+        s.bind("grandchild", Some("child")).unwrap();
+        task(&mut s, "open", "child", "working", 1000);
+        task(&mut s, "closed", "child", "completed", 1000);
+        s.messages.insert("m".into(), Message { to: "child".into(), ..Message::default() });
+        s.waits.insert("w".into(), Wait { id: "w".into(), session: "child".into(), created: 1000, expect_by: 5000, ..Wait::default() });
+        s.reports.push(Report { id: "r".into(), session: "child".into(), kind: "needs_human".into(), created: 3000, ..Report::default() });
+        s.sessions.get_mut("child").unwrap().attention = Some(Attention { kind: "assessment".into(), text: "review".into(), since: 3000, report: Some("needs_human".into()), ..Attention::default() });
+        let sessions: Vec<Value> = s.sessions.iter().map(|(id, t)| json!({"id": id, "cwd": "/work", "harness": t, "exit": if id == "ended" { json!(0) } else { Value::Null }})).collect();
+        let all = s.overview(&sessions, None, 10000);
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(all["sessions"][0]["id"], "z-root");
+        let child = &all["sessions"][0]["executors"][0];
+        assert_eq!(child["executors"][0]["id"], "grandchild");
+        assert_eq!(child["stateAgeSeconds"], 9);
+        assert_eq!(child["statusAgeSeconds"], 8);
+        assert_eq!(child["stateFromHooks"], true);
+        // The same rule as the brief (MCR-71): an agent that has reported nothing has no state from hooks
+        let mut unreported = sessions.clone();
+        unreported.iter_mut().filter(|v| v["id"] == "child").for_each(|v| v["harness"]["hooked"] = json!(false));
+        assert_eq!(s.overview(&unreported, None, 10000)["sessions"][0]["executors"][0]["stateFromHooks"], false);
+        assert_eq!(child["openTasks"].as_array().unwrap().len(), 1);
+        assert_eq!(child["unreadMessages"], 1);
+        assert_eq!(child["waits"][0]["overdue"], true);
+        assert_eq!(child["waits"][0]["dueInSeconds"], -5);
+        assert_eq!(child["lastOpenReport"]["id"], "r");
+        assert_eq!(child["needsOperator"], true);
+        assert!(all["sessions"][0]["statusAgeSeconds"].is_null());
+        let mine = s.overview(&sessions, Some("child"), 10000);
+        assert_eq!(mine["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(mine["sessions"][0], *child);
+        assert!(s.overview(&sessions, Some("unknown"), 10000)["sessions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn supervision_overview_and_lists_through_the_service() {
+        let dir = Path::new("/tmp").join(format!("mcr-overview-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = UnixListener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": [
+                        {"id": "a", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "b", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "root", "cwd": "/tmp", "meta": {"profile": "claude", "role": "supervisor"}}
+                    ]}),
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            for id in ["a", "b", "root"] {
+                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+            }
+            s.bind("b", Some("a")).unwrap();
+        });
+        assert_eq!(h.tool("overview", &json!({})).unwrap()["sessions"].as_array().unwrap().len(), 2);
+        let mine = h.agent_tool("b", "overview", &json!({})).unwrap();
+        assert_eq!(mine["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(mine["sessions"][0]["id"], "b");
+        h.agent_tool("b", "set_status", &json!({"text": "checking"})).unwrap();
+        assert!(lock(&h.store).sessions["b"].status_since > 0);
+        let restored: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
+        assert!(restored.sessions["b"].status_since > 0);
+        assert!(h.tool("messages_list", &json!({"brief": true})).is_ok());
+        assert!(h.tool("reports_list", &json!({"open": true})).is_ok());
+        for catalog in [supervisor_tools(), agent_tools()] {
+            assert!(catalog["tools"].as_array().unwrap().iter().any(|t| t["name"] == "overview"));
+        }
+        let mut stream = UnixStream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn store_with(session: &str, state: &str) -> Store {
