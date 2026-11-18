@@ -316,20 +316,20 @@ Zero-tolerance counts, shown in the harness panel: rows shown live without a liv
 
 ## Slack connector (D14, MCR-26)
 
-**Status:** first version built on 2026-11-17 for an end-to-end test on the owner's workspace; not yet run against Slack (see "What is built"). Ships in 1.0 as a preview. Tasks: MCR-27 to MCR-40.
+**Status:** first version built on 2026-11-17. On 2026-11-18 these passed live on the owner's workspace: connect, the Socket Mode connection and its reconnect, listening on mentions, delivery to a Claude session, a reply approved in the app, a reply approved in Slack, and a denial in the app with a reason. Not yet run live: the app closed, sleep and wake with catch-up, disconnect, a Codex session as receiver, an automatic post to a second channel, Deny with the Slack button, edit before approval (see "What is built"). Ships in 1.0 as a preview. Tasks: MCR-27 to MCR-40.
 
 ### What is built
 
 | Part | State |
 |---|---|
-| Connect flow: tokens checked with Slack, native confirmation, tokens in the Keychain, disconnect | Built; not run live |
-| Socket Mode connection in the harness service: store, acknowledge, deliver; reconnect; off switch | Built; the Web API side is tested against a fake, the WebSocket loop only compiles until the live run |
+| Connect flow: tokens checked with Slack, native confirmation, tokens in the Keychain, disconnect | Built. Connect passed live on 2026-11-18; disconnect is not yet run live |
+| Socket Mode connection in the harness service: store, acknowledge, deliver; reconnect; off switch | Built; the Web API side is tested against a fake. The connection, its reconnect and the delivery of a mention passed live on 2026-11-18. Not yet run live: the app closed |
 | Channel policies in the app (Slack tab): listen, senders, route, posting, who may post | Built |
-| Routing to a session or the Supervisor as inbox data; threads stay with their session | Built, tested |
-| Catch-up of channels after a reconnect | Built, tested |
+| Routing to a session or the Supervisor as inbox data; threads stay with their session | Built, tested. Listening on mentions and delivery to a Claude session passed live on 2026-11-18; a Codex session as receiver is not yet run live |
+| Catch-up of channels after a reconnect | Built, tested; not yet run live (sleep and wake) |
 | Harness tools `slack_channels`, `slack_reply`, `slack_post`, `slack_post_status`, `slack_thread`; supervisor tool `slack_status` | Built, tested |
-| Approval in the app (approve, edit then approve, deny with a reason) and in Slack (Approve, Deny) | Built, tested |
-| Sending as the bot, at most once, with the outcome told to the session | Built, tested |
+| Approval in the app (approve, edit then approve, deny with a reason) and in Slack (Approve, Deny) | Built, tested. Passed live on 2026-11-18: approve in the app, Approve in Slack, deny in the app with a reason. Not yet run live: edit before approval, Deny with the Slack button |
+| Sending as the bot, at most once, with the outcome told to the session | Built, tested. Replies approved in the app and in Slack were sent live on 2026-11-18; an automatic post to a second channel is not yet run live |
 
 What differs from this design for now, and why:
 
