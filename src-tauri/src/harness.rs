@@ -1479,15 +1479,18 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
     let event = if event == crate::agents::CODEX_HOOK {
         tracked.own_hooks = true;
         tracked.hooked = true;
-        // Whether hooks also run for other threads in the terminal (subagents,
-        // the title writer) is not known, so they are held to the session's
-        // own thread as turn ends are: `top-level` is what the transcripts
-        // say (added by `hook`), and an id that differs from the known one
-        // is another thread's
+        // Codex runs the hooks for its subagents too, under the SAME
+        // session_id as the session's own thread, with `agent_id` (and the
+        // subagent's own transcript_path) added: seen on codex-cli 0.170,
+        // 2026-11-18. So a subagent is told by `agent_id`. The other two
+        // checks are for what was not seen: `top-level` is what the
+        // transcripts say about the id (added by `hook`), and an id that
+        // differs from the known one is another thread's
         let id = payload["session_id"].as_str().filter(|id| !id.is_empty());
         let top = payload["top-level"].as_bool();
         let own = tracked.agent_session.as_deref();
-        let other = top == Some(false) || (top.is_none() && id.zip(own).is_some_and(|(id, own)| id != own));
+        let subagent = payload["agent_id"].as_str().is_some_and(|a| !a.is_empty());
+        let other = subagent || top == Some(false) || (top.is_none() && id.zip(own).is_some_and(|(id, own)| id != own));
         match payload["hook_event_name"].as_str().unwrap_or("") {
             // The conversation's id from its first moment. Nothing more: when in
             // its start Codex runs this is not known, so it neither makes the
@@ -1497,7 +1500,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
             // real turn ends would be ignored and a restart would resume the
             // wrong conversation
             "SessionStart" => {
-                if let Some(id) = id.filter(|_| top == Some(true) || (own.is_none() && top.is_none())) {
+                if let Some(id) = id.filter(|_| !subagent && (top == Some(true) || (own.is_none() && top.is_none()))) {
                     tracked.agent_session = Some(id.to_string());
                     if let Some(path) = payload["transcript_path"].as_str() {
                         tracked.transcript = Some(path.to_string());
@@ -5536,7 +5539,8 @@ mod tests {
         // Codex run hooks for them: they never move the conversation id, clear
         // the session's approval mark or change its state
         assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "session_id": "T", "tool_name": "Bash", "command": "git push"})));
-        for other in [json!({"session_id": "SUB"}), json!({"session_id": "SUB", "top-level": false}), json!({"session_id": "T", "top-level": false})] {
+        // The first is what Codex 0.170 really sends for a subagent: the session's own id, and agent_id
+        for other in [json!({"session_id": "T", "top-level": true, "agent_id": "A", "agent_type": "default"}), json!({"session_id": "SUB"}), json!({"session_id": "SUB", "top-level": false}), json!({"session_id": "T", "top-level": false})] {
             for name in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
                 let mut payload = other.clone();
                 payload["hook_event_name"] = json!(name);
@@ -5550,6 +5554,7 @@ mod tests {
         let t = s.sessions.get_mut("ex").unwrap();
         (t.attention, t.state) = (None, "idle".into());
         assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "SUB"})));
+        assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "T", "agent_id": "A"})));
         assert_eq!(s.sessions["ex"].state, "idle");
         // An approval request is kept from any thread: the terminal waits for the person
         assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "session_id": "SUB", "top-level": false, "tool_name": "Bash", "command": "ls"})));
@@ -5561,6 +5566,33 @@ mod tests {
         s.sessions.get_mut("ex").unwrap().agent_session = Some("SUB".into());
         assert!(!hook(&mut s, json!({"hook_event_name": "SessionStart", "session_id": "T", "top-level": true})));
         assert_eq!(s.sessions["ex"].agent_session.as_deref(), Some("T"));
+        // The payloads as recorded on 2026-11-18 (codex-cli 0.170), through the bridge's trimming
+        let mut real = Store::default();
+        real.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });
+        let (sid, path) = ("01a1f03a-adba-74e1-8003-b76067fb18a3", "/Users/x/.codex/sessions/2026/11/18/rollout-2026-11-18T20-55-39-01a1f03a-adba-74e1-8003-b76067fb18a3.jsonl");
+        let recorded = |name: &str, more: Value| {
+            let mut p = json!({"session_id": sid, "turn_id": "01a1f03a-ea29-79a1-9935-76446564857e", "transcript_path": path, "cwd": "/work", "hook_event_name": name, "model": "gpt-6-astra", "permission_mode": "default"});
+            p.as_object_mut().unwrap().extend(more.as_object().unwrap().clone());
+            trim_hook("codex-hook", &mut p);
+            p
+        };
+        let send = |s: &mut Store, p: Value| apply_hook(s, "ex", "codex-hook", &p);
+        assert!(!send(&mut real, recorded("SessionStart", json!({"source": "startup"}))));
+        assert_eq!((real.sessions["ex"].agent_session.as_deref(), real.sessions["ex"].transcript.as_deref()), (Some(sid), Some(path)));
+        assert!(!send(&mut real, recorded("UserPromptSubmit", json!({"prompt": "Start one subagent that runs ls. Then run the shell command: touch probe.txt"}))));
+        // The sandbox refused the first try; Codex reports that as a tool use, then asks
+        assert!(!send(&mut real, recorded("PostToolUse", json!({"tool_name": "Bash", "tool_input": {"command": "touch probe.txt"}, "tool_response": "touch: probe.txt: Operation not permitted\n", "tool_use_id": "exec-6f"}))));
+        assert!(!send(&mut real, recorded("PermissionRequest", json!({"tool_name": "Bash", "tool_input": {"command": "touch probe.txt", "description": "May I create probe.txt? The read-only sandbox blocked the requested touch command."}}))));
+        let a = real.sessions["ex"].attention.clone().unwrap();
+        assert_eq!(a.text, "Codex asks to use Bash: touch probe.txt (May I create probe.txt? The read-only sandbox blocked the requested touch command.)");
+        // The subagent's tool use while the request is up: same session_id, its own transcript
+        assert!(!send(&mut real, recorded("PostToolUse", json!({"agent_id": "01a1f03a-f91c-7a80-af25-d7ce401850af", "agent_type": "default", "transcript_path": "/Users/x/.codex/sessions/2026/11/18/rollout-sub.jsonl", "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": "", "tool_use_id": "exec-13"}))));
+        let t = real.sessions["ex"].clone();
+        assert_eq!((t.state.as_str(), t.attention.is_some(), t.transcript.as_deref(), t.agent_session.as_deref()), ("waiting", true, Some(path), Some(sid)));
+        // Approved: the session's own tool use
+        assert!(!send(&mut real, recorded("PostToolUse", json!({"tool_name": "Bash", "tool_input": {"command": "touch probe.txt"}, "tool_response": "", "tool_use_id": "exec-91"}))));
+        assert_eq!((real.sessions["ex"].state.as_str(), real.sessions["ex"].attention.is_none()), ("working", true));
+
         // A first start that the transcripts call another agent's is not taken at all
         let mut fresh = Store::default();
         fresh.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });

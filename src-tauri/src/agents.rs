@@ -504,7 +504,7 @@ impl Adapter for Codex {
         body.starts_with("Approval requested")
     }
     fn question(&self, screen: &str) -> Option<String> {
-        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?")).or_else(|| {
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
             // The folder question at start (0.170 wording), whose answers may not be numbered
             if self.at_prompt(screen) {
                 return None;
@@ -638,6 +638,9 @@ mod tests {
         let codex = adapter("codex");
         assert_eq!(codex.title_asks("[ ! ] Action Required | teob-ai"), Some(true));
         assert_eq!(codex.title_asks("[ . ] Action Required | teob-ai"), Some(true));
+        // As recorded on 2026-11-18: the conversation's title stands between the words and the folder
+        assert_eq!(codex.title_asks("[ ! ] Action Required | Run ls and touch probe.txt | folder"), Some(true));
+        assert_eq!(codex.title_asks("\u{280f} Run ls and touch probe.txt | folder"), Some(false));
         assert_eq!(codex.title_asks("\u{2807} Memory answer grounding | teob-ai"), Some(false));
         // A conversation's own title may hold the words
         assert_eq!(codex.title_asks("Action Required review | teob-ai"), Some(false));
@@ -663,8 +666,9 @@ mod tests {
         // As seen on 2026-11-18 (codex-cli 0.170): numbered answers
         assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
         assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
-        // Codex's own review of hooks (wording from the 0.170 binary; the layout is not known)
-        assert_eq!(codex.question("  Hooks need review\n  4 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n  Review hooks\n  Trust all and continue\n  Continue without trusting\n").as_deref(), Some("Hooks need review: Codex asks whether to trust the hooks it was started with"));
+        // Codex's own review of hooks, as recorded on 2026-11-18 (it does not set the title)
+        let review = "  Hooks need review\n  4 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\u{203a} 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n";
+        assert_eq!(codex.question(review).as_deref(), Some("Hooks need review 4 hooks are new or changed. Hooks can run outside the sandbox after you trust them."));
         // Long commands are cut, and control characters never get into a notice
         let long = format!("Would you like to run the following command?\n$ echo {}\u{7}\n1. Yes, proceed (y)", "x".repeat(600));
         let text = codex.question(&long).unwrap();
