@@ -1319,11 +1319,16 @@ impl Store {
         let Some(chars) = brief else { return Ok(json!({"messages": list})); };
         let mut names = BTreeMap::new();
         let rows: Vec<Value> = list.iter().map(|m| {
-            names.insert(&m.from, &m.from_name);
+            // A message that no session sent (from Slack, or a notice of the harness) has no id
+            // to look up: its label stands in the row, or its text would read as a peer's
+            let source = m.from.is_empty().then(|| if m.slack.is_some() && !m.from_name.starts_with("Slack") { format!("Slack · {}", m.from_name) } else { m.from_name.clone() });
+            if source.is_none() {
+                names.insert(&m.from, &m.from_name);
+            }
             names.insert(&m.to, &m.to_name);
-            json!([m.id, m.from, m.to, age_seconds(now, m.created), m.read != 0, m.expects_reply, m.answered, short_text(&m.text, chars), m.text.chars().count() > chars])
+            json!([m.id, m.from, m.to, age_seconds(now, m.created), m.read != 0, m.expects_reply, m.answered, short_text(&m.text, chars), m.text.chars().count() > chars, source])
         }).collect();
-        Ok(json!({"columns": ["id", "from", "to", "ageSeconds", "read", "expectsReply", "answered", "text", "truncated"], "sessions": names, "messages": rows}))
+        Ok(json!({"columns": ["id", "from", "to", "ageSeconds", "read", "expectsReply", "answered", "text", "truncated", "source"], "sessions": names, "messages": rows}))
     }
 
     fn list_reports(&self, args: &Value, now: u64) -> Result<Value, String> {
@@ -3855,7 +3860,7 @@ fn supervisor_tools() -> Value {
         tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}}), &["session"]),
         tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
         tool("session_forget", "Drop an ended session and its terminal output.", json!({"session": session}), &["session"]),
-        tool("messages_list", "Messages, newest last. Full objects for small lists; brief returns compact rows with columns and a session-name dictionary. Text is cut at Unicode characters; truncated is explicit. Filters apply before limit.", json!({"session": {"type": "string"}, "pair": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2, "description": "Both directions between exactly these two session ids"}, "since": {"type": ["number", "string"], "description": "Last N minutes (number), or strictly after a message id (string); unknown ids are errors"}, "brief": {"type": ["boolean", "integer"], "description": "First N characters (1..500), true = 48, false = full text. Defaults to 48 above 20 returned messages"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
+        tool("messages_list", "Messages, newest last. Full objects for small lists; brief returns compact rows with columns and a session-name dictionary; source is set for a message no session sent (from Slack, or a notice of the harness). Text is cut at Unicode characters; truncated is explicit. Filters apply before limit.", json!({"session": {"type": "string"}, "pair": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2, "description": "Both directions between exactly these two session ids"}, "since": {"type": ["number", "string"], "description": "Last N minutes (number), or strictly after a message id (string); unknown ids are errors"}, "brief": {"type": ["boolean", "integer"], "description": "First N characters (1..500), true = 48, false = full text. Defaults to 48 above 20 returned messages"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
         tool("attention_list", "Sessions with something for the human operator: a prompt they wait on (kind permission), or their own report (`report` is needs_human or done).", json!({}), &[]),
         tool("attention_wait", "Wait until some session has something for the operator (a prompt, or a report that it needs them or finished a piece of work) or the time is up.", json!({"timeout_seconds": wait}), &[]),
         tool("reports_list", "Reports (needs_human, done or status), newest last, filtered before limit. Status entries remain in history; the Board shows the latest. Open means the latest report matching the session's current report attention mark (the same rule as the Board); cleared or superseded marks are not open.", json!({"session": {"type": "string"}, "since": {"type": ["number", "string"], "description": "Last N minutes (number), or strictly after a report id (string)"}, "kind": {"type": "string", "enum": ["needs_human", "done", "status"]}, "open": {"type": "boolean", "description": "true: only open; false: only closed; omitted: all"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
@@ -4332,6 +4337,16 @@ mod tests {
         }
         s.messages.get_mut("m0000000099").unwrap().text = "🦀é中end".into();
         assert_eq!(s.list_messages(&json!({"limit": 1, "brief": 3}), 101000).unwrap()["messages"][0][7], "🦀é中");
+        // A message from Slack keeps its label in a brief row, and no nameless entry enters the dictionary
+        s.messages.insert("m0000000200".into(), Message { id: "m0000000200".into(), to: "abcdef012345".into(), from_name: "Slack #ops · Ann".into(), to_name: "Executor".into(), text: "please deploy".into(), slack: Some(json!({"ref": "C1:1"})), created: 200_000, ..Message::default() });
+        s.messages.insert("m0000000201".into(), Message { id: "m0000000201".into(), to: "abcdef012345".into(), from_name: "Agent MCR".into(), to_name: "Executor".into(), text: "notice".into(), created: 201_000, ..Message::default() });
+        let mixed = s.list_messages(&json!({"limit": 3, "brief": true}), 202_000).unwrap();
+        assert_eq!(mixed["columns"][9], "source");
+        assert_eq!(mixed["messages"].as_array().unwrap().iter().map(|r| r[9].clone()).collect::<Vec<_>>(), [Value::Null, json!("Slack #ops · Ann"), json!("Agent MCR")]);
+        assert_eq!((mixed["messages"][1][1].as_str(), mixed["messages"][1][7].as_str()), (Some(""), Some("please deploy")));
+        assert!(mixed["sessions"].get("").is_none() && mixed["sessions"]["0123456789ab"] == "Supervisor");
+        s.messages.remove("m0000000200");
+        s.messages.remove("m0000000201");
         // Ties use id ordering, so a cursor never silently repeats its own row.
         s.messages.get_mut("m0000000099").unwrap().created = 99000;
         assert_eq!(s.list_messages(&json!({"since": "m0000000098"}), 101000).unwrap()["messages"][0]["id"], "m0000000099");
