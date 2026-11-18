@@ -369,16 +369,34 @@ mod win {
         }
 
         pub fn ancestor_among(&self, roots: &[i32]) -> super::Ancestry {
-            let mut cur_created = self.created;
-            super::walk_ancestry(self.pid, roots, |cur_pid| {
-                if cur_pid <= 4 {
-                    return Ok(None);
-                }
-                let (up_pid, _up_handle, up_created) = parent_with_handle(cur_pid, cur_created)?;
-                cur_created = up_created;
-                Ok(Some(up_pid))
-            })
+            walk_from(self.pid, self.created, roots)
         }
+    }
+
+    /// Walk up from `pid`, created at `created`, checking each parent's
+    /// creation time against its child's.
+    fn walk_from(pid: i32, created: u64, roots: &[i32]) -> super::Ancestry {
+        let mut cur_created = created;
+        super::walk_ancestry(pid, roots, |cur_pid| {
+            if cur_pid <= 4 {
+                return Ok(None);
+            }
+            let (up_pid, _up_handle, up_created) = parent_with_handle(cur_pid, cur_created)?;
+            cur_created = up_created;
+            Ok(Some(up_pid))
+        })
+    }
+
+    /// The same walk as `Peer::ancestor_among`, from a pid.
+    #[cfg(test)]
+    pub fn ancestor_among(pid: i32, roots: &[i32]) -> super::Ancestry {
+        let Some(handle) = u32::try_from(pid).ok().filter(|&p| p > 0).and_then(Handle::open_process) else {
+            return super::Ancestry::Unknown;
+        };
+        let Some(created) = creation_time(handle.0) else {
+            return super::Ancestry::Unknown;
+        };
+        walk_from(pid, created, roots)
     }
 
     pub(super) fn same_user_handle(peer_proc: &Handle) -> bool {
@@ -598,7 +616,7 @@ pub fn ancestor_among(pid: i32, roots: &[i32]) -> Ancestry {
     #[cfg(unix)]
     return walk_ancestry(pid, roots, |p| unix_step(p, parent, owner));
     #[cfg(windows)]
-    walk_ancestry(pid, roots, |p| parent(p).ok_or(Unreadable::Failed).map(Some))
+    win::ancestor_among(pid, roots)
 }
 
 #[cfg(test)]
@@ -689,6 +707,7 @@ mod tests {
         assert_eq!(ancestor_among(me, &[up]), Ancestry::Found(up));
         assert_eq!(peer.ancestor_among(&[up]), Ancestry::Found(up));
         assert_eq!(ancestor_among(me, &[]), Ancestry::Outside);
+        assert_eq!(peer.ancestor_among(&[]), Ancestry::Outside);
     }
 
     #[test]

@@ -1444,6 +1444,26 @@ mod tests {
         assert!(control.call(json!({"op": "nope"})).is_err());
     }
 
+    /// The number after the first `PID=` that is followed by digits and then a
+    /// non-digit, so a number split across reads is not taken half-read.
+    #[cfg(any(windows, test))]
+    fn pid_line(text: &str) -> Option<u32> {
+        text.match_indices("PID=").find_map(|(i, _)| {
+            let rest = &text[i + 4..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            (digits > 0 && digits < rest.len()).then(|| rest[..digits].parse().ok()).flatten()
+        })
+    }
+
+    #[test]
+    fn pid_line_finds_the_number_after_escape_sequences() {
+        assert_eq!(pid_line("\u{1b}[?25hPID=800\r\n"), Some(800));
+        assert_eq!(pid_line("('PID' + '=' + $p.Id)\r\nPID=12\r\n"), Some(12));
+        assert_eq!(pid_line("PID=80"), None, "the number may continue in the next read");
+        assert_eq!(pid_line("PID=\r\n"), None);
+        assert_eq!(pid_line("no pid here"), None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn control_writes_resizes_and_signals() {
@@ -1460,16 +1480,14 @@ mod tests {
         control.call(json!({"op": "resize", "id": "cmd", "cols": 120, "rows": 40})).unwrap();
         // Spawn a descendant process inside the job; wait for a complete PID=<digits> line so cmd echo cannot match.
         control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden powershell '-NoProfile -Command Start-Sleep 30'; Write-Output ('PID' + '=' + $p.Id)\"\r\n"})).unwrap();
+        // ConPTY can put the line after escape sequences on the same row, so look
+        // for PID= anywhere, and take the number only once a non-digit ends it.
+        out.get_ref().set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut seen = Vec::new();
         let mut buf = [0u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(10);
         let desc_pid: u32 = loop {
-            if let Some(pid) = String::from_utf8_lossy(&seen).lines().find_map(|line| {
-                let rest = line.trim().strip_prefix("PID=")?;
-                (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-                    .then(|| rest.parse().ok())
-                    .flatten()
-            }) {
+            if let Some(pid) = pid_line(&String::from_utf8_lossy(&seen)) {
                 break pid;
             }
             assert!(Instant::now() < deadline, "timed out waiting for PID= line; got {:?}", String::from_utf8_lossy(&seen));
