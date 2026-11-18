@@ -3804,7 +3804,9 @@ impl slack::Host for Harness {
     fn inbox(&self, session: &str, from: &str, text: &str, about: Value) -> Option<String> {
         let text: String = text.chars().take(MAX_MESSAGE_TEXT).collect();
         let id = self.update(|s| {
-            s.sessions.get(session)?;
+            // Not to a session that ended and is only not forgotten yet (MCR-75):
+            // nobody would read it, and the connector must hold the message instead
+            s.sessions.get(session).filter(|t| t.state != ENDED)?;
             let id = s.post(Message { to: session.into(), text, slack: Some(about), ..Message::default() }).id;
             if let Some(m) = s.messages.get_mut(&id) {
                 m.from_name = from.chars().filter(|c| !c.is_control()).take(120).collect();
@@ -5954,10 +5956,42 @@ mod tests {
         assert_eq!((on_disk.sessions["gone"].state.as_str(), on_disk.sessions["gone"].attention.is_none()), (ENDED, true));
         // And nothing in the attention list
         assert!(h.attention().unwrap().is_empty());
+        // The Slack connector is told only of running sessions, so a channel routed to the
+        // ended one is held as "The routed session is not running", and its inbox takes nothing
+        use crate::slack::Host;
+        let mut peers: Vec<String> = h.peers().into_iter().map(|p| p.id).collect();
+        peers.sort();
+        assert_eq!(peers, ["live", "up"]);
+        assert!(h.inbox("gone", "Slack #bots · Tim", "hello", json!({"ref": "C1:1.0"})).is_none());
         let mut stream = UnixStream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// MCR-75: Slack text is delivered to a running session only. An ended
+    /// session stays tracked until it is forgotten, and took the message before.
+    #[test]
+    fn slack_delivers_nothing_to_a_session_that_ended() {
+        use crate::slack::Host;
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            for id in ["runs", "ended"] {
+                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+            }
+        });
+        harness.runner_event(&json!({"event": "exited", "id": "ended"}));
+        let about = json!({"ref": "C1:1.0", "channel": "C1"});
+        assert!(harness.inbox("runs", "Slack #bots · Tim", "hello", about.clone()).is_some());
+        assert!(harness.inbox("ended", "Slack #bots · Tim", "hello", about.clone()).is_none(), "the connector holds it");
+        assert!(harness.inbox("unknown", "Slack #bots · Tim", "hello", about).is_none());
+        let store = lock(&harness.store);
+        assert_eq!(store.messages.values().map(|m| m.to.as_str()).collect::<Vec<_>>(), ["runs"]);
+        assert_eq!(store.unread("ended"), 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// MCR-75: an exit the service did not hear of (it was restarting) is
