@@ -1014,15 +1014,23 @@ impl Slack {
         }
         match name {
             "slack_channels" => {
+                let supervisor = host.peers().iter().any(|p| p.id == me && p.supervisor);
                 let state = lock(&self.state);
+                // Only where this session may post, and where its Slack messages come from: the
+                // names of the other channels the bot is in, private ones too, are not its business
                 let channels: Vec<Value> = state
                     .channels
                     .values()
                     .filter(|c| c.member)
-                    .map(|c| {
+                    .filter_map(|c| {
                         let may = c.posting != "never" && Self::may_post(c, me, false);
-                        json!({
-                            "channel": c.id, "name": c.name, "listenedFor": if c.route.session == me && c.listen != "off" { json!(c.listen) } else { Value::Null },
+                        let routed = c.listen != "off" && match c.route.kind.as_str() {
+                            "session" => c.route.session == me,
+                            "supervisor" => supervisor,
+                            _ => false,
+                        };
+                        (may || routed).then(|| json!({
+                            "channel": c.id, "name": c.name, "listenedFor": if routed { json!(c.listen) } else { Value::Null },
                             "youMayPost": may,
                             "posting": match (may, c.posting.as_str()) {
                                 (false, _) => "not allowed for this session",
@@ -1031,10 +1039,10 @@ impl Slack {
                                 (_, "auto") => "sent at once",
                                 _ => "not allowed",
                             },
-                        })
+                        }))
                     })
                     .collect();
-                Ok(json!({ "channels": channels, "note": "Posts go out under the bot's name with this session's name. Text only; nothing you write mentions or notifies anyone." }))
+                Ok(json!({ "channels": channels, "note": "Only the channels you may post to or get messages from. Posts go out under the bot's name with this session's name. Text only; nothing you write mentions or notifies anyone." }))
             }
             "slack_reply" | "slack_post" => {
                 let reply = name == "slack_reply";
@@ -2119,6 +2127,31 @@ mod tests {
         assert_eq!(web.count("chat.postMessage"), 1);
         assert_eq!(post_of(&slack, &p.id).state, "sent");
         assert!(std::fs::read_to_string(dir.path().join("slack-state.json")).unwrap().contains("\"sent\""));
+    }
+
+    #[test]
+    fn a_session_is_told_only_the_channels_it_posts_to_or_hears_from() {
+        let (_dir, slack, _web, host) = connected("never");
+        let seen = |me: &str| slack.tool(&host, me, "slack_channels", &json!({})).unwrap()["channels"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap().to_string(), c["youMayPost"] == true, !c["listenedFor"].is_null())).collect::<Vec<_>>();
+        // The routed session hears from #ops and may not post; #reports is nobody's, and s2 has no channel
+        assert_eq!(seen("s1"), [("ops".to_string(), false, true)]);
+        assert!(seen("s2").is_empty());
+        assert!(!slack.tool(&host, "s2", "slack_channels", &json!({})).unwrap().to_string().contains("reports"));
+        // Posting allowed for the routed session only, then for every session
+        slack.set_policy("C1", &json!({"posting": "approve"})).unwrap();
+        assert_eq!(seen("s1"), [("ops".to_string(), true, true)]);
+        assert!(seen("s2").is_empty());
+        slack.set_policy("C2", &json!({"posting": "approve", "posters": ["*"]})).unwrap();
+        assert_eq!(seen("s2"), [("reports".to_string(), true, false)]);
+        assert_eq!(seen("s1").len(), 2);
+        // A list of posters that holds another session, and a channel where posting is never
+        slack.set_policy("C2", &json!({"posters": ["s1"]})).unwrap();
+        assert!(seen("s2").is_empty());
+        slack.set_policy("C2", &json!({"posting": "never", "posters": ["*"]})).unwrap();
+        assert!(seen("s2").is_empty());
+        // A channel the bot left is not listed, and a route that is not listened to is no source
+        slack.set_policy("C1", &json!({"posting": "never", "listen": "off"})).unwrap();
+        assert!(seen("s1").is_empty());
     }
 
     #[test]
