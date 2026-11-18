@@ -78,6 +78,10 @@ export interface HarnessStatus {
   supervisorCommand?: string;
   /** The operator lets agents outside the harness use the supervisor tools */
   outsideSupervisors?: boolean;
+  /** New Codex sessions are started with the harness's hooks (the person trusts them once in Codex) */
+  codexHooks?: boolean;
+  /** A running Codex session's hooks have reported: Codex runs them, so they are trusted */
+  codexHooksReporting?: boolean;
 }
 
 /** One of the app's two background processes, as found without starting it. */
@@ -259,6 +263,8 @@ export const harnessApi = {
   /** The hosted supervisor session: the running one, or a new one */
   /** Asks in a native dialog before turning it on; resolves to the setting as it is now */
   outsideSupervisors: (on: boolean) => invoke<boolean>('harness_outside_supervisors', { on }),
+  /** Asks in a native dialog before turning it on; resolves to the setting as it is afterwards */
+  codexHooks: (on: boolean) => invoke<boolean>('harness_codex_hooks', { on }),
   supervisor: (cols: number, rows: number) => invoke<Hosted>('harness_supervisor', { cols, rows }),
   /** End the agent and continue its conversation in a new process; the session id changes */
   restart: (id: string) => invoke<Hosted & { replaced: string; resumed: boolean }>('harness_restart', { id }),

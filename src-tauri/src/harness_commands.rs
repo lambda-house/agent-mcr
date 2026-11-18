@@ -65,7 +65,7 @@ pub async fn harness_status() -> Result<Value, String> {
         let settings = service(json!({"op": "settings"}))?;
         // The service can outlive an app update and return an older settings shape.
         let preferences = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
-        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"] }))
+        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"] }))
     })
     .await
 }
@@ -205,6 +205,34 @@ fn stop_for_quit(dir: Option<&std::path::Path>) {
             eprintln!("{e}");
         }
     }
+}
+
+/// Start Codex sessions with the harness's hooks, or stop that (MCR-74).
+/// Turning it on is confirmed in a native dialog, never by the page alone:
+/// from then on Codex asks the person to trust the hooks, and a Codex
+/// session nobody watches stops at that question until they have.
+#[tauri::command]
+pub async fn harness_codex_hooks(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    blocking(move || {
+        if on {
+            let mut dialog = app
+                .dialog()
+                .message("New Codex sessions will be started with four hooks that call Agent MCR and report the session's state: when it starts, takes a prompt, asks for approval and has used a tool. They never answer a prompt for you.\n\nCodex asks once to review them (\"Hooks need review\"). Start a Codex session yourself next and choose \"Trust all and continue\". Until you have, every new Codex session stops at that question, also one started by another agent. Codex asks again when Agent MCR runs from another location.\n\nRunning sessions are not changed.")
+                .title("Start Codex with Agent MCR's hooks?")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom("Use hooks".to_string(), "Cancel".to_string()));
+            if let Some(window) = app.get_webview_window("main") {
+                dialog = dialog.parent(&window);
+            }
+            if !dialog.blocking_show() {
+                return Ok(false);
+            }
+        }
+        service(json!({"op": "settings", "codexHooks": on})).map(|s| s["codexHooks"] == true)
+    })
+    .await
 }
 
 /// Let agents outside the harness use the supervisor tools, or stop that.
