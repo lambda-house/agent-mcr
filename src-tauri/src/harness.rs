@@ -2396,7 +2396,7 @@ impl Harness {
     /// on a prompt (D6) or into a shell, where it would run as a command.
     fn nudge(&self, session: &str) {
         let pending = |s: &Store| s.messages.values().any(|m| m.to == session && m.read == 0 && !m.notified);
-        let (untracked, unsure) = {
+        let (untracked, unsure, sees) = {
             let store = lock(&self.store);
             if !pending(&store) {
                 return;
@@ -2405,9 +2405,11 @@ impl Harness {
             // An agent without state tracking (no turn-end hooks) is only seen
             // through its screen; a shell has no input box (`at_prompt` is false)
             let agent = adapter(&t.profile);
-            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown")
+            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown", agent.sees_prompt())
         };
-        let at_prompt = (untracked || unsure) && self.at_prompt(session);
+        // Not read where no input box is known: this runs at every timer tick
+        // while a message waits, and a snapshot is up to 4 MB
+        let at_prompt = reads_screen(untracked, unsure, sees) && self.at_prompt(session);
         let from = self.update(|s| {
             let t = s.sessions.get(session)?;
             if !notice_ready(untracked, unsure, at_prompt, &t.state) {
@@ -3847,6 +3849,12 @@ impl slack::Host for Harness {
 /// Whether an inbox notice may be typed now. A session with state tracking
 /// takes it when idle (or, before its first report, at its input box); one
 /// without (Antigravity, OpenCode, Pi) only when `at_prompt` sees the input box.
+/// Whether `nudge` has to read the session's screen to decide: only where the
+/// screen is what tells (`notice_ready`) and the adapter knows the input box.
+fn reads_screen(untracked: bool, unsure: bool, sees_prompt: bool) -> bool {
+    (untracked || unsure) && sees_prompt
+}
+
 fn notice_ready(untracked: bool, unsure: bool, at_prompt: bool, state: &str) -> bool {
     if untracked {
         at_prompt
@@ -5199,6 +5207,17 @@ mod tests {
         for profile in ["opencode", "pi", "shell"] {
             assert!(!adapter(profile).at_prompt(prompt), "{profile} must not take a notice while unsure");
         }
+        // The screen of a program whose input box is not known is never read for a notice (MCR-76)
+        let codex_prompt = "\u{203a} Ask Codex to do anything\n  ? for shortcuts";
+        for agent in adapters() {
+            let id = agent.id();
+            assert_eq!(agent.sees_prompt(), ["codex", "antigravity"].contains(&id), "{id}");
+            assert!(agent.sees_prompt() || !(agent.at_prompt(prompt) || agent.at_prompt(codex_prompt)), "{id} finds a prompt it says it cannot see");
+            let untracked = !agent.is_agent();
+            assert_eq!(reads_screen(untracked, false, agent.sees_prompt()), id == "antigravity", "{id}");
+            assert_eq!(reads_screen(untracked, agent.silent_until_first_turn(), agent.sees_prompt()), ["codex", "antigravity"].contains(&id), "{id}");
+        }
+        assert!(adapter("codex").at_prompt(codex_prompt));
         // Untracked: the screen decides, whatever the (never updated) state
         assert!(notice_ready(true, false, true, "unknown"));
         assert!(!notice_ready(true, false, false, "idle"));

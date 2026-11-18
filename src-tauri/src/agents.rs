@@ -305,6 +305,11 @@ pub trait Adapter: Sync {
     fn at_prompt(&self, _screen: &str) -> bool {
         false
     }
+    /// Whether `at_prompt` knows this program's input box at all. Where it
+    /// doesn't, the answer is always no and the screen is not read to ask
+    fn sees_prompt(&self) -> bool {
+        false
+    }
     /// Whether the terminal title says that the agent waits for the operator's
     /// answer. `None`: its title says nothing about that
     fn title_asks(&self, _title: &str) -> Option<bool> {
@@ -491,6 +496,9 @@ impl Adapter for Codex {
     }
     fn at_prompt(&self, screen: &str) -> bool {
         screen.contains("for shortcuts") && screen.lines().any(|l| l.starts_with('\u{203a}'))
+    }
+    fn sees_prompt(&self) -> bool {
+        true
     }
     /// Codex sets "[ ! ] Action Required" as the title while it waits for an answer
     /// (after a glyph that blinks, before the folder). Nothing else: a
