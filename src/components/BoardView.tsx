@@ -1,20 +1,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRight, X } from 'lucide-react';
-import { formatUntil, harnessApi, openReports, shortPath, tildePath, type Board, type Hosted } from '../utils/harness';
+import { formatUntil, harnessApi, openReports, reportGroups, shortPath, tildePath, type Board, type ExecutorLine, type Hosted, type Report } from '../utils/harness';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
-const KIND = { needs_human: 'Needs you', done: 'Done' } as const;
+const KIND = { needs_human: 'Needs you', done: 'Done', status: 'Status' } as const;
 type Filter = 'all' | keyof typeof KIND;
 /** How long a note of the person can stay: label and hours */
 const LASTS: [string, number][] = [['1 hour', 1], ['8 hours', 8], ['1 day', 24], ['3 days', 72], ['1 week', 168], ['2 weeks', 336]];
 
 /**
+ * The executors of a supervising session, as the harness recorded them when
+ * the status report was made: not what the agent wrote, and not their state now.
+ */
+function ExecutorLines({ lines }: { lines: ExecutorLine[] }) {
+  return <span className="hs-board-execs" role="list" aria-label="Its executors when it reported">
+    {lines.map(e => <span key={e.session} role="listitem">
+      <span className={`hs-dot ${e.needsOperator ? 'waiting' : ['working', 'idle', 'starting'].includes(e.state) ? e.state : ''}`} aria-hidden="true"/>
+      <span><b>{e.name || e.session}</b> {e.needsOperator ? 'needed you' : e.state}{e.waits.length ? ` · waited for: ${e.waits.join('; ')}` : ''}</span>
+    </span>)}
+  </span>;
+}
+
+/**
  * What sessions reported to the person (their `report` tool), and the notes
  * they left for each other on the bulletin board. Text here is written by
- * agents: it is shown, never acted on.
+ * agents: it is shown, never acted on. Reports are grouped by supervisor,
+ * with its executors' reports under its own.
  */
 export default function BoardView({ active, onOpen }: { active: boolean; /** Show a running session in Live */ onOpen: (id: string) => void }) {
   const [board, setBoard] = useState<Board | null>(null);
@@ -52,7 +66,7 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
 
   const running = useMemo(() => new Set(hosted.filter(h => !h.exit).map(h => h.id)), [hosted]);
   const open = useMemo(() => openReports(board?.reports ?? [], hosted), [board, hosted]);
-  const reports = useMemo(() => [...board?.reports ?? []].reverse().filter(r => filter === 'all' || r.kind === filter), [board, filter]);
+  const groups = useMemo(() => reportGroups((board?.reports ?? []).filter(r => filter === 'all' || r.kind === filter), hosted), [board, filter, hosted]);
   const notes = useMemo(() => [...board?.notes ?? []].reverse(), [board]);
   const folder = (path: string) => shortPath(tildePath(path, home));
   // A note can be for one of the folders sessions run in, or for all
@@ -71,6 +85,21 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
     harnessApi.removeNote(id).then(refresh).catch(e => setError(err(e)));
   };
 
+  const row = (r: Report) => {
+    const live = running.has(r.session);
+    const body = <>
+      <span className={`hs-dot ${r.kind === 'needs_human' ? 'waiting' : r.kind === 'status' ? 'status' : 'idle'}${open.has(r.id) || r.kind === 'status' ? '' : ' past'}`} aria-label={KIND[r.kind] ?? r.kind}/>
+      <span className="hs-item-text">
+        <strong>{r.name || r.session}{open.has(r.id) && <em>{r.kind === 'needs_human' ? 'waiting for you' : 'not looked at'}</em>}</strong>
+        <span className="hs-board-text">{r.text}</span>
+        {!!r.executors?.length && <ExecutorLines lines={r.executors}/>}
+        <small>{KIND[r.kind] ?? r.kind} · <span title={r.cwd}>{folder(r.cwd)}</span> · {formatAge(r.created)}{live ? '' : ' · session ended'}</small>
+      </span>
+      {live && <span className="hs-board-go">{r.kind === 'needs_human' && open.has(r.id) ? 'Answer' : 'Open'}<ArrowRight size={11}/></span>}
+    </>;
+    return live ? <button type="button" className="hs-board-row" title="Show this session in Live" onClick={() => onOpen(r.session)}>{body}</button> : <div className="hs-board-row">{body}</div>;
+  };
+
   return <div className="hs-board">
     {error && <div className="hs-error" role="alert">{error}</div>}
     <section aria-label="Reports">
@@ -78,28 +107,22 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
         <h2>Reports</h2>
         <small>What sessions told you. Click one to open its session</small>
         <span className="hs-board-filter" role="group" aria-label="Kind of report">
-          {(['all', 'needs_human', 'done'] as Filter[]).map(f => <button key={f} type="button" aria-pressed={filter === f} onClick={() => setFilter(f)}>{f === 'all' ? 'All' : KIND[f]}</button>)}
+          {(['all', 'needs_human', 'done', 'status'] as Filter[]).map(f => <button key={f} type="button" aria-pressed={filter === f} onClick={() => setFilter(f)}>{f === 'all' ? 'All' : KIND[f]}</button>)}
         </span>
       </header>
-      <p className="hs-board-help">A <b>Needs you</b> report waits until you type into its session; a <b>Done</b> one until you open the session.</p>
-      {board && !reports.length && <p className="hs-empty">{board.reports.length ? 'No reports of this kind.' : 'No reports yet. A session reports when it cannot go on without you, or when a piece of work is complete.'}</p>}
-      <ul>
-        {reports.map(r => {
-          const live = running.has(r.session);
-          const body = <>
-            <span className={`hs-dot ${r.kind === 'needs_human' ? 'waiting' : 'idle'}${open.has(r.id) ? '' : ' past'}`} aria-label={KIND[r.kind] ?? r.kind}/>
-            <span className="hs-item-text">
-              <strong>{r.name || r.session}{open.has(r.id) && <em>{r.kind === 'needs_human' ? 'waiting for you' : 'not looked at'}</em>}</strong>
-              <span className="hs-board-text">{r.text}</span>
-              <small>{KIND[r.kind] ?? r.kind} · <span title={r.cwd}>{folder(r.cwd)}</span> · {formatAge(r.created)}{live ? '' : ' · session ended'}</small>
-            </span>
-            {live && <span className="hs-board-go">{r.kind === 'needs_human' && open.has(r.id) ? 'Answer' : 'Open'}<ArrowRight size={11}/></span>}
-          </>;
-          return <li key={r.id} className={open.has(r.id) ? 'open' : ''}>
-            {live ? <button type="button" className="hs-board-row" title="Show this session in Live" onClick={() => onOpen(r.session)}>{body}</button> : <div className="hs-board-row">{body}</div>}
-          </li>;
-        })}
-      </ul>
+      <p className="hs-board-help">A <b>Needs you</b> report waits until you type into its session; a <b>Done</b> one until you open the session. A <b>Status</b> report notifies nobody: it says where a session and its executors stood, and the session's next one replaces it.</p>
+      {board && !groups.length && <p className="hs-empty">{board.reports.length ? 'No reports of this kind.' : 'No reports yet. A session reports when it cannot go on without you, when a piece of work is complete, or to say where it stands.'}</p>}
+      {groups.map(g => <div key={g.session || 'alone'} className="hs-board-group" role="group" aria-label={g.session ? `Reports of ${g.name} and its executors` : 'Reports of sessions without a supervisor'}>
+        {(g.session || groups.length > 1) && <h3 className="hs-board-group-head">
+          {g.session ? <><strong>{g.name}</strong><small>and its executors{g.live ? '' : ' · session ended'}</small></> : <small>Sessions without a supervisor</small>}
+          {g.session && g.live && <button type="button" title="Show this session in Live" onClick={() => onOpen(g.session)}>Open<ArrowRight size={11}/></button>}
+        </h3>}
+        <ul className="hs-board-reports">
+          {g.rows.map(({ report: r, depth }) => <li key={r.id} className={`${open.has(r.id) ? 'open' : ''}${r.kind === 'status' ? ' status' : ''}`.trim()} style={depth ? { paddingLeft: depth * 16 } : undefined}>
+            {row(r)}
+          </li>)}
+        </ul>
+      </div>)}
     </section>
     <section aria-label="Bulletin board">
       <header className="hs-board-head">

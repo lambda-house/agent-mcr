@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gist, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices } from './harness';
+import { gist, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -104,6 +104,61 @@ describe('supervisors and executors', () => {
     const all = [session('lead', '/w'), session('worker', '/w', 'lead'), session('helper', '/w', 'worker'), session('solo', '/w')];
     expect([...executorsBelow('lead', all)].sort()).toEqual(['helper', 'worker']);
     expect(executorsBelow('solo', all).size).toBe(0);
+  });
+});
+
+describe('reports by supervisor', () => {
+  const session = (id: string, supervisor?: string, exit = false): Hosted => ({
+    id, pid: 1, argv: ['claude'], cwd: '/w', started: 1, cols: 120, rows: 32, title: '', lastOutput: 1, exit: exit ? { code: 0, signal: null, at: 9 } : null,
+    meta: { profile: 'claude', label: 'Claude Code' }, harness: { profile: 'claude', state: 'idle', supervisor } as Hosted['harness'],
+  });
+  const report = (id: string, from: string, kind: Report['kind'], created: number, supervisor?: string): Report => ({ id, session: from, name: from.toUpperCase(), cwd: '/w', kind, text: id, created, supervisor });
+  const shape = (reports: Report[], hosted: Hosted[]) => reportGroups(reports, hosted).map(g => [g.session, g.rows.map(r => `${r.report.id}:${r.depth}`).join(' ')]);
+
+  it('puts a supervisor first with its status on top, then its executors and theirs', () => {
+    const hosted = [session('lead'), session('worker', 'lead'), session('helper', 'worker'), session('solo'), session('second'), session('aide', 'second')];
+    const reports = [
+      report('r1', 'worker', 'done', 1), report('r2', 'lead', 'done', 2), report('r3', 'solo', 'done', 3), report('r4', 'lead', 'status', 4),
+      report('r5', 'helper', 'needs_human', 5), report('r6', 'worker', 'status', 6), report('r7', 'worker', 'done', 7), report('r8', 'aide', 'done', 8), report('r9', 'lead', 'done', 9),
+    ];
+    expect(shape(reports, hosted)).toEqual([
+      // The group with the newest report first; 'second' has no report itself and still heads its group
+      ['lead', 'r4:0 r9:0 r2:0 r6:1 r7:1 r1:1 r5:2'],
+      ['second', 'r8:1'],
+      ['', 'r3:0'],
+    ]);
+    const [lead, second] = reportGroups(reports, hosted);
+    expect([lead.name, lead.live, second.name, second.live]).toEqual(['LEAD', true, 'Claude Code', true]);
+  });
+
+  it('keeps a session that ended under the supervisor its report names, and lists the rest newest first', () => {
+    const hosted = [session('lead'), session('left', undefined, true), session('free')];
+    const reports = [
+      report('r1', 'gone', 'done', 1, 'lead'), report('r2', 'left', 'done', 2, 'lead'), report('r3', 'free', 'done', 3, 'lead'),
+      report('r4', 'orphan', 'done', 4, 'nobody'), report('r5', 'old', 'done', 5),
+    ];
+    expect(shape(reports, hosted)).toEqual([
+      // 'nobody' is known from a report only: its group says that it ended
+      ['nobody', 'r4:1'],
+      // 'free' is live and works for nobody now: what its old report recorded does not count
+      ['lead', 'r1:1 r2:1'],
+      ['', 'r5:0 r3:0'],
+    ]);
+    expect(reportGroups(reports, hosted).map(g => [g.name, g.live])).toEqual([['nobody', false], ['Claude Code', true], ['', false]]);
+  });
+
+  it('gives a supervisor its group before any executor has reported', () => {
+    const root = { ...session('root'), meta: { role: 'supervisor' } };
+    const hosted = [root, session('lead'), session('worker', 'lead'), session('solo')];
+    const was = { ...report('r3', 'past', 'status', 3), executors: [{ session: 'x', name: 'X', state: 'idle', needsOperator: false, waits: [] }] };
+    const groups = reportGroups([report('r1', 'root', 'status', 1), report('r2', 'lead', 'status', 2), was, report('r4', 'solo', 'status', 4)], hosted);
+    expect(groups.map(g => [g.session, g.name, g.rows.length])).toEqual([['past', 'PAST', 1], ['lead', 'LEAD', 1], ['root', 'Supervisor', 1], ['', '', 1]]);
+  });
+
+  it('loses no report to a relation that goes in a circle', () => {
+    const reports = [report('r1', 'a', 'done', 1, 'b'), report('r2', 'b', 'done', 2, 'a')];
+    expect(reportGroups(reports, []).flatMap(g => g.rows.map(r => r.report.id)).sort()).toEqual(['r1', 'r2']);
+    expect(reportGroups([], [session('lead')])).toEqual([]);
   });
 });
 

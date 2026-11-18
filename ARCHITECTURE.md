@@ -83,6 +83,8 @@ A session that needs the person carries an **attention** mark, shown in the Live
 | `assessment` | The agent's own `report` with `needs_human` | The person types into the session |
 | `notification` | The agent's `report` with `done`, or a terminal notification | The person looks at the session |
 
+A `report` with `status` raises no mark and no notification, and does not wake the supervisor: it is read on the Board, where a session's next status report replaces it, and at the supervisor's next inbox read.
+
 **Only the person answers a permission prompt (D6).** While a session waits on one, the supervisor's input to it is refused, and notices are never typed into it.
 
 ## Tools between sessions
@@ -143,7 +145,7 @@ Two surfaces in one window (`App.tsx`).
 **Sessions** (`SessionWorkspace.tsx`):
 
 - **Live** (`LiveWorkspace.tsx`, `TerminalPane.tsx` with xterm.js): the hosted sessions by working folder, their state, subagents and running shells, and their terminals. Terminal bytes go from the runner to the webview over a raw channel and never pass through the harness service.
-- **Board** (`BoardView.tsx`): what sessions reported to the person, newest first, with the ones not yet acted on marked, and the live notes of the bulletin board. The person can take a note off the board; the text is shown and never acted on.
+- **Board** (`BoardView.tsx`): what sessions reported to the person, grouped by supervisor with its executors' reports under its own, each session's latest status report first and the ones not yet acted on marked, and the live notes of the bulletin board. The person can take a note off the board; the text is shown and never acted on.
 - **Search**: past Claude and Codex sessions from the index, with activity, subagents, usage, memories and linked work. A past session can be resumed in Live.
 
 **Documents** (`AgentPanel.tsx`, `DocumentPanel.tsx`): the agents' Markdown and nothing else. Instructions, rules, memory, plans, skills, agents and commands, grouped by the folder sessions work in, then the agents' own folders. Changes since the person last read a document are marked. The reader has tabs, a table of contents, find, a source editor (CodeMirror 6) and export. A memory opened from Sessions gets its own reader window, which shares preferences read-only and nothing else.

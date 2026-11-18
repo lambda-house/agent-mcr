@@ -422,7 +422,19 @@
 .hs-board-row small { color: var(--sc-muted); font-size: 10px; }
 .hs-board-text { font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .hs-board li:not(.open) .hs-board-text { color: var(--sc-muted); }
-.hs-board section[aria-label='Bulletin board'] li .hs-board-text { color: var(--sc-text); }
+.hs-board section[aria-label='Bulletin board'] li .hs-board-text, .hs-board li.status .hs-board-text { color: var(--sc-text); }
+/* Reports by supervisor: a head per group, executors' reports indented under the supervisor's own */
+.hs-board-group + .hs-board-group { margin-top: 12px; }
+.hs-board-group-head { display: flex; align-items: baseline; gap: 6px; margin: 0; padding: 6px 4px 4px; border-bottom: 1px solid var(--sc-border); font-size: 11px; font-weight: 400; }
+.hs-board-group-head strong { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-board-group-head small { color: var(--sc-muted); font-size: 11px; white-space: nowrap; }
+.session-cockpit .hs-board-group-head button { margin-left: auto; height: 18px; padding: 0 4px; border: 0; background: transparent; color: var(--sc-muted); font-size: 11px; gap: 3px; }
+.session-cockpit .hs-board-group-head button:hover { color: var(--sc-accent); }
+.hs-dot.status { background: transparent; border: 1.5px solid var(--sc-muted); }
+.hs-board-execs { display: flex; flex-direction: column; gap: 1px; margin: 2px 0; padding-left: 8px; border-left: 2px solid var(--sc-border); color: var(--sc-muted); font-size: 11px; line-height: 1.45; }
+.hs-board-execs > span { display: flex; align-items: flex-start; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.hs-board-execs .hs-dot { width: 6px; height: 6px; margin-top: 5px; box-shadow: none; }
+.hs-board-execs b { font-weight: 500; color: var(--sc-text); }
 .hs-dot.past { opacity: .45; box-shadow: none; }
 .hs-board-help { margin: 0 0 6px; color: var(--sc-muted); font-size: 11px; line-height: 1.4; }
 .hs-board-help b { font-weight: 600; color: var(--sc-text); }
