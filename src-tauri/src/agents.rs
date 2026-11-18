@@ -258,6 +258,9 @@ pub struct Launch<'a> {
     pub agent_session: Option<&'a str>,
     pub resume: Option<&'a str>,
     pub task: Option<&'a str>,
+    /// Pass the hooks that the agent runs only after the person trusted them
+    /// in the agent itself (Codex, MCR-74)
+    pub own_hooks: bool,
 }
 
 /// How the current turn of an agent is stopped.
@@ -352,6 +355,13 @@ fn asked(screen: &str, is_question: impl Fn(&str) -> bool) -> Option<String> {
     let text = lines[at..at + answers].iter().filter(|l| !l.is_empty()).copied().collect::<Vec<_>>().join(" ");
     Some(text.chars().filter(|c| !c.is_control()).take(300).collect())
 }
+
+/// The event name Codex's own hooks report under (`--harness-hook`); which
+/// hook it was is in the payload's `hook_event_name`.
+pub const CODEX_HOOK: &str = "codex-hook";
+
+/// The Codex hooks the harness asks for.
+pub const CODEX_HOOKS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse"];
 
 pub struct Claude;
 pub struct Codex;
@@ -451,6 +461,17 @@ impl Adapter for Codex {
             cmd += " resume";
         }
         cmd += &format!(" {flags} -c {} -c tui.notifications=true {tools}", sh(&notify));
+        // Codex's own hooks (MCR-74). Codex runs them only after the person
+        // trusted them in Codex; until then it asks at start, so they are
+        // passed only when the person turned them on. No Stop hook: the turn
+        // end stays with `notify`, which needs no trust, and must not be
+        // reported twice. The trust bypass flag is never passed
+        if l.own_hooks {
+            let command = json!(format!("{} --harness-hook {CODEX_HOOK}", sh(l.exe)));
+            for event in CODEX_HOOKS {
+                cmd += &format!(" -c {}", sh(&format!("hooks.{event}=[{{hooks=[{{type=\"command\",command={command},timeout=5}}]}}]")));
+            }
+        }
         if l.supervisor {
             cmd += &format!(" -c {} -c {}", sh(&format!("mcp_servers.supervisor.command={}", json!(l.exe))), sh("mcp_servers.supervisor.args=[\"--supervise\"]"));
         }
@@ -485,8 +506,15 @@ impl Adapter for Codex {
     fn question(&self, screen: &str) -> Option<String> {
         asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?")).or_else(|| {
             // The folder question at start (0.170 wording), whose answers may not be numbered
+            if self.at_prompt(screen) {
+                return None;
+            }
+            // Codex's review of hooks it has not run before, ours among them (MCR-74)
+            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
+                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
+            }
             let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
-            (!self.at_prompt(screen)).then(|| trust.chars().filter(|c| !c.is_control()).take(300).collect())
+            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
         })
     }
     /// Codex takes one `developer_instructions` value: the operator's own, if set, stays
@@ -635,6 +663,8 @@ mod tests {
         // As seen on 2026-11-18 (codex-cli 0.170): numbered answers
         assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
         assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
+        // Codex's own review of hooks (wording from the 0.170 binary; the layout is not known)
+        assert_eq!(codex.question("  Hooks need review\n  4 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n  Review hooks\n  Trust all and continue\n  Continue without trusting\n").as_deref(), Some("Hooks need review: Codex asks whether to trust the hooks it was started with"));
         // Long commands are cut, and control characters never get into a notice
         let long = format!("Would you like to run the following command?\n$ echo {}\u{7}\n1. Yes, proceed (y)", "x".repeat(600));
         let text = codex.question(&long).unwrap();

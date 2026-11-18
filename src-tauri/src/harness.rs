@@ -624,6 +624,9 @@ pub struct Tracked {
     pub supervisor: Option<String>,
     /// The session that started it with `executor_create`, and may end it (MCR-46)
     pub created_by: Option<String>,
+    /// Its agent's own hooks reported (Codex, once the person trusted them):
+    /// prompts come from the agent, and the terminal is not read for them
+    pub own_hooks: bool,
     /// The operator or the supervisor named it (output only)
     #[serde(skip_deserializing)]
     pub named: bool,
@@ -841,6 +844,10 @@ struct Store {
     /// The operator lets agents outside the harness use the supervisor tools
     #[serde(default)]
     outside_supervisors: bool,
+    /// The operator lets Codex be started with its own hooks, which Codex
+    /// asks them to trust once (MCR-74)
+    #[serde(default)]
+    codex_hooks: bool,
     waits: BTreeMap<String, Wait>,
     /// Connected `mcr` bridges per session; `Tracked.tools` follows it
     #[serde(skip)]
@@ -1467,6 +1474,53 @@ fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
 fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) -> bool {
     let Some(tracked) = store.sessions.get_mut(session) else { return false };
     let text = |v: &Value| v.as_str().map(|s| s.chars().take(MAX_TEXT).collect::<String>());
+    // Codex's own hooks (MCR-74), which run once the person trusted them. They
+    // arrive under one name; which hook it was is in the payload
+    let event = if event == crate::agents::CODEX_HOOK {
+        tracked.own_hooks = true;
+        tracked.hooked = true;
+        match payload["hook_event_name"].as_str().unwrap_or("") {
+            // The conversation's id from its first moment. Nothing more: when in
+            // its start Codex runs this is not known, so it neither makes the
+            // session idle nor lets a queued task be typed
+            "SessionStart" => {
+                if let Some(id) = payload["session_id"].as_str().filter(|id| !id.is_empty()) {
+                    tracked.agent_session = Some(id.to_string());
+                }
+                if let Some(path) = payload["transcript_path"].as_str() {
+                    tracked.transcript = Some(path.to_string());
+                }
+                return false;
+            }
+            // Codex is about to ask: the same mark as a prompt Claude Code reports.
+            // The hook itself prints nothing, so Codex asks the person as always (D6)
+            "PermissionRequest" => {
+                let tool = payload["tool_name"].as_str().unwrap_or("a tool");
+                let mut asks = format!("Codex asks to use {}", tool.chars().filter(|c| !c.is_control()).take(60).collect::<String>());
+                if let Some(command) = text(&payload["command"]) {
+                    asks += &format!(": {command}");
+                }
+                if let Some(reason) = text(&payload["reason"]) {
+                    asks += &format!(" ({reason})");
+                }
+                // Where it returns when the title stops asking: the state before the first mark
+                let was = match tracked.attention.as_ref().filter(|a| a.kind == "permission" && !a.was.is_empty()) {
+                    Some(a) => a.was.clone(),
+                    None if tracked.state == "waiting" => "working".into(),
+                    None => tracked.state.clone(),
+                };
+                tracked.precise = true;
+                tracked.attention = Some(Attention { kind: "permission".into(), text: asks, since: now_ms(), was, ..Attention::default() });
+                store.set_state(session, "waiting");
+                return false;
+            }
+            "UserPromptSubmit" => "UserPromptSubmit",
+            "PostToolUse" => "PostToolUse",
+            _ => return false,
+        }
+    } else {
+        event
+    };
     if event == "codex-notify" {
         // Codex also reports turns of other threads in the same terminal: the
         // one that writes the session title, and subagents. Only the session's
@@ -1488,7 +1542,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
             (Some(own), None) if own != thread => return false,
             _ => {}
         }
-    } else if let Some(id) = payload["session_id"].as_str() {
+    } else if let Some(id) = payload["session_id"].as_str().filter(|_| !tracked.own_hooks || adapter(&tracked.profile).reports_from_start()) {
         tracked.agent_session = Some(id.to_string());
     }
     if let Some(path) = payload["transcript_path"].as_str() {
@@ -2061,6 +2115,7 @@ impl Harness {
             agent_session: agent_session.as_deref(),
             resume,
             task,
+            own_hooks: lock(&self.store).codex_hooks,
         })?;
         let id = runner::random_id()[..12].to_string();
         let name: String = req["name"].as_str().unwrap_or("").trim().chars().filter(|c| !c.is_control()).take(80).collect();
@@ -3061,14 +3116,20 @@ impl Harness {
     /// the service's timer, which also covers a prompt that was up while the
     /// service restarted.
     fn look(&self, id: &str, title: &str, output: Option<u64>) {
-        let (profile, hooked, prompt) = {
+        let (profile, hooked, own_hooks, prompt) = {
             let store = lock(&self.store);
             let Some(t) = store.sessions.get(id) else { return };
-            (t.profile.clone(), t.hooked, t.attention.as_ref().filter(|a| a.kind == "permission" && a.report.is_none()).cloned())
+            (t.profile.clone(), t.hooked, t.own_hooks, t.attention.as_ref().filter(|a| a.kind == "permission" && a.report.is_none()).cloned())
         };
         let agent = adapter(&profile);
         let titled = agent.title_asks(title);
         let unreported = agent.is_agent() && !hooked;
+        // Its own hooks report its prompts: the terminal is not read for one.
+        // A title that stops asking still takes a mark back (a refused request
+        // has no hook)
+        if own_hooks && prompt.is_none() {
+            return;
+        }
         if titled.is_none() && !unreported {
             return;
         }
@@ -3191,8 +3252,11 @@ impl Harness {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
                 }
+                if let Some(on) = req["codexHooks"].as_bool() {
+                    self.update(|s| s.codex_hooks = on);
+                }
                 let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
-                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
+                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "codexHooks": lock(&self.store).codex_hooks, "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
             }
             "harness_preferences" => {
                 let _store = lock(&self.store);
@@ -4080,6 +4144,38 @@ pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>, supervisor: b
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
+/// What of a hook's input goes to the service: the fact, not the tool's input
+/// and output. Of a Codex approval request the command and Codex's reason
+/// are kept, cut short: that is what the operator is asked.
+fn trim_hook(event: &str, payload: &mut Value) {
+    let Some(obj) = payload.as_object_mut() else { return };
+    let input = obj.remove("tool_input").unwrap_or(Value::Null);
+    obj.remove("tool_response");
+    if event != crate::agents::CODEX_HOOK {
+        return;
+    }
+    // The person's prompt is theirs, not the service's
+    obj.remove("prompt");
+    if obj.get("hook_event_name").and_then(Value::as_str) != Some("PermissionRequest") {
+        return;
+    }
+    let short = |v: &Value| -> Option<String> {
+        let text = match v {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+            _ => return None,
+        };
+        let text: String = text.chars().filter(|c| !c.is_control()).take(300).collect();
+        (!text.is_empty()).then_some(text)
+    };
+    if let Some(command) = short(&input["command"]) {
+        obj.insert("command".into(), json!(command));
+    }
+    if let Some(reason) = short(&input["description"]) {
+        obj.insert("reason".into(), json!(reason));
+    }
+}
+
 /// `--harness-hook <event> [json]`: report an agent's hook to the service.
 /// Always quiet and successful: a hook must never change what the agent does.
 pub fn hook_bridge(event: &str, argument: Option<String>) {
@@ -4090,11 +4186,7 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
         input
     });
     let mut payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    // The service needs the fact, not the tool's input and output
-    if let Some(obj) = payload.as_object_mut() {
-        obj.remove("tool_input");
-        obj.remove("tool_response");
-    }
+    trim_hook(event, &mut payload);
     let Ok(mut stream) = UnixStream::connect(path) else { return };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -5365,6 +5457,111 @@ mod tests {
         show("cl", "Do you want to make this edit to main.rs?\n\u{276f} 1. Yes\n  2. No");
         harness.look("cl", "\u{2733} Claude Code", Some(quiet + 9));
         assert!(state("cl").attention.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCR-74: Codex's own hooks, passed only when the operator turned them on,
+    /// give the conversation id at once and the approval request as Codex states it.
+    #[test]
+    fn codex_hooks_report_the_conversation_and_the_approval_request() {
+        // The launch: nothing by default, four hooks when asked, never a Stop hook or the trust bypass
+        let plain = command_line(&launch("codex")).unwrap();
+        assert!(!plain.contains("hooks."), "{plain}");
+        let line = command_line(&Launch { own_hooks: true, task: Some("rebase"), ..launch("codex") }).unwrap();
+        for event in crate::agents::CODEX_HOOKS {
+            assert!(line.contains(&format!(" -c 'hooks.{event}=[{{hooks=[{{type=\"command\",command=\"")), "{event}: {line}");
+        }
+        assert_eq!(line.matches("--harness-hook codex-hook").count(), 4, "{line}");
+        assert!(line.contains("notify=") && !line.contains("hooks.Stop") && !line.contains("bypass"), "{line}");
+        assert!(!command_line(&Launch { own_hooks: true, ..launch("claude") }).unwrap().contains("codex-hook"));
+
+        // The bridge passes the question on, cut short, and nothing else of the tool's input
+        let mut asked = json!({"hook_event_name": "PermissionRequest", "session_id": "S", "tool_name": "Bash", "tool_input": {"command": format!("git push {}", "x".repeat(600)), "description": "needs the network", "env": {"TOKEN": "secret"}}});
+        trim_hook("codex-hook", &mut asked);
+        assert!(asked["tool_input"].is_null() && asked["command"].as_str().unwrap().chars().count() == 300 && asked["reason"] == "needs the network");
+        assert!(!asked.to_string().contains("secret"));
+        let mut argv = json!({"hook_event_name": "PermissionRequest", "tool_input": {"command": ["git", "push\u{7}"]}});
+        trim_hook("codex-hook", &mut argv);
+        assert_eq!(argv["command"], "git push");
+        let mut prompt = json!({"hook_event_name": "UserPromptSubmit", "prompt": "the person's words", "tool_input": {"command": "x"}});
+        trim_hook("codex-hook", &mut prompt);
+        assert!(prompt["prompt"].is_null() && prompt["command"].is_null());
+        // Claude Code's hooks are trimmed as before
+        let mut claude = json!({"hook_event_name": "PostToolUse", "prompt": "kept", "tool_input": {"command": "x"}, "tool_response": "y"});
+        trim_hook("PostToolUse", &mut claude);
+        assert_eq!(claude, json!({"hook_event_name": "PostToolUse", "prompt": "kept"}));
+
+        let hook = |s: &mut Store, payload: Value| apply_hook(s, "ex", "codex-hook", &payload);
+        let mut s = Store::default();
+        s.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });
+        task(&mut s, "t1", "ex", "working", 1);
+        // The start: the conversation is known at once. The state is not touched and no task is typed on it
+        assert!(!hook(&mut s, json!({"hook_event_name": "SessionStart", "session_id": "T", "transcript_path": "/r.jsonl", "source": "startup"})));
+        let t = s.sessions["ex"].clone();
+        assert_eq!((t.agent_session.as_deref(), t.hooked, t.own_hooks, t.precise, t.state.as_str()), (Some("T"), true, true, false, "working"));
+        // The approval request, in Codex's words, not a guess
+        assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "session_id": "T", "tool_name": "Bash", "command": "git rebase origin/main", "reason": "the branch is behind"})));
+        let t = s.sessions["ex"].clone();
+        let a = t.attention.clone().unwrap();
+        assert_eq!((t.state.as_str(), t.precise, a.kind.as_str(), a.guess, a.was.as_str()), ("waiting", true, "permission", false, "working"));
+        assert_eq!(a.text, "Codex asks to use Bash: git rebase origin/main (the branch is behind)");
+        let brief = Harness::brief(&json!({"id": "ex", "exit": null, "harness": t}));
+        assert_eq!((brief["stateFromHooks"].as_bool(), brief["stateNote"].is_null(), brief["agentSession"].as_str()), (Some(true), true, Some("T")));
+        // Approved: the tool ran
+        assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "T", "tool_name": "Bash"})));
+        assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].attention.is_none(), s.tasks["t1"].state.as_str()), ("working", true, "working"));
+        // A subagent's hooks carry the session's id, and a hook never moves the conversation id
+        assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "OTHER"})));
+        assert_eq!(s.sessions["ex"].agent_session.as_deref(), Some("T"));
+        // A request without a command, and a hook the harness did not ask for
+        assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "tool_name": "mcp__x__send"})));
+        assert_eq!(s.sessions["ex"].attention.as_ref().unwrap().text, "Codex asks to use mcp__x__send");
+        assert!(!hook(&mut s, json!({"hook_event_name": "Stop"})));
+        assert_eq!(s.sessions["ex"].state, "waiting");
+        // The turn end still comes from notify, once
+        assert!(apply_hook(&mut s, "ex", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": "T", "top-level": true, "last-assistant-message": "done"})));
+        assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].attention.is_none(), s.tasks["t1"].state.as_str()), ("idle", true, "completed"));
+
+        // A prompt the terminal showed first (a guess) is replaced by Codex's own
+        // words, and the session still returns to where it was
+        assert!(apply_look(&mut s, "ex", Seen::Asking("Seen in its terminal: Would you like to".into()), 1000));
+        assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "command": "ls"})));
+        let a = s.sessions["ex"].attention.clone().unwrap();
+        assert_eq!((a.guess, a.was.as_str(), a.text.as_str()), (false, "idle", "Codex asks to use Bash: ls"));
+        // Refused: no hook says so. The title, seen asking while the mark was up, does
+        assert!(!apply_look(&mut s, "ex", Seen::Answered { announced: false }, 2000));
+        assert_eq!(s.sessions["ex"].state, "waiting");
+        assert!(!apply_look(&mut s, "ex", Seen::Answered { announced: true }, 3000));
+        assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].attention.is_none()), ("idle", true));
+        // The operator's own prompt answers a report, as with Claude Code
+        s.report("ex", "needs_human", "which branch?").unwrap();
+        assert!(!hook(&mut s, json!({"hook_event_name": "UserPromptSubmit", "session_id": "T"})));
+        assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].attention.is_none()), ("working", true));
+
+        // The setting is off until the operator turns it on, and a session whose
+        // hooks report is not read from its terminal
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Harness::open(&dir);
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooks"], false);
+        assert_eq!(harness.control(&json!({"op": "settings", "codexHooks": true})).unwrap()["codexHooks"], true);
+        assert!(lock(&harness.store).codex_hooks);
+        harness.update(|st| {
+            st.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), hooked: true, own_hooks: true, ..Tracked::default() });
+            st.sessions.insert("old".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });
+        });
+        for id in ["ex", "old"] {
+            harness.runner_event(&json!({"event": "title", "id": id, "title": "[ ! ] Action Required | teob-ai"}));
+        }
+        assert!(lock(&harness.store).sessions["ex"].attention.is_none(), "its hook will say");
+        assert!(lock(&harness.store).sessions["old"].attention.as_ref().is_some_and(|a| a.guess), "the fallback stays for sessions without hooks");
+        // The hook's mark, the title seen asking, then not: taken back
+        harness.hook("ex", "codex-hook", &json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "command": "ls"}));
+        harness.runner_event(&json!({"event": "title", "id": "ex", "title": "[ ! ] Action Required | teob-ai"}));
+        assert_eq!(lock(&harness.store).sessions["ex"].state, "waiting");
+        harness.runner_event(&json!({"event": "title", "id": "ex", "title": "Rebase | teob-ai"}));
+        let ex = lock(&harness.store).sessions["ex"].clone();
+        assert_eq!((ex.state.as_str(), ex.attention.is_none()), ("working", true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
