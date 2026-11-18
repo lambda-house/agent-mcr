@@ -215,6 +215,8 @@ export interface SlackPost {
 export interface SlackReceived {
   key: string; channel: string; channelName: string; user: string; userName: string; text: string; at: number;
   caughtUp: boolean; session?: string | null; held?: string | null;
+  /** The text was longer than what the service keeps */
+  cut?: boolean;
 }
 export interface SlackStatus {
   connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;

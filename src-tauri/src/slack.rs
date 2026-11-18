@@ -21,6 +21,15 @@ const MAX_POST_TEXT: usize = 3500;
 /// Posts one session may ask for per ten minutes
 const MAX_POSTS: usize = 20;
 const MAX_RECEIVED: usize = 2000;
+/// Characters kept of a message from a sender on the channel's list, and of one
+/// from anybody else, which no session gets and only the operator sees
+const MAX_TEXT_LISTED: usize = 4000;
+const MAX_TEXT_UNLISTED: usize = 500;
+/// Live messages delivered per minute from one channel and to one session; what
+/// comes above that is held (design, edge S1). Messages read back after a gap
+/// are bounded by `PAGE * CATCH_UP_PAGES` per channel and do not count
+const MAX_ROUTED_CHANNEL: usize = 20;
+const MAX_ROUTED_SESSION: usize = 30;
 const MAX_POSTS_KEPT: usize = 500;
 const MAX_AUDIT: usize = 500;
 /// Messages read per history call: what Slack allows a commercially distributed app (MCR-40)
@@ -224,6 +233,10 @@ pub struct Received {
     pub held: Option<String>,
     /// The sender was on the channel's list when it was delivered
     pub allowed: bool,
+    /// The text was longer than what is kept
+    pub cut: bool,
+    /// When it reached the session's inbox
+    pub delivered: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -769,8 +782,12 @@ impl Slack {
             if ts_value(ts) > ts_value(&policy.cursor) {
                 policy.cursor = ts.to_string();
             }
+            // A bound on what anyone in the channel can make this Mac store
+            let max = if policy.senders.iter().any(|s| s == user) { MAX_TEXT_LISTED } else { MAX_TEXT_UNLISTED };
+            let full = unescape(event["text"].as_str().unwrap_or(""));
+            let (text, cut) = (full.chars().take(max).collect::<String>(), full.chars().count() > max);
             let thread_ts = event["thread_ts"].as_str().filter(|t| *t != ts).map(str::to_owned);
-            s.received.insert(key.clone(), Received { key: key.clone(), channel: channel.into(), ts: ts.into(), thread_ts, user: user.into(), text: unescape(event["text"].as_str().unwrap_or("")), at: ts_ms(ts), caught_up, ..Received::default() });
+            s.received.insert(key.clone(), Received { key: key.clone(), channel: channel.into(), ts: ts.into(), thread_ts, user: user.into(), text, cut, at: ts_ms(ts), caught_up, ..Received::default() });
             Some(key)
         })
     }
@@ -820,14 +837,28 @@ impl Slack {
         let live = host.peers();
         let (to, connection, channel) = {
             let state = lock(&self.state);
-            (Self::destination(&state, &r, &live), state.connection.clone().unwrap_or_default(), state.channels.get(&r.channel).cloned().unwrap_or_default())
+            let to = Self::destination(&state, &r, &live).and_then(|session| {
+                // A flood in a listened channel does not become a flood in an inbox
+                let since = now_ms().saturating_sub(60_000);
+                let recent = |by: &dyn Fn(&Received) -> bool| state.received.values().filter(|x| !x.caught_up && x.delivered >= since && by(x)).count();
+                if r.caught_up {
+                    Ok(session)
+                } else if recent(&|x| x.channel == r.channel) >= MAX_ROUTED_CHANNEL {
+                    Err(format!("Held back: more than {MAX_ROUTED_CHANNEL} messages a minute were delivered from this channel"))
+                } else if recent(&|x| x.session.as_deref() == Some(session.as_str())) >= MAX_ROUTED_SESSION {
+                    Err(format!("Held back: more than {MAX_ROUTED_SESSION} messages a minute were delivered to this session"))
+                } else {
+                    Ok(session)
+                }
+            });
+            (to, state.connection.clone().unwrap_or_default(), state.channels.get(&r.channel).cloned().unwrap_or_default())
         };
         let message = to.as_ref().ok().and_then(|session| {
             let link = format!("{}archives/{}/p{}", connection.url, r.channel, r.ts.replace('.', ""));
             let from_operator = r.user == connection.operator;
             let about = json!({
                 "ref": r.key, "channel": r.channel, "channelName": channel.name, "user": r.user, "userName": r.user_name, "fromOperator": from_operator,
-                "ts": r.ts, "threadTs": r.thread_ts, "link": link, "sentAt": r.at, "caughtUp": r.caught_up,
+                "ts": r.ts, "threadTs": r.thread_ts, "link": link, "sentAt": r.at, "caughtUp": r.caught_up, "textCut": r.cut,
                 "replyPolicy": channel.posting,
             });
             host.inbox(session, &format!("Slack #{} · {}", channel.name, r.user_name), &r.text, about)
@@ -850,6 +881,7 @@ impl Slack {
                 // `destination` checked the sender against the list as it was then
                 stored.allowed = stored.session.is_some();
                 stored.message = message.clone();
+                stored.delivered = if stored.session.is_some() { now_ms() } else { 0 };
                 stored.held = held;
             }
         });
@@ -1975,6 +2007,47 @@ mod tests {
             assert_eq!(web.last("conversations.history").iter().find(|(k, _)| k == "oldest").unwrap().1, "1.000000");
             assert_eq!(lock(&host.inbox).iter().map(|m| m.2.as_str()).collect::<Vec<_>>(), ["older", "newer"], "{cut:?}");
         }
+    }
+
+    #[test]
+    fn stored_text_is_bounded_and_a_flood_is_held_back() {
+        let (_dir, slack, web, host) = connected("never");
+        // A long message of a listed sender is cut and says so; a stranger's is cut shorter
+        slack.on_event(&host, &message("UOP", "5.000100", &"é".repeat(MAX_TEXT_LISTED + 10)), || Ok(())).unwrap();
+        slack.on_event(&host, &message("USTRANGER", "5.000200", &"x".repeat(MAX_TEXT_LISTED)), || Ok(())).unwrap();
+        {
+            let state = lock(&slack.state);
+            assert_eq!((state.received["C1:5.000100"].text.chars().count(), state.received["C1:5.000100"].cut), (MAX_TEXT_LISTED, true));
+            assert_eq!((state.received["C1:5.000200"].text.len(), state.received["C1:5.000200"].cut), (MAX_TEXT_UNLISTED, true));
+        }
+        assert_eq!(lock(&host.inbox)[0].3["textCut"], true);
+        slack.on_event(&host, &message("UOP", "5.000300", "short"), || Ok(())).unwrap();
+        assert_eq!(lock(&host.inbox)[1].3["textCut"], false);
+        // More live messages a minute than the channel's bound: the rest is held, and shown as held
+        for i in 2..MAX_ROUTED_CHANNEL + 5 {
+            slack.on_event(&host, &message("UOP", &format!("6.{i:06}"), "again"), || Ok(())).unwrap();
+        }
+        assert_eq!(lock(&host.inbox).len(), MAX_ROUTED_CHANNEL);
+        let held: Vec<String> = lock(&slack.state).received.values().filter_map(|r| r.held.clone()).filter(|h| h.starts_with("Held back")).collect();
+        assert_eq!(held.len(), 5);
+        assert!(held[0].contains("from this channel"));
+        assert_eq!(slack.status()["counts"]["held"], 6);
+        // What is read back after a gap has its own bound and is not held back
+        web.script("conversations.history", Ok(json!({"ok": true, "has_more": false, "messages": [{"type": "message", "user": "UOP", "ts": "7.000100", "text": "read back"}]})));
+        slack.catch_up.store(true, Ordering::SeqCst);
+        slack.work(&host);
+        assert_eq!(lock(&host.inbox).last().unwrap().2, "read back");
+        // A second channel to the same session fills the session's bound
+        slack.set_policy("C2", &json!({"listen": "all", "route": "session", "session": "s1"})).unwrap();
+        for i in 0..MAX_ROUTED_SESSION - MAX_ROUTED_CHANNEL + 1 {
+            slack.on_event(&host, &json!({"type": "message", "channel": "C2", "user": "UOP", "ts": format!("8.{i:06}"), "text": "other channel"}), || Ok(())).unwrap();
+        }
+        assert_eq!(lock(&host.inbox).len(), MAX_ROUTED_SESSION + 1);
+        assert!(lock(&slack.state).received.values().any(|r| r.held.as_deref().is_some_and(|h| h.contains("to this session"))));
+        // A minute later it flows again
+        lock(&slack.state).received.values_mut().for_each(|r| r.delivered = r.delivered.saturating_sub(61_000).min(1));
+        slack.on_event(&host, &message("UOP", "9.000100", "later"), || Ok(())).unwrap();
+        assert_eq!(lock(&host.inbox).last().unwrap().2, "later");
     }
 
     #[test]

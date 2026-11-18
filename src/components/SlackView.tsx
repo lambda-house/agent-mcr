@@ -164,7 +164,7 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         <span className="hs-item-text">
           <strong>#{r.channelName} · {r.userName || r.user}{r.held ? <em>not delivered</em> : null}</strong>
           <span className="hs-board-text">{r.text}</span>
-          <small>{formatAge(r.at)}{r.caughtUp ? ' · read back after a gap' : ''} · {r.held ?? `delivered to ${sessionName(r.session)}`}</small>
+          <small>{formatAge(r.at)}{r.caughtUp ? ' · read back after a gap' : ''}{r.cut ? ' · a long text, cut here' : ''} · {r.held ?? `delivered to ${sessionName(r.session)}`}</small>
         </span>
       </div></li>)}</ul>
     </section>
