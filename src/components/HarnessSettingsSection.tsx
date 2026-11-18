@@ -7,7 +7,7 @@ import { BackgroundPanel } from './Background';
 export function codexHooksDescription(status: HarnessStatus): string {
   const what = 'Start new Codex sessions with hooks that report their state to Agent MCR: the conversation from its start, and what Codex asks to approve. They never answer for you.';
   if (!status.codexHooks) return `${what} Off: Agent MCR reads a Codex prompt from its terminal instead, as a guess.`;
-  if (status.codexHooksReporting) return `${what} On, and a Codex session has reported through them.`;
+  if (status.codexHooksReporting) return `${what} On, and Codex runs them: a session has reported through them.`;
   return `${what} On. Codex asks once to review them: start a Codex session and choose "Trust all and continue". Until then new Codex sessions stop at that question.`;
 }
 

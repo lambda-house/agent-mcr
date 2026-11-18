@@ -854,6 +854,13 @@ struct Store {
     /// asks them to trust once (MCR-74)
     #[serde(default)]
     codex_hooks: bool,
+    /// The program path under which a Codex hook last reported. Codex's
+    /// trust covers the hook's command, which holds this path: while it is
+    /// this program's, the person has trusted the hooks. Kept, so the
+    /// Settings row does not ask for trust again once the sessions that
+    /// reported are forgotten (MCR-74)
+    #[serde(default)]
+    codex_hooks_seen: String,
     waits: BTreeMap<String, Wait>,
     /// Connected `mcr` bridges per session; `Tracked.tools` follows it
     #[serde(skip)]
@@ -863,6 +870,11 @@ struct Store {
     restarting: BTreeSet<String>,
     #[serde(skip)]
     version: u64,
+}
+
+/// This program's path, as it stands in the hook commands Codex is given.
+fn this_program() -> String {
+    std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
 }
 
 /// The state of a session whose process ended. Kept in the store, so that
@@ -3099,6 +3111,9 @@ impl Harness {
         let payload = &payload;
         let (ready, waiting) = self.update(|s| {
             let before = s.sessions.get(session).map(|t| t.state.clone());
+            if event == crate::agents::CODEX_HOOK && s.sessions.contains_key(session) {
+                s.codex_hooks_seen = this_program();
+            }
             let ready = apply_hook(s, session, event, payload);
             let tracked = s.sessions.get(session);
             let now_waiting = tracked.filter(|t| t.state == "waiting" && before.as_deref() != Some("waiting")).cloned();
@@ -3367,7 +3382,7 @@ impl Harness {
                     self.update(|s| s.codex_hooks = on);
                 }
                 let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
-                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "codexHooks": lock(&self.store).codex_hooks, "codexHooksReporting": lock(&self.store).sessions.values().any(|t| t.own_hooks), "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
+                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "codexHooks": lock(&self.store).codex_hooks, "codexHooksReporting": lock(&self.store).codex_hooks_seen == this_program(), "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
             }
             "harness_preferences" => {
                 let _store = lock(&self.store);
@@ -5715,6 +5730,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let harness = Harness::open(&dir);
         assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooks"], false);
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], false);
         assert_eq!(harness.control(&json!({"op": "settings", "codexHooks": true})).unwrap()["codexHooks"], true);
         assert!(lock(&harness.store).codex_hooks);
         harness.update(|st| {
@@ -5733,6 +5749,18 @@ mod tests {
         harness.runner_event(&json!({"event": "title", "id": "ex", "title": "Rebase | teob-ai"}));
         let ex = lock(&harness.store).sessions["ex"].clone();
         assert_eq!((ex.state.as_str(), ex.attention.is_none()), ("working", true));
+        // A hook has reported: the person trusted the hooks of this program. That is
+        // remembered when the sessions are forgotten and when the service starts again
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], true);
+        harness.update(|st| st.sessions.clear());
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], true);
+        assert_eq!(Harness::open(&dir).control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], true);
+        // Codex's trust covers the command with the program's path: a hook seen under another path says nothing about this one
+        harness.update(|st| st.codex_hooks_seen = "/another/build/agent-mcr".into());
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], false);
+        // A hook attributed to no tracked session is not counted
+        harness.hook("nobody", "codex-hook", &json!({"hook_event_name": "PostToolUse"}));
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
