@@ -3712,7 +3712,7 @@ impl Harness {
             return Err("Refused: terminal_write is unavailable through the CLI; ask the operator to use the terminal or an MCP client that asks for approval.".into());
         }
         match who {
-            Caller::Session { id, .. } if lock(&self.store).sessions.get(id).is_some_and(|t| t.profile == "claude") => Ok(()),
+            Caller::Session { id, .. } if lock(&self.store).sessions.get(id).is_some_and(|t| adapter(&t.profile).asks_before_terminal_write()) => Ok(()),
             _ => Err("Refused: terminal_write is only available to a hosted Claude supervisor (which asks the operator for permission). Use task_assign or ask the operator to type into the terminal.".into()),
         }
     }
@@ -3745,7 +3745,10 @@ impl Harness {
                 let out = self.tool(name, &args)?;
                 Ok(if name == "session_resumable" && !summaries_for(&who) { without_summaries(out) } else { out })
             };
+            // A caller that would be refused `terminal_write` is not listed it either
+            let unlisted = frame["method"] == "tools/list" && self.allows_terminal_write(&who, cli).is_err();
             if let Some(reply) = protocol.dispatch_for(&SUPERVISOR, frame, call) {
+                let reply = if unlisted { without_terminal_write(reply) } else { reply };
                 writeln!(writer, "{reply}")?;
             }
         }
@@ -3905,6 +3908,14 @@ fn has_session_workspace(dir: &Path) -> bool {
 /// tools gets ids, folders and times (owner's decision of 2026-11-18, MCR-76).
 fn summaries_for(who: &Caller) -> bool {
     matches!(who, Caller::Session { supervisor: true, .. })
+}
+
+/// A `tools/list` answer of the Supervisor surface without `terminal_write`.
+fn without_terminal_write(mut reply: Value) -> Value {
+    if let Some(tools) = reply.get_mut("result").and_then(|r| r.get_mut("tools")).and_then(Value::as_array_mut) {
+        tools.retain(|t| t["name"] != "terminal_write");
+    }
+    reply
 }
 
 /// A `resumable` answer with ids, folders and times only.
@@ -5439,6 +5450,18 @@ mod tests {
             s.sessions.insert("sup-codex".into(), Tracked { name: "sup".into(), profile: "codex".into(), ..Tracked::default() });
             s.sessions.insert("sup-pi".into(), Tracked { name: "sup".into(), profile: "pi".into(), ..Tracked::default() });
         });
+        // The adapter says it, not a profile name: only Claude is launched to ask the operator for this tool
+        for agent in adapters() {
+            assert_eq!(agent.asks_before_terminal_write(), agent.id() == "claude", "{}", agent.id());
+        }
+        // Who is refused the tool is not listed it
+        let listed = |reply: Value| reply["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "terminal_write");
+        let reply = json!({"jsonrpc": "2.0", "id": 1, "result": supervisor_tools()});
+        let all = reply["result"]["tools"].as_array().unwrap().len();
+        assert!(listed(reply.clone()) && !listed(without_terminal_write(reply.clone())));
+        assert_eq!(without_terminal_write(reply)["result"]["tools"].as_array().unwrap().len(), all - 1);
+        let error = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32002, "message": "x"}});
+        assert_eq!(without_terminal_write(error.clone()), error);
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, false).is_ok());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, true).is_err());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }, false).is_err());

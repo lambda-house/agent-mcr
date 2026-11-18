@@ -310,6 +310,13 @@ pub trait Adapter: Sync {
     fn sees_prompt(&self) -> bool {
         false
     }
+    /// Launched as Supervisor so that `terminal_write` is the one tool left to
+    /// its own permission prompt: the operator approves each call (Claude:
+    /// `claude_settings` pre-approves every other supervisor tool). Only such
+    /// a Supervisor is listed that tool and may call it
+    fn asks_before_terminal_write(&self) -> bool {
+        false
+    }
     /// Whether the terminal title says that the agent waits for the operator's
     /// answer. `None`: its title says nothing about that
     fn title_asks(&self, _title: &str) -> Option<bool> {
@@ -408,6 +415,9 @@ impl Adapter for Claude {
         files
     }
     fn names_conversation(&self) -> bool {
+        true
+    }
+    fn asks_before_terminal_write(&self) -> bool {
         true
     }
     fn reports_from_start(&self) -> bool {
