@@ -1479,16 +1479,29 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
     let event = if event == crate::agents::CODEX_HOOK {
         tracked.own_hooks = true;
         tracked.hooked = true;
+        // Whether hooks also run for other threads in the terminal (subagents,
+        // the title writer) is not known, so they are held to the session's
+        // own thread as turn ends are: `top-level` is what the transcripts
+        // say (added by `hook`), and an id that differs from the known one
+        // is another thread's
+        let id = payload["session_id"].as_str().filter(|id| !id.is_empty());
+        let top = payload["top-level"].as_bool();
+        let own = tracked.agent_session.as_deref();
+        let other = top == Some(false) || (top.is_none() && id.zip(own).is_some_and(|(id, own)| id != own));
         match payload["hook_event_name"].as_str().unwrap_or("") {
             // The conversation's id from its first moment. Nothing more: when in
             // its start Codex runs this is not known, so it neither makes the
             // session idle nor lets a queued task be typed
+            // The id is taken when none is known or the transcripts say that
+            // this is the person's thread; another thread never moves it, or
+            // real turn ends would be ignored and a restart would resume the
+            // wrong conversation
             "SessionStart" => {
-                if let Some(id) = payload["session_id"].as_str().filter(|id| !id.is_empty()) {
+                if let Some(id) = id.filter(|_| top == Some(true) || (own.is_none() && top.is_none())) {
                     tracked.agent_session = Some(id.to_string());
-                }
-                if let Some(path) = payload["transcript_path"].as_str() {
-                    tracked.transcript = Some(path.to_string());
+                    if let Some(path) = payload["transcript_path"].as_str() {
+                        tracked.transcript = Some(path.to_string());
+                    }
                 }
                 return false;
             }
@@ -1514,6 +1527,10 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
                 store.set_state(session, "waiting");
                 return false;
             }
+            // Another thread's prompt or tool says nothing about the session's
+            // own approval mark or state. (An approval request above is kept
+            // from any thread: whichever asks, the terminal waits for the person)
+            "UserPromptSubmit" | "PostToolUse" if other => return false,
             "UserPromptSubmit" => "UserPromptSubmit",
             "PostToolUse" => "PostToolUse",
             _ => return false,
@@ -2985,7 +3002,12 @@ impl Harness {
     fn hook(&self, session: &str, event: &str, payload: &Value) {
         // Whether a Codex turn end is the session's own thread or a subagent's
         let mut payload = payload.clone();
-        if let (true, Some(thread), Some(home)) = (event == "codex-notify", payload["thread-id"].as_str(), dirs::home_dir()) {
+        let thread = match event {
+            "codex-notify" => payload["thread-id"].as_str(),
+            crate::agents::CODEX_HOOK => payload["session_id"].as_str(),
+            _ => None,
+        };
+        if let (Some(thread), Some(home)) = (thread, dirs::home_dir()) {
             payload["top-level"] = json!(top_level_thread(&home, thread));
         }
         let payload = &payload;
@@ -5510,9 +5532,40 @@ mod tests {
         // Approved: the tool ran
         assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "T", "tool_name": "Bash"})));
         assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].attention.is_none(), s.tasks["t1"].state.as_str()), ("working", true, "working"));
-        // A subagent's hooks carry the session's id, and a hook never moves the conversation id
-        assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "OTHER"})));
+        // Other threads in the same terminal (a subagent, the title writer), should
+        // Codex run hooks for them: they never move the conversation id, clear
+        // the session's approval mark or change its state
+        assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "session_id": "T", "tool_name": "Bash", "command": "git push"})));
+        for other in [json!({"session_id": "SUB"}), json!({"session_id": "SUB", "top-level": false}), json!({"session_id": "T", "top-level": false})] {
+            for name in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+                let mut payload = other.clone();
+                payload["hook_event_name"] = json!(name);
+                payload["transcript_path"] = json!("/sub.jsonl");
+                assert!(!hook(&mut s, payload));
+                let t = &s.sessions["ex"];
+                assert_eq!((t.agent_session.as_deref(), t.transcript.as_deref(), t.state.as_str(), t.attention.is_some()), (Some("T"), Some("/r.jsonl"), "waiting", true), "{name} {other}");
+            }
+        }
+        // An idle session is not made working by another thread's tool
+        let t = s.sessions.get_mut("ex").unwrap();
+        (t.attention, t.state) = (None, "idle".into());
+        assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "SUB"})));
+        assert_eq!(s.sessions["ex"].state, "idle");
+        // An approval request is kept from any thread: the terminal waits for the person
+        assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "session_id": "SUB", "top-level": false, "tool_name": "Bash", "command": "ls"})));
+        assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].agent_session.as_deref()), ("waiting", Some("T")));
+        // The session's own thread, also when the transcripts confirm it, goes on
+        assert!(!hook(&mut s, json!({"hook_event_name": "PostToolUse", "session_id": "T", "top-level": true})));
+        assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].attention.is_none()), ("working", true));
+        // A thread taken by mistake is corrected by a start the transcripts call the person's
+        s.sessions.get_mut("ex").unwrap().agent_session = Some("SUB".into());
+        assert!(!hook(&mut s, json!({"hook_event_name": "SessionStart", "session_id": "T", "top-level": true})));
         assert_eq!(s.sessions["ex"].agent_session.as_deref(), Some("T"));
+        // A first start that the transcripts call another agent's is not taken at all
+        let mut fresh = Store::default();
+        fresh.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });
+        assert!(!apply_hook(&mut fresh, "ex", "codex-hook", &json!({"hook_event_name": "SessionStart", "session_id": "SUB", "top-level": false})));
+        assert_eq!(fresh.sessions["ex"].agent_session, None);
         // A request without a command, and a hook the harness did not ask for
         assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "tool_name": "mcp__x__send"})));
         assert_eq!(s.sessions["ex"].attention.as_ref().unwrap().text, "Codex asks to use mcp__x__send");
