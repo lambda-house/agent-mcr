@@ -89,7 +89,17 @@ export interface Background { consent: 'allowed' | 'stopped' | 'new'; units: Bac
 export const notAllowed = (e: unknown) => String(e instanceof Error ? e.message : e).includes('Background processes are not allowed');
 
 /** What an agent told the person with its `report` tool. */
-export interface Report { id: string; session: string; name: string; cwd: string; kind: 'needs_human' | 'done'; text: string; created: number }
+/** An executor in a status report, as the service knew it when the report was made. */
+export interface ExecutorLine { session: string; name: string; state: string; needsOperator: boolean; waits: string[] }
+export interface Report {
+  id: string; session: string; name: string; cwd: string; text: string; created: number;
+  /** `status` notifies nobody and marks nothing; the board holds the latest one of each session */
+  kind: 'needs_human' | 'done' | 'status';
+  /** The session it worked for when it reported (id) */
+  supervisor?: string;
+  /** On a status report of a supervising session */
+  executors?: ExecutorLine[];
+}
 /** A note on the bulletin board, read by sessions until it expires. */
 export interface Note {
   id: string; from: { id: string; name: string }; folder: string; scope: 'folder' | 'all'; text: string;
@@ -120,6 +130,61 @@ export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
     if (last) open.add(last.id);
   }
   return open;
+}
+
+/** A report in its group: `depth` is the number of supervisors above its session inside the group. */
+export interface ReportRow { report: Report; depth: number }
+/**
+ * The reports of one supervisor and of the sessions below it, or (`session`
+ * empty) of the sessions that work for nobody and supervise nobody.
+ */
+export interface ReportGroup { session: string; name: string; live: boolean; rows: ReportRow[] }
+
+/**
+ * Reports by supervisor: a group per top session, with its own reports first
+ * and then each executor's, and theirs, in the order of the tree. Inside a
+ * session the status report comes first, then the rest, newest first. Who
+ * works for whom is what the session list says now; for a session that ended
+ * it is what its last report recorded. Groups with the newest report come
+ * first; sessions outside any tree are one last group, newest report first.
+ */
+export function reportGroups(reports: Report[], hosted: Hosted[]): ReportGroup[] {
+  const live = new Map(hosted.filter(h => !h.exit).map(h => [h.id, h]));
+  const own = new Map<string, Report[]>();
+  for (const r of reports) own.set(r.session, [...own.get(r.session) ?? [], r]);
+  const above = (id: string) => live.has(id) ? live.get(id)!.harness?.supervisor || '' : [...own.get(id) ?? []].reverse().find(r => r.supervisor)?.supervisor ?? '';
+  // Every session with a report, and the supervisors above them; a circle ends where it closes
+  const up = new Map<string, string>();
+  for (const id of own.keys()) {
+    const path = new Set<string>();
+    for (let at = id; at && !path.has(at) && !up.has(at); at = up.get(at)!) {
+      path.add(at);
+      const next = above(at);
+      up.set(at, path.has(next) ? '' : next);
+    }
+  }
+  const newest = (ids: string[]) => Math.max(0, ...ids.flatMap(id => (own.get(id) ?? []).map(r => r.created)));
+  const name = (id: string) => {
+    const h = hosted.find(x => x.id === id);
+    return h && isSupervisor(h) ? 'Supervisor' : (own.get(id) ?? []).slice(-1)[0]?.name || (h ? hostedLabel(h) : '') || id;
+  };
+  const rows = (id: string, depth: number): ReportRow[] => {
+    const mine = [...own.get(id) ?? []].reverse();
+    const status = mine.find(r => r.kind === 'status');
+    return [...status ? [status] : [], ...mine.filter(r => r !== status)].map(report => ({ report, depth }));
+  };
+  const below = (id: string) => [...up].filter(([, s]) => s === id).map(([child]) => child).sort((a, b) => name(a).localeCompare(name(b)) || a.localeCompare(b));
+  const tree = (id: string, depth: number): ReportRow[] => [...rows(id, depth), ...below(id).flatMap(child => tree(child, depth + 1))];
+  const members = (id: string): string[] => [id, ...below(id).flatMap(members)];
+  const tops = [...up].filter(([, s]) => !s).map(([id]) => id);
+  // A supervisor heads a group before any of its executors has reported
+  const supervises = (id: string) => below(id).length > 0 || [...live.values()].some(h => h.id === id ? isSupervisor(h) : h.harness?.supervisor === id) || (own.get(id) ?? []).some(r => r.executors?.length);
+  const groups = tops.filter(supervises)
+    .map(id => ({ group: { session: id, name: name(id), live: live.has(id), rows: tree(id, 0) }, at: newest(members(id)) }))
+    .sort((a, b) => b.at - a.at || a.group.session.localeCompare(b.group.session))
+    .map(g => g.group);
+  const alone = tops.filter(id => !supervises(id)).flatMap(id => own.get(id) ?? []).sort((a, b) => b.created - a.created);
+  return alone.length ? [...groups, { session: '', name: '', live: false, rows: alone.map(report => ({ report, depth: 0 })) }] : groups;
 }
 
 /** The Slack connector as the harness service reports it (decision D14). No token is in it. */

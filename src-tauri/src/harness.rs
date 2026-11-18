@@ -122,6 +122,8 @@ The operator runs many sessions and does not read every terminal. Two tools put 
 Call it when you judge it necessary; nobody has to ask.
 - `report` with `kind: "needs_human"`: you cannot make further progress without the operator's assessment: a decision that is theirs, a result only they can judge, an access you lack, a risk you will not take alone. Give the question and the options in `text`, in a form that can be answered in one line. Then end your turn. Your session is marked as needing the operator until they type into it.
 - `report` with `kind: "done"`: a piece of work is complete: a task, a milestone, a review. Say in `text` what is done, where it is (branch, commit, path) and what you did not verify. The mark stays until the operator looks at your session.
+- `report` with `kind: "status"`: where you or the sessions you supervise stand, when the operator should be able to read it without being called: a supervisor after each review round or periodic assessment ("all three executors fine", "MCR-72 waits for CI"), the result of a long check. Nobody is notified and your session is not marked. It replaces your previous status report on the Board, so write it complete in itself, not as a change to the last one. If you supervise, the harness adds one line per executor (state, whether it needs the operator, the waits it registered): don't repeat those, say what you make of them.
+- A status report is not for every step: one line on what you are doing now is `set_status`. And it is not a wait: when you depend on something outside your session, call `wait_register`. A status text that says "waiting for CI" tells nobody when to look; a registered wait is followed up when it runs late.
 - Don't report progress that needs nobody ("still working"): that is `set_status`. Reports are refused after 6 in ten minutes.
 - A report does not replace your answer in the terminal: write the full account there, and the short form in the report.
 - The supervisor session reads reports too (`reports_list`), so a report is also how you report back on a task it gave you.
@@ -725,10 +727,32 @@ pub struct Report {
     pub session: String,
     pub name: String,
     pub cwd: String,
-    /// needs_human | done
+    /// needs_human | done | status
     pub kind: String,
     pub text: String,
     pub created: u64,
+    /// The session it worked for when it reported: the Board groups by it
+    /// when the session itself is gone
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<String>,
+    /// A status report of a supervising session: its executors as the
+    /// service knew them at that moment
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub executors: Vec<ExecutorLine>,
+}
+
+/// One executor in a status report. Taken from the store, never from what
+/// the reporting agent says about it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutorLine {
+    pub session: String,
+    pub name: String,
+    pub state: String,
+    /// It waits on the operator: a prompt, or its own needs_human report
+    pub needs_operator: bool,
+    /// What it registered with wait_register and has not cleared, in its words
+    pub waits: Vec<String>,
 }
 
 /// A note on the bulletin board: read by sessions that start later, until it expires.
@@ -996,6 +1020,31 @@ impl Store {
         notes
     }
 
+    /// A restarted session keeps its reports, and those of its executors keep
+    /// naming it as their supervisor.
+    fn move_reports(&mut self, from: &str, to: &str) {
+        for r in &mut self.reports {
+            if r.session == from {
+                r.session = to.into();
+            }
+            if r.supervisor.as_deref() == Some(from) {
+                r.supervisor = Some(to.into());
+            }
+        }
+    }
+
+    /// The reports the Board shows, newest last: a status report replaces the
+    /// same session's earlier one, the others all stay. `reports` keeps the
+    /// replaced ones for `reports_list`.
+    fn board_reports(&self) -> Vec<&Report> {
+        let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
+        for r in self.reports.iter().filter(|r| r.kind == "status") {
+            latest.insert(&r.session, &r.id);
+        }
+        let shown: Vec<&Report> = self.reports.iter().filter(|r| r.kind != "status" || latest.get(r.session.as_str()) == Some(&r.id.as_str())).collect();
+        shown[shown.len().saturating_sub(BOARD_REPORTS)..].to_vec()
+    }
+
     /// What the app shows: the latest reports (newest last) and the live notes.
     fn board(&self) -> Value {
         let now = now_ms();
@@ -1010,7 +1059,7 @@ impl Store {
                 shown
             })
             .collect();
-        json!({ "reports": &self.reports[self.reports.len().saturating_sub(BOARD_REPORTS)..], "notes": notes })
+        json!({ "reports": self.board_reports(), "notes": notes })
     }
 
     /// Notes this session has not read yet.
@@ -1037,15 +1086,33 @@ impl Store {
     }
 
     /// The agent's own report: recorded, and shown on its session unless the
-    /// session already waits on a prompt.
+    /// session already waits on a prompt. A `status` report is recorded only:
+    /// it marks nothing, and the Board shows the session's latest one.
     fn report(&mut self, session: &str, kind: &str, text: &str) -> Result<Report, String> {
         let now = now_ms();
-        if self.reports.iter().filter(|r| r.session == session && r.created >= now.saturating_sub(600_000)).count() >= MAX_REPORTS_SENT {
-            return Err(format!("Refused: this session reported {MAX_REPORTS_SENT} times in ten minutes. Progress that needs nobody belongs in set_status."));
+        let status = kind == "status";
+        // Counted apart, so that a status never takes the room of a needs_human
+        if self.reports.iter().filter(|r| r.session == session && (r.kind == "status") == status && r.created >= now.saturating_sub(600_000)).count() >= MAX_REPORTS_SENT {
+            return Err(if status {
+                format!("Refused: this session reported its status {MAX_REPORTS_SENT} times in ten minutes. A status report is for an assessment or the end of a review round, not for every step.")
+            } else {
+                format!("Refused: this session reported {MAX_REPORTS_SENT} times in ten minutes. Progress that needs nobody belongs in set_status.")
+            });
         }
+        let executors = if status { self.executor_lines(session) } else { Vec::new() };
         let tracked = self.sessions.get_mut(session).ok_or("This session is not tracked")?;
-        let report = Report { id: format!("r{}", &runner::random_id()[..10]), session: session.into(), name: label(tracked), cwd: tracked.cwd.clone(), kind: kind.into(), text: text.into(), created: now };
-        if tracked.attention.as_ref().is_none_or(|a| a.kind != "permission") {
+        let report = Report {
+            id: format!("r{}", &runner::random_id()[..10]),
+            session: session.into(),
+            name: label(tracked),
+            cwd: tracked.cwd.clone(),
+            kind: kind.into(),
+            text: text.into(),
+            created: now,
+            supervisor: tracked.supervisor.clone(),
+            executors,
+        };
+        if !status && tracked.attention.as_ref().is_none_or(|a| a.kind != "permission") {
             let (shown, prefix) = if kind == "needs_human" { ("assessment", "Needs you") } else { ("notification", "Done") };
             tracked.attention = Some(Attention { kind: shown.into(), text: format!("{prefix}: {text}"), since: now, report: Some(kind.into()) });
         }
@@ -1055,6 +1122,25 @@ impl Store {
             self.reports.drain(..extra);
         }
         Ok(report)
+    }
+
+    /// The sessions that work for `session`, for its status report: state,
+    /// whether the operator is needed and the open waits, by name.
+    fn executor_lines(&self, session: &str) -> Vec<ExecutorLine> {
+        let mut lines: Vec<ExecutorLine> = self
+            .sessions
+            .iter()
+            .filter(|(_, t)| t.supervisor.as_deref() == Some(session))
+            .map(|(id, t)| ExecutorLine {
+                session: id.clone(),
+                name: label(t),
+                state: t.state.clone(),
+                needs_operator: t.attention.as_ref().is_some_and(|a| a.kind != "notification"),
+                waits: self.open_waits(id).iter().map(|w| w.on.clone()).collect(),
+            })
+            .collect();
+        lines.sort_by(|a, b| (&a.name, &a.session).cmp(&(&b.name, &b.session)));
+        lines
     }
 
     /// Open waits of a session, oldest first.
@@ -1612,6 +1698,8 @@ impl Harness {
             for n in s.notes.values_mut().filter(|n| n.from == id) {
                 n.from = new_id.clone();
             }
+            // Its reports too: the next status report replaces the one from before the restart
+            s.move_reports(id, &new_id);
             let (status, role, above) = s.sessions.get(id).map(|t| (t.status.clone(), t.role.clone(), t.supervisor.clone())).unwrap_or_default();
             if let Some(t) = s.sessions.get_mut(&new_id) {
                 t.status = status;
@@ -2214,31 +2302,43 @@ impl Harness {
             }
             "report" => {
                 let kind = text("kind")?;
-                if kind != "needs_human" && kind != "done" {
-                    return Err("kind is needs_human or done".into());
+                if !["needs_human", "done", "status"].contains(&kind) {
+                    return Err("kind is needs_human, done or status".into());
                 }
                 let said: String = text("text")?.trim().chars().filter(|c| !c.is_control() || *c == '\n').take(MAX_NOTE_TEXT).collect();
                 if said.is_empty() {
-                    return Err("text is required: what you need from the operator, or what is done".into());
+                    return Err("text is required: what you need from the operator, what is done, or where things stand".into());
                 }
                 let report = self.update(|s| s.report(me, kind, &said))?;
                 // Its supervisor reads it too (MCR-41); the operator's mark is unchanged
                 // Bound first: a guard in the `if let` would be held while `update` locks again
                 let above = lock(&self.store).sessions.get(me).and_then(|t| t.supervisor.clone());
                 if let Some(up) = above {
-                    let what = if kind == "needs_human" { "reports that it needs the operator" } else { "reports a piece of work done" };
+                    let what = match kind {
+                        "needs_human" => "reports that it needs the operator",
+                        "status" => "reports where it stands (a status report: nobody was notified)",
+                        _ => "reports a piece of work done",
+                    };
                     self.update(|s| {
                         s.post(Message { from: me.into(), to: up.clone(), text: format!("Your executor {what}:\n{said}"), ..Message::default() });
                     });
                     self.nudge(&up);
                 }
-                let (title, note) = if kind == "needs_human" {
-                    (format!("Agent MCR: {} needs you", report.name), "Recorded and shown to the operator. End your turn: the mark stays until they type into your session.")
+                // A status report is read on the Board when the operator looks: no notification, no mark
+                if kind == "status" {
+                    json!({
+                        "report": report.id, "kind": kind, "executors": report.executors,
+                        "note": "Recorded. It replaces your previous status report on the Board; nobody is notified and your session is not marked. If you cannot go on without the operator, that is a needs_human report.",
+                    })
                 } else {
-                    (format!("Agent MCR: {} finished a piece of work", report.name), "Recorded and shown to the operator. The mark stays until they look at your session.")
-                };
-                notify_user(&title, &said);
-                json!({ "report": report.id, "kind": kind, "note": note })
+                    let (title, note) = if kind == "needs_human" {
+                        (format!("Agent MCR: {} needs you", report.name), "Recorded and shown to the operator. End your turn: the mark stays until they type into your session.")
+                    } else {
+                        (format!("Agent MCR: {} finished a piece of work", report.name), "Recorded and shown to the operator. The mark stays until they look at your session.")
+                    };
+                    notify_user(&title, &said);
+                    json!({ "report": report.id, "kind": kind, "note": note })
+                }
             }
             "bulletin_read" => {
                 let notes = self.update(|s| {
@@ -2397,7 +2497,7 @@ impl Harness {
                 let name = self.update(|s| {
                     let by = s.sessions.get(me).map(label).unwrap_or_default();
                     let (name, cwd) = s.sessions.get(&id).map(|t| (label(t), t.cwd.clone())).unwrap_or_default();
-                    s.reports.push(Report { id: format!("r{}", &runner::random_id()[..10]), session: id.clone(), name: name.clone(), cwd, kind: "done".into(), text: format!("Ended by its supervisor {by:?} (mcr:{me}), which had started it as its executor. Its conversation is kept."), created: now_ms() });
+                    s.reports.push(Report { id: format!("r{}", &runner::random_id()[..10]), session: id.clone(), name: name.clone(), cwd, kind: "done".into(), text: format!("Ended by its supervisor {by:?} (mcr:{me}), which had started it as its executor. Its conversation is kept."), created: now_ms(), supervisor: Some(me.to_string()), ..Report::default() });
                     name
                 });
                 self.notice(me, format!("Your executor {name:?} (mcr:{id}) was ended at your request. Its conversation is kept; the operator can resume it."));
@@ -3287,7 +3387,7 @@ fn agent_tools() -> Value {
         tool("read_inbox", "Your unread messages, oldest first; they are then marked read. With all=true: the last 40 messages you sent or received.", json!({"all": {"type": "boolean"}}), &[], false),
         tool("listen", "Wait inside this turn until a message arrives or the time is up, then return it. Usually you don't need it: an idle session is told about new messages.", json!({"timeout_seconds": {"type": "integer", "description": "Default 50, at most 600"}}), &[], false),
         tool("set_status", "One line on what you are doing, shown to the operator and to peers, and your role: the part you play, which peers in your folder take into account.", json!({"text": {"type": "string", "description": "What you are doing now"}, "role": {"type": "string", "description": "Your part, in a few words: reviewer, implementer of MCR-24, release build"}}), &[], false),
-        tool("report", "Tell the operator where you stand, when you judge it necessary. needs_human: you cannot make further progress without their assessment or decision; your session is marked until they type into it. done: a piece of work is complete; marked until they look. They get a notification either way.", json!({"kind": {"type": "string", "enum": ["needs_human", "done"]}, "text": {"type": "string", "description": "needs_human: the question and the options, answerable in one line. done: what is done, where it is, what was not verified"}}), &["kind", "text"], false),
+        tool("report", "Tell the operator where you stand, when you judge it necessary. needs_human: you cannot make further progress without their assessment or decision; your session is marked until they type into it. done: a piece of work is complete; marked until they look. They get a notification for these two. status: where you or the sessions you supervise stand after an assessment or a review round; no notification and no mark, and it replaces your previous status report on the Board.", json!({"kind": {"type": "string", "enum": ["needs_human", "done", "status"]}, "text": {"type": "string", "description": "needs_human: the question and the options, answerable in one line. done: what is done, where it is, what was not verified. status: the whole picture now, complete without the previous one"}}), &["kind", "text"], false),
         tool("bulletin_read", "The bulletin board: notes left for sessions in your folder (and for all sessions) that have not expired. Read it when you start, and when a tool result says bulletin is above zero.", json!({}), &[], false),
         tool("bulletin_post", "Leave a note for the sessions that start after you: a fact they must know and would not find in the code. Not for messages to one peer or for your own progress.", json!({"text": {"type": "string", "description": "The fact, complete without your context"}, "expires_hours": {"type": "integer", "description": "How long it stays true or useful: 1 to 336. A stale note misleads; choose shorter when unsure"}, "until_i_end": {"type": "boolean", "description": "Also remove it when your session ends: for what is about your running work"}, "scope": {"type": "string", "enum": ["folder", "all"], "description": "folder (default): sessions in your folder, below and above it. all: every session"}}), &["text", "expires_hours"], false),
         tool("bulletin_remove", "Take back a note of yours that is no longer true.", json!({"note": {"type": "string", "description": "Note id from bulletin_read"}}), &["note"], false),
@@ -3764,6 +3864,8 @@ mod tests {
         assert_eq!((manifest, skill, second), (".claude-plugin/plugin.json", "skills/peers/SKILL.md", "skills/reporting/SKILL.md"));
         assert!(body.starts_with("---\nname: peers\ndescription: ") && body.contains("## Rules"));
         assert!(reporting.starts_with("---\nname: reporting\ndescription: ") && reporting.contains("needs_human") && reporting.contains("expires_hours"));
+        // When a status report fits, and what it is not (MCR-73)
+        assert!(reporting.contains("`kind: \"status\"`") && reporting.contains("wait_register") && reporting.contains("set_status"));
         // Every tool the note and the guides name exists
         let tools = agent_tools();
         let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
@@ -4023,6 +4125,94 @@ mod tests {
         c.sessions.get_mut("c").unwrap().injected = 0;
         apply_hook(&mut c, "c", "codex-notify", &turn);
         assert!(c.sessions["c"].attention.is_none());
+    }
+
+    #[test]
+    fn a_status_report_marks_nothing_and_replaces_the_previous_one_on_the_board() {
+        let mut s = store_with("up", "working");
+        s.sessions.get_mut("up").unwrap().name = "Lead".into();
+        s.sessions.insert("ex".into(), Tracked { name: "Worker".into(), profile: "codex".into(), state: "idle".into(), supervisor: Some("up".into()), ..Tracked::default() });
+        s.sessions.insert("ex2".into(), Tracked { name: "Builder".into(), state: "waiting".into(), supervisor: Some("up".into()), attention: Some(Attention { kind: "permission".into(), text: "Bash?".into(), since: 1, report: None }), ..Tracked::default() });
+        s.sessions.insert("other".into(), Tracked { name: "Elsewhere".into(), state: "working".into(), ..Tracked::default() });
+        s.waits.insert("w1".into(), Wait { id: "w1".into(), session: "ex".into(), on: "CI run 42".into(), created: 1, ..Wait::default() });
+        s.waits.insert("w0".into(), Wait { id: "w0".into(), session: "ex".into(), on: "an old deploy".into(), created: 1, cleared: 2, ..Wait::default() });
+
+        // Recorded, with the executors as the store knows them; the session is not marked
+        let first = s.report("up", "status", "Round one: both at work").unwrap();
+        assert_eq!((first.kind.as_str(), first.supervisor.as_deref()), ("status", None));
+        assert!(s.sessions["up"].attention.is_none());
+        assert_eq!(
+            first.executors,
+            vec![
+                ExecutorLine { session: "ex2".into(), name: "Builder".into(), state: "waiting".into(), needs_operator: true, waits: vec![] },
+                ExecutorLine { session: "ex".into(), name: "Worker".into(), state: "idle".into(), needs_operator: false, waits: vec!["CI run 42".into()] },
+            ]
+        );
+        // It does not take away a mark the session already carries
+        s.report("up", "needs_human", "merge or wait?").unwrap();
+        let second = s.report("up", "status", "Round two: Worker waits for CI").unwrap();
+        assert_eq!(s.sessions["up"].attention.as_ref().and_then(|a| a.report.as_deref()), Some("needs_human"));
+        // An executor's own status names whom it worked for, and has no lines of its own
+        let below = s.report("ex", "status", "tests pass, waiting for review").unwrap();
+        assert_eq!((below.supervisor.as_deref(), below.executors.len()), (Some("up"), 0));
+        // A done report carries no executor lines
+        assert!(s.report("up", "done", "merged").unwrap().executors.is_empty());
+
+        // The Board: one status per session, the latest; the other kinds all stay
+        let board = s.board();
+        let shown: Vec<(&str, &str)> = board["reports"].as_array().unwrap().iter().map(|r| (r["kind"].as_str().unwrap(), r["text"].as_str().unwrap())).collect();
+        assert_eq!(shown, [("needs_human", "merge or wait?"), ("status", "Round two: Worker waits for CI"), ("status", "tests pass, waiting for review"), ("done", "merged")]);
+        let status = board["reports"].as_array().unwrap().iter().find(|r| r["id"] == second.id.as_str()).unwrap();
+        assert_eq!((status["executors"][1]["name"].as_str(), status["executors"][1]["waits"][0].as_str(), status["executors"][0]["needsOperator"].as_bool()), (Some("Worker"), Some("CI run 42"), Some(true)));
+        // Fields that say nothing are left out, and a record from before they existed still reads
+        let done = &board["reports"][3];
+        assert!(done.get("supervisor").is_none() && done.get("executors").is_none());
+        let old: Report = serde_json::from_value(json!({"id": "r1", "session": "a", "name": "A", "cwd": "/w", "kind": "done", "text": "x", "created": 1})).unwrap();
+        assert!(old.supervisor.is_none() && old.executors.is_empty());
+        // The history stays in the store, for reports_list
+        assert_eq!(s.reports.iter().filter(|r| r.session == "up" && r.kind == "status").map(|r| r.text.as_str()).collect::<Vec<_>>(), ["Round one: both at work", "Round two: Worker waits for CI"]);
+
+        // Status reports have their own limit, and do not use up the one for the other kinds
+        for _ in 0..MAX_REPORTS_SENT - 2 {
+            s.report("up", "status", "again").unwrap();
+        }
+        assert!(s.report("up", "status", "too many").unwrap_err().contains("status"));
+        s.report("up", "needs_human", "still heard").unwrap();
+
+        // A restarted session keeps its reports: the next status replaces the old one
+        s.sessions.insert("new".into(), Tracked { name: "Lead".into(), ..Tracked::default() });
+        s.move_reports("up", "new");
+        s.reports.iter_mut().for_each(|r| r.created = 1);
+        s.report("new", "status", "after the restart").unwrap();
+        let board = s.board();
+        let statuses: Vec<(&str, &str)> = board["reports"].as_array().unwrap().iter().filter(|r| r["kind"] == "status").map(|r| (r["session"].as_str().unwrap(), r["text"].as_str().unwrap())).collect();
+        assert_eq!(statuses, [("ex", "tests pass, waiting for review"), ("new", "after the restart")]);
+        assert_eq!(board["reports"].as_array().unwrap().iter().find(|r| r["session"] == "ex").unwrap()["supervisor"], "new");
+    }
+
+    /// The tool: no mark and no notification, but the supervisor reads it.
+    #[test]
+    fn a_status_report_reaches_the_supervisor_and_leaves_the_session_unmarked() {
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            s.sessions.insert("up".into(), Tracked { name: "Lead".into(), ..Tracked::default() });
+            s.sessions.insert("ex".into(), Tracked { name: "Worker".into(), supervisor: Some("up".into()), ..Tracked::default() });
+        });
+        let out = harness.agent_tool("ex", "report", &json!({"kind": "status", "text": "half of the files reviewed"})).unwrap();
+        assert_eq!(out["kind"], "status");
+        assert!(out["note"].as_str().unwrap().contains("nobody is notified"));
+        let lead = harness.agent_tool("up", "report", &json!({"kind": "status", "text": "one executor, at work"})).unwrap();
+        assert_eq!(lead["executors"][0]["session"], "ex");
+        assert!(harness.agent_tool("ex", "report", &json!({"kind": "progress", "text": "x"})).unwrap_err().contains("status"));
+        let store = lock(&harness.store);
+        assert!(store.sessions["ex"].attention.is_none() && store.sessions["up"].attention.is_none());
+        let inbox: Vec<&Message> = store.messages.values().filter(|m| m.to == "up").collect();
+        assert_eq!(inbox.len(), 1);
+        assert!(inbox[0].from == "ex" && inbox[0].text.contains("half of the files reviewed") && inbox[0].text.contains("status report"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
