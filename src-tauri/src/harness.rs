@@ -3000,14 +3000,6 @@ impl Harness {
                 let sessions = self.sessions()?;
                 Ok(lock(&self.store).overview(&sessions, None, now_ms()))
             }
-            "session_bind" => {
-                let supervisor = match args.get("supervisor") {
-                    Some(Value::Null) => None,
-                    Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
-                    _ => return Err("supervisor is required: a session id or null to detach".into()),
-                };
-                self.bind(text("session")?, supervisor).map(|s| Self::brief(&s))
-            }
             "session_list" => Ok(json!({ "sessions": self.sessions()?.iter().map(Self::brief).collect::<Vec<_>>() })),
             "session_status" => {
                 let s = self.session(text("session")?)?;
@@ -3368,7 +3360,6 @@ fn supervisor_tools() -> Value {
     let wait = json!({"type": "integer", "description": "How long to wait, in seconds (default 50, at most 600)"});
     json!({ "tools": [
         tool("overview", "All live supervisor/executor trees, then independent sessions: state and status ages in seconds (null when unknown), open tasks, unread messages, waits, latest open report and attention.", json!({}), &[]),
-        tool("session_bind", "Connect an existing live session to a supervisor, or detach it with null. Uses the app's binding rules: no cycles, at most 5 levels and 12 executors per session.", json!({"session": session, "supervisor": {"type": ["string", "null"]}}), &["session", "supervisor"]),
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
         tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
@@ -3902,7 +3893,7 @@ mod tests {
     }
 
     #[test]
-    fn supervision_tools_bind_and_overview_through_the_service() {
+    fn supervision_overview_and_lists_through_the_service() {
         let dir = Path::new("/tmp").join(format!("mcr-overview-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let listener = UnixListener::bind(dir.join("runner.sock")).unwrap();
@@ -3930,14 +3921,8 @@ mod tests {
             for id in ["a", "b", "root"] {
                 s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
             }
+            s.bind("b", Some("a")).unwrap();
         });
-        assert!(h.tool("session_bind", &json!({"session": "a"})).is_err());
-        assert!(h.tool("session_bind", &json!({"session": "root", "supervisor": "a"})).is_err());
-        assert!(h.agent_tool("a", "session_bind", &json!({"session": "b", "supervisor": "a"})).is_err());
-        h.tool("session_bind", &json!({"session": "b", "supervisor": "a"})).unwrap();
-        assert!(h.tool("session_bind", &json!({"session": "a", "supervisor": "b"})).unwrap_err().contains("circle"));
-        assert!(h.tool("session_bind", &json!({"session": "a", "supervisor": "a"})).is_err());
-        assert!(h.tool("session_bind", &json!({"session": "missing", "supervisor": "a"})).is_err());
         assert_eq!(h.tool("overview", &json!({})).unwrap()["sessions"].as_array().unwrap().len(), 2);
         let mine = h.agent_tool("b", "overview", &json!({})).unwrap();
         assert_eq!(mine["sessions"].as_array().unwrap().len(), 1);
@@ -3946,8 +3931,6 @@ mod tests {
         assert!(lock(&h.store).sessions["b"].status_since > 0);
         let restored: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
         assert!(restored.sessions["b"].status_since > 0);
-        h.tool("session_bind", &json!({"session": "b", "supervisor": null})).unwrap();
-        assert!(lock(&h.store).sessions["b"].supervisor.is_none());
         assert!(h.tool("messages_list", &json!({"brief": true})).is_ok());
         assert!(h.tool("reports_list", &json!({"open": true})).is_ok());
         for catalog in [supervisor_tools(), agent_tools()] {
