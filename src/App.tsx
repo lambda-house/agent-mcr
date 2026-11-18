@@ -447,9 +447,9 @@ const App: React.FC = () => {
       </div>
 
       <StatusBar />
+      </div>}
       <SettingsModal />
       <SaveAllDialog />
-      </div>}
     </div>
   );
 };

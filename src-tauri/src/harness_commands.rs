@@ -24,7 +24,7 @@ const MAX_PASTED_IMAGE: usize = 30 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct HarnessState {
-    views: Mutex<BTreeMap<u64, UnixStream>>,
+    views: Mutex<BTreeMap<u64, (UnixStream, String)>>,
     next_view: AtomicU64,
 }
 
@@ -57,13 +57,41 @@ fn service(req: Value) -> Result<Value, String> {
 pub async fn harness_status() -> Result<Value, String> {
     blocking(|| {
         let hello = runner::ensure(&socket()?)?;
-        let service = harness::ensure(&config_dir()?)?;
+        let service_info = harness::ensure(&config_dir()?)?;
         let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
         let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
         // What the user runs once to give an outside agent the supervisor tools
         let supervisor = format!("claude mcp add --scope user agent-mcr-supervisor -- '{}' --supervise", exe.replace('\'', "'\\''"));
-        let outside = harness::call(&config_dir()?, json!({"op": "settings"})).map(|s| s["outsideSupervisors"] == true).unwrap_or(false);
-        Ok(json!({ "runner": hello, "service": service, "profiles": harness::PROFILES, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": outside }))
+        let settings = service(json!({"op": "settings"}))?;
+        // The service can outlive an app update and return an older settings shape.
+        let preferences = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
+        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"] }))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn harness_preferences(app: tauri::AppHandle, preferences: Option<crate::harness_preferences::HarnessPreferences>) -> Result<Value, String> {
+    blocking(move || {
+        if let Some(next) = &preferences {
+            let current = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
+            if next.supervisor_profile != current.supervisor_profile {
+                if let Some(profile) = next.supervisor_profile.as_deref() {
+                    let label = crate::agents::profiles().into_iter().find(|p| p.id == profile).map(|p| p.label).unwrap_or(profile);
+                    let message = format!(
+                        "Use {label} for the next Supervisor session?\n\nThe Supervisor session can create, inspect, and manage agent sessions in Agent MCR. Only choose a harness you trust with those tools."
+                    );
+                    if !confirmed(&app, "Change Supervisor harness?", message, "Change Supervisor", true) {
+                        return Ok(json!({
+                            "profiles": crate::agents::profiles(),
+                            "enabledProfiles": current.enabled_profiles,
+                            "supervisorProfile": current.supervisor_profile,
+                        }));
+                    }
+                }
+            }
+        }
+        service(json!({"op": "harness_preferences", "preferences": preferences}))
     })
     .await
 }
@@ -238,9 +266,9 @@ pub async fn harness_note_remove(note: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn harness_ack(id: String) -> Result<(), String> {
+pub async fn harness_ack(id: String, since: Option<u64>) -> Result<(), String> {
     valid_id(&id)?;
-    blocking(move || service(json!({"op": "ack", "id": id})).map(drop)).await
+    blocking(move || service(json!({"op": "ack", "id": id, "since": since})).map(drop)).await
 }
 
 // One argument per field the page sends: Tauri passes them by name
@@ -483,6 +511,7 @@ pub async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), Str
 #[tauri::command]
 pub async fn terminal_attach(id: String, output: Channel<InvokeResponseBody>, state: State<'_, HarnessState>) -> Result<u64, String> {
     valid_id(&id)?;
+    let view_id = id.clone();
     let (mut reader, writer) = blocking(move || {
         let socket = socket()?;
         runner::ensure(&socket)?;
@@ -490,7 +519,7 @@ pub async fn terminal_attach(id: String, output: Channel<InvokeResponseBody>, st
     })
     .await?;
     let handle = state.next_view.fetch_add(1, Ordering::SeqCst) + 1;
-    state.views.lock().map_err(|_| "View state unavailable")?.insert(handle, writer);
+    state.views.lock().map_err(|_| "View state unavailable")?.insert(handle, (writer, view_id));
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -511,10 +540,16 @@ pub async fn terminal_attach(id: String, output: Channel<InvokeResponseBody>, st
 #[tauri::command]
 pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -> Result<(), String> {
     let mut views = state.views.lock().map_err(|_| "View state unavailable")?;
-    let stream = views.get_mut(&view).ok_or("The terminal is detached")?;
+    let (stream, id) = views.get_mut(&view).ok_or("The terminal is detached")?;
     if let Err(e) = stream.write_all(data.as_bytes()) {
         views.remove(&view);
         return Err(format!("The terminal is detached: {e}"));
+    }
+    if data == "\r" {
+        let id = id.clone();
+        drop(views);
+        // Only the attached human view submits here; harness injections use runner write.
+        service(json!({"op": "operator_input", "id": id}))?;
     }
     Ok(())
 }
@@ -522,7 +557,7 @@ pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -
 #[tauri::command]
 pub fn terminal_detach(view: u64, state: State<'_, HarnessState>) {
     if let Ok(mut views) = state.views.lock() {
-        if let Some(stream) = views.remove(&view) {
+        if let Some((stream, _)) = views.remove(&view) {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }

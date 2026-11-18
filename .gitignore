@@ -5,3 +5,12 @@ src-tauri/gen/schemas/
 .DS_Store
 *.log
 src-tauri/signing.conf.json
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+/.claude
+.ignore
+.mcp.json
+AGENTS.md
+opencode.json
+docs/superpowers/

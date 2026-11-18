@@ -82,14 +82,18 @@ export function metricsTooltip(s: Session, cost: number | null, now: number): st
 export default function SessionMetrics({ hosted, data }: { hosted: Hosted; data: Record<string, Session> }) {
   // No session access or no indexed conversation yet: nothing to show
   const s = indexedSession(hosted, data);
-  if (!s) return null;
+  return s ? <SessionFigures session={s} cache={!hosted.exit}/> : null;
+}
+
+/** The figures of one indexed conversation; `cache` is false for one that has ended. */
+export function SessionFigures({ session: s, cache: withCache = true }: { session: Session; cache?: boolean }) {
   const c = s.context;
   const known = !!c && c.now > 0;
   const limit = known ? contextWindow(s) : null;
   const pct = known && limit ? Math.round(100 * c.now / limit.size) : null;
   const cost = estimatedCost(s);
   const now = Date.now();
-  const cache = hosted.exit ? null : cacheState(s, now);
+  const cache = withCache ? cacheState(s, now) : null;
   if (!known && cost === null && !c?.compactions && !cache) return null;
   return <span className="hs-metrics" aria-label="Session metrics" title={metricsTooltip(s, cost, now)}>
     {known && <span className={`hs-metric-context${pct !== null && pct >= 80 ? ' high' : ''}`}>

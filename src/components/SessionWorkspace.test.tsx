@@ -16,12 +16,12 @@ const button = (text: string) => [...host.querySelectorAll('button')].find(b => 
 beforeEach(() => { vi.resetAllMocks(); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session); });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 describe('Sessions workspace', () => {
-  it('opens on the Live view until Search is chosen, and remembers the choice', async () => {
+  it('opens on the Live view until Journal is chosen, and remembers the choice', async () => {
     localStorage.removeItem('agent-mcr.sessions.view');
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
-    expect(host.textContent).toContain('Connecting to the runner');
+    expect(host.textContent).toContain('Open supervisor');
     expect(host.textContent).not.toContain('Fix CORE-123');
-    await act(async () => button('search').click()); await flush();
+    await act(async () => button('journal').click()); await flush();
     expect(host.textContent).toContain('Fix CORE-123');
     expect(localStorage.getItem('agent-mcr.sessions.view')).toBe('history');
   });

@@ -1,7 +1,9 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 
 /** A launch profile held by the backend; the webview can only pick one by id. */
-export interface Profile { id: string; label: string; command: string }
+export interface Profile { id: string; label: string; command: string; optional: boolean; canSupervise: boolean; taskTracking: boolean }
+export interface HarnessPreferences { profiles: Profile[]; enabledProfiles: string[]; supervisorProfile: string | null }
+export const HARNESS_PREFERENCES_CHANGED = 'harness-preferences-changed';
 export interface HostedExit { code: number; signal: string | null; at: number }
 /** Why a session needs the person: a prompt only they may answer, or a notification. */
 /** `assessment` and `report` come from the agent's own `report` tool: it needs the person, or finished a piece of work. */
@@ -58,9 +60,18 @@ export interface SessionWait {
   escalated: 'supervisor' | 'operator' | null;
 }
 /** An earlier Claude or Codex session that can continue in the harness. */
-export interface Resumable { agent: 'claude' | 'codex'; id: string; cwd: string; modified: number }
+export interface Resumable {
+  agent: 'claude' | 'codex';
+  id: string;
+  cwd: string;
+  modified: number;
+  title?: string;
+  role?: string;
+  tags?: string[];
+}
 export interface HarnessStatus {
   runner: { protocol: number; pid: number; version: string; exe: string }; profiles: Profile[]; home: string;
+  supervisorProfile?: string | null;
   /** Run once in a terminal to give an outside agent the supervisor tools */
   supervisorCommand?: string;
   /** The operator lets agents outside the harness use the supervisor tools */
@@ -161,6 +172,12 @@ export const slackApi = {
 
 export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
+  preferences: () => invoke<HarnessPreferences>('harness_preferences'),
+  savePreferences: async (preferences: Omit<HarnessPreferences, 'profiles'>) => {
+    const result = await invoke<HarnessPreferences>('harness_preferences', { preferences });
+    window.dispatchEvent(new Event(HARNESS_PREFERENCES_CHANGED));
+    return result;
+  },
   /** The background processes and the person's decision about them; starts nothing */
   background: () => invoke<Background>('harness_background'),
   /** Asks in a native dialog; resolves to whether they are allowed now */
@@ -185,7 +202,7 @@ export const harnessApi = {
   postNote: (text: string, hours: number, folder?: string) => invoke<void>('harness_note_post', { text, hours, folder: folder || null }),
   removeNote: (note: string) => invoke<void>('harness_note_remove', { note }),
   /** The person looked at a session's notification */
-  ack: (id: string) => invoke<void>('harness_ack', { id }),
+  ack: (id: string, since?: number) => invoke<void>('harness_ack', { id, since }),
   signal: (id: string, signal: 'INT' | 'TERM' | 'HUP' | 'KILL') => invoke<void>('harness_signal', { id, signal }),
   forget: (id: string) => invoke<void>('harness_forget', { id }),
   resize: (id: string, cols: number, rows: number) => invoke<void>('terminal_resize', { id, cols, rows }),
@@ -205,17 +222,27 @@ export function shellQuote(path: string): string {
   return path.replace(/([^A-Za-z0-9_\-.,:/@+=%^~])/g, '\\$1');
 }
 
+const HARNESS_NAME = /^(claude code|claude|codex|antigravity|antigravity cli|agy|pi|opencode|shell|terminal|root)$/i;
+
 /** The name in a terminal title: without the agent's status glyph and Codex's folder suffix. */
 function titleName(h: Hosted): string {
   const text = h.title.replace(/^[^\p{L}\p{N}]+/u, '').split(' | ')[0].trim();
   const folder = h.cwd.split('/').filter(Boolean).pop() ?? '';
-  return !text || text === folder || /^(claude code|claude|codex|shell)$/i.test(text) ? '' : text;
+  return !text || text === folder || HARNESS_NAME.test(text) ? '' : text;
 }
 
 export const isSupervisor = (h: Hosted) => h.meta.role === 'supervisor';
 
-export function hostedLabel(h: Hosted): string {
-  return h.harness?.name || h.meta.name || titleName(h) || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;
+export function hostedLabel(h: Hosted, titles: Record<string, string> = {}): string {
+  const name = h.harness?.name?.trim() ?? '';
+  const named = h.harness?.named ? name : '';
+  const meaningfulName = HARNESS_NAME.test(name) || /^[0-9a-f-]{8,}$/i.test(name) ? '' : name;
+  return named || h.meta.name || meaningfulName || h.harness?.role?.trim() || titles[h.harness?.agentSession ?? ''] || titleName(h) || h.meta.label || h.argv[h.argv.length - 1]?.replace(/^exec /, '') || h.id;
+}
+
+/** Display name shown in the Live sidebar (and command panel) for a hosted session. */
+export function liveSessionLabel(h: Hosted, titles: Record<string, string> = {}): string {
+  return isSupervisor(h) ? 'Supervisor' : hostedLabel(h, titles);
 }
 
 export type HostedState = 'running' | 'starting' | 'working' | 'idle' | 'waiting' | 'exited' | 'failed';
@@ -258,8 +285,8 @@ export const SESSION_DRAG_TYPE = 'application/x-mcr-session';
  * into a shell: it goes in single quotes, without anything a shell would
  * expand or that would end the quotes or the line.
  */
-export function sessionReference(h: Hosted): string {
-  const name = hostedLabel(h).replace(/[\u0000-\u001f\u007f-\u009f'"`$\\]/g, '').trim();
+export function sessionReference(h: Hosted, titles: Record<string, string> = {}): string {
+  const name = hostedLabel(h, titles).replace(/[\u0000-\u001f\u007f-\u009f'"`$\\]/g, '').trim();
   return `mcr:${h.id} '${name}'`;
 }
 

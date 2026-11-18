@@ -9,7 +9,7 @@
 pub use crate::agents::{command_line, Launch};
 use crate::peer;
 use crate::slack::{self, Slack};
-use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, ADAPTERS};
+use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, adapters, profiles};
 use crate::runner::{self, lock, now_ms, Client, Unit};
 use crate::session_mcp::{read_frame, Protocol, Server};
 use serde::{Deserialize, Serialize};
@@ -159,23 +159,6 @@ pub fn claude_plugin() -> [(&'static str, String); 3] {
 /// The name the hosted supervisor session sees the supervisor tools under
 pub const SUPERVISOR_SERVER: &str = "supervisor";
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Profile {
-    pub id: &'static str,
-    pub label: &'static str,
-    /// What runs inside the user's login shell
-    pub command: &'static str,
-}
-
-/// D7: agents start in their own permission modes that keep prompts to shell
-/// commands and network access.
-pub const PROFILES: &[Profile] = &[
-    Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits" },
-    Profile { id: "codex", label: "Codex", command: "codex --sandbox workspace-write --ask-for-approval on-request" },
-    Profile { id: "shell", label: "Shell", command: "" },
-];
-
 /// The user's login shell from the account database: GUI apps and launchd
 /// jobs don't reliably have `$SHELL`.
 pub fn login_shell() -> String {
@@ -251,6 +234,12 @@ pub struct Resumable {
     pub id: String,
     pub cwd: String,
     pub modified: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -270,7 +259,7 @@ fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// and times only; no transcript content.
 pub fn resumable(home: &Path, since: u64, limit: usize) -> Vec<Resumable> {
     let mut out = Vec::new();
-    for agent in ADAPTERS {
+    for agent in adapters() {
         let Some((folder, depth)) = agent.transcripts() else { continue };
         let mut files = Vec::new();
         jsonl_files(&home.join(folder), depth, &mut files);
@@ -287,7 +276,7 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
         return None;
     }
     let suffix = format!("{id}.jsonl");
-    ADAPTERS.iter().find_map(|agent| {
+    adapters().find_map(|agent| {
         let (folder, depth) = agent.transcripts()?;
         let mut files = Vec::new();
         jsonl_files(&home.join(folder), depth, &mut files);
@@ -401,7 +390,7 @@ pub fn top_level_thread(home: &Path, id: &str) -> Option<bool> {
         return None;
     }
     let suffix = format!("{id}.jsonl");
-    ADAPTERS.iter().find_map(|agent| {
+    adapters().find_map(|agent| {
         let (folder, depth) = agent.transcripts()?;
         let mut files = Vec::new();
         jsonl_files(&home.join(folder), depth, &mut files);
@@ -632,7 +621,7 @@ pub struct Tracked {
 pub fn title_name(title: &str, cwd: &str) -> String {
     let text = title.trim_start_matches(|c: char| !c.is_alphanumeric()).split(" | ").next().unwrap_or("").trim();
     let folder = cwd.rsplit('/').find(|p| !p.is_empty()).unwrap_or("");
-    if text.is_empty() || text == folder || PROFILES.iter().any(|p| p.label.eq_ignore_ascii_case(text)) || text.eq_ignore_ascii_case("claude") {
+    if text.is_empty() || text == folder || profiles().iter().any(|p| p.label.eq_ignore_ascii_case(text)) || text.eq_ignore_ascii_case("claude") {
         return String::new();
     }
     text.chars().filter(|c| !c.is_control() && *c != '"').take(80).collect()
@@ -1526,14 +1515,16 @@ impl Harness {
     }
 
     /// The hosted supervisor session: the one already running, or a new one.
-    /// A Claude session in its own folder with the supervisor tools wired in.
+    /// The selected harness in its own folder with the supervisor tools wired in.
     fn supervisor(&self, req: &Value) -> Result<Value, String> {
         if let Some(live) = self.sessions()?.into_iter().find(|s| s["exit"].is_null() && s["meta"]["role"] == "supervisor") {
             return Ok(live);
         }
         let folder = self.dir.join("supervisor");
+        let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
+        let profile = prefs.supervisor_profile.ok_or("Choose a supervisor in Settings → Harnesses")?;
         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-        self.create_as(&json!({"profile": "claude", "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true)
+        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true)
     }
 
     fn create(&self, req: &Value) -> Result<Value, String> {
@@ -1551,6 +1542,7 @@ impl Harness {
     fn restart(&self, id: &str, force: bool) -> Result<Value, String> {
         let old = self.session(id)?;
         let profile = old["harness"]["profile"].as_str().unwrap_or("").to_string();
+        crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
         if !adapter(&profile).is_agent() {
             return Err("Only an agent session can be restarted; a shell has no conversation to continue".into());
         }
@@ -1665,7 +1657,8 @@ impl Harness {
             Some(r) => r.agent.to_string(),
             None => req["profile"].as_str().unwrap_or("").to_string(),
         };
-        let label = PROFILES.iter().find(|p| p.id == profile).ok_or_else(|| format!("Unknown profile {profile:?}"))?.label;
+        let label = profiles().iter().find(|p| p.id == profile).ok_or_else(|| format!("Unknown profile {profile:?}"))?.label;
+        crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
         let cwd = match (req["cwd"].as_str().filter(|s| !s.is_empty()), &found) {
             (Some(cwd), _) => cwd.to_string(),
             (None, Some(r)) => r.cwd.clone(),
@@ -1718,6 +1711,7 @@ impl Harness {
         let plugin = self.dir.join("claude-plugin");
         let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
         let argv = argv_for(&Launch {
+            supervisor,
             plugin: &plugin.display().to_string(),
             note: agent.takes_note(&home),
             profile: &profile,
@@ -1794,16 +1788,22 @@ impl Harness {
         Ok(created)
     }
 
-    /// Type a prompt into the session, then Enter. As a bracketed paste when
-    /// the program asked for it, so a multi-line text arrives whole; a program
-    /// that didn't (a plain shell) would see the markers as text.
+    /// Type a prompt into the session, then Enter (`submit`).
     fn deliver(&self, session: &str, text: &str) -> Result<(), String> {
         let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
-        // Agents always turn it on, and their old output may have left the scrollback
         let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
         if agent {
             plain_prompt(&clean)?;
         }
+        self.submit(session, &clean)
+    }
+
+    /// Type text into the session, then Enter as a write of its own 250 ms
+    /// later (`submit_writes`). Shared by tasks, inbox notices and
+    /// `terminal_write` with `submit`.
+    fn submit(&self, session: &str, text: &str) -> Result<(), String> {
+        // Agents always turn it on, and their old output may have left the scrollback
+        let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
         // The prompt that follows is the harness's own, not the operator's answer
         self.update(|s| {
             if let Some(t) = s.sessions.get_mut(session) {
@@ -1811,10 +1811,13 @@ impl Harness {
             }
         });
         let bracketed = agent || runner::snapshot(&runner_socket(&self.dir), session).is_ok_and(|bytes| wants_bracketed_paste(&bytes));
-        let data = if bracketed { format!("\x1b[200~{clean}\x1b[201~") } else { clean };
-        self.runner(json!({"op": "write", "id": session, "data": data}))?;
-        std::thread::sleep(Duration::from_millis(250));
-        self.runner(json!({"op": "write", "id": session, "data": "\r"}))?;
+        let writes = submit_writes(text, bracketed);
+        for (i, data) in writes.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            self.runner(json!({"op": "write", "id": session, "data": data}))?;
+        }
         Ok(())
     }
 
@@ -1873,21 +1876,21 @@ impl Harness {
     /// on a prompt (D6) or into a shell, where it would run as a command.
     fn nudge(&self, session: &str) {
         let pending = |s: &Store| s.messages.values().any(|m| m.to == session && m.read == 0 && !m.notified);
-        let unsure = {
+        let (untracked, unsure) = {
             let store = lock(&self.store);
             if !pending(&store) {
                 return;
             }
             let Some(t) = store.sessions.get(session) else { return };
-            if !adapter(&t.profile).is_agent() {
-                return;
-            }
-            adapter(&t.profile).silent_until_first_turn() && t.state == "unknown"
+            // An agent without state tracking (no turn-end hooks) is only seen
+            // through its screen; a shell has no input box (`at_prompt` is false)
+            let agent = adapter(&t.profile);
+            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown")
         };
-        let at_prompt = unsure && self.at_prompt(session);
+        let at_prompt = (untracked || unsure) && self.at_prompt(session);
         let from = self.update(|s| {
             let t = s.sessions.get(session)?;
-            if !(t.state == "idle" || (unsure && at_prompt && t.state == "unknown")) {
+            if !notice_ready(untracked, unsure, at_prompt, &t.state) {
                 return None;
             }
             let mut from: Vec<String> = Vec::new();
@@ -1898,7 +1901,10 @@ impl Harness {
                 }
             }
             let tools = t.tools;
-            s.set_state(session, "working");
+            // Nothing would set an untracked session back to idle
+            if !untracked {
+                s.set_state(session, "working");
+            }
             Some((from, tools))
         });
         let Some((from, tools)) = from else { return };
@@ -1924,7 +1930,9 @@ impl Harness {
                 for m in s.messages.values_mut().filter(|m| m.to == session && m.read == 0) {
                     m.notified = false;
                 }
-                s.set_state(session, "idle");
+                if !untracked {
+                    s.set_state(session, "idle");
+                }
             });
         }
     }
@@ -2713,7 +2721,29 @@ impl Harness {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
                 }
-                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors }))
+                let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
+                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
+            }
+            "harness_preferences" => {
+                let _store = lock(&self.store);
+                if !req["preferences"].is_null() {
+                    let prefs: crate::harness_preferences::HarnessPreferences = serde_json::from_value(req["preferences"].clone()).map_err(|e| e.to_string())?;
+                    prefs.save(&self.dir)?;
+                }
+                let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
+                Ok(json!({"profiles": profiles(), "enabledProfiles": prefs.enabled_profiles, "supervisorProfile": prefs.supervisor_profile}))
+            }
+            "operator_input" => {
+                let id = id()?;
+                self.update(|s| {
+                    if let Some(t) = s.sessions.get_mut(id) {
+                        t.injected = 0;
+                        if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
+                            t.attention = None;
+                        }
+                    }
+                });
+                Ok(json!({}))
             }
             // What the app shows of the reports and the bulletin board
             "board" => Ok(lock(&self.store).board()),
@@ -2737,11 +2767,11 @@ impl Harness {
                 let note = req["note"].as_str().ok_or("Missing note")?;
                 self.update(|s| s.notes.remove(note)).map(|_| json!({})).ok_or_else(|| format!("No note {note}"))
             }
-            // The human looked at it
+            // The human looked at this version of the notice; a newer one must survive.
             "ack" => {
                 let id = id()?;
                 self.update(|s| {
-                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| a.kind == "notification")) {
+                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| a.kind == "notification" && req["since"].as_u64().is_none_or(|since| since == a.since))) {
                         t.attention = None;
                     }
                 });
@@ -2752,8 +2782,20 @@ impl Harness {
                 let days = req["days"].as_u64().unwrap_or(3).clamp(1, 90);
                 let running: BTreeSet<String> =
                     self.sessions()?.iter().filter(|s| s["exit"].is_null()).filter_map(|s| s["harness"]["agentSession"].as_str().map(str::to_owned)).collect();
-                let list: Vec<Resumable> =
-                    resumable(&home, now_ms().saturating_sub(days * 86_400_000), 200).into_iter().filter(|r| !running.contains(&r.id)).collect();
+                let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
+                let allowed = has_session_workspace(&self.dir);
+                let list: Vec<Resumable> = resumable(&home, now_ms().saturating_sub(days * 86_400_000), 200)
+                    .into_iter()
+                    .filter(|r| !running.contains(&r.id) && prefs.require_enabled(r.agent).is_ok())
+                    .map(|mut r| {
+                        if !allowed {
+                            r.title = None;
+                            r.role = None;
+                            r.tags.clear();
+                        }
+                        r
+                    })
+                    .collect();
                 Ok(json!({ "sessions": list }))
             }
             // The Slack connector, as the app sees and steers it. Only the app gets here (see `handle`)
@@ -2813,7 +2855,7 @@ impl Harness {
             }
         };
         match name {
-            "profiles_list" => Ok(json!({ "profiles": PROFILES })),
+            "profiles_list" => Ok(json!({ "profiles": crate::harness_preferences::HarnessPreferences::load(&self.dir)?.profiles() })),
             "session_list" => Ok(json!({ "sessions": self.sessions()?.iter().map(Self::brief).collect::<Vec<_>>() })),
             "session_status" => {
                 let s = self.session(text("session")?)?;
@@ -2825,6 +2867,10 @@ impl Harness {
             }
             "session_create" if args["profile"] == "shell" && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
                 Err("Refused: a task for a shell is a command, and commands need the operator. Start the shell without one; terminal_write asks the operator.".into())
+            }
+            // No turn-end signal: the task would stay open for good
+            "session_create" if !adapter(args["profile"].as_str().unwrap_or("")).is_agent() && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+                Err("Refused: the harness can't tell when this agent finishes a turn, so it takes no task. Start it without one and work in its terminal.".into())
             }
             "session_create" if args["task"].as_str().is_some_and(|t| plain_prompt(t).is_err()) => plain_prompt(args["task"].as_str().unwrap_or("")).map(|_| json!({})),
             "session_create" => self.create(args).map(|s| {
@@ -2871,7 +2917,12 @@ impl Harness {
             "terminal_write" => {
                 let id = text("session")?;
                 refuse_if_waiting(id)?;
-                self.runner(json!({"op": "write", "id": id, "data": text("input")?}))?;
+                match terminal_input(text("input")?, args["submit"] == true) {
+                    (input, true) => self.submit(id, &input)?,
+                    (input, false) => {
+                        self.runner(json!({"op": "write", "id": id, "data": input}))?;
+                    }
+                }
                 Ok(json!({ "written": true }))
             }
             "session_interrupt" => {
@@ -2964,7 +3015,17 @@ impl Harness {
         }
     }
 
-    fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
+    fn allows_terminal_write(&self, who: &Caller, cli: bool) -> Result<(), String> {
+        if cli {
+            return Err("Refused: terminal_write is unavailable through the CLI; ask the operator to use the terminal or an MCP client that asks for approval.".into());
+        }
+        match who {
+            Caller::Session { id, .. } if lock(&self.store).sessions.get(id).is_some_and(|t| t.profile == "claude") => Ok(()),
+            _ => Err("Refused: terminal_write is only available to a hosted Claude supervisor (which asks the operator for permission). Use task_assign or ask the operator to type into the terminal.".into()),
+        }
+    }
+
+    fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream, cli: bool) -> std::io::Result<()> {
         // Only the Supervisor session has these tools. An agent outside the
         // harness gets them when the operator allowed that, and not otherwise:
         // a worker's process that left its session looks like an outside one.
@@ -2985,6 +3046,9 @@ impl Harness {
             let call = |name: &str, args: Value| {
                 if let Some(why) = refusal() {
                     return Err(why.into());
+                }
+                if name == "terminal_write" {
+                    self.allows_terminal_write(&who, cli)?;
                 }
                 self.tool(name, &args)
             };
@@ -3010,7 +3074,7 @@ impl Harness {
                 return writeln!(writer, "{}", json!({"error": "Invalid request"}));
             };
             if req["op"] == "supervise" {
-                return self.supervise(reader, writer);
+                return self.supervise(reader, writer, req["cli"] == true);
             }
             if req["op"] == "agent" {
                 return self.agent(reader, writer, req["cli"] != true);
@@ -3087,8 +3151,54 @@ impl slack::Host for Harness {
 /// A prompt an agent reads as a request. An agent's input box treats a first
 /// `!` as a shell command, `#` as a note to keep and `/` as a command of its
 /// own or of the folder's: none of them passes its permission prompts.
+/// Whether an inbox notice may be typed now. A session with state tracking
+/// takes it when idle (or, before its first report, at its input box); one
+/// without (Antigravity, OpenCode, Pi) only when `at_prompt` sees the input box.
+fn notice_ready(untracked: bool, unsure: bool, at_prompt: bool, state: &str) -> bool {
+    if untracked {
+        at_prompt
+    } else {
+        state == "idle" || (unsure && at_prompt && state == "unknown")
+    }
+}
+
+/// The writes that type `text` and then press Enter: the text without ESC (as
+/// a bracketed paste when the program asked for one, so a multi-line text
+/// arrives whole; a plain shell would see the markers as text), then CR alone.
+/// LF is a soft line break in agy's input box, and a CR in the same burst as
+/// the text can be taken as part of a paste.
+fn submit_writes(text: &str, bracketed: bool) -> Vec<String> {
+    let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
+    let mut writes = Vec::new();
+    if !clean.is_empty() {
+        writes.push(if bracketed { format!("\x1b[200~{clean}\x1b[201~") } else { clean });
+    }
+    writes.push("\r".into());
+    writes
+}
+
+/// `terminal_write`'s input and whether to submit it. A model can't always
+/// produce a CR byte through tool arguments: a trailing `\r` or `\n` written
+/// out as two characters, or a trailing newline, means Enter.
+fn terminal_input(input: &str, submit: bool) -> (String, bool) {
+    for end in ["\\r", "\\n", "\n"] {
+        if let Some(text) = input.strip_suffix(end) {
+            return (text.to_string(), true);
+        }
+    }
+    (input.to_string(), submit)
+}
+
+fn has_session_workspace(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("access.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|v| v["session_workspace"] == true)
+}
+
 fn plain_prompt(text: &str) -> Result<(), String> {
-    match text.trim_start().chars().next() {
+    let clean: String = text.chars().filter(|c| *c != '\x1b').collect();
+    match clean.trim_start().chars().next() {
         Some(c @ ('!' | '#' | '/')) => Err(format!("Refused: a task can't start with {c:?}. In an agent's input that runs a command instead of asking the agent; write the request in words, or let the operator type it.")),
         _ => Ok(()),
     }
@@ -3120,7 +3230,7 @@ fn supervisor_tools() -> Value {
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
         tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
-            "profile": {"type": "string", "description": "claude, codex or shell (see profiles_list)"},
+            "profile": {"type": "string", "description": "Enabled harness id (see profiles_list)"},
             "role": {"type": "string", "description": "The part it plays (reviewer, implementer of X): its peers see it in list_peers"},
             "cwd": {"type": "string", "description": "Working folder (absolute path)"},
             "name": {"type": "string", "description": "A short name shown to the operator"},
@@ -3134,7 +3244,7 @@ fn supervisor_tools() -> Value {
         tool("task_status", "A task's state: queued, working, completed (with the agent's last message as result), delivered (the session reports no turn end) or failed.", json!({"task": {"type": "string"}}), &["task"]),
         tool("task_wait", "Wait until a task ends or the time is up, then return it.", json!({"task": {"type": "string"}, "timeout_seconds": wait}), &["task"]),
         tool("terminal_read", "The session's terminal as text (last lines).", json!({"session": session, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"]),
-        tool("terminal_write", "Type raw input into a session's terminal (use \\r for Enter). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}}), &["session", "input"]),
+        tool("terminal_write", "Type raw input into a session's terminal. Escape sequences in input are not interpreted: to press Enter, set submit to true (a trailing \\r or \\n written out as two characters counts as submit too). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}, "submit": {"type": "boolean", "description": "Press Enter after the text, as a separate key 250 ms later; the text goes in as a paste when the program asked for that"}}), &["session", "input"]),
         tool("session_interrupt", "Stop the current turn (Esc for Claude, Ctrl-C otherwise).", json!({"session": session}), &["session"]),
         tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}}), &["session"]),
         tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
@@ -3443,13 +3553,19 @@ pub fn agent_bridge(dir: &Path) -> Result<(), String> {
 }
 
 /// `--harness-tool <name> [json]`: one harness tool call from a shell, for a
-/// hosted agent that has no `mcr` MCP server loaded. Same identity check and
-/// same tools; prints the result as JSON.
-pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>) -> Result<String, String> {
+/// hosted agent that has no `mcr` MCP server loaded. `--supervisor-tool` uses
+/// supervisor authorization. Raw terminal input still needs an approving client.
+pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>, supervisor: bool) -> Result<String, String> {
+    if supervisor && name == "terminal_write" {
+        return Err("Raw terminal input needs the operator's approval. Use the app's terminal or an MCP client that asks for approval.".into());
+    }
     let arguments: Value = match arguments.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
         Some(raw) => serde_json::from_str(raw).map_err(|e| format!("The arguments must be a JSON object: {e}"))?,
         None => json!({}),
     };
+    if !arguments.is_object() {
+        return Err("The arguments must be a JSON object".into());
+    }
     let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
     let stream = UnixStream::connect(path).map_err(|e| format!("Harness service unavailable: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(MAX_WAIT + 30)));
@@ -3461,16 +3577,23 @@ pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>) -> Result<Str
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
         serde_json::from_str(&line).map_err(|_| "The harness service closed the connection".to_string())
     };
-    send(json!({"op": "agent", "cli": true}))?;
+    send(json!({"op": if supervisor { "supervise" } else { "agent" }, "cli": true}))?;
     send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "agent-mcr-cli"}, "capabilities": {}}}))?;
     receive()?;
     send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
-    send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}}))?;
+    send(if name == "tools_list" {
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    } else {
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+    })?;
     let reply = receive()?;
     if let Some(message) = reply["error"]["message"].as_str() {
         return Err(message.to_string());
     }
     let result = &reply["result"];
+    if name == "tools_list" {
+        return serde_json::to_string_pretty(result).map_err(|e| e.to_string());
+    }
     if result["isError"] == true {
         return Err(result["content"][0]["text"].as_str().unwrap_or("The tool failed").to_string());
     }
@@ -3504,6 +3627,22 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_profiles_are_refused_before_launch_and_cli_never_bypasses_approval() {
+        let dir = Path::new("/tmp").join(format!("mcr-disabled-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Harness::open(&dir);
+        assert!(harness.create(&json!({"profile": "pi", "cwd": "/tmp"})).unwrap_err().contains("disabled"));
+        assert!(!harness.tool("profiles_list", &json!({})).unwrap()["profiles"].as_array().unwrap().iter().any(|p| p["id"] == "pi"));
+        let saved = harness.control(&json!({"op": "harness_preferences", "preferences": {"enabledProfiles": ["pi"], "supervisorProfile": "pi"}})).unwrap();
+        assert_eq!(saved["supervisorProfile"], "pi");
+        assert_eq!(harness.tool("profiles_list", &json!({})).unwrap()["profiles"][0]["id"], "pi");
+        assert!(harness.create(&json!({"profile": "claude", "cwd": "/tmp"})).unwrap_err().contains("disabled"));
+        assert!(tool_cli(&dir, "terminal_write", None, true).unwrap_err().contains("approval"));
+        assert!(tool_cli(&dir, "session_list", Some("[]".into()), true).unwrap_err().contains("JSON object"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn launch<'a>(profile: &'a str) -> Launch<'a> {
         Launch { profile, exe: "/Apps/Agent MCR.app/agent-mcr", settings: "/cfg dir/claude-hooks.json", ..Launch::default() }
@@ -4001,8 +4140,43 @@ mod tests {
         assert_eq!(screen_text(&bytes, 10, 40, 2), "line 25\nred prompt>");
         assert_eq!(screen_text(b"one\r\ntwo", 10, 40, 60), "one\ntwo");
         assert!(!wants_bracketed_paste(b"bash-3.2$ "));
+        // Enter is a write of its own after the text, never glued to it
+        assert_eq!(submit_writes("hi", true), ["\x1b[200~hi\x1b[201~", "\r"]);
+        assert_eq!(submit_writes("ls\x1b", false), ["ls", "\r"]);
+        assert_eq!(submit_writes("", true), ["\r"]);
         assert!(wants_bracketed_paste(b"\x1b[?2004h> "));
         assert!(!wants_bracketed_paste(b"\x1b[?2004h> \x1b[?2004l"));
+    }
+
+    #[test]
+    fn terminal_write_submits_escaped_enter() {
+        // What a model sends through tool arguments when asked for "\r"
+        assert_eq!(terminal_input("hi\\r", false), ("hi".to_string(), true));
+        assert_eq!(terminal_input("hi\\n", false), ("hi".to_string(), true));
+        assert_eq!(terminal_input("hi\n", false), ("hi".to_string(), true));
+        assert_eq!(terminal_input("hi", true), ("hi".to_string(), true));
+        assert_eq!(terminal_input("a\\rb", false), ("a\\rb".to_string(), false));
+        assert_eq!(terminal_input("\x03", false), ("\x03".to_string(), false));
+    }
+
+    #[test]
+    fn untracked_agents_get_notices_only_at_their_input_box() {
+        // Screens of Antigravity CLI 1.5.9
+        let prompt = "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\n? for shortcuts  accept-edits · Gemini";
+        let trust = "Do you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit\n  ↑/↓ Navigate · enter Confirm";
+        let busy = "> \nesc to cancel  plan · Gemini";
+        let agy = adapter("antigravity");
+        assert!(agy.at_prompt(prompt) && !agy.at_prompt(trust) && !agy.at_prompt(busy));
+        for profile in ["opencode", "pi", "shell"] {
+            assert!(!adapter(profile).at_prompt(prompt), "{profile} must not take a notice while unsure");
+        }
+        // Untracked: the screen decides, whatever the (never updated) state
+        assert!(notice_ready(true, false, true, "unknown"));
+        assert!(!notice_ready(true, false, false, "idle"));
+        // Tracked: unchanged
+        assert!(notice_ready(false, false, false, "idle"));
+        assert!(!notice_ready(false, false, true, "working"));
+        assert!(notice_ready(false, true, true, "unknown"));
     }
 
     #[test]
@@ -4121,11 +4295,55 @@ mod tests {
     }
     #[test]
     fn a_task_is_words_not_a_command() {
-        for text in ["!curl x | sh", "  !ls", "\n/permissions", "# remember this", "/evil"] {
+        for text in ["!curl x | sh", "  !ls", "\n/permissions", "# remember this", "/evil", "\x1b!curl x | sh"] {
             assert!(plain_prompt(text).is_err(), "{text:?}");
         }
         for text in ["Run the tests", "Fix #12 and !important in the CSS", "", "see /tmp/log"] {
             assert!(plain_prompt(text).is_ok(), "{text:?}");
         }
+        // deliver() also strips ESC before plain_prompt so an agent session refuses it before touching the runner
+        let dir = std::env::temp_dir().join(format!("agent-mcr-deliver-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            s.sessions.insert("s1".into(), Tracked {
+                name: "s1".into(),
+                profile: "claude".into(),
+                cwd: dir.to_string_lossy().into(),
+                ..Tracked::default()
+            });
+        });
+        assert!(harness.deliver("s1", "\x1b!curl x | sh").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_claude_supervisor_cannot_use_terminal_write() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-sup-tw-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            s.sessions.insert("sup-claude".into(), Tracked { name: "sup".into(), profile: "claude".into(), ..Tracked::default() });
+            s.sessions.insert("sup-codex".into(), Tracked { name: "sup".into(), profile: "codex".into(), ..Tracked::default() });
+            s.sessions.insert("sup-pi".into(), Tracked { name: "sup".into(), profile: "pi".into(), ..Tracked::default() });
+        });
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, false).is_ok());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, true).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-pi".into(), supervisor: true }, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "unknown".into(), supervisor: true }, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Outside, false).is_err());
+        assert!(harness.allows_terminal_write(&Caller::Unknown, false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_workspace_permission_gates_resumable_titles() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-sw-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!has_session_workspace(&dir));
+        std::fs::write(dir.join("access.json"), r#"{"session_workspace":false}"#).unwrap();
+        assert!(!has_session_workspace(&dir));
+        std::fs::write(dir.join("access.json"), r#"{"session_workspace":true}"#).unwrap();
+        assert!(has_session_workspace(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

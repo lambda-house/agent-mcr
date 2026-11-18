@@ -1,23 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronRight, ClipboardList, MessageSquare, Play, RefreshCw, Search, Shield, Terminal, X, Zap } from 'lucide-react';
-import { compact, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
+import { Bot, ChevronRight, ClipboardList, History, MessageSquare, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
+import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
-import { formatAge } from '../utils/agent';
+import { useStore } from '../store';
+import { pluginRegistry, usePluginVersion } from '../plugins';
 import '../styles/sessions.css';
 import SessionTree from './SessionTree';
 import WorkspaceSwitch from './WorkspaceSwitch';
 import SessionResults from './SessionResults';
 import { harnessApi, slackApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
-import SessionAgentAccess from './SessionAgentAccess';
 import LiveWorkspace from './LiveWorkspace';
 import BoardView from './BoardView';
 import SlackView from './SlackView';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
-type View = 'live' | 'history' | 'board' | 'slack';
-function savedView(): View {
-  try { const v = localStorage.getItem(VIEW_KEY); return v === 'history' || v === 'board' || v === 'slack' ? v : 'live'; } catch { return 'live'; }
+function savedView(): string {
+  try { return localStorage.getItem(VIEW_KEY) || 'live'; } catch { return 'live'; }
 }
 
 const empty: Snapshot = { sessions: [], errors: [], scannedFiles: 0, pendingFiles: 0, indexedAt: 0 };
@@ -28,9 +27,14 @@ function Metric({ label, value, hint }: { label: string; value: string; hint: st
   return <div className="sc-metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>;
 }
 export default function SessionWorkspace({ onClose, active = true }: { onClose: () => void; active?: boolean }) {
+  usePluginVersion();
+  const topTabs = pluginRegistry.getTopTabs();
+  const globalOverlays = pluginRegistry.getGlobalOverlays();
   const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [view, setViewState] = useState<View>(savedView);
+  const [view, setViewState] = useState<string>(savedView);
   const [focus, setFocus] = useState<{ id: string; at: number }>();
+  const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
+  const activePluginTab = topTabs.find(t => t.id === view);
   // Posts that wait for the person's approval: shown on the Slack tab from every view
   const [slackWaiting, setSlackWaiting] = useState(0);
   useEffect(() => {
@@ -40,7 +44,6 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     const timer = setInterval(look, 4000);
     return () => clearInterval(timer);
   }, [active]);
-  const setView = (v: View) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
   const [data, setData] = useState<Snapshot>(empty);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [focusedEvidence, setFocusedEvidence] = useState<{ session: string; event: SessionEvent } | null>(null);
@@ -50,8 +53,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const [selected, setSelected] = useState(''); const [query, setQuery] = useState('');
   const [provider, setProvider] = useState('all'); const [directory, setDirectory] = useState('');
   const [role, setRole] = useState('all'); const [activeSince, setActiveSince] = useState(''); const [inactiveSince, setInactiveSince] = useState(''); const [inactiveMinutes, setInactiveMinutes] = useState(''); const [activeMinutes, setActiveMinutes] = useState('');
-  const [agentAccess, setAgentAccess] = useState(false);
-  const [userMemories, setUserMemories] = useState(false); const [filter, setFilter] = useState('all');
+  const [filter, setFilter] = useState('all');
   const [tab, setTab] = useState('activity'); const [eventFilter, setEventFilter] = useState('all');
   const inflight = useRef(false); const mounted = useRef(true); const contextVersion = useRef(0);
   const refresh = useCallback(async () => {
@@ -87,8 +89,8 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const usage = sumUsage(filtered); const working = filtered.filter(s => s.status === 'working').length;
   const events = focusedEvidence?.session === selected ? [focusedEvidence.event] : olderEvents ?? chosen?.events ?? [];
   const descendants = chosen ? family(data.sessions,chosen) : [];
-  // Titles for the Live view's earlier sessions, which only know ids
-  const titles = useMemo(() => Object.fromEntries(data.sessions.filter(s => !s.parentId && s.title).map(s => [s.id, s.title])), [data.sessions]);
+  // The same cleaned names in Live and the command panel, joined by conversation id
+  const titles = useMemo(() => Object.fromEntries(data.sessions.filter(s => !s.parentId).map(s => [s.id, formatSessionTitle(s)])), [data.sessions]);
   const searchFolder = (path: string) => { setDirectory(path); setView('history'); };
   const filtersOn = [provider !== 'all', role !== 'all', filter !== 'all', !!(activeSince || inactiveSince || activeMinutes || inactiveMinutes)].filter(Boolean).length;
   const clearFilters = () => { setActiveSince(''); setInactiveSince(''); setInactiveMinutes(''); setActiveMinutes(''); setDirectory(''); setRole('all'); setProvider('all'); setFilter('all'); setQuery(''); };
@@ -102,12 +104,17 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       <WorkspaceSwitch active="sessions" onChange={workspace => { if (workspace === 'documents') onClose(); }}/>
       <nav className="hs-view-switch" aria-label="Sessions view">
         <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
-        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><Search size={13}/> Search</button>
+        {topTabs.map(t => (
+          <button key={t.id} type="button" aria-current={view === t.id ? 'page' : undefined} title={t.title} onClick={() => setView(t.id)}>
+            {t.icon} {t.label}
+          </button>
+        ))}
+        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><History size={13}/> Journal</button>
         <button type="button" aria-current={view === 'board' ? 'page' : undefined} onClick={() => setView('board')} title="What sessions reported to you, and the notes they left for each other"><ClipboardList size={13}/> Board</button>
         <button type="button" aria-current={view === 'slack' ? 'page' : undefined} onClick={() => setView('slack')} title="Slack: what is listened to, what sessions may post, and posts that wait for your approval"><MessageSquare size={13}/> Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</button>
       </nav>
       <div className="sc-top-actions">
-        {enabled && <><button onClick={() => void refresh()} disabled={busy} aria-label="Refresh sessions" title={busy ? 'Indexing transcripts…' : `Refresh · updated ${formatAge(data.indexedAt)}`}><RefreshCw size={14}/></button><button onClick={() => setUserMemories(true)}>User memories</button><button onClick={() => setAgentAccess(true)}>Agent access</button></>}
+        <button onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"><Settings size={14}/></button>
       </div>
       {enabled && <details className="sc-summary">
         <summary><span className="sc-summary-working">{working} working</span><span> · {filtered.length.toLocaleString()} sessions</span><ChevronRight size={12}/></summary>
@@ -121,6 +128,20 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       </details>}
     </header>
     <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
+    {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
+    {globalOverlays.map(o => o.render({
+      enabled,
+      sessions: data.sessions,
+      directory,
+      onClearDirectory: () => setDirectory(''),
+      onSelectSession: (key) => { setSelected(key); setView('history'); },
+      onOpenLive: (id) => { setFocus({ id, at: Date.now() }); setView('live'); },
+      onNavigateView: (viewId) => setView(viewId),
+      onOpenSettings: () => useStore.getState().setSettingsOpen(true),
+      onRefresh: () => void refresh(),
+      onEnableAccess: async () => { try { setEnabled(await sessionApi.enable()); } catch (e) { setError(err(e)); } },
+      topTabs,
+    }))}
     {view === 'slack' && <SlackView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }} onWaiting={setSlackWaiting}/>}
     {view === 'board' && <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/>}
     {view === 'history' && <>
@@ -162,5 +183,5 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div></> : <div className="sc-empty"><Bot size={32}/><h2>Select a session</h2><p>Inspect its activity, agents and linked work.</p></div>}</main></div>
       <footer className="sc-footer"><span title={data.cachePath || 'No persistent cache'}><i className="sc-local-dot"/> {data.cachePath ? 'SQLite index' : 'In-memory index'} · {data.restoredFiles || 0} restored · {data.pendingFiles ? `${data.pendingFiles} files still indexing · totals partial` : 'history indexed'} · {compact(data.bytesRead || 0)} bytes read this scan · {data.errors.length} warnings</span><button onClick={async () => { try { await sessionApi.disable(); setEnabled(false); setData(empty); } catch(e) {setError(err(e));} }}>Revoke session access</button></footer>
       {data.errors.length > 0 && <details className="sc-errors"><summary>Index warnings</summary>{data.errors.map((e,i) => <p key={i}>{e}</p>)}</details>}
-    </>}</>}{agentAccess && <SessionAgentAccess close={() => setAgentAccess(false)} directory={directory} selected={chosen} inspect={(key,event)=>{setSelected(key);setTab('activity');setEventFilter('all');setAgentAccess(false);setFocusedEvidence({session:key,event});}}/>}{userMemories && <div className="sc-dialog-backdrop"><section className="sc-dialog sc-memory-dialog" role="dialog" aria-modal="true" aria-label="User memories"><header><h2>User memories</h2><button onClick={()=>setUserMemories(false)} aria-label="Close user memories"><X size={18}/></button></header><SessionMemoryBrowser/></section></div>}</section>;
+    </>}</>}</section>;
 }

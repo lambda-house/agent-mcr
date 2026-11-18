@@ -11,19 +11,33 @@ import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
 import './styles/index.css';
+import './styles/ui.css';
+import { pluginRegistry, usePluginVersion } from './plugins';
 
 // Apply the persisted theme before the first paint (no dark flash in light
 // mode), and follow later changes
 const applyTheme = (theme: string) => {
-  document.documentElement.dataset.theme = theme;
+  const root = document.documentElement;
+  root.dataset.theme = theme;
+  root.classList.toggle('dark', theme === 'dark');
 };
 applyTheme(useStore.getState().theme);
 useStore.subscribe((state, prev) => {
   if (state.theme !== prev.theme) applyTheme(state.theme);
 });
 
+function PluginAppRoot() {
+  usePluginVersion();
+  const wrappers = pluginRegistry.getAppWrappers();
+  let node: React.ReactNode = <App />;
+  for (let i = wrappers.length - 1; i >= 0; i--) {
+    node = wrappers[i].wrap(node);
+  }
+  return <>{node}</>;
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <PluginAppRoot />
   </React.StrictMode>
 );
