@@ -3899,10 +3899,12 @@ fn has_session_workspace(dir: &Path) -> bool {
 
 /// Whether a caller of the Supervisor surface gets what a transcript says of
 /// itself in `session_resumable`: its title, the guessed role and the tags.
-/// Nobody: that text is for the webview, behind the Sessions grant (MCR-76).
-/// A caller that should get it while the grant is on is named here.
-fn summaries_for(_who: &Caller) -> bool {
-    false
+/// Only the hosted Supervisor session, which chooses a conversation to resume
+/// by its title, and only while the Sessions grant is on (the `resumable` op
+/// leaves the text out without it). An outside agent with the supervisor
+/// tools gets ids, folders and times (owner's decision of 2026-11-18, MCR-76).
+fn summaries_for(who: &Caller) -> bool {
+    matches!(who, Caller::Session { supervisor: true, .. })
 }
 
 /// A `resumable` answer with ids, folders and times only.
@@ -5456,8 +5458,9 @@ mod tests {
         let tool = without_summaries(app);
         assert_eq!(tool, json!({ "sessions": [{"agent": "claude", "id": "a", "cwd": "/work/app", "modified": 7}, {"agent": "codex", "id": "b", "cwd": "/work", "modified": 5}] }));
         assert_eq!(without_summaries(json!({})), json!({}));
-        // No caller of that surface gets them: not the hosted Supervisor, not an outside agent
-        for who in [Caller::Session { id: "sup".into(), supervisor: true }, Caller::Session { id: "w".into(), supervisor: false }, Caller::Outside, Caller::Unknown] {
+        // Only the hosted Supervisor session keeps them; an outside agent does not
+        assert!(summaries_for(&Caller::Session { id: "sup".into(), supervisor: true }));
+        for who in [Caller::Session { id: "w".into(), supervisor: false }, Caller::Outside, Caller::Unknown] {
             assert!(!summaries_for(&who));
         }
     }
