@@ -471,7 +471,11 @@ impl Adapter for Codex {
         Some(title.contains("Action Required"))
     }
     fn question(&self, screen: &str) -> Option<String> {
-        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval."))
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust")).or_else(|| {
+            // The folder question at start (0.170 wording), whose answers may not be numbered
+            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
+            (!self.at_prompt(screen)).then(|| trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        })
     }
     /// Codex takes one `developer_instructions` value: the operator's own, if set, stays
     fn takes_note(&self, home: &Path) -> bool {
@@ -605,6 +609,10 @@ mod tests {
         assert_eq!(codex.question("\u{2022} Earlier I asked: Would you like to run the following command?\n\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
         assert_eq!(codex.question("  Would you like to run the following command?\n  $ ls\n"), None);
         assert_eq!(codex.question("\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
+        // The folder question at start, in the newer and the older wording
+        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n  Yes, continue\n  No, quit\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
+        assert_eq!(codex.question("Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, quit").as_deref(), Some("Do you trust the contents of this directory?"));
+        assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
         // Long commands are cut, and control characters never get into a notice
         let long = format!("Would you like to run the following command?\n$ echo {}\u{7}\n1. Yes, proceed (y)", "x".repeat(600));
         let text = codex.question(&long).unwrap();

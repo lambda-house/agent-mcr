@@ -1133,6 +1133,10 @@ const BOARD_REPORTS: usize = 200;
 /// How much of the screen is read for a prompt's text.
 const LOOK_LINES: usize = 40;
 
+/// How long a terminal must have printed nothing before its screen is read
+/// for a prompt: a prompt waits, a turn that runs keeps printing.
+const LOOK_QUIET_MS: u64 = 2_000;
+
 /// What a supervising session is told when its executor starts to wait on a
 /// prompt. The prompt's text is the agent's or the terminal's: data.
 fn waiting_notice(who: &str, id: &str, text: &str, guess: bool) -> String {
@@ -1301,6 +1305,12 @@ pub struct Harness {
     subagents: Mutex<BTreeMap<String, (Instant, Vec<Subagent>)>>,
     /// The Slack connector (D14)
     slack: Arc<Slack>,
+    /// Per session that has not reported yet: the output time at which its
+    /// screen was last read for a prompt, and the question found (MCR-71)
+    screens: Mutex<BTreeMap<String, (u64, Option<String>)>>,
+    /// Screens for tests, in place of the runner's
+    #[cfg(test)]
+    shown: Mutex<BTreeMap<String, String>>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -1426,7 +1436,7 @@ impl Harness {
         let mut store: Store = std::fs::read(dir.join("harness-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)) }
+        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), screens: Mutex::new(BTreeMap::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) }
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
@@ -2695,7 +2705,7 @@ impl Harness {
                 }
             }
             // An agent whose title says that it asks (Codex): seen at once, not at the next look
-            Some("title") => self.look(id, event["title"].as_str().unwrap_or("")),
+            Some("title") => self.look(id, event["title"].as_str().unwrap_or(""), None),
             _ => {}
         }
     }
@@ -2707,9 +2717,10 @@ impl Harness {
     fn stalled(&self) {
         let Ok(list) = Client::connect(&runner_socket(&self.dir)).and_then(|mut c| c.call(json!({"op": "list"}))) else { return };
         let now = now_ms();
+        lock(&self.screens).retain(|id, _| list["sessions"].as_array().is_some_and(|all| all.iter().any(|i| i["id"] == id.as_str() && i["exit"].is_null())));
         for info in list["sessions"].as_array().into_iter().flatten().filter(|i| i["exit"].is_null()) {
             let Some(id) = info["id"].as_str() else { continue };
-            self.look(id, info["title"].as_str().unwrap_or(""));
+            self.look(id, info["title"].as_str().unwrap_or(""), info["lastOutput"].as_u64());
             let quiet = info["lastOutput"].as_u64().is_some_and(|at| at > 0 && now.saturating_sub(at) > 4000);
             if !quiet || now.saturating_sub(info["started"].as_u64().unwrap_or(now)) < 10_000 {
                 continue;
@@ -2718,15 +2729,11 @@ impl Harness {
             if !candidate(&lock(&self.store)) {
                 continue;
             }
-            // The question itself, when the screen shows one this agent is known to ask
-            let profile = lock(&self.store).sessions.get(id).map(|t| t.profile.clone()).unwrap_or_default();
-            let text = match self.read_terminal(id, LOOK_LINES).ok().and_then(|screen| adapter(&profile).question(&screen)) {
-                Some(question) => format!("It has not started: its terminal asks first: {question}"),
-                None => "It has not started: its terminal is asking something first (for example whether to trust this folder)".into(),
-            };
+            // `look` found no question it knows on the screen: this is the guess that remains
             let raised = self.update(|s| {
+                let text = "It has not started: its terminal is asking something first (for example whether to trust this folder)";
                 let tracked = s.sessions.get_mut(id)?;
-                tracked.attention = Some(Attention { kind: "permission".into(), text, since: now, report: None, guess: true });
+                tracked.attention = Some(Attention { kind: "permission".into(), text: text.into(), since: now, report: None, guess: true });
                 s.set_state(id, "waiting");
                 Some(())
             });
@@ -2736,35 +2743,87 @@ impl Harness {
         }
     }
 
-    /// A look at a session's terminal title, for agents whose title says that
-    /// they wait for an answer (`Adapter::title_asks`): no hook reports a
-    /// Codex approval request, and before its first turn ends Codex has
-    /// reported nothing at all (MCR-71). The screen is read only when the
-    /// title starts to ask, for the question's text. Called for every title
-    /// the runner reports and on the service's timer, which also covers a
-    /// prompt that was up while the service restarted.
-    fn look(&self, id: &str, title: &str) {
-        let (profile, prompt) = {
+    /// The last lines of a session's screen.
+    fn screen(&self, id: &str) -> Option<String> {
+        #[cfg(test)]
+        if let Some(text) = lock(&self.shown).get(id) {
+            return Some(text.clone());
+        }
+        self.read_terminal(id, LOOK_LINES).ok()
+    }
+
+    /// A look at a session's terminal for a prompt no hook reports (MCR-71):
+    /// Codex reports no approval request, and nothing at all before its first
+    /// turn ends. Two signals. The title, for agents whose title says that
+    /// they wait (`Adapter::title_asks`): the screen is then read once, for
+    /// the question's text. And, while the agent has not reported yet
+    /// (`precise` is false), the screen itself once it has gone quiet: that
+    /// is how the folder question at start is found. A screen is read once
+    /// per output time, never on every look: a snapshot is up to 4 MB.
+    /// Called for every title the runner reports (`output` unknown) and on
+    /// the service's timer, which also covers a prompt that was up while the
+    /// service restarted.
+    fn look(&self, id: &str, title: &str, output: Option<u64>) {
+        let (profile, precise, prompt) = {
             let store = lock(&self.store);
             let Some(t) = store.sessions.get(id) else { return };
-            (t.profile.clone(), t.attention.as_ref().filter(|a| a.kind == "permission" && a.report.is_none()).cloned())
+            (t.profile.clone(), t.precise, t.attention.as_ref().filter(|a| a.kind == "permission" && a.report.is_none()).cloned())
         };
         let agent = adapter(&profile);
-        let Some(asks) = agent.title_asks(title) else { return };
+        let titled = agent.title_asks(title);
+        let unreported = agent.is_agent() && !precise;
+        if titled.is_none() && !unreported {
+            return;
+        }
+        let now = now_ms();
+        let seen = lock(&self.screens).get(id).cloned();
+        // The mark on the session is the question found on its screen
+        let from_screen = prompt.as_ref().is_some_and(|a| a.guess) && seen.as_ref().is_some_and(|s| s.1.is_some());
+        let quiet = output.is_some_and(|at| at > 0 && now.saturating_sub(at) > LOOK_QUIET_MS);
         // The words are the terminal's, and the mark says where they are from
-        let question = || self.read_terminal(id, LOOK_LINES).ok().and_then(|screen| agent.question(&screen)).map(|q| format!("Seen in its terminal: {q}"));
-        let unread = prompt.as_ref().is_some_and(|a| a.guess && a.text == UNREAD_PROMPT && now_ms().saturating_sub(a.since) < 15_000);
-        let asking = match (asks, &prompt) {
-            (true, None) => Some(question().unwrap_or_else(|| UNREAD_PROMPT.into())),
-            (true, Some(_)) if unread => match question() {
+        let question = || self.screen(id).and_then(|screen| agent.question(&screen)).map(|q| format!("Seen in its terminal: {q}"));
+        let asking = if titled == Some(true) {
+            match &prompt {
+                None => Some(question().unwrap_or_else(|| UNREAD_PROMPT.into())),
+                // Seen before its text was drawn: one more read
+                Some(a) if a.guess && a.text == UNREAD_PROMPT && now.saturating_sub(a.since) < 15_000 => match question() {
+                    Some(question) => Some(question),
+                    None => return,
+                },
+                Some(_) => return,
+            }
+        } else if from_screen {
+            // Still there while nothing was printed. After new output: gone when a
+            // quiet screen no longer shows it, or when the output keeps coming
+            let (Some(at), was) = (output, seen.map(|s| s.0).unwrap_or(0)) else { return };
+            if at == was {
+                return;
+            }
+            if quiet {
+                let found = question();
+                lock(&self.screens).insert(id.into(), (at, found.clone()));
+                if found.is_some() {
+                    return;
+                }
+            } else if now.saturating_sub(was) > PROMPT_SETTLE_MS {
+                lock(&self.screens).remove(id);
+            } else {
+                return;
+            }
+            None
+        } else if unreported && quiet && prompt.is_none() && seen.as_ref().map(|s| s.0) != output {
+            let found = question();
+            lock(&self.screens).insert(id.into(), (output.unwrap_or(0), found.clone()));
+            match found {
                 Some(question) => Some(question),
                 None => return,
-            },
-            (true, Some(_)) => return,
-            (false, None) => return,
-            (false, Some(_)) => None,
+            }
+        } else if titled == Some(false) && prompt.is_some() {
+            None
+        } else {
+            return;
         };
-        if self.update(|s| apply_look(s, id, asking, now_ms())) {
+        if self.update(|s| apply_look(s, id, asking, now)) {
             self.tell_waiting(id);
         }
     }
@@ -4564,9 +4623,9 @@ mod tests {
         let inbox = |h: &Harness| lock(&h.store).messages.values().filter(|m| m.to == "up").map(|m| m.text.clone()).collect::<Vec<_>>();
 
         // A title that does not ask, and a title of an agent whose title says nothing: no change
-        harness.look("ex", "\u{2807} Memory answer grounding | teob-ai");
-        harness.look("cl", "[ ! ] Action Required | teob-ai");
-        harness.look("gone", "[ ! ] Action Required | teob-ai");
+        harness.look("ex", "\u{2807} Memory answer grounding | teob-ai", None);
+        harness.look("cl", "[ ! ] Action Required | teob-ai", None);
+        harness.look("gone", "[ ! ] Action Required | teob-ai", None);
         assert!(lock(&harness.store).sessions.values().all(|t| t.attention.is_none() && t.state != "waiting"));
         assert!(inbox(&harness).is_empty());
 
@@ -4607,6 +4666,75 @@ mod tests {
         assert_eq!(told.len(), 2);
         let about_claude = told.iter().find(|t| t.contains("(mcr:cl)")).unwrap();
         assert!(about_claude.contains("as the agent reported it") && about_claude.ends_with("Claude needs your permission to use Bash"), "{about_claude}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCR-71: the folder question at start has no title and no hook. A session
+    /// that has not reported yet is read from its screen once it is quiet.
+    #[test]
+    fn a_question_at_start_is_read_from_the_quiet_screen_of_a_session_that_has_not_reported() {
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            s.sessions.insert("up".into(), Tracked { name: "Lead".into(), profile: "claude".into(), state: "idle".into(), precise: true, ..Tracked::default() });
+            for (id, profile) in [("cx", "codex"), ("cl", "claude")] {
+                s.sessions.insert(id.into(), Tracked { profile: profile.into(), state: "starting".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            }
+        });
+        let show = |id: &str, text: &str| lock(&harness.shown).insert(id.into(), text.into());
+        let state = |id: &str| lock(&harness.store).sessions[id].clone();
+        let told = || lock(&harness.store).messages.values().filter(|m| m.to == "up").count();
+        let now = now_ms();
+        let (trust, title) = ("  Trust this folder? Codex can read, edit, and run files here.\n\n  Yes, continue\n  No, quit\n", "teob-ai");
+        show("cx", trust);
+
+        // Still printing: the screen is not read
+        harness.look("cx", title, Some(now));
+        assert!(state("cx").attention.is_none() && lock(&harness.screens).is_empty());
+        // Quiet: read once, the session waits with the question, its supervisor is told
+        let quiet = now - LOOK_QUIET_MS - 1;
+        harness.look("cx", title, Some(quiet));
+        let cx = state("cx");
+        let a = cx.attention.unwrap();
+        assert_eq!((cx.state.as_str(), a.kind.as_str(), a.guess), ("waiting", "permission", true));
+        assert_eq!(a.text, "Seen in its terminal: Trust this folder? Codex can read, edit, and run files here.");
+        assert_eq!(told(), 1);
+        // The same screen at the next looks, and a title event in between: nothing new, nothing cleared
+        harness.look("cx", title, Some(quiet));
+        harness.runner_event(&json!({"event": "title", "id": "cx", "title": title}));
+        assert_eq!((state("cx").state.as_str(), told()), ("waiting", 1));
+        // A repaint with the question still there keeps the mark, and nobody is told again
+        harness.look("cx", title, Some(quiet + 1));
+        assert_eq!((state("cx").state.as_str(), told()), ("waiting", 1));
+        // Answered: the screen moved on and shows the input box
+        show("cx", "\u{203a} Explain this codebase\n\n  ? for shortcuts");
+        harness.look("cx", title, Some(quiet + 2));
+        let cx = state("cx");
+        assert_eq!((cx.state.as_str(), cx.attention.is_none(), told()), ("working", true, 1));
+        // A screen without a question is read once per output time, and raises nothing
+        harness.look("cx", title, Some(quiet + 2));
+        assert!(state("cx").attention.is_none());
+
+        // Output that keeps coming after the question was seen: answered as well
+        show("cx", trust);
+        harness.look("cx", title, Some(quiet + 3));
+        assert_eq!(state("cx").state, "waiting");
+        lock(&harness.screens).get_mut("cx").unwrap().0 = now - PROMPT_SETTLE_MS - LOOK_QUIET_MS - 10;
+        harness.look("cx", title, Some(now));
+        assert_eq!((state("cx").state.as_str(), state("cx").attention.is_none()), ("working", true));
+
+        // Claude Code before its first hook: the same, by its own wording
+        show("cl", "Do you trust the files in this folder?\n/work/x\n\u{276f} 1. Yes, proceed\n  2. No, exit");
+        harness.look("cl", "\u{2733} Claude Code", Some(quiet));
+        assert_eq!(state("cl").attention.unwrap().text, "Seen in its terminal: Do you trust the files in this folder? /work/x");
+        // Its first hook says that it started: the question was answered
+        harness.hook("cl", "SessionStart", &json!({"session_id": "S"}));
+        assert_eq!((state("cl").state.as_str(), state("cl").attention.is_none()), ("idle", true));
+        // Once an agent reports, its screen is not read any more
+        show("cl", "Do you want to make this edit to main.rs?\n\u{276f} 1. Yes\n  2. No");
+        harness.look("cl", "\u{2733} Claude Code", Some(quiet + 9));
+        assert!(state("cl").attention.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
