@@ -204,6 +204,8 @@ export type SlackPosting = 'never' | 'approve' | 'thread' | 'auto';
 export interface SlackChannel {
   id: string; name: string; private: boolean; member: boolean; listen: SlackListen; senders: string[];
   route: { kind: 'none' | 'session' | 'supervisor'; session: string }; posting: SlackPosting; posters: string[]; skipped: boolean;
+  /** Why a message that arrives now would reach no session (its route names nobody who runs); the service's words */
+  routeProblem?: string | null;
 }
 export type SlackPostState = 'waiting' | 'approved' | 'sending' | 'sent' | 'denied' | 'cancelled' | 'failed' | 'unknown';
 export interface SlackPost {
@@ -220,6 +222,8 @@ export interface SlackStatus {
   connectedAt?: number; eventsSeen?: number; actionsSeen?: number;
   /** Frames of any kind from Slack, the kind of the last one, and the last event that was not kept (type and why, never its text) */
   envelopesSeen?: number; lastEnvelope?: string; lastDropped?: string;
+  /** Slack asked to wait before giving these channels' history: their names and when they are read again */
+  catchUpWait?: { until: number; channels: string[] } | null;
   channels: SlackChannel[]; users: Record<string, string>; posts: SlackPost[]; received: SlackReceived[];
   audit: { at: number; kind: string; text: string }[];
   counts: { sentWithoutApproval: number; refusedApprovals: number; deliveredFromStrangers: number; held: number; waiting: number };

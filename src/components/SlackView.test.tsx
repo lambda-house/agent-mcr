@@ -84,6 +84,19 @@ describe('Slack view', () => {
     expect(chips).toEqual(['Tim (you)', 'Ann×']);
   });
 
+  it('says on the channel that its route reaches nobody, and that Slack asked to wait with the history', async () => {
+    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    expect(host.querySelector('.hs-slack-channel .hs-slack-warning')).toBeNull();
+    expect(host.textContent).not.toContain('Slack asked to wait');
+    await act(async () => root.unmount()); root = createRoot(host);
+    vi.mocked(slackApi.status).mockResolvedValue({ ...status, channels: [{ ...status.channels[0], routeProblem: 'The routed session is not running' }], catchUpWait: { until: Date.now() + 60_000, channels: ['ops'] } });
+    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    expect(host.querySelector('.hs-slack-channel .hs-slack-warning')!.textContent).toContain('The routed session is not running. A message that arrives now is kept under Received and delivered to nobody');
+    const connection = host.querySelector('section[aria-label="Slack connection and channels"]')!.textContent!;
+    expect(connection).toContain('Slack asked to wait before it gives the history of #ops');
+    expect(connection).toContain('is read back at ');
+  });
+
   it('offers only the connect form while nothing is connected', async () => {
     vi.mocked(slackApi.status).mockResolvedValue({ ...status, connection: null, enabled: false, link: 'off', channels: [], posts: [], received: [], counts: { ...status.counts, waiting: 0, held: 0 } });
     await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();

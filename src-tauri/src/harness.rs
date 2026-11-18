@@ -3397,7 +3397,7 @@ impl Harness {
                 Ok(json!({ "sessions": list }))
             }
             // The Slack connector, as the app sees and steers it. Only the app gets here (see `handle`)
-            "slack" => Ok(self.slack.status()),
+            "slack" => Ok(self.slack.status_live(self)),
             "slack_probe" | "slack_connect" => {
                 let text = |key: &str| req[key].as_str().unwrap_or("").trim().to_string();
                 let (bot, app, operator) = (text("bot"), text("app"), text("operator"));
@@ -3405,23 +3405,23 @@ impl Harness {
             }
             "slack_disconnect" => {
                 self.slack.disconnect(self);
-                Ok(self.slack.status())
+                Ok(self.slack.status_live(self))
             }
             "slack_enable" => {
                 self.slack.set_enabled(self, req["on"] == true);
-                Ok(self.slack.status())
+                Ok(self.slack.status_live(self))
             }
             "slack_approval" => {
                 self.slack.set_slack_approval(req["on"] == true);
-                Ok(self.slack.status())
+                Ok(self.slack.status_live(self))
             }
-            "slack_refresh" => self.slack.refresh_channels().map(|()| self.slack.status()),
-            "slack_policy" => self.slack.set_policy(req["channel"].as_str().unwrap_or(""), &req["policy"]).map(|()| self.slack.status()),
+            "slack_refresh" => self.slack.refresh_channels().map(|()| self.slack.status_live(self)),
+            "slack_policy" => self.slack.set_policy(req["channel"].as_str().unwrap_or(""), &req["policy"]).map(|()| self.slack.status_live(self)),
             // The operator's decision on a post, made in the app
             "slack_decide" => self
                 .slack
                 .decide_in_app(self, req["post"].as_str().unwrap_or(""), req["approve"] == true, req["text"].as_str(), req["reason"].as_str())
-                .map(|()| self.slack.status()),
+                .map(|()| self.slack.status_live(self)),
             other => Err(format!("Unknown request {other:?}")),
         }
     }
@@ -3601,7 +3601,7 @@ impl Harness {
             }
             "wait_resolve" => self.resolve_wait(text("wait")?, text("note")?, "supervisor", "the Supervisor"),
             // Read only: the supervisor can't approve a post or change a policy (D6, D14)
-            "slack_status" => Ok(self.slack.status_for_agents()),
+            "slack_status" => Ok(self.slack.status_for_agents(self)),
             "attention_list" => Ok(json!({ "waiting": self.attention()? })),
             "attention_wait" => {
                 // Wakes on any change, then looks again
