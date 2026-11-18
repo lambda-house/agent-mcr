@@ -7,7 +7,9 @@ export const HARNESS_PREFERENCES_CHANGED = 'harness-preferences-changed';
 export interface HostedExit { code: number; signal: string | null; at: number }
 /** Why a session needs the person: a prompt only they may answer, or a notification. */
 /** `assessment` and `report` come from the agent's own `report` tool: it needs the person, or finished a piece of work. */
-export interface Attention { kind: 'permission' | 'assessment' | 'notification'; text: string; since: number; report?: 'needs_human' | 'done' }
+export interface Attention { kind: 'permission' | 'assessment' | 'notification'; text: string; since: number; report?: 'needs_human' | 'done';
+  /** Read from the terminal by the harness, not reported by the agent */
+  guess?: boolean }
 /** What the harness service knows about a session (`harness::Tracked`). */
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';

@@ -302,6 +302,17 @@ pub trait Adapter: Sync {
     fn at_prompt(&self, _screen: &str) -> bool {
         false
     }
+    /// Whether the terminal title says that the agent waits for the operator's
+    /// answer. `None`: its title says nothing about that
+    fn title_asks(&self, _title: &str) -> Option<bool> {
+        None
+    }
+    /// The question on screen, when the screen ends in one of the agent's own
+    /// prompts with numbered answers. Read from the terminal, so a guess: the
+    /// wording depends on the agent's version
+    fn question(&self, _screen: &str) -> Option<String> {
+        None
+    }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Signal("INT")
     }
@@ -323,6 +334,18 @@ pub trait Adapter: Sync {
     fn subagents(&self, _home: &Path, _transcript: Option<&str>, _conversation: Option<&str>, _since: u64) -> Vec<Subagent> {
         Vec::new()
     }
+}
+
+/// The last question on a screen that is followed by numbered answers: the
+/// question and what stands between it and the first answer (the command, the
+/// reason), on one line. Nothing when no answers follow, as then the agent
+/// only quoted the words.
+fn asked(screen: &str, is_question: impl Fn(&str) -> bool) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().map(|l| l.trim_matches(|c: char| c.is_whitespace() || "\u{2502}\u{2503}|".contains(c))).collect();
+    let at = lines.iter().rposition(|l| is_question(l))?;
+    let answers = lines[at..].iter().take(40).position(|l| l.trim_start_matches(['\u{203a}', '\u{276f}', '>', ' ']).starts_with("1."))?;
+    let text = lines[at..at + answers].iter().filter(|l| !l.is_empty()).copied().collect::<Vec<_>>().join(" ");
+    Some(text.chars().filter(|c| !c.is_control()).take(300).collect())
 }
 
 pub struct Claude;
@@ -370,6 +393,9 @@ impl Adapter for Claude {
     fn reports_from_start(&self) -> bool {
         true
     }
+    fn question(&self, screen: &str) -> Option<String> {
+        asked(screen, |l| l.starts_with("Do you want to") || l.starts_with("Do you trust") || l.starts_with("Is this a project you"))
+    }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Key("\x1b")
     }
@@ -415,7 +441,11 @@ impl Adapter for Codex {
         if l.resume.is_some() {
             cmd += " resume";
         }
-        cmd += &format!(" {flags} -c {} -c tui.notifications=true {tools}", sh(&notify));
+        // Codex tells its terminal about an approval request only while the
+        // pane is out of focus, and a pane nobody opened never says it is:
+        // always, and as OSC 9, which the runner finds (MCR-71)
+        let notifications = format!("-c tui.notifications=true -c {} -c {}", sh("tui.notification_condition=\"always\""), sh("tui.notification_method=\"osc9\""));
+        cmd += &format!(" {flags} -c {} {notifications} {tools}", sh(&notify));
         if l.supervisor {
             cmd += &format!(" -c {} -c {}", sh(&format!("mcp_servers.supervisor.command={}", json!(l.exe))), sh("mcp_servers.supervisor.args=[\"--supervise\"]"));
         }
@@ -435,6 +465,13 @@ impl Adapter for Codex {
     }
     fn at_prompt(&self, screen: &str) -> bool {
         screen.contains("for shortcuts") && screen.lines().any(|l| l.starts_with('\u{203a}'))
+    }
+    /// Codex sets "[ ! ] Action Required" as the title while it waits for an answer
+    fn title_asks(&self, title: &str) -> Option<bool> {
+        Some(title.contains("Action Required"))
+    }
+    fn question(&self, screen: &str) -> Option<String> {
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval."))
     }
     /// Codex takes one `developer_instructions` value: the operator's own, if set, stays
     fn takes_note(&self, home: &Path) -> bool {
@@ -550,6 +587,36 @@ mod tests {
         assert!(!adapter("codex").at_prompt("Do you trust the files in this folder?"));
         assert!(matches!(adapter("claude").interrupt(), Interrupt::Key("\x1b")));
         assert!(matches!(adapter("codex").interrupt(), Interrupt::Signal("INT")));
+    }
+
+    #[test]
+    fn a_prompt_is_recognised_from_the_title_and_the_screen() {
+        let codex = adapter("codex");
+        assert_eq!(codex.title_asks("[ ! ] Action Required | teob-ai"), Some(true));
+        assert_eq!(codex.title_asks("[ . ] Action Required | teob-ai"), Some(true));
+        assert_eq!(codex.title_asks("\u{2807} Memory answer grounding | teob-ai"), Some(false));
+        // Claude Code's title says nothing about prompts: its hooks do
+        assert_eq!(adapter("claude").title_asks("\u{2733} Action Required"), None);
+        assert_eq!(adapter("shell").title_asks("Action Required"), None);
+
+        let screen = "\u{2022} I will rebase first.\n\n  Would you like to run the following command?\n\n  Reason: the branch is behind\n\n  $ git rebase origin/main\n\n\u{203a} 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `git rebase` (p)\n  3. No, and tell Codex what to do differently (esc)\n";
+        assert_eq!(codex.question(screen).as_deref(), Some("Would you like to run the following command? Reason: the branch is behind $ git rebase origin/main"));
+        // Words the agent only quoted, with no answers under them, are not a prompt
+        assert_eq!(codex.question("\u{2022} Earlier I asked: Would you like to run the following command?\n\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
+        assert_eq!(codex.question("  Would you like to run the following command?\n  $ ls\n"), None);
+        assert_eq!(codex.question("\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
+        // Long commands are cut, and control characters never get into a notice
+        let long = format!("Would you like to run the following command?\n$ echo {}\u{7}\n1. Yes, proceed (y)", "x".repeat(600));
+        let text = codex.question(&long).unwrap();
+        assert!(text.chars().count() == 300 && !text.contains('\u{7}'));
+
+        let claude = adapter("claude");
+        let trust = "\u{256d}\u{2500}\u{2500}\u{256e}\n\u{2502} Do you trust the files in this folder?   \u{2502}\n\u{2502} /Users/x/work                            \u{2502}\n\u{2502} \u{276f} 1. Yes, proceed                        \u{2502}\n\u{2502}   2. No, exit                            \u{2502}\n";
+        assert_eq!(claude.question(trust).as_deref(), Some("Do you trust the files in this folder? /Users/x/work"));
+        let edit = "Do you want to make this edit to main.rs?\n\u{276f} 1. Yes\n  2. Yes, allow all edits during this session\n  3. No";
+        assert_eq!(claude.question(edit).as_deref(), Some("Do you want to make this edit to main.rs?"));
+        assert_eq!(claude.question("> Do you want to know more?\n"), None);
+        assert_eq!(adapter("shell").question(screen), None);
         assert!(matches!(adapter("antigravity").interrupt(), Interrupt::Key("\x1b")));
         let agy_cmd = command_line(&Launch { profile: "antigravity", task: Some("hi"), ..Default::default() }).unwrap();
         assert!(agy_cmd.starts_with("exec agy ") && agy_cmd.contains("--prompt-interactive 'hi'"));
