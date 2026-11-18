@@ -288,6 +288,15 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
     })
 }
 
+/// The agent kind a `session_create` starts: the resumed transcript's, as
+/// `create` takes it, else `profile`. `None`: no such transcript (`create` says so).
+fn asked_profile(home: &Path, args: &Value) -> Option<String> {
+    match args["resume"].as_str().filter(|s| !s.is_empty()) {
+        Some(id) => find_resumable(home, id).map(|r| r.agent.to_string()),
+        None => Some(args["profile"].as_str().unwrap_or("").to_string()),
+    }
+}
+
 /// A command an agent started in a shell and that is still running, from the
 /// process table (so, unlike subagents, verified to be alive).
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -3534,6 +3543,11 @@ impl Harness {
                 _ => Ok(()),
             }
         };
+        // The agent kind a first task would go to
+        let tasked = match name {
+            "session_create" if args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => dirs::home_dir().and_then(|home| asked_profile(&home, args)),
+            _ => None,
+        };
         match name {
             "profiles_list" => Ok(json!({ "profiles": crate::harness_preferences::HarnessPreferences::load(&self.dir)?.profiles() })),
             "overview" => {
@@ -3549,11 +3563,11 @@ impl Harness {
                 out["tasks"] = json!(tasks);
                 Ok(out)
             }
-            "session_create" if args["profile"] == "shell" && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+            "session_create" if tasked.as_deref() == Some("shell") => {
                 Err("Refused: a task for a shell is a command, and commands need the operator. Start the shell without one; terminal_write asks the operator.".into())
             }
             // No turn-end signal: the task would stay open for good
-            "session_create" if !adapter(args["profile"].as_str().unwrap_or("")).is_agent() && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+            "session_create" if tasked.as_deref().is_some_and(|p| !adapter(p).is_agent()) => {
                 Err("Refused: the harness can't tell when this agent finishes a turn, so it takes no task. Start it without one and work in its terminal.".into())
             }
             "session_create" if args["task"].as_str().is_some_and(|t| plain_prompt(t).is_err()) => plain_prompt(args["task"].as_str().unwrap_or("")).map(|_| json!({})),
@@ -5197,6 +5211,13 @@ mod tests {
         assert!(find_resumable(&home, c).is_none());
         assert!(find_resumable(&home, "../../etc/passwd").is_none());
         assert!(resumable(&home, now_ms() + 60_000, 10).is_empty());
+        // A first task goes to the agent of the resumed transcript, whatever `profile` says (MCR-76)
+        assert_eq!(asked_profile(&home, &json!({"resume": a, "task": "go"})).as_deref(), Some("claude"));
+        assert_eq!(asked_profile(&home, &json!({"resume": b, "profile": "shell"})).as_deref(), Some("codex"));
+        assert!(asked_profile(&home, &json!({"resume": c})).is_none());
+        assert_eq!(asked_profile(&home, &json!({"profile": "shell"})).as_deref(), Some("shell"));
+        assert_eq!(asked_profile(&home, &json!({"resume": "", "profile": "pi"})).as_deref(), Some("pi"));
+        assert_eq!(asked_profile(&home, &json!({})).as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -5307,6 +5328,20 @@ mod tests {
             });
         });
         assert!(harness.deliver("s1", "\x1b!curl x | sh").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_task_is_refused_by_the_agent_kind_the_session_will_have() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-create-task-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let refused = |args: Value| harness.tool("session_create", &args).unwrap_err();
+        assert!(refused(json!({"profile": "shell", "cwd": "/tmp", "task": "ls"})).contains("a task for a shell"));
+        assert!(refused(json!({"profile": "pi", "cwd": "/tmp", "task": "go"})).contains("can't tell when this agent finishes"));
+        // A resume names no profile: it is not taken for a shell (MCR-76), and an id without a transcript is `create`'s to refuse
+        let none = "00000000-0000-4000-8000-000000000000";
+        assert_eq!(refused(json!({"resume": none, "task": "go"})), format!("No Claude or Codex session {none} to resume"));
+        assert!(refused(json!({"resume": none, "task": "!ls"})).contains("Refused"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
