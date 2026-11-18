@@ -5227,6 +5227,22 @@ mod tests {
         assert!(notice_ready(false, true, true, "unknown"));
     }
 
+    /// MCR-76, finding 8 of MCR-50 comment 15629: what Antigravity's `at_prompt`
+    /// does with its own markers when they are printed text. It records the
+    /// function as it is; whether the last screen can occur was not seen live.
+    #[test]
+    fn antigravity_prompt_markers_are_looked_for_anywhere_on_the_screen() {
+        let agy = adapter("antigravity");
+        let status = "? for shortcuts  accept-edits · Gemini";
+        // Printed while a turn runs, or over a menu it knows: not taken for the input box
+        assert!(!agy.at_prompt("The footer reads ? for shortcuts when idle\n> \nesc to cancel  plan · Gemini"));
+        assert!(!agy.at_prompt("The footer reads ? for shortcuts when idle\n> Yes, I trust this folder\n  ↑/↓ Navigate · enter Confirm"));
+        // The other way round it errs to the safe side: no notice while such words are in view
+        assert!(!agy.at_prompt(&format!("Press esc to cancel a turn\n> \n{status}")));
+        // A screen that shows neither menu marker with the words printed above it is taken for the input box
+        assert!(agy.at_prompt("The footer reads ? for shortcuts when idle\n  1. Allow once\n  2. Deny\n  ↑/↓ Navigate"));
+    }
+
     #[test]
     fn resumable_sessions_come_from_transcripts_only() {
         let home = std::env::temp_dir().join(format!("agent-mcr-resume-{}", std::process::id()));
