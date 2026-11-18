@@ -198,7 +198,7 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         <label className="hs-slack-toggle"><input type="checkbox" checked={status.enabled} disabled={busy} onChange={e => run(() => slackApi.enable(e.target.checked))}/>
           Slack is on <small>Off: nothing is received, nothing is sent, and posts that wait are cancelled</small></label>
         <label className="hs-slack-toggle"><input type="checkbox" checked={c.approveInSlack} disabled={busy} onChange={e => run(() => slackApi.approval(e.target.checked))}/>
-          Approve in Slack too <small>The bot sends {c.operatorName || c.operator} a direct message with Approve and Deny for every post that waits. Its text is then in that direct message, also when you deny it</small></label>
+          Approve in Slack too <small>Off unless you switch it on: posts are approved here. When on, the bot sends {c.operatorName || c.operator} a direct message with Approve and Deny for every post that waits. Its text is then in that direct message, also when you deny it</small></label>
         <div className="hs-slack-actions">
           <button type="button" disabled={busy} onClick={() => run(slackApi.refresh)} title="Read again which channels the bot is a member of"><RefreshCw size={11}/> Channels</button>
           <button type="button" disabled={busy} onClick={() => run(slackApi.disconnect)}>Disconnect…</button>

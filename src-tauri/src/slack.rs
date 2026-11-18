@@ -167,6 +167,8 @@ pub struct Connection {
     /// The one Slack user who may approve posts in Slack; set in the app only
     pub operator: String,
     pub operator_name: String,
+    /// Posts that wait are also put to the operator in a direct message with
+    /// buttons. Off at connect; the operator switches it on in the app (owner, 2026-11-18)
     pub approve_in_slack: bool,
     pub connected: u64,
     /// Scopes of the manifest that the bot token lacks, as Slack reported them
@@ -574,7 +576,7 @@ impl Slack {
                 s.received.clear();
                 s.users.clear();
             }
-            s.connection = Some(Connection { team: text("team"), team_id: text("teamId"), url: text("url"), bot_user: text("botUser"), bot_name: text("botName"), operator: text("operator"), operator_name: text("operatorName"), approve_in_slack: true, connected: now_ms(), missing_scopes: found["missingScopes"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default() });
+            s.connection = Some(Connection { team: text("team"), team_id: text("teamId"), url: text("url"), bot_user: text("botUser"), bot_name: text("botName"), operator: text("operator"), operator_name: text("operatorName"), approve_in_slack: false, connected: now_ms(), missing_scopes: found["missingScopes"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default() });
             s.users.insert(text("operator"), text("operatorName"));
             s.enabled = true;
             s.log("connected", format!("{} as {}; operator {}", text("team"), text("botName"), text("operatorName")));
@@ -1790,6 +1792,8 @@ mod tests {
         let web = Arc::new(FakeWeb::default());
         let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
         slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
+        // Off from connect; the tests of approval in Slack are about a connection where the operator switched it on
+        slack.set_slack_approval(true);
         slack.set_policy("C1", &json!({"listen": "all", "route": "session", "session": "s1", "posting": posting})).unwrap();
         slack.update(|s| s.channels.get_mut("C1").unwrap().cursor = "1.000000".into());
         (dir, slack, web, FakeHost::default())
@@ -2152,6 +2156,38 @@ mod tests {
         // A channel the bot left is not listed, and a route that is not listened to is no source
         slack.set_policy("C1", &json!({"posting": "never", "listen": "off"})).unwrap();
         assert!(seen("s1").is_empty());
+    }
+
+    #[test]
+    fn approval_in_slack_is_off_until_the_operator_switches_it_on() {
+        let dir = tempdir::Dir::new();
+        let web = Arc::new(FakeWeb::default());
+        let host = FakeHost::default();
+        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
+        slack.set_policy("C1", &json!({"listen": "all", "route": "session", "session": "s1", "posting": "approve"})).unwrap();
+        assert_eq!(slack.status()["connection"]["approveInSlack"], false);
+        // A post that waits is put to the operator in the app only: nothing goes to a direct message
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "kept here"}));
+        while slack.work(&host) {}
+        assert_eq!((web.count("conversations.open"), web.count("chat.postMessage")), (0, 0));
+        assert_eq!(lock(&host.notices).len(), 1);
+        // A button press is refused and counted, also the operator's own
+        slack.on_action(&host, &press("UOP", "post_approve", &p));
+        slack.on_action(&host, &press("UOP", "post_deny", &p));
+        assert_eq!(post_of(&slack, &p.id).state, "waiting");
+        assert_eq!(slack.status()["counts"]["refusedApprovals"], 2);
+        // The app decides
+        slack.decide_in_app(&host, &p.id, true, None, None).unwrap();
+        while slack.work(&host) {}
+        assert_eq!((post_of(&slack, &p.id).state.as_str(), web.count("conversations.open"), web.count("chat.postMessage")), ("sent", 0, 1));
+        // Switched on by the operator, it is kept as stored: on after a restart, and a later post is asked about in Slack
+        slack.set_slack_approval(true);
+        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        assert_eq!(again.status()["connection"]["approveInSlack"], true);
+        ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "asked in Slack too"}));
+        slack.work(&host);
+        assert_eq!((web.count("conversations.open"), web.last("chat.postMessage")[0].1.as_str()), (1, "D1"));
     }
 
     #[test]
