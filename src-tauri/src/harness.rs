@@ -1486,7 +1486,8 @@ fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
             true
         }
         // A prompt first seen before its text was drawn
-        (Seen::Asking(text), Some(a)) if a.guess && a.text == UNREAD_PROMPT && text != UNREAD_PROMPT => {
+        // or whose words were not kept across a restart of the service
+        (Seen::Asking(text), Some(a)) if a.guess && [UNREAD_PROMPT, UNSAVED_PROMPT].contains(&a.text.as_str()) && text != UNREAD_PROMPT => {
             tracked.attention = Some(Attention { text, ..a.clone() });
             false
         }
@@ -3206,8 +3207,14 @@ impl Harness {
         let seen = if titled == Some(true) {
             match &prompt {
                 None => Seen::Asking(question().unwrap_or_else(|| UNREAD_PROMPT.into())),
-                // Seen before its text was drawn: one more read
+                // Seen before its text was drawn: one more read. And after a restart
+                // of the service, which kept the mark without its words: read
+                // again, at most every `LOOK_AGAIN_MS`
                 Some(a) if a.guess && a.text == UNREAD_PROMPT && now.saturating_sub(a.since) < 15_000 => match question() {
+                    Some(question) => Seen::Asking(question),
+                    None => return,
+                },
+                Some(a) if a.guess && a.text == UNSAVED_PROMPT && last.as_ref().is_none_or(|s| now.saturating_sub(s.read) > LOOK_AGAIN_MS) => match read(output.unwrap_or(0)) {
                     Some(question) => Seen::Asking(question),
                     None => return,
                 },
@@ -5737,6 +5744,15 @@ mod tests {
         assert_eq!(told.iter().filter(|t| t.contains("read it with session_status or terminal_read")).count(), 4);
         // A service that starts again still shows the sessions as waiting, without the words
         let again = Harness::open(&dir);
+        assert_eq!(lock(&again.store).sessions["hook"].attention.as_ref().unwrap().text, UNSAVED_PROMPT);
+        // A guessed mark gets its words back from the screen at the next look, while the title asks;
+        // what Codex's hook said cannot be read again and stays without them
+        lock(&again.shown).insert("title".into(), asking.clone());
+        again.look("title", "[ ! ] Action Required | Fetch | teob-ai", Some(now_ms()));
+        let back = lock(&again.store).sessions["title"].attention.clone().unwrap();
+        assert!(back.text.contains("SECRET-TOKEN-123") && back.unsaved && back.guess, "{back:?}");
+        assert!(!std::fs::read_to_string(dir.join("harness-state.json")).unwrap().contains("SECRET-TOKEN-123"));
+        again.look("hook", "[ ! ] Action Required | Fetch | teob-ai", Some(now_ms()));
         assert_eq!(lock(&again.store).sessions["hook"].attention.as_ref().unwrap().text, UNSAVED_PROMPT);
         // A later save that has nothing to hide is the plain store
         harness.update(|s| s.sessions.values_mut().for_each(|t| t.attention = None));

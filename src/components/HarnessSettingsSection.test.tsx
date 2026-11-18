@@ -72,11 +72,11 @@ it('turns Codex hooks on only when the native question was answered yes, and say
   expect(box().checked).toBe(false);
 });
 
-it('says that Codex hooks report once a running session has used them', async () => {
+it('says that Codex hooks report once a session has used them', async () => {
   vi.mocked(harnessApi.status).mockResolvedValue({ runner: { protocol: 1, pid: 7, version: '0.1.0', exe: '/x' }, profiles: prefs.profiles, home: '/Users/me', codexHooks: true, codexHooksReporting: true });
   await act(async () => root.render(<HarnessSettingsSection/>)); await flush();
   expect((host.querySelector('input[aria-label="Use Codex hooks"]') as HTMLInputElement).checked).toBe(true);
-  expect(host.textContent).toContain('On, and a running Codex session reports through them.');
+  expect(host.textContent).toContain('On, and a Codex session has reported through them.');
   expect(host.textContent).not.toContain('Trust all and continue');
 });
 
