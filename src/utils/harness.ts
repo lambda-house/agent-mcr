@@ -80,7 +80,7 @@ export interface HarnessStatus {
   outsideSupervisors?: boolean;
   /** New Codex sessions are started with the harness's hooks (the person trusts them once in Codex) */
   codexHooks?: boolean;
-  /** A tracked Codex session's hooks have reported (it may have ended since): Codex runs them, so they are trusted */
+  /** A Codex hook has reported under this program's path: Codex runs them, so the person trusted them. Remembered after the sessions are gone */
   codexHooksReporting?: boolean;
 }
 

@@ -854,6 +854,13 @@ struct Store {
     /// asks them to trust once (MCR-74)
     #[serde(default)]
     codex_hooks: bool,
+    /// The program path under which a Codex hook last reported. Codex's
+    /// trust covers the hook's command, which holds this path: while it is
+    /// this program's, the person has trusted the hooks. Kept, so the
+    /// Settings row does not ask for trust again once the sessions that
+    /// reported are forgotten (MCR-74)
+    #[serde(default)]
+    codex_hooks_seen: String,
     waits: BTreeMap<String, Wait>,
     /// Connected `mcr` bridges per session; `Tracked.tools` follows it
     #[serde(skip)]
@@ -864,6 +871,16 @@ struct Store {
     #[serde(skip)]
     version: u64,
 }
+
+/// This program's path, as it stands in the hook commands Codex is given.
+fn this_program() -> String {
+    std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// The state of a session whose process ended. Kept in the store, so that
+/// what reads the store alone (a status report's executor lines) agrees with
+/// the runner's list (MCR-75).
+const ENDED: &str = "exited";
 
 fn label(t: &Tracked) -> String {
     let name = [&t.name, &t.title, &t.profile].into_iter().find(|n| !n.is_empty()).unwrap_or(&t.profile);
@@ -890,8 +907,36 @@ impl Store {
         self.chain(target).iter().any(|s| s == me)
     }
 
+    /// The sessions that work for `id` and have not ended. An ended session
+    /// stays tracked until it is forgotten, and keeps its relation for the
+    /// record, but it is nobody's executor any more (MCR-75).
     fn executors(&self, id: &str) -> Vec<String> {
-        self.sessions.iter().filter(|(_, t)| t.supervisor.as_deref() == Some(id)).map(|(k, _)| k.clone()).collect()
+        self.sessions.iter().filter(|(_, t)| t.supervisor.as_deref() == Some(id) && t.state != ENDED).map(|(k, _)| k.clone()).collect()
+    }
+
+    /// The session's process ended (the runner said so, or its list shows it):
+    /// the store knows it from here on. Nothing waits on an ended session:
+    /// its mark goes, and its open waits are closed. Returns true when this
+    /// changed anything.
+    fn end(&mut self, id: &str) -> bool {
+        let Some(t) = self.sessions.get_mut(id) else { return false };
+        if t.state == ENDED && t.attention.is_none() {
+            return false;
+        }
+        t.attention = None;
+        if t.state != ENDED {
+            t.state = ENDED.into();
+            t.since = now_ms();
+        }
+        // A restart ends the process and carries the waits to the new one
+        if !self.restarting.contains(id) {
+            let now = now_ms();
+            for wait in self.waits.values_mut().filter(|w| w.cleared == 0 && w.session == id) {
+                wait.cleared = now;
+                wait.outcome = "the session ended".into();
+            }
+        }
+        true
     }
 
     /// Levels of executors below a session.
@@ -945,7 +990,8 @@ impl Store {
 
     fn set_state(&mut self, session: &str, state: &str) {
         if let Some(t) = self.sessions.get_mut(session) {
-            if t.state != state {
+            // An ended session stays ended, whatever a late hook says
+            if t.state != state && t.state != ENDED {
                 t.state = state.into();
                 t.since = now_ms();
             }
@@ -1174,13 +1220,14 @@ impl Store {
         Ok(report)
     }
 
-    /// The sessions that work for `session`, for its status report: state,
-    /// whether the operator is needed and the open waits, by name.
+    /// The sessions that work for `session` and are running, for its status
+    /// report: state, whether the operator is needed and the open waits, by
+    /// name. The same set as `overview` shows: an ended executor is not in it.
     fn executor_lines(&self, session: &str) -> Vec<ExecutorLine> {
         let mut lines: Vec<ExecutorLine> = self
             .sessions
             .iter()
-            .filter(|(_, t)| t.supervisor.as_deref() == Some(session))
+            .filter(|(_, t)| t.supervisor.as_deref() == Some(session) && t.state != ENDED)
             .map(|(id, t)| ExecutorLine {
                 session: id.clone(),
                 name: label(t),
@@ -1290,7 +1337,7 @@ fn short_text(text: &str, chars: usize) -> String {
 impl Store {
     // Matches the Board's openReports rule: one active mark, latest matching report.
     fn open_report(&self, session: &str) -> Option<&Report> {
-        let tracked = self.sessions.get(session).filter(|t| t.state != "exited")?;
+        let tracked = self.sessions.get(session).filter(|t| t.state != ENDED)?;
         let kind = tracked.attention.as_ref()?.report.as_deref()?;
         self.reports.iter().rev().find(|r| r.session == session && r.kind == kind)
     }
@@ -1481,7 +1528,8 @@ enum Seen {
 /// fallback for prompts no hook reports, as Codex's approval requests.
 /// Returns true when the session started to wait.
 fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
-    let Some(tracked) = store.sessions.get_mut(session) else { return false };
+    // Nothing is asked in the terminal of a session that ended (a late title, a last screen)
+    let Some(tracked) = store.sessions.get_mut(session).filter(|t| t.state != ENDED) else { return false };
     let prompt = tracked.attention.as_ref().filter(|a| a.kind == "permission" && a.report.is_none());
     match (seen, prompt) {
         (Seen::Asking(text), None) => {
@@ -1511,7 +1559,8 @@ fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
 /// What a hook event does to a session. Returns true when the session became
 /// ready for its next queued task.
 fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) -> bool {
-    let Some(tracked) = store.sessions.get_mut(session) else { return false };
+    // A hook that arrives after the end changes nothing: no mark, no state, no task typed
+    let Some(tracked) = store.sessions.get_mut(session).filter(|t| t.state != ENDED) else { return false };
     let text = |v: &Value| v.as_str().map(|s| s.chars().take(MAX_TEXT).collect::<String>());
     // Codex's own hooks (MCR-74), which run once the person trusted them. They
     // arrive under one name; which hook it was is in the payload
@@ -1885,6 +1934,14 @@ impl Harness {
         let ids: BTreeSet<&str> = infos.iter().filter_map(|i| i["id"].as_str()).collect();
         if lock(&self.store).sessions.keys().any(|k| !ids.contains(k.as_str())) {
             self.update(|s| s.sessions.retain(|k, _| ids.contains(k.as_str())));
+        }
+        // An exit the service did not hear of (it was down, or restarting): the list says so
+        let ended: Vec<&str> = {
+            let store = lock(&self.store);
+            infos.iter().filter(|i| !i["exit"].is_null()).filter_map(|i| i["id"].as_str()).filter(|id| store.sessions.get(*id).is_some_and(|t| t.state != ENDED || t.attention.is_some())).collect()
+        };
+        if !ended.is_empty() {
+            self.update(|s| ended.iter().for_each(|id| { s.end(id); }));
         }
         // Titles the agents gave their sessions, kept so messages and peers can use them
         let titles: Vec<(String, String, String)> = {
@@ -2679,6 +2736,10 @@ impl Harness {
                 if said.is_empty() {
                     return Err("text is required: what you need from the operator, what is done, or where things stand".into());
                 }
+                // A status lists the executors that run: learn first of exits the service did not hear of
+                if kind == "status" {
+                    let _ = self.sessions();
+                }
                 let report = self.update(|s| s.report(me, kind, &said))?;
                 // Its supervisor reads it too (MCR-41); the operator's mark is unchanged
                 // Bound first: a guard in the `if let` would be held while `update` locks again
@@ -3055,6 +3116,9 @@ impl Harness {
         let payload = &payload;
         let (ready, waiting) = self.update(|s| {
             let before = s.sessions.get(session).map(|t| t.state.clone());
+            if event == crate::agents::CODEX_HOOK && s.sessions.contains_key(session) {
+                s.codex_hooks_seen = this_program();
+            }
             let ready = apply_hook(s, session, event, payload);
             let tracked = s.sessions.get(session);
             let now_waiting = tracked.filter(|t| t.state == "waiting" && before.as_deref() != Some("waiting")).cloned();
@@ -3082,9 +3146,7 @@ impl Harness {
                     task.finished = now_ms();
                     task.result = Some(if restarting { "The session was restarted" } else { "The session ended" }.into());
                 }
-                if let Some(t) = s.sessions.get_mut(id) {
-                    t.attention = None;
-                }
+                s.end(id);
                 if !restarting {
                     s.notes.retain(|_, n| !(n.until_end && n.from == id));
                 }
@@ -3097,7 +3159,7 @@ impl Harness {
                 let raised = self.update(|s| {
                     let tracked = s.sessions.get_mut(id)?;
                     // An agent that reports through hooks: its terminal notifications would only repeat them
-                    if adapter(&tracked.profile).reports_from_start() || tracked.state == "waiting" {
+                    if adapter(&tracked.profile).reports_from_start() || tracked.state == "waiting" || tracked.state == ENDED {
                         return None;
                     }
                     let approval = adapter(&tracked.profile).announces_approval(&body);
@@ -3325,7 +3387,7 @@ impl Harness {
                     self.update(|s| s.codex_hooks = on);
                 }
                 let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
-                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "codexHooks": lock(&self.store).codex_hooks, "codexHooksReporting": lock(&self.store).sessions.values().any(|t| t.own_hooks), "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
+                Ok(json!({ "outsideSupervisors": lock(&self.store).outside_supervisors, "codexHooks": lock(&self.store).codex_hooks, "codexHooksReporting": lock(&self.store).codex_hooks_seen == this_program(), "profiles": prefs.profiles(), "supervisorProfile": prefs.supervisor_profile }))
             }
             "harness_preferences" => {
                 let _store = lock(&self.store);
@@ -5683,6 +5745,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let harness = Harness::open(&dir);
         assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooks"], false);
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], false);
         assert_eq!(harness.control(&json!({"op": "settings", "codexHooks": true})).unwrap()["codexHooks"], true);
         assert!(lock(&harness.store).codex_hooks);
         harness.update(|st| {
@@ -5701,6 +5764,18 @@ mod tests {
         harness.runner_event(&json!({"event": "title", "id": "ex", "title": "Rebase | teob-ai"}));
         let ex = lock(&harness.store).sessions["ex"].clone();
         assert_eq!((ex.state.as_str(), ex.attention.is_none()), ("working", true));
+        // A hook has reported: the person trusted the hooks of this program. That is
+        // remembered when the sessions are forgotten and when the service starts again
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], true);
+        harness.update(|st| st.sessions.clear());
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], true);
+        assert_eq!(Harness::open(&dir).control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], true);
+        // Codex's trust covers the command with the program's path: a hook seen under another path says nothing about this one
+        harness.update(|st| st.codex_hooks_seen = "/another/build/agent-mcr".into());
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], false);
+        // A hook attributed to no tracked session is not counted
+        harness.hook("nobody", "codex-hook", &json!({"hook_event_name": "PostToolUse"}));
+        assert_eq!(harness.control(&json!({"op": "settings"})).unwrap()["codexHooksReporting"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5772,6 +5847,142 @@ mod tests {
         // A later save that has nothing to hide is the plain store
         harness.update(|s| s.sessions.values_mut().for_each(|t| t.attention = None));
         assert!(!std::fs::read_to_string(dir.join("harness-state.json")).unwrap().contains("unsaved"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCR-75: a session that ended and was not forgotten stays tracked. The
+    /// store must know that it ended, or what reads the store alone (a status
+    /// report's executor lines) shows it with its last state.
+    #[test]
+    fn an_ended_executor_is_not_in_a_status_report_and_never_waits() {
+        let mut s = Store::default();
+        s.sessions.insert("up".into(), Tracked { name: "Lead".into(), profile: "claude".into(), state: "idle".into(), ..Tracked::default() });
+        for (id, name, state) in [("live", "Slack rollout", "idle"), ("ended", "MCR-72 overview", "idle"), ("prompt", "Trust check Codex", "waiting")] {
+            s.sessions.insert(id.into(), Tracked { name: name.into(), profile: "codex".into(), state: state.into(), supervisor: Some("up".into()), ..Tracked::default() });
+        }
+        s.sessions.get_mut("prompt").unwrap().attention = Some(Attention { kind: "permission".into(), text: "Trust this folder?".into(), since: 1, unsaved: true, ..Attention::default() });
+        s.waits.insert("w".into(), Wait { id: "w".into(), session: "ended".into(), created: 1, expect_by: 5, on: "CI".into(), ..Wait::default() });
+        let lines = |s: &mut Store| s.report("up", "status", "where things stand").unwrap().executors.into_iter().map(|l| (l.name, l.state, l.needs_operator)).collect::<Vec<_>>();
+        // All three run: all three are listed, the one at a prompt as needing the operator
+        assert_eq!(lines(&mut s).len(), 3);
+        assert!(lines(&mut s).contains(&("Trust check Codex".into(), "waiting".into(), true)));
+
+        // Two end, one of them at its prompt
+        assert!(s.end("ended") && s.end("prompt"));
+        assert!(!s.end("ended"), "nothing more to change");
+        assert_eq!(lines(&mut s), vec![("Slack rollout".to_string(), "idle".to_string(), false)]);
+        let t = &s.sessions["prompt"];
+        assert_eq!((t.state.as_str(), t.attention.is_none(), t.supervisor.as_deref()), (ENDED, true, Some("up")), "the relation stays for the record");
+        // The same set as the overview's, which goes by the runner's list
+        let infos: Vec<Value> = s.sessions.iter().map(|(id, t)| json!({"id": id, "cwd": "/w", "harness": t, "exit": if t.state == ENDED { json!(0) } else { Value::Null }})).collect();
+        let overview = s.overview(&infos, Some("up"), 10_000);
+        let shown: Vec<&str> = overview["sessions"][0]["executors"].as_array().unwrap().iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(shown, ["live"]);
+        // Nothing waits on an ended session: its open wait is closed and will not escalate
+        assert!(s.waits["w"].cleared > 0 && s.waits["w"].outcome == "the session ended");
+        assert!(s.open_waits("ended").is_empty());
+        // An ended executor takes no place among the executors a session may have, and does not block ending its supervisor's own work
+        assert_eq!(s.executors("up"), vec!["live".to_string()]);
+        // A late hook or a late look does not bring it back
+        apply_hook(&mut s, "prompt", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": "T", "last-assistant-message": "x"}));
+        assert_eq!(s.sessions["prompt"].state, ENDED);
+        assert!(!apply_look(&mut s, "prompt", Seen::Asking("Would you like to".into()), 1));
+        s.set_state("ended", "working");
+        assert_eq!(s.sessions["ended"].state, ENDED);
+        // Nor is it in what is written to disk as waiting
+        let on_disk: Store = serde_json::from_slice(&saved(&s).unwrap()).unwrap();
+        assert!(on_disk.sessions.values().filter(|t| t.state == ENDED).all(|t| t.attention.is_none()));
+        assert!(!on_disk.sessions.values().any(|t| t.state == "waiting"));
+
+        // A restart ends the process too, but its waits go on to the new one
+        s.waits.insert("r".into(), Wait { id: "r".into(), session: "live".into(), created: 1, expect_by: 5, ..Wait::default() });
+        s.restarting.insert("live".into());
+        assert!(s.end("live"));
+        assert_eq!(s.waits["r"].cleared, 0);
+    }
+
+    /// MCR-75, the case from the ticket after a service restart: the service
+    /// never heard the exit, and learns it from the runner's list. Through the
+    /// service, with a runner that lists one running and one ended executor.
+    #[test]
+    fn an_exit_the_service_did_not_hear_of_is_learnt_from_the_runners_list() {
+        let dir = Path::new("/tmp").join(format!("mcr-ended-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = UnixListener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": [
+                        {"id": "up", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "live", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "gone", "cwd": "/tmp", "exit": {"code": 0}, "meta": {"profile": "codex"}}
+                    ]}),
+                    // Nothing is typed anywhere in this test
+                    _ => json!({"error": "not in this test"}),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        // As the store was saved before the restart: the executor sat at a prompt
+        h.update(|s| {
+            s.sessions.insert("up".into(), Tracked { name: "Lead".into(), profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+            s.sessions.insert("live".into(), Tracked { name: "Slack rollout".into(), profile: "claude".into(), state: "idle".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            s.sessions.insert("gone".into(), Tracked { name: "Trust check Codex".into(), profile: "codex".into(), state: "waiting".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            s.sessions.get_mut("gone").unwrap().attention = Some(Attention { kind: "permission".into(), text: "Trust this folder?".into(), since: 1, ..Attention::default() });
+            s.waits.insert("w".into(), Wait { id: "w".into(), session: "gone".into(), created: 1, expect_by: now_ms() + 3_600_000, on: "CI".into(), ..Wait::default() });
+        });
+        // The status report asks the list first: only the running executor is in it
+        let report = h.agent_tool("up", "report", &json!({"kind": "status", "text": "where things stand"})).unwrap();
+        let lines: Vec<&str> = report["executors"].as_array().unwrap().iter().filter_map(|e| e["name"].as_str()).collect();
+        assert_eq!(lines, ["Slack rollout"], "{report}");
+        // The same set as the overview's
+        let overview = h.agent_tool("up", "overview", &json!({})).unwrap();
+        let shown: Vec<&str> = overview["sessions"][0]["executors"].as_array().unwrap().iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(shown, ["live"]);
+        // The store was put right, in memory and on disk: ended, no mark, no open wait
+        let gone = lock(&h.store).sessions["gone"].clone();
+        assert_eq!((gone.state.as_str(), gone.attention.is_none(), gone.supervisor.as_deref()), (ENDED, true, Some("up")));
+        assert!(lock(&h.store).waits["w"].cleared > 0);
+        let on_disk: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
+        assert_eq!((on_disk.sessions["gone"].state.as_str(), on_disk.sessions["gone"].attention.is_none()), (ENDED, true));
+        // And nothing in the attention list
+        assert!(h.attention().unwrap().is_empty());
+        let mut stream = UnixStream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// MCR-75: an exit the service did not hear of (it was restarting) is
+    /// learnt from the runner's event when it comes, and the store is saved so.
+    #[test]
+    fn the_runners_exit_event_ends_the_session_in_the_store() {
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            s.sessions.insert("up".into(), Tracked { name: "Lead".into(), profile: "claude".into(), state: "idle".into(), ..Tracked::default() });
+            s.sessions.insert("ex".into(), Tracked { name: "Trust check Codex".into(), profile: "codex".into(), state: "working".into(), supervisor: Some("up".into()), ..Tracked::default() });
+        });
+        harness.runner_event(&json!({"event": "title", "id": "ex", "title": "[ ! ] Action Required | x | y"}));
+        assert_eq!(lock(&harness.store).sessions["ex"].state, "waiting");
+        harness.runner_event(&json!({"event": "exited", "id": "ex"}));
+        let ex = lock(&harness.store).sessions["ex"].clone();
+        assert_eq!((ex.state.as_str(), ex.attention.is_none()), (ENDED, true));
+        assert!(harness.update(|s| s.report("up", "status", "x")).unwrap().executors.is_empty());
+        let state = std::fs::read_to_string(dir.join("harness-state.json")).unwrap();
+        assert!(!state.contains("\"state\":\"waiting\""), "{state}");
+        // A title that comes after the end raises nothing
+        harness.runner_event(&json!({"event": "title", "id": "ex", "title": "[ ! ] Action Required | x | y"}));
+        let ex = lock(&harness.store).sessions["ex"].clone();
+        assert_eq!((ex.state.as_str(), ex.attention.is_none()), (ENDED, true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
