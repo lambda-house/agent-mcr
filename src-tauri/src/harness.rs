@@ -4377,7 +4377,7 @@ mod tests {
         let mut s = store_with("up", "working");
         s.sessions.get_mut("up").unwrap().name = "Lead".into();
         s.sessions.insert("ex".into(), Tracked { name: "Worker".into(), profile: "codex".into(), state: "idle".into(), supervisor: Some("up".into()), ..Tracked::default() });
-        s.sessions.insert("ex2".into(), Tracked { name: "Builder".into(), state: "waiting".into(), supervisor: Some("up".into()), attention: Some(Attention { kind: "permission".into(), text: "Bash?".into(), since: 1, report: None }), ..Tracked::default() });
+        s.sessions.insert("ex2".into(), Tracked { name: "Builder".into(), state: "waiting".into(), supervisor: Some("up".into()), attention: Some(Attention { kind: "permission".into(), text: "Bash?".into(), since: 1, ..Attention::default() }), ..Tracked::default() });
         s.sessions.insert("other".into(), Tracked { name: "Elsewhere".into(), state: "working".into(), ..Tracked::default() });
         s.waits.insert("w1".into(), Wait { id: "w1".into(), session: "ex".into(), on: "CI run 42".into(), created: 1, ..Wait::default() });
         s.waits.insert("w0".into(), Wait { id: "w0".into(), session: "ex".into(), on: "an old deploy".into(), created: 1, cleared: 2, ..Wait::default() });
