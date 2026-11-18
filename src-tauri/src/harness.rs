@@ -5886,6 +5886,65 @@ mod tests {
         assert_eq!(s.waits["r"].cleared, 0);
     }
 
+    /// MCR-75, the case from the ticket after a service restart: the service
+    /// never heard the exit, and learns it from the runner's list. Through the
+    /// service, with a runner that lists one running and one ended executor.
+    #[test]
+    fn an_exit_the_service_did_not_hear_of_is_learnt_from_the_runners_list() {
+        let dir = Path::new("/tmp").join(format!("mcr-ended-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = UnixListener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": [
+                        {"id": "up", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "live", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "gone", "cwd": "/tmp", "exit": {"code": 0}, "meta": {"profile": "codex"}}
+                    ]}),
+                    // Nothing is typed anywhere in this test
+                    _ => json!({"error": "not in this test"}),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        // As the store was saved before the restart: the executor sat at a prompt
+        h.update(|s| {
+            s.sessions.insert("up".into(), Tracked { name: "Lead".into(), profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+            s.sessions.insert("live".into(), Tracked { name: "Slack rollout".into(), profile: "claude".into(), state: "idle".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            s.sessions.insert("gone".into(), Tracked { name: "Trust check Codex".into(), profile: "codex".into(), state: "waiting".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            s.sessions.get_mut("gone").unwrap().attention = Some(Attention { kind: "permission".into(), text: "Trust this folder?".into(), since: 1, ..Attention::default() });
+            s.waits.insert("w".into(), Wait { id: "w".into(), session: "gone".into(), created: 1, expect_by: now_ms() + 3_600_000, on: "CI".into(), ..Wait::default() });
+        });
+        // The status report asks the list first: only the running executor is in it
+        let report = h.agent_tool("up", "report", &json!({"kind": "status", "text": "where things stand"})).unwrap();
+        let lines: Vec<&str> = report["executors"].as_array().unwrap().iter().filter_map(|e| e["name"].as_str()).collect();
+        assert_eq!(lines, ["Slack rollout"], "{report}");
+        // The same set as the overview's
+        let overview = h.agent_tool("up", "overview", &json!({})).unwrap();
+        let shown: Vec<&str> = overview["sessions"][0]["executors"].as_array().unwrap().iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(shown, ["live"]);
+        // The store was put right, in memory and on disk: ended, no mark, no open wait
+        let gone = lock(&h.store).sessions["gone"].clone();
+        assert_eq!((gone.state.as_str(), gone.attention.is_none(), gone.supervisor.as_deref()), (ENDED, true, Some("up")));
+        assert!(lock(&h.store).waits["w"].cleared > 0);
+        let on_disk: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
+        assert_eq!((on_disk.sessions["gone"].state.as_str(), on_disk.sessions["gone"].attention.is_none()), (ENDED, true));
+        // And nothing in the attention list
+        assert!(h.attention().unwrap().is_empty());
+        let mut stream = UnixStream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// MCR-75: an exit the service did not hear of (it was restarting) is
     /// learnt from the runner's event when it comes, and the store is saved so.
     #[test]
