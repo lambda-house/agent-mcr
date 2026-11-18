@@ -3409,14 +3409,18 @@ impl Harness {
             }
             "operator_input" => {
                 let id = id()?;
-                self.update(|s| {
-                    if let Some(t) = s.sessions.get_mut(id) {
-                        t.injected = 0;
-                        if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
-                            t.attention = None;
+                // Sent at every Enter in a terminal, and most change nothing: the store is written only for one that does
+                let changes = lock(&self.store).sessions.get(id).is_some_and(|t| t.injected != 0 || t.attention.as_ref().is_some_and(|a| a.kind != "permission"));
+                if changes {
+                    self.update(|s| {
+                        if let Some(t) = s.sessions.get_mut(id) {
+                            t.injected = 0;
+                            if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
+                                t.attention = None;
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 Ok(json!({}))
             }
             // What the app shows of the reports and the bulletin board
@@ -5359,6 +5363,33 @@ mod tests {
         let none = "00000000-0000-4000-8000-000000000000";
         assert_eq!(refused(json!({"resume": none, "task": "go"})), format!("No Claude or Codex session {none} to resume"));
         assert!(refused(json!({"resume": none, "task": "!ls"})).contains("Refused"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_operators_enter_writes_the_store_only_when_it_changes_something() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-enter-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let mark = |kind: &str| Some(Attention { kind: kind.into(), text: "t".into(), since: 1, ..Attention::default() });
+        harness.update(|s| {
+            s.sessions.insert("quiet".into(), Tracked { profile: "claude".into(), ..Tracked::default() });
+            s.sessions.insert("asked".into(), Tracked { profile: "claude".into(), attention: mark("permission"), ..Tracked::default() });
+            s.sessions.insert("typed".into(), Tracked { profile: "claude".into(), injected: 5, ..Tracked::default() });
+            s.sessions.insert("reported".into(), Tracked { profile: "claude".into(), attention: mark("assessment"), ..Tracked::default() });
+        });
+        let enter = |id: &str| {
+            let before = lock(&harness.store).version;
+            harness.control(&json!({"op": "operator_input", "id": id})).unwrap();
+            lock(&harness.store).version - before
+        };
+        // Nothing to take back: no write. A permission prompt is not answered by this op
+        assert_eq!((enter("quiet"), enter("asked"), enter("nobody")), (0, 0, 0));
+        assert!(lock(&harness.store).sessions["asked"].attention.is_some());
+        // What the harness typed and the report mark are taken back, once
+        assert_eq!((enter("typed"), enter("typed")), (1, 0));
+        assert_eq!(lock(&harness.store).sessions["typed"].injected, 0);
+        assert_eq!((enter("reported"), enter("reported")), (1, 0));
+        assert!(lock(&harness.store).sessions["reported"].attention.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
