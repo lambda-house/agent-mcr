@@ -3736,7 +3736,8 @@ impl Harness {
                 if name == "terminal_write" {
                     self.allows_terminal_write(&who, cli)?;
                 }
-                self.tool(name, &args)
+                let out = self.tool(name, &args)?;
+                Ok(if name == "session_resumable" && !summaries_for(&who) { without_summaries(out) } else { out })
             };
             if let Some(reply) = protocol.dispatch_for(&SUPERVISOR, frame, call) {
                 writeln!(writer, "{reply}")?;
@@ -3882,6 +3883,22 @@ fn has_session_workspace(dir: &Path) -> bool {
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .is_some_and(|v| v["session_workspace"] == true)
+}
+
+/// Whether a caller of the Supervisor surface gets what a transcript says of
+/// itself in `session_resumable`: its title, the guessed role and the tags.
+/// Nobody: that text is for the webview, behind the Sessions grant (MCR-76).
+/// A caller that should get it while the grant is on is named here.
+fn summaries_for(_who: &Caller) -> bool {
+    false
+}
+
+/// A `resumable` answer with ids, folders and times only.
+fn without_summaries(mut out: Value) -> Value {
+    for r in out.get_mut("sessions").and_then(Value::as_array_mut).into_iter().flatten().filter_map(Value::as_object_mut) {
+        r.retain(|key, _| !matches!(key.as_str(), "title" | "role" | "tags"));
+    }
+    out
 }
 
 fn plain_prompt(text: &str) -> Result<(), String> {
@@ -5362,6 +5379,21 @@ mod tests {
         assert!(harness.allows_terminal_write(&Caller::Outside, false).is_err());
         assert!(harness.allows_terminal_write(&Caller::Unknown, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_supervisor_surface_lists_resumable_sessions_without_transcript_text() {
+        // What the control op answers for the app while the Sessions grant is on
+        let r = Resumable { agent: "claude", id: "a".into(), cwd: "/work/app".into(), modified: 7, title: Some("Rotate the signing key".into()), role: Some("reviewer".into()), tags: vec!["Rust".into()] };
+        let app = json!({ "sessions": [r, Resumable { agent: "codex", id: "b".into(), cwd: "/work".into(), modified: 5, title: None, role: None, tags: vec![] }] });
+        assert_eq!(app["sessions"][0]["title"], "Rotate the signing key");
+        let tool = without_summaries(app);
+        assert_eq!(tool, json!({ "sessions": [{"agent": "claude", "id": "a", "cwd": "/work/app", "modified": 7}, {"agent": "codex", "id": "b", "cwd": "/work", "modified": 5}] }));
+        assert_eq!(without_summaries(json!({})), json!({}));
+        // No caller of that surface gets them: not the hosted Supervisor, not an outside agent
+        for who in [Caller::Session { id: "sup".into(), supervisor: true }, Caller::Session { id: "w".into(), supervisor: false }, Caller::Outside, Caller::Unknown] {
+            assert!(!summaries_for(&who));
+        }
     }
 
     #[test]
