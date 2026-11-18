@@ -122,7 +122,7 @@ The operator runs many sessions and does not read every terminal. Two tools put 
 Call it when you judge it necessary; nobody has to ask.
 - `report` with `kind: "needs_human"`: you cannot make further progress without the operator's assessment: a decision that is theirs, a result only they can judge, an access you lack, a risk you will not take alone. Give the question and the options in `text`, in a form that can be answered in one line. Then end your turn. Your session is marked as needing the operator until they type into it.
 - `report` with `kind: "done"`: a piece of work is complete: a task, a milestone, a review. Say in `text` what is done, where it is (branch, commit, path) and what you did not verify. The mark stays until the operator looks at your session.
-- `report` with `kind: "status"`: where you or the sessions you supervise stand, when the operator should be able to read it without being called: a supervisor after each review round or periodic assessment ("all three executors fine", "MCR-72 waits for CI"), the result of a long check. Nobody is notified and your session is not marked. It replaces your previous status report on the Board, so write it complete in itself, not as a change to the last one. If you supervise, the harness adds one line per executor (state, whether it needs the operator, the waits it registered): don't repeat those, say what you make of them.
+- `report` with `kind: "status"`: where you or the sessions you supervise stand, when the operator should be able to read it without being called: a supervisor after each review round or periodic assessment ("all three executors fine", "MCR-72 waits for CI"), the result of a long check. The operator is not notified and your session is not marked. Your supervisor, if you have one, gets it in its inbox but is not woken: it reads it at its next inbox read (a `needs_human` or `done` report is announced to it at once, as before). It replaces your previous status report on the Board, so write it complete in itself, not as a change to the last one; your last 20 stay readable through `reports_list`. If you supervise, the harness adds one line per executor (state, whether it needs the operator, the waits it registered): don't repeat those, say what you make of them.
 - A status report is not for every step: one line on what you are doing now is `set_status`. And it is not a wait: when you depend on something outside your session, call `wait_register`. A status text that says "waiting for CI" tells nobody when to look; a registered wait is followed up when it runs late.
 - Don't report progress that needs nobody ("still working"): that is `set_status`. Reports are refused after 6 in ten minutes.
 - A report does not replace your answer in the terminal: write the full account there, and the short form in the report.
@@ -810,6 +810,8 @@ pub fn folder_relation(mine: &str, theirs: &str) -> Option<&'static str> {
 
 const MAX_REPORTS: usize = 500;
 const MAX_REPORTS_SENT: usize = 6;
+/// Status reports kept per session: the one on the Board and its history for `reports_list`.
+const STATUS_HISTORY: usize = 20;
 const MAX_NOTES: usize = 200;
 const MAX_NOTES_EACH: usize = 10;
 const MAX_NOTE_TEXT: usize = 2000;
@@ -1020,6 +1022,31 @@ impl Store {
         notes
     }
 
+    /// Keeps the list within its bounds without losing what the operator still
+    /// has to read: a session's status history is `STATUS_HISTORY` long, and
+    /// when the whole list is over `MAX_REPORTS`, status reports that a later
+    /// one replaced go first, oldest first, before any other report.
+    fn trim_reports(&mut self, session: &str) {
+        let mine = self.reports.iter().filter(|r| r.kind == "status" && r.session == session).count();
+        let mut extra = mine.saturating_sub(STATUS_HISTORY);
+        self.reports.retain(|r| {
+            let drop = extra > 0 && r.kind == "status" && r.session == session;
+            extra -= drop as usize;
+            !drop
+        });
+        let mut extra = self.reports.len().saturating_sub(MAX_REPORTS);
+        if extra > 0 {
+            let latest: BTreeSet<String> = self.reports.iter().filter(|r| r.kind == "status").map(|r| (r.session.as_str(), r.id.clone())).collect::<BTreeMap<_, _>>().into_values().collect();
+            self.reports.retain(|r| {
+                let drop = extra > 0 && r.kind == "status" && !latest.contains(&r.id);
+                extra -= drop as usize;
+                !drop
+            });
+        }
+        let extra = self.reports.len().saturating_sub(MAX_REPORTS);
+        self.reports.drain(..extra);
+    }
+
     /// A restarted session keeps its reports, and those of its executors keep
     /// naming it as their supervisor.
     fn move_reports(&mut self, from: &str, to: &str) {
@@ -1117,10 +1144,7 @@ impl Store {
             tracked.attention = Some(Attention { kind: shown.into(), text: format!("{prefix}: {text}"), since: now, report: Some(kind.into()) });
         }
         self.reports.push(report.clone());
-        if self.reports.len() > MAX_REPORTS {
-            let extra = self.reports.len() - MAX_REPORTS;
-            self.reports.drain(..extra);
-        }
+        self.trim_reports(session);
         Ok(report)
     }
 
@@ -2316,19 +2340,24 @@ impl Harness {
                 if let Some(up) = above {
                     let what = match kind {
                         "needs_human" => "reports that it needs the operator",
-                        "status" => "reports where it stands (a status report: nobody was notified)",
+                        "status" => "reports where it stands (a status report: the operator was not notified, and you were not woken for it)",
                         _ => "reports a piece of work done",
                     };
+                    // A status waits in the inbox for the supervisor's next read: marked as told, so
+                    // that neither this call nor its next idle moment types a notice and costs it a turn
+                    let quiet = kind == "status";
                     self.update(|s| {
-                        s.post(Message { from: me.into(), to: up.clone(), text: format!("Your executor {what}:\n{said}"), ..Message::default() });
+                        s.post(Message { from: me.into(), to: up.clone(), text: format!("Your executor {what}:\n{said}"), notified: quiet, ..Message::default() });
                     });
-                    self.nudge(&up);
+                    if !quiet {
+                        self.nudge(&up);
+                    }
                 }
                 // A status report is read on the Board when the operator looks: no notification, no mark
                 if kind == "status" {
                     json!({
                         "report": report.id, "kind": kind, "executors": report.executors,
-                        "note": "Recorded. It replaces your previous status report on the Board; nobody is notified and your session is not marked. If you cannot go on without the operator, that is a needs_human report.",
+                        "note": "Recorded. It replaces your previous status report on the Board. The operator is not notified and your session is not marked; your supervisor, if you have one, finds it at its next inbox read and is not woken for it. If you cannot go on without the operator, that is a needs_human report.",
                     })
                 } else {
                     let (title, note) = if kind == "needs_human" {
@@ -3387,7 +3416,7 @@ fn agent_tools() -> Value {
         tool("read_inbox", "Your unread messages, oldest first; they are then marked read. With all=true: the last 40 messages you sent or received.", json!({"all": {"type": "boolean"}}), &[], false),
         tool("listen", "Wait inside this turn until a message arrives or the time is up, then return it. Usually you don't need it: an idle session is told about new messages.", json!({"timeout_seconds": {"type": "integer", "description": "Default 50, at most 600"}}), &[], false),
         tool("set_status", "One line on what you are doing, shown to the operator and to peers, and your role: the part you play, which peers in your folder take into account.", json!({"text": {"type": "string", "description": "What you are doing now"}, "role": {"type": "string", "description": "Your part, in a few words: reviewer, implementer of MCR-24, release build"}}), &[], false),
-        tool("report", "Tell the operator where you stand, when you judge it necessary. needs_human: you cannot make further progress without their assessment or decision; your session is marked until they type into it. done: a piece of work is complete; marked until they look. They get a notification for these two. status: where you or the sessions you supervise stand after an assessment or a review round; no notification and no mark, and it replaces your previous status report on the Board.", json!({"kind": {"type": "string", "enum": ["needs_human", "done", "status"]}, "text": {"type": "string", "description": "needs_human: the question and the options, answerable in one line. done: what is done, where it is, what was not verified. status: the whole picture now, complete without the previous one"}}), &["kind", "text"], false),
+        tool("report", "Tell the operator where you stand, when you judge it necessary. needs_human: you cannot make further progress without their assessment or decision; your session is marked until they type into it. done: a piece of work is complete; marked until they look. They get a notification for these two. status: where you or the sessions you supervise stand after an assessment or a review round; the operator gets no notification and your session no mark, your supervisor finds it at its next inbox read without being woken, and it replaces your previous status report on the Board.", json!({"kind": {"type": "string", "enum": ["needs_human", "done", "status"]}, "text": {"type": "string", "description": "needs_human: the question and the options, answerable in one line. done: what is done, where it is, what was not verified. status: the whole picture now, complete without the previous one"}}), &["kind", "text"], false),
         tool("bulletin_read", "The bulletin board: notes left for sessions in your folder (and for all sessions) that have not expired. Read it when you start, and when a tool result says bulletin is above zero.", json!({}), &[], false),
         tool("bulletin_post", "Leave a note for the sessions that start after you: a fact they must know and would not find in the code. Not for messages to one peer or for your own progress.", json!({"text": {"type": "string", "description": "The fact, complete without your context"}, "expires_hours": {"type": "integer", "description": "How long it stays true or useful: 1 to 336. A stale note misleads; choose shorter when unsure"}, "until_i_end": {"type": "boolean", "description": "Also remove it when your session ends: for what is about your running work"}, "scope": {"type": "string", "enum": ["folder", "all"], "description": "folder (default): sessions in your folder, below and above it. all: every session"}}), &["text", "expires_hours"], false),
         tool("bulletin_remove", "Take back a note of yours that is no longer true.", json!({"note": {"type": "string", "description": "Note id from bulletin_read"}}), &["note"], false),
@@ -4190,6 +4219,44 @@ mod tests {
         assert_eq!(board["reports"].as_array().unwrap().iter().find(|r| r["session"] == "ex").unwrap()["supervisor"], "new");
     }
 
+    #[test]
+    fn status_history_never_pushes_out_what_the_operator_has_to_read() {
+        let mut s = store_with("a", "working");
+        s.sessions.insert("b".into(), Tracked { profile: "codex".into(), ..Tracked::default() });
+        s.report("a", "needs_human", "which database?").unwrap();
+        s.report("b", "status", "b stands here").unwrap();
+        // Far more status reports than the list holds, past the limit of the tool
+        for i in 0..MAX_REPORTS + 20 {
+            s.reports.iter_mut().for_each(|r| r.created = 1);
+            s.report("a", "status", &format!("round {i}")).unwrap();
+        }
+        // The session's history is bounded and ends with the newest
+        let history: Vec<&str> = s.reports.iter().filter(|r| r.session == "a" && r.kind == "status").map(|r| r.text.as_str()).collect();
+        assert_eq!(history.len(), STATUS_HISTORY);
+        assert_eq!(history.last().copied(), Some(format!("round {}", MAX_REPORTS + 19).as_str()));
+        assert!(s.reports.iter().any(|r| r.kind == "needs_human" && r.text == "which database?"));
+        assert!(s.reports.iter().any(|r| r.session == "b" && r.kind == "status"));
+
+        // Many sessions: over the cap, replaced status reports go before any other report
+        let mut s = store_with("a", "working");
+        s.report("a", "needs_human", "still open").unwrap();
+        s.report("a", "done", "an old milestone").unwrap();
+        for n in 0..MAX_REPORTS / STATUS_HISTORY + 2 {
+            let id = format!("s{n}");
+            s.sessions.insert(id.clone(), Tracked::default());
+            for i in 0..STATUS_HISTORY {
+                s.reports.iter_mut().for_each(|r| r.created = 1);
+                s.report(&id, "status", &format!("{id} round {i}")).unwrap();
+            }
+        }
+        assert_eq!(s.reports.len(), MAX_REPORTS);
+        assert!(s.reports.iter().any(|r| r.text == "still open") && s.reports.iter().any(|r| r.text == "an old milestone"));
+        // Every session still has its latest status on the Board
+        let board = s.board();
+        let shown: BTreeSet<&str> = board["reports"].as_array().unwrap().iter().filter(|r| r["kind"] == "status").map(|r| r["text"].as_str().unwrap()).collect();
+        assert!(shown.contains("s0 round 19") && shown.contains(format!("s{} round 19", MAX_REPORTS / STATUS_HISTORY + 1).as_str()));
+    }
+
     /// The tool: no mark and no notification, but the supervisor reads it.
     #[test]
     fn a_status_report_reaches_the_supervisor_and_leaves_the_session_unmarked() {
@@ -4202,7 +4269,7 @@ mod tests {
         });
         let out = harness.agent_tool("ex", "report", &json!({"kind": "status", "text": "half of the files reviewed"})).unwrap();
         assert_eq!(out["kind"], "status");
-        assert!(out["note"].as_str().unwrap().contains("nobody is notified"));
+        assert!(out["note"].as_str().unwrap().contains("not woken"));
         let lead = harness.agent_tool("up", "report", &json!({"kind": "status", "text": "one executor, at work"})).unwrap();
         assert_eq!(lead["executors"][0]["session"], "ex");
         assert!(harness.agent_tool("ex", "report", &json!({"kind": "progress", "text": "x"})).unwrap_err().contains("status"));
@@ -4211,6 +4278,15 @@ mod tests {
         let inbox: Vec<&Message> = store.messages.values().filter(|m| m.to == "up").collect();
         assert_eq!(inbox.len(), 1);
         assert!(inbox[0].from == "ex" && inbox[0].text.contains("half of the files reviewed") && inbox[0].text.contains("status report"));
+        // Unread, and already counted as told: no notice is typed for it now or when the supervisor goes idle
+        assert!(inbox[0].read == 0 && inbox[0].notified);
+        assert_eq!(store.unread("up"), 1);
+        drop(store);
+        // A done report is still announced: its message waits for a notice
+        harness.agent_tool("ex", "report", &json!({"kind": "done", "text": "all reviewed"})).unwrap();
+        let store = lock(&harness.store);
+        let told: Vec<bool> = store.messages.values().filter(|m| m.to == "up" && m.text.contains("all reviewed")).map(|m| m.notified).collect();
+        assert_eq!(told.len(), 1);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

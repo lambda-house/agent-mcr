@@ -83,7 +83,7 @@ A session that needs the person carries an **attention** mark, shown in the Live
 | `assessment` | The agent's own `report` with `needs_human` | The person types into the session |
 | `notification` | The agent's `report` with `done`, or a terminal notification | The person looks at the session |
 
-A `report` with `status` raises no mark and no notification: it is read on the Board, where a session's next status report replaces it.
+A `report` with `status` raises no mark and no notification, and does not wake the supervisor: it is read on the Board, where a session's next status report replaces it, and at the supervisor's next inbox read.
 
 **Only the person answers a permission prompt (D6).** While a session waits on one, the supervisor's input to it is refused, and notices are never typed into it.
 
