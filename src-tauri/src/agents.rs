@@ -221,7 +221,7 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
         (docs_hits, "Docs"),
         (data_hits, "Data"),
     ];
-    scope_counts.sort_by(|a, b| b.0.cmp(&a.0));
+    scope_counts.sort_by_key(|c| std::cmp::Reverse(c.0));
     let tags = scope_counts
         .into_iter()
         .filter(|(c, _)| *c > 0)
