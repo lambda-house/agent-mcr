@@ -897,7 +897,10 @@ impl Slack {
                         }
                     }
                     Err(Fail::Limited(seconds)) => {
-                        // Try the rest later; what was read is delivered now
+                        // Try again later, from the same place: history comes newest first, and
+                        // delivering the pages read so far would move the cursor past the older
+                        // messages that were not read
+                        found.clear();
                         again_at = again_at.max(now_ms() + seconds * 1000);
                         limited.push(c.name.clone());
                         // Said once per channel, not at every try: the status has the time
@@ -911,7 +914,11 @@ impl Slack {
                         break;
                     }
                     Err(e) => {
+                        // Nothing of a read that was cut short is delivered, for the same reason;
+                        // the next catch-up starts where this one did.
                         // Said once per channel and reason, not on every reconnect
+                        found.clear();
+                        more = false;
                         let line = format!("#{}: the channel could not be read ({e})", c.name);
                         self.update(|s| {
                             if !s.audit.iter().rev().take(40).any(|a| a.text == line) {
@@ -1944,6 +1951,30 @@ mod tests {
         assert!(!slack.status()["catchUpWait"].is_null());
         slack.set_enabled(&host, false);
         assert!(slack.status()["catchUpWait"].is_null());
+    }
+
+    #[test]
+    fn a_history_read_cut_short_skips_no_older_message() {
+        let page = |ts: &str, text: &str, more: bool| Ok(json!({"ok": true, "has_more": more, "response_metadata": {"next_cursor": if more { "next" } else { "" }}, "messages": [{"type": "message", "user": "UOP", "ts": ts, "text": text}]}));
+        for cut in [Fail::Limited(0), Fail::Transport("timeout".into())] {
+            let (_dir, slack, web, host) = connected("never");
+            // History is newest first: the first page is read, the second is not
+            web.script("conversations.history", page("52.000100", "newer", true));
+            web.script("conversations.history", Err(cut.clone()));
+            slack.catch_up.store(true, Ordering::SeqCst);
+            slack.work(&host);
+            // Nothing of the channel is delivered and its cursor stays, so the next read starts at the same place
+            assert!(lock(&host.inbox).is_empty(), "{cut:?}");
+            assert_eq!(lock(&slack.state).channels["C1"].cursor, "1.000000");
+            assert!(!lock(&slack.state).channels["C1"].skipped);
+            web.script("conversations.history", page("52.000100", "newer", true));
+            web.script("conversations.history", page("51.000100", "older", false));
+            lock(&slack.link).catch_up_after = 0;
+            slack.catch_up.store(true, Ordering::SeqCst);
+            slack.work(&host);
+            assert_eq!(web.last("conversations.history").iter().find(|(k, _)| k == "oldest").unwrap().1, "1.000000");
+            assert_eq!(lock(&host.inbox).iter().map(|m| m.2.as_str()).collect::<Vec<_>>(), ["older", "newer"], "{cut:?}");
+        }
     }
 
     #[test]
