@@ -189,6 +189,9 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         {status.link === 'connected' && !status.eventsSeen && channels.some(ch => ch.member && ch.listen !== 'off') && <p className="hs-slack-warning">
           Connected, but Slack has sent no event yet. If you wrote in a listened channel and nothing shows under Received, the Slack app is not subscribed to events: in the Slack app open Event Subscriptions, turn it on, and under "Subscribe to bot events" add <b>message.channels</b>, <b>message.groups</b>, <b>app_mention</b> and <b>member_joined_channel</b>; Socket Mode must be on. Save, and reinstall the app if Slack asks.
         </p>}
+        {status.storeError && <p className="hs-slack-warning" role="alert">
+          The Slack state could not be saved on this Mac ({status.storeError}). Nothing is sent or delivered until it can be saved; what you decide meanwhile is lost if the harness service restarts.
+        </p>}
         {status.link !== 'off' && status.catchUpWait && status.catchUpWait.channels.length > 0 && <p className="hs-slack-warning" role="status">
           Slack asked to wait before it gives the history of {status.catchUpWait.channels.map(n => `#${n}`).join(', ')}. What was written there while disconnected is read back {status.catchUpWait.until > Date.now() ? `at ${new Date(status.catchUpWait.until).toLocaleTimeString()}` : 'shortly'}; until then it may be missing under Received.
         </p>}

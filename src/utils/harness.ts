@@ -226,6 +226,8 @@ export interface SlackStatus {
   envelopesSeen?: number; lastEnvelope?: string; lastDropped?: string;
   /** Slack asked to wait before giving these channels' history: their names and when they are read again */
   catchUpWait?: { until: number; channels: string[] } | null;
+  /** Why the service could not write its Slack state; while set it sends and delivers nothing */
+  storeError?: string | null;
   channels: SlackChannel[]; users: Record<string, string>; posts: SlackPost[]; received: SlackReceived[];
   audit: { at: number; kind: string; text: string }[];
   counts: { sentWithoutApproval: number; refusedApprovals: number; deliveredFromStrangers: number; held: number; waiting: number };

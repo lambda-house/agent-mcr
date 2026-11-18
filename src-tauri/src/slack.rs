@@ -372,6 +372,10 @@ pub struct Slack {
     routing: Mutex<std::collections::BTreeSet<String>>,
     /// How long after an unanswered attempt the channel's history is trusted
     settle_after: u64,
+    /// Why the last change could not be written to `slack-state.json`; empty when
+    /// it was. While it is set, memory is ahead of the file and nothing is sent,
+    /// delivered or acknowledged: a restart would act on the older file again
+    unsaved: Mutex<String>,
 }
 
 /// Text an agent wrote, made safe to send: nothing in it mentions anyone or
@@ -417,26 +421,31 @@ impl Slack {
         for p in state.posts.values_mut().filter(|p| p.state == "sending") {
             p.state = "unknown".into();
         }
-        Self { dir: dir.to_path_buf(), state: Mutex::new(state), wake: Condvar::new(), web, vault, link: Mutex::new(Link { state: "off".into(), ..Link::default() }), epoch: AtomicU64::new(0), catch_up: AtomicBool::new(false), routing: Mutex::new(Default::default()), settle_after }
+        Self { dir: dir.to_path_buf(), state: Mutex::new(state), wake: Condvar::new(), web, vault, link: Mutex::new(Link { state: "off".into(), ..Link::default() }), epoch: AtomicU64::new(0), catch_up: AtomicBool::new(false), routing: Mutex::new(Default::default()), settle_after, unsaved: Mutex::new(String::new()) }
     }
 
-    /// Change the state and store it before anything acts on the change.
+    /// Change the state and store it before anything acts on the change. A
+    /// write that fails is remembered (`saved`): who acts on a change asks first.
     fn update<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
         let mut state = lock(&self.state);
         let out = f(&mut state);
         state.trim();
-        if let Ok(bytes) = serde_json::to_vec(&*state) {
+        let written = serde_json::to_vec(&*state).map_err(|e| e.to_string()).and_then(|bytes| {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             let tmp = self.dir.join("slack-state.json.tmp");
-            let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(&bytes));
-            if written.is_ok() {
-                let _ = std::fs::rename(&tmp, self.dir.join("slack-state.json"));
-            }
-        }
+            std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(&bytes)).and_then(|()| std::fs::rename(&tmp, self.dir.join("slack-state.json"))).map_err(|e| e.to_string())
+        });
+        *lock(&self.unsaved) = written.err().unwrap_or_default();
         drop(state);
         self.wake.notify_all();
         out
+    }
+
+    /// The last change is in the file. When it is not, nothing may be sent,
+    /// delivered or acknowledged on the strength of what is only in memory.
+    fn saved(&self) -> bool {
+        lock(&self.unsaved).is_empty()
     }
 
     fn bot(&self) -> Result<String, String> {
@@ -493,6 +502,8 @@ impl Slack {
             "envelopesSeen": link.envelopes,
             "lastEnvelope": link.last_envelope,
             "lastDropped": link.last_dropped,
+            // The state file could not be written: nothing is sent or delivered until it can
+            "storeError": Some(lock(&self.unsaved).clone()).filter(|e| !e.is_empty()),
             // Slack asked to wait before giving a channel's history: which channels, and when they are read again
             "catchUpWait": if on && !link.limited.is_empty() && self.catch_up.load(Ordering::SeqCst) { json!({"until": link.catch_up_after, "channels": link.limited}) } else { Value::Null },
             "channels": channels,
@@ -823,7 +834,8 @@ impl Slack {
 
     /// Deliver a stored message to the inbox of the session it is routed to.
     fn route(&self, host: &dyn Host, key: &str) {
-        if !lock(&self.routing).insert(key.to_string()) {
+        // Not in the file yet: it stays stored but not delivered, and `work` delivers it later
+        if !self.saved() || !lock(&self.routing).insert(key.to_string()) {
             return;
         }
         self.route_claimed(host, key);
@@ -895,6 +907,11 @@ impl Slack {
             // Kind, subtype and channel only: never the text of something that was not kept
             let field = |k: &str| event[k].as_str().unwrap_or("-").chars().take(40).collect::<String>();
             lock(&self.link).last_dropped = format!("{} (subtype {}, channel {}{})", field("type"), field("subtype"), field("channel"), if event["bot_id"].is_null() { "" } else { ", from a bot" });
+        }
+        if key.is_some() && !self.saved() {
+            // Not acknowledged, so Slack sends it again. It is in memory and is delivered
+            // once the file can be written; after a restart it is read back from history
+            return Ok(());
         }
         ack()?;
         match key {
@@ -1065,6 +1082,11 @@ impl Slack {
                     Ok((post, policy.name))
                 })?;
                 let (post, channel) = post;
+                if !self.saved() {
+                    // No receipt for what is not stored
+                    self.update(|s| s.posts.remove(&post.id));
+                    return Err("Refused: the post could not be stored on this Mac, so it is not kept. Report to the operator.".into());
+                }
                 if post.state == "waiting" {
                     host.notify(&format!("Agent MCR: {} wants to post to #{channel}", post.session_name), &post.text);
                 }
@@ -1251,6 +1273,13 @@ impl Slack {
         if !self.active() || self.vault.get("bot").is_none() {
             return false;
         }
+        if !self.saved() {
+            // Try the write again; while it fails nothing is sent or delivered
+            self.update(|_| ());
+            if !self.saved() {
+                return false;
+            }
+        }
         let now = now_ms();
         let mut did = false;
         // Stored but not delivered: the connection or the service stopped between the two
@@ -1355,6 +1384,17 @@ impl Slack {
             Some(stored)
         });
         let Some(p) = go else { return };
+        if !self.saved() {
+            // "sending" is not in the file: after a restart the post would be sent a second
+            // time. Not sent now; it stays allowed and goes out once the file can be written
+            self.update(|s| {
+                if let Some(stored) = s.posts.get_mut(&p.id).filter(|stored| stored.state == "sending") {
+                    stored.state = "approved".into();
+                    stored.attempted = 0;
+                }
+            });
+            return;
+        }
         if p.state == "cancelled" {
             self.tell(host, &p);
             return;
@@ -2048,6 +2088,37 @@ mod tests {
         lock(&slack.state).received.values_mut().for_each(|r| r.delivered = r.delivered.saturating_sub(61_000).min(1));
         slack.on_event(&host, &message("UOP", "9.000100", "later"), || Ok(())).unwrap();
         assert_eq!(lock(&host.inbox).last().unwrap().2, "later");
+    }
+
+    #[test]
+    fn nothing_is_sent_or_delivered_while_the_state_cannot_be_written() {
+        let (dir, slack, web, host) = connected("approve");
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "once"}));
+        slack.decide_in_app(&host, &p.id, true, None, None).unwrap();
+        assert!(slack.status()["storeError"].is_null());
+        // The folder is gone: no change reaches the file from here on
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        slack.work(&host);
+        slack.work(&host);
+        // The post is not sent on a state the file does not have, and stays allowed
+        assert_eq!(web.count("chat.postMessage"), 0);
+        assert_eq!(post_of(&slack, &p.id).state, "approved");
+        assert!(slack.status()["storeError"].is_string());
+        // A message is kept in memory, neither acknowledged nor delivered
+        let acked = AtomicBool::new(false);
+        slack.on_event(&host, &message("UOP", "30.000100", "hello"), || { acked.store(true, Ordering::SeqCst); Ok(()) }).unwrap();
+        assert!(!acked.load(Ordering::SeqCst) && lock(&host.inbox).is_empty());
+        // A new post gets no receipt and is not kept
+        assert!(slack.tool(&host, "s1", "slack_post", &json!({"channel": "C1", "text": "second"})).unwrap_err().contains("could not be stored"));
+        assert_eq!(lock(&slack.state).posts.len(), 1);
+        // The folder is back: the write is tried again, then the message is delivered and the post sent, each once
+        std::fs::create_dir_all(dir.path()).unwrap();
+        while slack.work(&host) {}
+        assert!(slack.status()["storeError"].is_null());
+        assert_eq!(lock(&host.inbox).iter().filter(|m| m.2 == "hello").count(), 1);
+        assert_eq!(web.count("chat.postMessage"), 1);
+        assert_eq!(post_of(&slack, &p.id).state, "sent");
+        assert!(std::fs::read_to_string(dir.path().join("slack-state.json")).unwrap().contains("\"sent\""));
     }
 
     #[test]
