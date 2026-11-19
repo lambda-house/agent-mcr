@@ -939,9 +939,18 @@ impl Memory {
                     Err(why) => return done(told(why.clone())),
                     Ok(session) => session,
                 };
-                // The operator's sign-in reaches several memories: a call that names none goes to the agents' own
-                let takes_memory = self.tool_list().ok().is_some_and(|t| t["tools"].as_array().is_some_and(|all| all.iter().any(|d| d["name"] == name && d["inputSchema"]["properties"]["memory"].is_object())));
-                if takes_memory && args.get("memory").is_none() {
+                // The operator's sign-in reaches several memories: a call that names none goes to
+                // the agents' own. Whether the tool takes a memory is in its schema. When that
+                // cannot be had, the call is not sent on: without the default the other side
+                // would pick a memory itself, and for a write that is the wrong one
+                let tools = match self.noted(self.tool_list()) {
+                    Ok(tools) => tools,
+                    Err(Fail::Rpc(e)) => return Some(json!({"jsonrpc": "2.0", "id": id, "error": e})),
+                    Err(fail) => return done(told(fail.text())),
+                };
+                let takes_memory = tools["tools"].as_array().is_some_and(|all| all.iter().any(|d| d["name"] == name && d["inputSchema"]["properties"]["memory"].is_object()));
+                // A `memory` that is null names none
+                if takes_memory && args.get("memory").is_none_or(Value::is_null) {
                     args["memory"] = json!(DEFAULT_MEMORY);
                 }
                 // Who called what: here only, never sent on (per-session identity is parked)
@@ -1045,6 +1054,8 @@ mod tests {
         token_fails: bool,
         /// The MCP side accepts no token at all
         deaf: bool,
+        /// The tool list cannot be had
+        list_fails: bool,
     }
 
     impl World {
@@ -1126,6 +1137,9 @@ mod tests {
                 let method = message["method"].as_str().unwrap_or("").to_string();
                 if method != "initialize" && w.session.is_some() && req.headers.get("mcp-session-id") != w.session.as_ref() {
                     return res(404, Value::Null);
+                }
+                if w.list_fails && method == "tools/list" {
+                    return res(503, Value::Null);
                 }
                 w.mcp.push(message.clone());
                 let result = match method.as_str() {
@@ -1402,6 +1416,21 @@ mod tests {
         let sent = lock(&rig.world).mcp.iter().map(Value::to_string).collect::<String>();
         assert!(!sent.contains("s1"), "{sent}");
         assert!(!rig.visible().contains("secret"));
+    }
+
+    #[test]
+    fn a_call_is_not_sent_on_when_it_is_not_known_whether_the_tool_takes_a_memory() {
+        let rig = Rig::signed_in();
+        // The list was never fetched, and cannot be now
+        lock(&rig.world).list_fails = true;
+        let told = rig.call("memory_list", json!({"limit": 1}));
+        assert_eq!(told["result"]["isError"], true, "{told}");
+        assert!(told["result"]["content"][0]["text"].as_str().unwrap().starts_with("The memory service could not be reached"), "{told}");
+        // Without the default it would have gone to whatever memory the other side picks
+        assert!(lock(&rig.world).mcp.iter().all(|m| m["method"] != "tools/call"));
+        // Once the list is known, a `memory` that is null is no memory given
+        lock(&rig.world).list_fails = false;
+        assert_eq!(rig.call("memory_list", json!({"memory": null}))["result"]["content"][0]["text"], json!({"memory": "mcr-agents"}).to_string());
     }
 
     #[test]
