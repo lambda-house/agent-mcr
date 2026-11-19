@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionWorkspace from './SessionWorkspace';
 import { sessionApi, type Session } from '../utils/sessions';
+import { harnessApi, type Hosted } from '../utils/harness';
 import { createPlugin, pluginRegistry } from '../plugins';
 vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
@@ -31,6 +32,35 @@ describe('Sessions workspace', () => {
     expect(host.textContent).toContain('Fix CORE-123');expect(host.textContent).toContain('<script>untrusted()</script>');expect(host.querySelector('script')).toBeNull();
     await act(async () => button('linked work').click());expect(host.textContent).toContain('CORE-123');
     expect(host.querySelector('.sc-ticket-list button')).toBeNull();
+  });
+  it('draws a found session as the Live list does: an earlier one as mark, title and age', async () => {
+    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+    const row = host.querySelector('.ss-results .sc-session')!;
+    expect(row.classList.contains('hs-item') && row.classList.contains('hs-resume')).toBe(true);
+    expect(row.querySelector('strong')?.textContent?.trim()).toBe('Fix CORE-123');
+    expect([...row.querySelectorAll('small')].map(e => e.textContent)).toEqual(['just now']);
+    expect(row.querySelector('.hs-dot')).toBeNull();
+    // Tokens, origin and the guessed state are in the tooltip, as the list keeps its detail
+    expect(row.textContent).not.toMatch(/tokens|working|unknown/);
+    expect(row.getAttribute('title')).toContain('120 tokens');
+    expect(row.getAttribute('title')).toContain('working (inferred from the transcript)');
+    expect(host.querySelector('.ss-dir .hs-dir-path')?.textContent).toContain('demo');
+  });
+  it('draws a found session that runs now as its Live row', async () => {
+    const hosted: Hosted = { id: 'h1', pid: 42, argv: ['codex'], cwd: '/work/demo', started: 1, cols: 120, rows: 32, title: '', lastOutput: 1, exit: null, unread: 1,
+      meta: { label: 'Codex', profile: 'codex', name: 'Parser fixer' }, harness: { profile: 'codex', state: 'waiting', agentSession: 'a', attention: { kind: 'permission', text: 'Approve the command?' } } as Hosted['harness'] };
+    vi.mocked(harnessApi.list).mockResolvedValue([hosted]);
+    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush(); await flush();
+    const row = host.querySelector('.ss-results .sc-session')!;
+    expect(row.classList.contains('hs-resume')).toBe(false);
+    expect(row.querySelector('.hs-dot.waiting')).not.toBeNull();
+    expect(row.querySelector('strong')?.textContent?.trim()).toBe('Parser fixer');
+    expect([...row.querySelectorAll('small')].map(e => e.textContent)).toEqual(['1 unread', 'Approve the command?']);
+    // The name's own tooltip must not hide the detail the row left out
+    expect(row.querySelector('strong')?.getAttribute('title')).toContain('120 tokens');
+    // Selecting it still opens the conversation in the Journal
+    await act(async () => (row as HTMLElement).click());
+    expect(row.classList.contains('selected')).toBe(true);
   });
   it('mounts the global overlays only while Sessions is shown, so their keys stay free over Documents', async () => {
     const onKey = vi.fn();

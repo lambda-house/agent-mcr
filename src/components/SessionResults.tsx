@@ -4,7 +4,7 @@ import { Filter } from 'lucide-react';
 import SessionTree from './SessionTree';
 import { type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
-import { shortPath } from '../utils/harness';
+import { shortPath, type Hosted } from '../utils/harness';
 
 /** Folders listed before the person is asked to narrow the search. */
 const MAX_FOLDERS = 40;
@@ -14,11 +14,14 @@ const tilde = (path: string) => homePath(path) || 'Unknown folder';
 
 /**
  * Search results by folder, in the same shape as the Live list: the folder's
- * path on the top line, its sessions under it (subagents under their parents).
+ * path on the top line, its sessions under it as the list's own rows
+ * (subagents under their parents).
  */
-export default function SessionResults({ all, matches, selected, select, directory, narrow }: {
+export default function SessionResults({ all, matches, selected, select, directory, narrow, live }: {
   all: Session[]; matches: Session[]; selected: string; select: (key: string) => void;
   directory: string; narrow: (directory: string) => void;
+  /** Conversations that run in Live now, by conversation key: drawn as their Live row */
+  live?: Map<string, Hosted>;
 }) {
   const folders = useMemo(() => {
     const by = new Map<string, Session[]>();
@@ -37,7 +40,7 @@ export default function SessionResults({ all, matches, selected, select, directo
           <small>{f.sessions.length} · {formatAge(f.latest)}</small>
           {directory !== f.path && f.path && <button type="button" className="hs-dir-start" title="Search only this folder" aria-label={`Search only ${f.path}`} onClick={() => narrow(f.path)}><Filter size={11}/></button>}
         </header>
-        {open && <SessionTree all={all} matches={f.sessions} selected={selected} select={select}/>}
+        {open && <SessionTree all={all} matches={f.sessions} selected={selected} select={select} live={live}/>}
       </section>;
     })}
     {folders.length > MAX_FOLDERS && <p className="ss-more">{folders.length - MAX_FOLDERS} more folders: narrow the search to see them.</p>}
