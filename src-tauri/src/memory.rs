@@ -47,6 +47,12 @@ const FOR_THE_APP: Duration = Duration::from_secs(7);
 /// How long a session's `initialize` waits for the memory service. An agent
 /// shows a server that starts slowly as failed, so this stays short.
 const AT_START: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 4000 });
+/// How long a connection may take to open. `ureq` bounds connecting by this
+/// alone and not by a request's own timeout, so it is the shortest wait there
+/// is: with a longer one a start-up or a call for the app waits for a host
+/// that does not answer past its own time. (Windows also takes two seconds to
+/// find that nothing listens on a local port, which is how this was found.)
+const TO_CONNECT: Duration = AT_START;
 /// A memory service that could not be reached is not asked again for this
 /// long by other sessions that start: they would each wait in turn.
 const AWAY_FOR: Duration = Duration::from_secs(20);
@@ -219,7 +225,7 @@ impl Http {
 
 fn agent() -> ureq::Agent {
     // No redirects: a token or a bearer header is never sent on to another place
-    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout(CALL).redirects(0).build()
+    ureq::AgentBuilder::new().timeout_connect(TO_CONNECT).timeout(CALL).redirects(0).build()
 }
 
 fn body(response: ureq::Response) -> Result<Vec<u8>, Http> {
@@ -1907,7 +1913,7 @@ mod tests {
         assert!(text.starts_with(DATA_NOTE) && text.contains("It did not answer when this session started: The memory service could not be reached"), "{text}");
         // The next session to start is told the same without another wait
         assert_eq!(hello(&away), first);
-        assert!(started.elapsed() < AT_START + Duration::from_secs(1));
+        assert!(started.elapsed() < AT_START + Duration::from_secs(1), "{:?}", started.elapsed());
         assert_eq!(away.status()["problem"]["kind"], "unreachable");
         // A call still tries, and says what happened
         let told = away.handle(&Ok("s1".into()), &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
