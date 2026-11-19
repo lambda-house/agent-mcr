@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, SESSION_DRAG_TYPE, shellQuote } from '../utils/harness';
+import { isPaletteKey, PLATFORM } from '../utils/platform';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
 export const RESIZE_SETTLE_MS = 200;
@@ -68,6 +69,8 @@ export default function TerminalPane({ id, active, onQuit }: {
     t.loadAddon(new Unicode11Addon());
     t.unicode.activeVersion = '11';
     t.open(element);
+    // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P
+    t.attachCustomKeyEventHandler(e => !isPaletteKey(e, PLATFORM));
     term.current = t; fit.current = f;
     try { f.fit(); } catch { /* not laid out yet */ }
 

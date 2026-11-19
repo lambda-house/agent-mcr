@@ -6,7 +6,9 @@ mod session_analysis;
 #[allow(dead_code)]
 #[path = "../src/session_db.rs"]
 mod session_db;
-#[cfg(unix)]
+#[allow(dead_code)]
+#[path = "../src/ipc.rs"]
+mod ipc;
 #[allow(dead_code)]
 #[path = "../src/peer.rs"]
 mod peer;

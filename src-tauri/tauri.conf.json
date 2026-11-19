@@ -46,7 +46,8 @@
     "active": true,
     "targets": [
       "app",
-      "dmg"
+      "dmg",
+      "nsis"
     ],
     "icon": [
       "icons/128x128@2x.png",
@@ -63,6 +64,10 @@
     "fileAssociations": [],
     "macOS": {
       "signingIdentity": "-"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": { "installMode": "currentUser" }
     }
   }
 }

@@ -5,13 +5,13 @@
 //! (docs/AGENT_HARNESS_DESIGN.md, 05 · Trust).
 
 use crate::harness;
+use crate::ipc::Stream;
 use crate::runner::{self, Client};
 use crate::session_commands::SessionState;
 use crate::AccessState;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -24,7 +24,7 @@ const MAX_PASTED_IMAGE: usize = 30 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct HarnessState {
-    views: Mutex<BTreeMap<u64, (UnixStream, String)>>,
+    views: Mutex<BTreeMap<u64, (Stream, String)>>,
     next_view: AtomicU64,
     told: Told,
 }
@@ -170,8 +170,8 @@ pub async fn harness_background_allow(app: tauri::AppHandle) -> Result<bool, Str
     blocking(move || {
         let dir = config_dir()?;
         if runner::consent(&dir) != Some(true) {
-            let message = "Agent MCR runs your agents in two background processes of its own, so they keep working when you close or update the app:\n\n\u{2022} the runner holds the terminals\n\u{2022} the harness service tracks sessions and gives agents their tools\n\nmacOS starts them through two files in ~/Library/LaunchAgents and may show a \"Background Items Added\" notice. They listen only on sockets private to your user, never on the network, and exit on their own ten minutes after the last session ends.\n\nYou can see, stop and remove them at any time under Background in the Live view.";
-            if !confirmed(&app, "Let Agent MCR run in the background?", message.to_string(), "Allow", false) {
+            let message = format!("Agent MCR runs your agents in two background processes of its own, so they keep working when you close or update the app:\n\n\u{2022} the runner holds the terminals\n\u{2022} the harness service tracks sessions and gives agents their tools\n\n{start} They listen only on sockets private to your user, never on the network, and exit on their own ten minutes after the last session ends.\n\nYou can see, stop and remove them at any time under Background in the Live view.", start = if cfg!(windows) { "They are ordinary processes of your user that Agent MCR starts itself; nothing is installed in Windows." } else { "macOS starts them through two files in ~/Library/LaunchAgents and may show a \"Background Items Added\" notice." });
+            if !confirmed(&app, "Let Agent MCR run in the background?", message, "Allow", false) {
                 return Ok(false);
             }
             runner::set_consent(&dir, true)?;
@@ -193,7 +193,9 @@ pub async fn harness_background_stop(app: tauri::AppHandle, uninstall: bool) -> 
             1 => "1 running session will be ended; unsaved work in it is lost.".to_string(),
             n => format!("{n} running sessions will be ended; unsaved work in them is lost."),
         };
-        let (title, rest, ok) = if uninstall {
+        let (title, rest, ok) = if uninstall && cfg!(windows) {
+            ("Remove Agent MCR's background items?", "The runner and the harness service are stopped and Agent MCR forgets that you allowed them; nothing was installed in Windows. Session history and settings stay; to remove those too, delete %LOCALAPPDATA%\\agent-mcr after quitting.", "Stop and Remove")
+        } else if uninstall {
             ("Remove Agent MCR's background items?", "The runner and the harness service are stopped and their two files in ~/Library/LaunchAgents are removed. Session history and settings stay; to remove those too, delete ~/Library/Application Support/agent-mcr after quitting.", "Stop and Remove")
         } else {
             ("Stop all sessions and background processes?", "The runner and the harness service are stopped. Nothing starts them again until you allow it here.", "Stop Everything")
@@ -496,8 +498,9 @@ pub async fn slack_connect(app: tauri::AppHandle, bot: String, app_token: String
         let found = service(json!({"op": "slack_probe", "bot": bot, "app": app_token, "operator": operator}))?;
         let text = |key: &str| found[key].as_str().unwrap_or("").to_string();
         let message = format!(
-            "Workspace: {}\nBot: {}\n\n{} ({}) is recorded as you. Only this Slack user's button presses can approve or deny a post, and this is the first sender whose messages reach a session.\n\nThe two tokens are kept in the macOS Keychain on this Mac and are shown to no agent. Nothing is listened to and nothing can be posted until you set a channel's policy.",
-            text("team"), text("botName"), text("operatorName"), text("operator")
+            "Workspace: {}\nBot: {}\n\n{} ({}) is recorded as you. Only this Slack user's button presses can approve or deny a post, and this is the first sender whose messages reach a session.\n\nThe two tokens are kept in {store} on this computer and are shown to no agent. Nothing is listened to and nothing can be posted until you set a channel's policy.",
+            text("team"), text("botName"), text("operatorName"), text("operator"),
+            store = if cfg!(windows) { "Windows Credential Manager" } else { "the macOS Keychain" }
         );
         if !confirmed(&app, "Connect Slack?", message, "Connect", false) {
             return Ok(Value::Null);
@@ -510,7 +513,7 @@ pub async fn slack_connect(app: tauri::AppHandle, bot: String, app_token: String
 #[tauri::command]
 pub async fn slack_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
     blocking(move || {
-        if !confirmed(&app, "Disconnect Slack?", "The tokens are removed from the Keychain, listening stops and posts that wait are cancelled. Channel policies are kept for the next time.".to_string(), "Disconnect", true) {
+        if !confirmed(&app, "Disconnect Slack?", "The tokens are removed from the secret store, listening stops and posts that wait are cancelled. Channel policies are kept for the next time.".to_string(), "Disconnect", true) {
             return service(json!({"op": "slack"}));
         }
         service(json!({"op": "slack_disconnect"}))
@@ -739,22 +742,21 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
     let ext = image_extension(bytes).ok_or("Not a PNG, JPEG, GIF or WebP image")?;
     // ~/Library/Caches has no space in its path (Application Support does), so
     // the typed path needs no quoting in most agents' prompts.
-    let dir = dirs::cache_dir().ok_or("Cache directory unavailable")?.join("agent-mcr/attachments").join(&id);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let cache_root = dirs::cache_dir().ok_or("Cache directory unavailable")?.join("agent-mcr");
+    crate::ipc::private_dir(&cache_root)?;
+    let root = cache_root.join("attachments");
+    crate::ipc::private_dir(&root)?;
     // Screenshots can show anything: the user's alone, and not kept for good
-    if let Some(root) = dir.parent() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
-        let old = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PASTED_IMAGE_KEPT));
-        for session in std::fs::read_dir(root).into_iter().flatten().flatten() {
-            for file in std::fs::read_dir(session.path()).into_iter().flatten().flatten().filter(|f| old(&f.path())) {
-                let _ = std::fs::remove_file(file.path());
-            }
-            // Fails, as it should, while the folder still holds images
-            let _ = std::fs::remove_dir(session.path());
+    let old = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PASTED_IMAGE_KEPT));
+    for session in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        for file in std::fs::read_dir(session.path()).into_iter().flatten().flatten().filter(|f| old(&f.path())) {
+            let _ = std::fs::remove_file(file.path());
         }
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // Fails, as it should, while the folder still holds images
+        let _ = std::fs::remove_dir(session.path());
     }
+    let dir = root.join(&id);
+    crate::ipc::private_dir(&dir)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
     let path = dir.join(format!("pasted-{stamp}.{ext}"));
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;

@@ -402,9 +402,13 @@ impl Slack {
         state.trim();
         let written = serde_json::to_vec(&*state).map_err(|e| e.to_string()).and_then(|bytes| {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
             let tmp = self.dir.join("slack-state.json.tmp");
-            std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(&bytes)).and_then(|()| std::fs::rename(&tmp, self.dir.join("slack-state.json"))).map_err(|e| e.to_string())
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // The config folder is user-only on Windows (`ipc::private_dir`)
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            options.open(&tmp).and_then(|mut f| f.write_all(&bytes)).and_then(|()| std::fs::rename(&tmp, self.dir.join("slack-state.json"))).map_err(|e| e.to_string())
         });
         *lock(&self.unsaved) = written.err().unwrap_or_default();
         drop(state);

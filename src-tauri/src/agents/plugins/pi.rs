@@ -1,5 +1,10 @@
+#[cfg(any(unix, test))]
 use super::cli_note;
-use super::super::{sh, Adapter, Launch, Profile, Interrupt};
+#[cfg(any(unix, test))]
+use super::super::sh;
+#[cfg(any(unix, test))]
+use super::super::Launch;
+use super::super::{Adapter, Profile, Interrupt};
 
 pub struct Pi;
 
@@ -9,6 +14,7 @@ impl Adapter for Pi {
     fn profile(&self) -> Profile {
         Profile { id: "pi", label: "Pi", command: "pi", optional: true, can_supervise: true, task_tracking: false }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let mut cmd = format!("exec {base}");
         if l.note { cmd += &format!(" --append-system-prompt {}", sh(&cli_note(l))); }

@@ -1,3 +1,5 @@
+import { homePath } from '../utils/paths';
+import { isPaletteKey, paletteShortcut, PLATFORM } from '../utils/platform';
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
@@ -107,6 +109,7 @@ export default function SessionCommandPanel({
   const id = useId();
   const listId = `${id}-list`;
 
+  const shortcut = paletteShortcut(PLATFORM);
   const close = () => {
     onOpenChange(false);
     setQuery('');
@@ -114,7 +117,7 @@ export default function SessionCommandPanel({
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 's') {
+      if (isPaletteKey(event, PLATFORM)) {
         event.preventDefault();
         onOpenChange(!open);
       }
@@ -171,7 +174,7 @@ export default function SessionCommandPanel({
         const key = sessionKey(s);
         const live = liveByKey.get(key);
         const title = live ? liveSessionLabel(live, { [s.id]: formatSessionTitle(s) }) : formatSessionTitle(s);
-        const folder = s.cwd ? s.cwd.replace(/^\/(Users|home)\/[^/]+/, '~') : '';
+        const folder = s.cwd ? homePath(s.cwd) : '';
         const age = s.modified ? formatAge(s.modified) : '';
         const metaParts = [folder, s.model, age].filter(Boolean);
         next.push({
@@ -341,13 +344,13 @@ export default function SessionCommandPanel({
         <button
           type="button"
           className="cmd-trigger-btn"
-          aria-keyshortcuts="Meta+S"
+          aria-keyshortcuts={shortcut.aria}
           onClick={() => onOpenChange(true)}
-          title="Search sessions & commands (⌘S)"
+          title={`Search sessions & commands (${shortcut.label})`}
         >
           <Search size={13} aria-hidden="true" />
           <span className="cmd-trigger-btn__label">Search</span>
-          <Kbd>⌘S</Kbd>
+          <Kbd>{shortcut.label}</Kbd>
         </button>
       )}
 
@@ -427,7 +430,7 @@ export default function SessionCommandPanel({
                 </div>
                 {directory && (
                   <span className="cmd-dir-badge" title={directory}>
-                    <span>in {directory.replace(/^\/(Users|home)\/[^/]+/, '~')}</span>
+                    <span>in {homePath(directory)}</span>
                     <button type="button" aria-label="Search all folders" onClick={onClearDirectory}>
                       <X size={11} />
                     </button>
@@ -545,7 +548,7 @@ export default function SessionCommandPanel({
                           {
                             label: 'Workspace',
                             value: activeItem.session.cwd
-                              ? activeItem.session.cwd.replace(/^\/(Users|home)\/[^/]+/, '~')
+                              ? homePath(activeItem.session.cwd)
                               : 'Unknown',
                             mono: true,
                           },

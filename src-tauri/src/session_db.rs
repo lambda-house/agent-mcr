@@ -12,9 +12,21 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 pub struct Database {
-    connection: SqliteConnection,
+    connection: Option<SqliteConnection>,
+}
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(conn) = self.connection.take() {
+            if tokio::runtime::Handle::try_current().is_err() {
+                let _ = runtime().block_on(conn.close());
+            }
+        }
+    }
 }
 impl Database {
+    fn conn(&mut self) -> &mut SqliteConnection {
+        self.connection.as_mut().expect("database connection")
+    }
     pub fn open(path: &Path, readonly: bool, immutable: bool) -> Result<Self, String> {
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -24,12 +36,14 @@ impl Database {
             .busy_timeout(Duration::from_secs(3));
         runtime()
             .block_on(SqliteConnection::connect_with(&options))
-            .map(|connection| Self { connection })
+            .map(|connection| Self {
+                connection: Some(connection),
+            })
             .map_err(|e| e.to_string())
     }
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
         runtime()
-            .block_on(sqlx::raw_sql(sql).execute(&mut self.connection))
+            .block_on(sqlx::raw_sql(sql).execute(self.conn()))
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -39,7 +53,7 @@ impl Database {
             q = q.bind(*arg);
         }
         runtime()
-            .block_on(q.execute(&mut self.connection))
+            .block_on(q.execute(self.conn()))
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -49,7 +63,7 @@ impl Database {
             q = q.bind(*arg);
         }
         runtime()
-            .block_on(q.fetch_all(&mut self.connection))
+            .block_on(q.fetch_all(self.conn()))
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(|row| {

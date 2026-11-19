@@ -42,13 +42,14 @@ function formatRelativeTime(timestamp: number): string {
 function truncatePath(path: string, maxLength: number = 50): string {
   if (path.length <= maxLength) return path;
   
-  const parts = path.split('/');
+  const parts = path.split(/[\\/]/);
+  const separator = path.includes('\\') ? '\\' : '/';
   if (parts.length <= 3) return path;
   
   const first = parts[0] || parts[1]; // Handle leading /
-  const last = parts.slice(-2).join('/');
+  const last = parts.slice(-2).join(separator);
   
-  return `${first}/.../${last}`;
+  return `${first}${separator}...${separator}${last}`;
 }
 
 /**

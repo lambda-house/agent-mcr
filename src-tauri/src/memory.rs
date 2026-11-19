@@ -3,7 +3,8 @@
 //! remote teob memory, whose tools are passed through unchanged.
 //!
 //! The service is the only holder of the sign-in. The tokens live in the
-//! macOS Keychain and never leave this module: no state file, status, tool
+//! system's secret store (`vault.rs`: the macOS Keychain, Windows Credential
+//! Manager) and never leave this module: no state file, status, tool
 //! result or log line carries one, and no session's configuration or
 //! environment does. Nothing connects by itself: the operator connects in the
 //! app, after a native dialog, and signs in in the browser.
@@ -162,11 +163,22 @@ fn b64url(bytes: &[u8]) -> String {
     out
 }
 
-/// Random bytes for the PKCE verifier and `state`. No weaker fallback: a
-/// sign-in without them is not started.
+/// Random bytes for the PKCE verifier and `state`, from the system's
+/// generator. No weaker fallback: a sign-in without them is not started.
 fn random(len: usize) -> Result<String, String> {
     let mut bytes = vec![0u8; len];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(|e| format!("No random numbers for the sign-in: {e}"))?;
+    #[cfg(unix)]
+    let filled = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(|e| e.to_string());
+    #[cfg(windows)]
+    let filled = {
+        use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+        // SAFETY: `bytes` is a writable buffer of `len` bytes; the system-preferred RNG needs no handle.
+        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+        if status == 0 { Ok(()) } else { Err(format!("BCryptGenRandom failed ({status:#x})")) }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let filled: Result<(), String> = Err("this system has no generator this app knows".into());
+    filled.map_err(|e| format!("No random numbers for the sign-in: {e}"))?;
     Ok(b64url(&bytes))
 }
 
@@ -348,12 +360,16 @@ impl Link {
     }
 
     fn change(&self, with: impl FnOnce(&mut State)) {
-        use std::os::unix::fs::OpenOptionsExt;
         let mut state = lock(&self.state);
         with(&mut state);
         let Ok(bytes) = serde_json::to_vec_pretty(&*state) else { return };
         let tmp = self.dir.join("memory-state.json.tmp");
-        let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(&bytes)).and_then(|()| std::fs::rename(&tmp, self.dir.join("memory-state.json")));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // The config folder is user-only on Windows (`ipc::private_dir`)
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let written = options.open(&tmp).and_then(|mut f| f.write_all(&bytes)).and_then(|()| std::fs::rename(&tmp, self.dir.join("memory-state.json")));
         if let Err(e) = written {
             eprintln!("memory: the state was not written: {e}");
         }
@@ -1483,8 +1499,11 @@ mod tests {
         let visible = rig.visible();
         assert!(!visible.contains("secret") && visible.contains(&base), "{visible}");
         // The state is the person's alone
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(rig.dir.join("memory-state.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(rig.dir.join("memory-state.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         // The loopback address took this one answer and is closed
         assert!(rig.memory.connect().is_err());
     }

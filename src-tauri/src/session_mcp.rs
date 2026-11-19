@@ -13,20 +13,42 @@ use std::{
 
 pub const MAX_MESSAGE: u64 = 1024 * 1024;
 pub fn read_frame(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
+    read_frame_with_abort(reader, || false)
+}
+fn read_frame_with_abort(
+    reader: &mut impl BufRead,
+    aborted: impl Fn() -> bool,
+) -> Result<Option<Value>, String> {
     let mut line = Vec::new();
-    reader
-        .take(MAX_MESSAGE + 1)
-        .read_until(b'\n', &mut line)
-        .map_err(|e| e.to_string())?;
-    if line.is_empty() {
-        return Ok(None);
+    loop {
+        if aborted() {
+            return Ok(None);
+        }
+        let remaining = (MAX_MESSAGE + 1).saturating_sub(line.len() as u64);
+        match reader.by_ref().take(remaining).read_until(b'\n', &mut line) {
+            Ok(0) => {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                return Err("Oversized or incomplete MCP frame".into());
+            }
+            Ok(_) => {
+                if line.len() as u64 > MAX_MESSAGE || line.last() != Some(&b'\n') {
+                    return Err("Oversized or incomplete MCP frame".into());
+                }
+                return serde_json::from_slice(&line)
+                    .map(Some)
+                    .map_err(|e| format!("Invalid JSON: {e}"));
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
     }
-    if line.len() as u64 > MAX_MESSAGE || line.last() != Some(&b'\n') {
-        return Err("Oversized or incomplete MCP frame".into());
-    }
-    serde_json::from_slice(&line)
-        .map(Some)
-        .map_err(|e| format!("Invalid JSON: {e}"))
 }
 /// What one MCP server on this transport offers.
 pub struct Server {
@@ -168,8 +190,8 @@ pub struct Service {
     clients: Mutex<std::collections::BTreeMap<u64, String>>,
     path: Mutex<Option<PathBuf>>,
     error: Mutex<Option<String>>,
-    #[cfg(unix)]
-    sockets: Mutex<std::collections::BTreeMap<u64, std::os::unix::net::UnixStream>>,
+    sockets: Mutex<std::collections::BTreeMap<u64, crate::ipc::Stream>>,
+    generation: std::sync::atomic::AtomicU64,
 }
 impl Service {
     pub fn status(&self) -> Value {
@@ -180,7 +202,8 @@ impl Service {
     }
     pub fn revoke(&self) {
         *self.grant.lock().unwrap() = Grant::default();
-        #[cfg(unix)]
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         for stream in self.sockets.lock().unwrap().values() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
@@ -217,54 +240,47 @@ impl Service {
         audit.push_back(json!({"at":chrono::Utc::now().to_rfc3339(),"client":client,"tool":name,"cohort":args.get("cohort"),"session":args.get("session"),"ok":result.is_ok(),"elapsedMs":began.elapsed().as_millis()}));
         result
     }
-    #[cfg(unix)]
     pub fn start(self: &Arc<Self>, path: &Path, index: Arc<Mutex<Index>>) -> Result<(), String> {
-        use std::os::unix::{
-            fs::PermissionsExt,
-            net::{UnixListener, UnixStream},
-        };
+        use crate::ipc::{is_socket, private_dir, private_file, Listener, Stream};
         let mut stored = self.path.lock().map_err(|_| "Service lock unavailable")?;
         if stored.is_some() {
             return Ok(());
         }
         let parent = path.parent().ok_or("Socket directory missing")?;
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        if std::fs::symlink_metadata(parent)
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_symlink()
+        #[cfg(unix)]
         {
-            return Err("Socket directory cannot be a symlink".into());
-        }
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
-        if path.exists() {
-            if UnixStream::connect(path).is_ok() {
-                return Err("Another Agent MCR analysis service is already listening".into());
-            }
-            use std::os::unix::fs::FileTypeExt;
-            if !std::fs::symlink_metadata(path)
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if std::fs::symlink_metadata(parent)
                 .map_err(|e| e.to_string())?
                 .file_type()
-                .is_socket()
+                .is_symlink()
             {
+                return Err("Socket directory cannot be a symlink".into());
+            }
+        }
+        private_dir(parent)?;
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if Stream::connect(path).is_ok() {
+                return Err("Another Agent MCR analysis service is already listening".into());
+            }
+            if !is_socket(path, &meta) {
                 return Err("Refusing to replace a non-socket file".into());
             }
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
         }
-        let listener = UnixListener::bind(path)
+        let listener = Listener::bind(path)
             .map_err(|e| format!("Cannot start local analysis socket: {e}"))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
+        private_file(path)?;
         *stored = Some(path.into());
         let service = self.clone();
         std::thread::spawn(move || {
             let mut next = 0u64;
             for incoming in listener.incoming() {
+                let accepted_at = crate::peer::accept_time();
                 let Ok(stream) = incoming else {
                     break;
                 };
-                if !crate::peer::same_user(&stream) {
+                if !crate::peer::Peer::open(&stream, accepted_at).is_some_and(|p| p.same_user()) {
                     continue;
                 }
                 if !service.grant.lock().unwrap().enabled
@@ -289,19 +305,24 @@ impl Service {
         });
         Ok(())
     }
-    #[cfg(unix)]
     pub fn serve_stream(
         self: Arc<Self>,
-        mut writer: std::os::unix::net::UnixStream,
+        mut writer: crate::ipc::Stream,
         index: Arc<Mutex<Index>>,
         client_id: u64,
     ) {
+        let start_gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
         let _ = writer.set_write_timeout(Some(std::time::Duration::from_secs(10)));
         if let Ok(copy) = writer.try_clone() {
+            // On Windows AF_UNIX, shutdown() does not unblock a thread already in recv().
+            #[cfg(windows)]
+            let _ = copy.set_read_timeout(Some(std::time::Duration::from_millis(100)));
             let mut reader = BufReader::new(copy);
             let mut protocol = Protocol::default();
             loop {
-                let v = match read_frame(&mut reader) {
+                let v = match read_frame_with_abort(&mut reader, || {
+                    self.generation.load(std::sync::atomic::Ordering::Acquire) != start_gen
+                }) {
                     Ok(Some(v)) => v,
                     Ok(None) => break,
                     Err(e) if e.starts_with("Invalid JSON:") => {
@@ -330,21 +351,14 @@ impl Service {
         self.clients.lock().unwrap().remove(&client_id);
         self.sockets.lock().unwrap().remove(&client_id);
     }
-    #[cfg(not(unix))]
-    pub fn start(self: &Arc<Self>, _: &Path, _: Arc<Mutex<Index>>) -> Result<(), String> {
-        Err("Local MCP currently requires macOS or Linux".into())
-    }
 }
-#[cfg(unix)]
 pub fn bridge(path: &Path) -> Result<(), String> {
-    use std::os::unix::net::UnixStream;
-    let socket = UnixStream::connect(path).map_err(|e| {
+    let socket = crate::ipc::Stream::connect(path).map_err(|e| {
         format!("Agent MCR analysis unavailable. Open the app and enable Agent access. {e}")
     })?;
     bridge_stream(socket)
 }
-#[cfg(unix)]
-pub fn bridge_stream(mut socket: std::os::unix::net::UnixStream) -> Result<(), String> {
+pub fn bridge_stream(mut socket: crate::ipc::Stream) -> Result<(), String> {
     let mut input = socket.try_clone().map_err(|e| e.to_string())?;
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
@@ -369,10 +383,6 @@ pub fn bridge_stream(mut socket: std::os::unix::net::UnixStream) -> Result<(), S
     });
     std::io::copy(&mut socket, &mut std::io::stdout().lock()).map_err(|e| e.to_string())?;
     Ok(())
-}
-#[cfg(not(unix))]
-pub fn bridge(_: &Path) -> Result<(), String> {
-    Err("Local MCP currently requires macOS or Linux".into())
 }
 
 #[cfg(test)]
@@ -467,55 +477,159 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod socket_tests {
     use super::*;
+    use crate::ipc::{Listener, Stream};
+
+    fn short_temp_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(unix)]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        base.join(format!("amcr-{tag}-{}-{n}", std::process::id()))
+    }
+
+    fn stream_pair(dir: &Path) -> (Stream, Stream) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("pair.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = Listener::bind(&path).unwrap();
+        let client = Stream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
     #[test]
     fn live_socket_protocol_and_revocation() {
-        use std::os::unix::net::UnixStream;
-        let service = Arc::new(Service::default());
-        *service.grant.lock().unwrap() = Grant {
-            enabled: true,
-            ..Grant::default()
-        };
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dir = short_temp_dir("p");
+            let service = Arc::new(Service::default());
+            *service.grant.lock().unwrap() = Grant {
+                enabled: true,
+                ..Grant::default()
+            };
+            let (mut client, server) = stream_pair(&dir);
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            service
+                .sockets
+                .lock()
+                .unwrap()
+                .insert(1, server.try_clone().unwrap());
+            let s = service.clone();
+            let worker = std::thread::spawn(move || {
+                s.serve_stream(server, Arc::new(Mutex::new(Index::default())), 1)
+            });
+            let mut read = BufReader::new(client.try_clone().unwrap());
+            writeln!(client, "not json").unwrap();
+            assert_eq!(
+                read_frame(&mut read).unwrap().unwrap()["error"]["code"],
+                -32700
+            );
+            writeln!(client,"{}",json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"socket-test"},"capabilities":{}}})).unwrap();
+            assert_eq!(
+                read_frame(&mut read).unwrap().unwrap()["result"]["serverInfo"]["name"],
+                "agent-mcr-analysis"
+            );
+            writeln!(
+                client,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
             .unwrap();
-        service
-            .sockets
-            .lock()
-            .unwrap()
-            .insert(1, server.try_clone().unwrap());
-        let s = service.clone();
-        let worker = std::thread::spawn(move || {
-            s.serve_stream(server, Arc::new(Mutex::new(Index::default())), 1)
+            writeln!(client,"{}",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analysis_status"}})).unwrap();
+            assert_eq!(
+                read_frame(&mut read).unwrap().unwrap()["result"]["isError"],
+                false
+            );
+            service.revoke();
+            assert!(read_frame(&mut read).unwrap().is_none());
+            worker.join().unwrap();
+            assert!(service.status()["clients"].as_array().unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = done_tx.send(());
         });
-        let mut read = BufReader::new(client.try_clone().unwrap());
-        writeln!(client, "not json").unwrap();
-        assert_eq!(
-            read_frame(&mut read).unwrap().unwrap()["error"]["code"],
-            -32700
-        );
-        writeln!(client,"{}",json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"socket-test"},"capabilities":{}}})).unwrap();
-        assert_eq!(
-            read_frame(&mut read).unwrap().unwrap()["result"]["serverInfo"]["name"],
-            "agent-mcr-analysis"
-        );
-        writeln!(
-            client,
-            "{}",
-            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        )
-        .unwrap();
-        writeln!(client,"{}",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"analysis_status"}})).unwrap();
-        assert_eq!(
-            read_frame(&mut read).unwrap().unwrap()["result"]["isError"],
-            false
-        );
-        service.revoke();
-        assert!(read_frame(&mut read).unwrap().is_none());
-        worker.join().unwrap();
-        assert!(service.status()["clients"].as_array().unwrap().is_empty());
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("live_socket_protocol_and_revocation timed out");
+    }
+
+    #[test]
+    fn service_start_enforces_socket_hygiene_and_concurrent_revocation() {
+        let dir = short_temp_dir("s");
+        let sock_dir = dir.join("analysis");
+        crate::ipc::private_dir(&sock_dir).unwrap();
+        let sock = sock_dir.join("mcp.sock");
+
+        // Refuses a regular non-socket file at the socket path.
+        std::fs::write(&sock, b"not a socket").unwrap();
+        let svc = Arc::new(Service::default());
+        let err = svc.start(&sock, Arc::new(Mutex::new(Index::default()))).unwrap_err();
+        assert!(err.contains("non-socket"), "{err}");
+        std::fs::remove_file(&sock).unwrap();
+
+        // Replaces a stale socket file and starts listening.
+        {
+            let _stale = Listener::bind(&sock).unwrap();
+        }
+        *svc.grant.lock().unwrap() = Grant { enabled: true, ..Grant::default() };
+        svc.start(&sock, Arc::new(Mutex::new(Index::default()))).unwrap();
+
+        // Parallel clients can initialize and call tools concurrently.
+        let mut clients = Vec::new();
+        for i in 0..3 {
+            let mut client = Stream::connect(&sock).unwrap();
+            client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            writeln!(client, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":format!("c{i}")},"capabilities":{}}})).unwrap();
+            assert_eq!(read_frame(&mut reader).unwrap().unwrap()["result"]["serverInfo"]["name"], "agent-mcr-analysis");
+            writeln!(client, "{}", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).unwrap();
+            clients.push((client, reader));
+        }
+
+        // Revocation closes every active stream.
+        svc.revoke();
+        for (_c, mut reader) in clients {
+            assert!(read_frame(&mut reader).unwrap().is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_start_rejects_symlink_parent() {
+        let dir = short_temp_dir("sym");
+        let target = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let svc = Arc::new(Service::default());
+        let err = svc.start(&link.join("mcp.sock"), Arc::new(Mutex::new(Index::default()))).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_start_creates_missing_analysis_dir() {
+        let dir = short_temp_dir("fresh");
+        let sock = dir.join("analysis").join("mcp.sock");
+        assert!(!dir.join("analysis").exists());
+        let svc = Arc::new(Service::default());
+        *svc.grant.lock().unwrap() = Grant { enabled: true, ..Grant::default() };
+        svc.start(&sock, Arc::new(Mutex::new(Index::default()))).unwrap();
+        assert!(sock.exists());
+        let mut client = Stream::connect(&sock).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        writeln!(client, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"fresh-test"},"capabilities":{}}})).unwrap();
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap()["result"]["serverInfo"]["name"], "agent-mcr-analysis");
+        svc.revoke();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

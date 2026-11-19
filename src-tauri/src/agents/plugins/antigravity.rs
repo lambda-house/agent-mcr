@@ -1,5 +1,10 @@
+#[cfg(any(unix, test))]
 use super::cli_prompt;
-use super::super::{sh, Adapter, Launch, Profile, Interrupt};
+#[cfg(any(unix, test))]
+use super::super::sh;
+#[cfg(any(unix, test))]
+use super::super::Launch;
+use super::super::{Adapter, Profile, Interrupt};
 
 pub struct Antigravity;
 
@@ -8,6 +13,7 @@ impl Adapter for Antigravity {
     fn profile(&self) -> Profile {
         Profile { id: "antigravity", label: "Antigravity", command: "agy --mode accept-edits", optional: true, can_supervise: true, task_tracking: false }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let mut cmd = format!("exec {base}");
         if let Some(id) = l.resume {
@@ -17,6 +23,9 @@ impl Adapter for Antigravity {
             cmd += &format!(" --prompt-interactive {}", sh(&t));
         }
         Ok(cmd)
+    }
+    fn detects_prompt(&self) -> bool {
+        true
     }
     /// Its status line says "? for shortcuts" only at the input box: a turn
     /// shows "esc to cancel", and menus (folder trust, permissions) "enter Confirm"

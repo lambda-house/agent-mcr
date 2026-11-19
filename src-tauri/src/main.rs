@@ -18,21 +18,16 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 
 mod agent;
-#[cfg(unix)]
+mod ipc;
 mod peer;
-#[cfg(unix)]
 mod runner;
-#[cfg(unix)]
 mod agents;
 mod harness;
-#[cfg(unix)]
 mod harness_preferences;
-#[cfg(unix)]
 mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
 mod session_mcp;
-#[cfg(unix)]
 mod memory;
 mod slack;
 mod vault;
@@ -565,12 +560,20 @@ fn encode_text(content: &str, previous: Option<&[u8]>) -> Result<Vec<u8>, AppErr
 // History Functions
 // ============================================================
 
+fn config_dir_from(
+    config: Option<PathBuf>,
+    data_local: Option<PathBuf>,
+    windows: bool,
+) -> Option<PathBuf> {
+    (if windows { data_local } else { config }).map(|p| p.join("agent-mcr"))
+}
+
 fn get_config_dir() -> Result<PathBuf, AppError> {
-    dirs::config_dir()
-        .map(|p| {
-            p.join("agent-mcr")
-        })
-        .ok_or_else(|| AppError::new("CONFIG_ERROR", "Cannot determine config directory"))
+    let dir = config_dir_from(dirs::config_dir(), dirs::data_local_dir(), cfg!(windows))
+        .ok_or_else(|| AppError::new("CONFIG_ERROR", "Cannot determine config directory"))?;
+    ipc::private_dir(&dir)
+        .map_err(|e| AppError::with_details("CONFIG_ERROR", "Cannot secure config directory", &e))?;
+    Ok(dir)
 }
 
 // ============================================================
@@ -826,7 +829,7 @@ fn session_folders(access: &AccessState, sessions: &session_commands::SessionSta
     let mut found: Vec<(u64, PathBuf)> = Vec::new();
     if let Ok(dir) = get_config_dir() {
         // Only a service that already runs: listing documents must not start one
-        let hosted = std::os::unix::net::UnixStream::connect(harness::socket(&dir)).is_ok()
+        let hosted = ipc::Stream::connect(harness::socket(&dir)).is_ok()
             .then(|| harness::call(&dir, serde_json::json!({"op": "sessions"})).ok())
             .flatten();
         for s in hosted.iter().flat_map(|h| h["sessions"].as_array().into_iter().flatten()) {
@@ -1167,7 +1170,6 @@ fn apply_linux_rendering_workarounds() {
 fn main() {
     // The runner owns agent terminals and outlives the app (started by launchd).
     // Like the MCP bridge, it must branch before any AppKit/Tauri initialization.
-    #[cfg(unix)]
     if std::env::args().nth(1).as_deref() == Some("--runner") {
         let result = get_config_dir()
             .map_err(|e| e.message)
@@ -1179,7 +1181,6 @@ fn main() {
         return;
     }
     // The harness service, the supervisor's MCP bridge and the agents' hook reporter
-    #[cfg(unix)]
     match std::env::args().nth(1).as_deref() {
         Some(flag @ ("--harness" | "--supervise" | "--harness-mcp" | "--memory-mcp")) => {
             let result = get_config_dir().map_err(|e| e.message).and_then(|dir| match flag {
@@ -1198,7 +1199,7 @@ fn main() {
         Some("--stop-background") => {
             let uninstall = std::env::args().nth(2).as_deref() == Some("--uninstall");
             match get_config_dir().map_err(|e| e.message).and_then(|dir| harness::stop_background(&dir, true, uninstall)) {
-                Ok(()) => println!("{}", if uninstall { "Sessions ended, background processes stopped, LaunchAgent files removed." } else { "Sessions ended, background processes stopped. They start again when you allow it in the app." }),
+                Ok(()) => println!("{}", if uninstall { if cfg!(windows) { "Sessions ended, background processes stopped, permission forgotten." } else { "Sessions ended, background processes stopped, LaunchAgent files removed." } } else { "Sessions ended, background processes stopped. They start again when you allow it in the app." }),
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -1226,7 +1227,7 @@ fn main() {
         _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
-        let path = std::env::args().nth(2).map(PathBuf::from).or_else(||get_config_dir().ok().map(|p|p.join("analysis/mcp.sock")));
+        let path = std::env::args().nth(2).map(PathBuf::from).or_else(|| get_config_dir().ok().map(|p| p.join("analysis").join("mcp.sock")));
         let result = path.ok_or_else(||"Configuration directory unavailable".to_string()).and_then(|p|session_mcp::bridge(&p));
         if let Err(e) = result {eprintln!("{e}");std::process::exit(1);}
         return;
@@ -1236,7 +1237,7 @@ fn main() {
 
     let access = AccessState::load();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Must be the first plugin: a second launch brings this instance forward and exits.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -1327,8 +1328,21 @@ fn main() {
             read_snapshot,
             mark_read,
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .build(tauri::generate_context!());
+    #[cfg(windows)]
+    let app = app.unwrap_or_else(|error| {
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(window: *mut std::ffi::c_void, text: *const u16, title: *const u16, kind: u32) -> i32;
+        }
+        let text: Vec<u16> = format!("Agent MCR could not start. Make sure Microsoft Edge WebView2 Runtime is installed.\n\n{error}").encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "Agent MCR".encode_utf16().chain(Some(0)).collect();
+        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10); }
+        std::process::exit(1);
+    });
+    #[cfg(not(windows))]
+    let app = app.expect("error while building tauri application");
+    app
         // Files handed over by the system ("Open with") are not opened: the app shows agent documents only
         .run(|_app, _event| {});
 }
@@ -1450,6 +1464,17 @@ mod tests {
         assert!(!access.can_open(Path::new("/work/app/CLAUDE.md")));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_folder_access_is_scoped() {
+        let access = Access { agent_workspace: true, session_folders: vec![PathBuf::from(r"C:\Users\me\app")], ..Access::default() };
+        assert!(access.can_open(Path::new(r"C:\Users\me\app\.claude\rules\api.md")));
+        assert!(!access.can_open(Path::new(r"C:\Users\me\application\CLAUDE.md")));
+        assert!(!access.can_open(Path::new(r"C:\Users\me\app\README.md")));
+        assert!(Path::new(r"C:\Users\me").starts_with(Path::new(r"C:\Users")));
+        assert!(!Path::new(r"C:\Users\me").starts_with(Path::new(r"C:\Users\me\app")));
+    }
+
     #[test]
     fn atomic_write_replaces_content_and_keeps_permissions() {
         let dir = temp_dir("atomic");
@@ -1485,6 +1510,15 @@ mod tests {
         assert!(!is_app_url(&url("http://tauri.localhost.evil.com/")));
         assert!(!is_app_url(&url("file:///etc/passwd")));
         assert!(!is_app_url(&url("localfile://localhost/x.png")));
+    }
+
+    #[test]
+    fn config_dir_uses_data_local_on_windows_and_config_on_unix() {
+        let cfg = Some(PathBuf::from("/cfg"));
+        let local = Some(PathBuf::from("/local"));
+        assert_eq!(config_dir_from(cfg.clone(), local.clone(), true), Some(PathBuf::from("/local/agent-mcr")));
+        assert_eq!(config_dir_from(cfg, local, false), Some(PathBuf::from("/cfg/agent-mcr")));
+        assert_eq!(config_dir_from(Some(PathBuf::from("/cfg")), None, true), None);
     }
 
 }

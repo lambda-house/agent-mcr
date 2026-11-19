@@ -6,6 +6,7 @@
 
 use crate::harness::{claude_mcp, claude_plugin, claude_settings, Resumable, Subagent, AGENT_SERVER, PEER_NOTE};
 use serde::Serialize;
+#[cfg(any(unix, test))]
 use serde_json::json;
 use std::io::Read;
 use std::path::Path;
@@ -221,7 +222,7 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
         (docs_hits, "Docs"),
         (data_hits, "Data"),
     ];
-    scope_counts.sort_by_key(|c| std::cmp::Reverse(c.0));
+    scope_counts.sort_by_key(|a| std::cmp::Reverse(a.0));
     let tags = scope_counts
         .into_iter()
         .filter(|(c, _)| *c > 0)
@@ -259,7 +260,9 @@ pub struct Launch<'a> {
     pub resume: Option<&'a str>,
     pub task: Option<&'a str>,
     /// Pass the hooks that the agent runs only after the person trusted them
-    /// in the agent itself (Codex, MCR-74)
+    /// in the agent itself (Codex, MCR-74). Unix only for now: see
+    /// docs/WINDOWS_PORT.md, "Not on Windows yet"
+    #[cfg_attr(windows, allow(dead_code))]
     pub own_hooks: bool,
 }
 
@@ -275,6 +278,7 @@ pub trait Adapter: Sync {
     fn profile(&self) -> Profile;
     fn id(&self) -> &'static str { self.profile().id }
     /// The command run in the login shell; `base` is the profile's command (D7)
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String>;
     /// Files the launch reads, as paths under the config dir. Written before
     /// every launch, so a restart picks up what a new build wants in them.
@@ -299,6 +303,10 @@ pub trait Adapter: Sync {
     /// tells whether it is at its prompt (`at_prompt`)
     fn silent_until_first_turn(&self) -> bool {
         false
+    }
+    /// Whether `at_prompt` reliably detects the input box (for queued first-task delivery)
+    fn detects_prompt(&self) -> bool {
+        self.silent_until_first_turn()
     }
     /// The input box is on screen (the markers depend on the agent's version).
     /// False when unsure: text typed into a menu would answer it
@@ -372,7 +380,8 @@ fn asked(screen: &str, is_question: impl Fn(&str) -> bool) -> Option<String> {
 /// hook it was is in the payload's `hook_event_name`.
 pub const CODEX_HOOK: &str = "codex-hook";
 
-/// The Codex hooks the harness asks for.
+/// The Codex hooks the harness asks for (Unix launches only, like `own_hooks`).
+#[cfg_attr(windows, allow(dead_code))]
 pub const CODEX_HOOKS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse"];
 
 pub struct Claude;
@@ -383,6 +392,7 @@ impl Adapter for Claude {
     fn profile(&self) -> Profile {
         Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits", optional: false, can_supervise: true, task_tracking: true }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let mut cmd = format!("exec {base}");
         if !l.mcp.is_empty() {
@@ -462,6 +472,7 @@ impl Adapter for Codex {
     fn profile(&self) -> Profile {
         Profile { id: "codex", label: "Codex", command: "codex --sandbox workspace-write --ask-for-approval on-request", optional: false, can_supervise: true, task_tracking: true }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
         let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
@@ -576,6 +587,7 @@ impl Adapter for Shell {
     fn profile(&self) -> Profile {
         Profile { id: "shell", label: "Terminal", command: "", optional: false, can_supervise: false, task_tracking: false }
     }
+    #[cfg(any(unix, test))]
     fn command_line(&self, _base: &str, l: &Launch) -> Result<String, String> {
         if l.resume.is_some() || l.task.is_some() {
             return Err("A shell has no session to resume and takes no task".into());
@@ -600,6 +612,7 @@ pub fn adapter(profile: &str) -> &'static dyn Adapter {
 }
 
 /// The command line run in the login shell (empty for a plain shell).
+#[cfg(any(unix, test))]
 pub fn command_line(l: &Launch) -> Result<String, String> {
     let agent = adapters().find(|a| a.id() == l.profile).ok_or_else(|| format!("Unknown profile {}", l.profile))?;
     if l.supervisor && !agent.profile().can_supervise {
@@ -610,6 +623,140 @@ pub fn command_line(l: &Launch) -> Result<String, String> {
     }
     let task = l.task.map(str::trim).filter(|t| !t.is_empty());
     agent.command_line(agent.profile().command, &Launch { task, ..*l })
+}
+
+/// A TOML single-quoted literal string (no escapes, no `"` needed).
+#[cfg(any(windows, test))]
+pub fn toml_literal(s: &str) -> Result<String, String> {
+    if s.chars().any(|c| matches!(c, '\'' | '\r' | '\n' | '\0')) {
+        return Err("TOML literal string contains an unsupported character".into());
+    }
+    Ok(format!("'{s}'"))
+}
+
+/// Encode `args` for `cmd.exe /d /v:off /c %AMCR_LAUNCH%`.
+///
+/// Refuses any argument containing `"`, `%`, CR, LF or NUL. Every argument
+/// (including the program name) is wrapped in double quotes, with trailing
+/// backslash runs doubled for CRT/`CommandLineToArgvW`, and joined by one space.
+#[cfg(any(windows, test))]
+pub fn cmd_line(args: &[String]) -> Result<String, String> {
+    if args.is_empty() {
+        return Err("Nothing to run".into());
+    }
+    let mut inner = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        if arg.chars().any(|c| matches!(c, '"' | '%' | '\r' | '\n' | '\0')) {
+            return Err("Launch argument contains an unsupported character for cmd.exe".into());
+        }
+        if i > 0 {
+            inner.push(' ');
+        }
+        inner.push('"');
+        let mut backslashes = 0usize;
+        for ch in arg.chars() {
+            if ch == '\\' {
+                backslashes += 1;
+                inner.push('\\');
+            } else {
+                backslashes = 0;
+                inner.push(ch);
+            }
+        }
+        for _ in 0..backslashes {
+            inner.push('\\');
+        }
+        inner.push('"');
+    }
+    Ok(inner)
+}
+
+/// Raw argument vector for a Windows launch (without `exec` and without free-text tasks).
+#[cfg(any(windows, test))]
+pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
+    let agent = adapters().find(|a| a.id() == l.profile).ok_or_else(|| format!("Unknown profile {}", l.profile))?;
+    if l.supervisor && !agent.profile().can_supervise {
+        return Err("This harness cannot supervise agents".into());
+    }
+    if l.resume.is_some_and(|id| !is_uuid(id)) {
+        return Err("Invalid session id to resume".into());
+    }
+    let task = l.task.map(str::trim).filter(|t| !t.is_empty());
+    let mut args: Vec<String> = Vec::new();
+    match l.profile {
+        "shell" => {
+            if l.resume.is_some() || task.is_some() {
+                return Err("A shell has no session to resume and takes no task".into());
+            }
+            return Ok(vec!["powershell.exe".into(), "-NoLogo".into()]);
+        }
+        "claude" => {
+            args.extend(["claude", "--permission-mode", "acceptEdits"].into_iter().map(str::to_owned));
+            if !l.mcp.is_empty() {
+                args.extend(["--mcp-config".into(), l.mcp.to_owned()]);
+            }
+            args.extend(["--settings".into(), l.settings.to_owned()]);
+            if !l.plugin.is_empty() {
+                args.extend(["--plugin-dir".into(), l.plugin.to_owned()]);
+            }
+            if l.note {
+                args.extend(["--append-system-prompt".into(), PEER_NOTE.to_owned()]);
+            }
+            match (l.resume, l.agent_session) {
+                (Some(id), _) => args.extend(["--resume".into(), id.to_owned()]),
+                (None, Some(id)) if is_uuid(id) => args.extend(["--session-id".into(), id.to_owned()]),
+                _ => {}
+            }
+        }
+        "codex" => {
+            args.push("codex".into());
+            if l.resume.is_some() {
+                args.push("resume".into());
+            }
+            args.extend([
+                "--sandbox", "workspace-write", "--ask-for-approval", "on-request",
+            ].into_iter().map(str::to_owned));
+            let exe_lit = toml_literal(l.exe)?;
+            args.extend(["-c".into(), format!("notify=[{exe_lit},'--harness-hook','codex-notify']")]);
+            args.extend(["-c".into(), "tui.notifications=true".into()]);
+            args.extend(["-c".into(), format!("mcp_servers.{AGENT_SERVER}.command={exe_lit}")]);
+            args.extend(["-c".into(), format!("mcp_servers.{AGENT_SERVER}.args=['--harness-mcp']")]);
+            // The memory server, as on the other systems: a program and one flag, no credential
+            let memory = crate::memory::SERVER;
+            args.extend(["-c".into(), format!("mcp_servers.{memory}.command={exe_lit}")]);
+            args.extend(["-c".into(), format!("mcp_servers.{memory}.args=['--memory-mcp']")]);
+            if l.supervisor {
+                args.extend(["-c".into(), format!("mcp_servers.supervisor.command={exe_lit}")]);
+                args.extend(["-c".into(), "mcp_servers.supervisor.args=['--supervise']".into()]);
+            }
+            if l.note {
+                args.extend(["-c".into(), format!("developer_instructions={}", toml_literal(PEER_NOTE)?)]);
+            }
+            if let Some(id) = l.resume {
+                args.push(id.to_owned());
+            }
+        }
+        "antigravity" => {
+            args.extend(["agy", "--mode", "accept-edits"].into_iter().map(str::to_owned));
+            if let Some(id) = l.resume {
+                args.extend(["--conversation".into(), id.to_owned()]);
+            }
+        }
+        "opencode" => {
+            args.extend(["opencode", "--standalone"].into_iter().map(str::to_owned));
+            if let Some(id) = l.resume {
+                args.extend(["--session".into(), id.to_owned()]);
+            }
+        }
+        "pi" => {
+            args.push("pi".into());
+            if let Some(id) = l.resume {
+                args.extend(["--session".into(), id.to_owned()]);
+            }
+        }
+        other => return Err(format!("Unknown profile {other}")),
+    }
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -753,5 +900,86 @@ mod tests {
         assert!(supervisor.contains("mcp_servers.supervisor.command=\"/x/mcr\"") && supervisor.contains("--supervise"));
         let worker = command_line(&Launch { profile: "codex", exe: "/x/mcr", ..Default::default() }).unwrap();
         assert!(!worker.contains("mcp_servers.supervisor"));
+    }
+
+    #[test]
+    fn cmd_line_quotes_and_refuses_cmd_metacharacters() {
+        let args = vec![
+            "C:\\Program Files\\agent-mcr\\agent-mcr.exe".to_string(),
+            "".to_string(),
+            "C:\\dir with space\\".to_string(),
+            "a & b | c < d > e ^ f (g) !h!".to_string(),
+        ];
+        let encoded = cmd_line(&args).unwrap();
+        assert_eq!(
+            encoded,
+            "\"C:\\Program Files\\agent-mcr\\agent-mcr.exe\" \"\" \"C:\\dir with space\\\\\" \"a & b | c < d > e ^ f (g) !h!\""
+        );
+
+        assert!(cmd_line(&[]).is_err());
+        for bad in ["has\"quote", "has%PATH%", "line\rbreak", "line\nbreak", "has\0nul"] {
+            assert!(cmd_line(&["prog".into(), bad.into()]).is_err(), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn windows_args_build_expected_launches_without_exec_or_free_text() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let shell = windows_args(&Launch { profile: "shell", ..Default::default() }).unwrap();
+        assert_eq!(shell, vec!["powershell.exe", "-NoLogo"]);
+        assert!(windows_args(&Launch { profile: "shell", task: Some("hi"), ..Default::default() }).is_err());
+
+        let claude = windows_args(&Launch {
+            profile: "claude",
+            exe: "C:\\Program Files\\Agent MCR\\agent-mcr.exe",
+            settings: "C:\\Users\\u\\AppData\\Local\\agent-mcr\\claude-hooks.json",
+            mcp: "C:\\Users\\u\\AppData\\Local\\agent-mcr\\claude-mcp.json",
+            plugin: "C:\\Users\\u\\AppData\\Local\\agent-mcr\\claude-plugin",
+            note: true,
+            agent_session: Some(id),
+            task: Some("fix %VAR% & \"quotes\""),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(claude[0], "claude");
+        assert!(claude.contains(&"--session-id".to_string()) && claude.contains(&id.to_string()));
+        assert!(!claude.iter().any(|a| a.contains("fix %VAR%")), "task must not go in Windows argv");
+        assert!(cmd_line(&claude).is_ok());
+
+        let claude_resume = windows_args(&Launch {
+            profile: "claude",
+            settings: "C:\\cfg\\claude-hooks.json",
+            resume: Some(id),
+            ..Default::default()
+        }).unwrap();
+        assert!(claude_resume.contains(&"--resume".to_string()) && claude_resume.contains(&id.to_string()));
+
+        let codex = windows_args(&Launch {
+            profile: "codex",
+            exe: "C:\\Program Files\\Agent MCR\\agent-mcr.exe",
+            supervisor: true,
+            note: true,
+            resume: Some(id),
+            task: Some("never in argv"),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(&codex[..2], &["codex", "resume"]);
+        assert!(codex.contains(&"notify=['C:\\Program Files\\Agent MCR\\agent-mcr.exe','--harness-hook','codex-notify']".to_string()));
+        assert!(codex.contains(&"mcp_servers.supervisor.command='C:\\Program Files\\Agent MCR\\agent-mcr.exe'".to_string()));
+        assert!(codex.contains(&"mcp_servers.supervisor.args=['--supervise']".to_string()));
+        // The memory server comes with a Windows launch too
+        assert!(codex.contains(&"mcp_servers.memory.command='C:\\Program Files\\Agent MCR\\agent-mcr.exe'".to_string()));
+        assert!(codex.contains(&"mcp_servers.memory.args=['--memory-mcp']".to_string()));
+        assert!(codex.iter().any(|a| a.starts_with("developer_instructions='You run in a terminal hosted by Agent MCR")));
+        assert!(!codex.iter().any(|a| a.contains("never in argv")));
+        assert!(cmd_line(&codex).is_ok());
+
+        let agy = windows_args(&Launch {
+            profile: "antigravity",
+            task: Some("hi"),
+            resume: Some(id),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(agy, vec!["agy", "--mode", "accept-edits", "--conversation", id]);
+        assert!(cmd_line(&agy).is_ok());
     }
 }

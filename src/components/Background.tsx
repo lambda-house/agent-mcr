@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { PLATFORM } from '../utils/platform';
 import { harnessApi, type Background, type BackgroundUnit } from '../utils/harness';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -18,7 +19,7 @@ export function BackgroundGate({ stopped, onAllowed }: { stopped: boolean; onAll
   return <div className="hs-gate" role="region" aria-label="Background processes">
     <strong>{stopped ? 'Sessions and background processes are stopped' : 'Agent MCR runs agents in the background'}</strong>
     <p>Two processes of its own keep your agents working when you close or update the app: the <b>runner</b> holds their terminals, the <b>harness service</b> tracks sessions and gives agents their tools.</p>
-    <p>macOS starts them through two files in <code>~/Library/LaunchAgents</code>. They listen only on sockets private to your user, never on the network, and exit ten minutes after the last session ends.</p>
+    <p>{PLATFORM === 'windows' ? <>They are ordinary processes of your user that Agent MCR starts itself; nothing is installed in Windows. They listen</> : <>macOS starts them through two files in <code>~/Library/LaunchAgents</code>. They listen</>} only on sockets private to your user, never on the network, and exit ten minutes after the last session ends.</p>
     <p>{stopped ? 'Nothing runs now, and nothing starts until you allow it.' : 'Nothing is installed or started until you allow it. You can stop and remove them here at any time.'}</p>
     <button type="button" className="primary" disabled={asking} onClick={allow}>{stopped ? 'Start again…' : 'Allow and start…'}</button>
     {error && <div className="hs-error" role="alert">{error}</div>}
@@ -60,7 +61,7 @@ export function BackgroundPanel({ onStopped }: { onStopped: () => void }) {
     {error && <div className="hs-error" role="alert">{error}</div>}
     <div className="hs-background-actions">
       <button type="button" disabled={busy} title="End every session and stop both processes. Nothing starts them again until you allow it." onClick={() => stop(false)}>Stop everything…</button>
-      <button type="button" disabled={busy} title="Stop everything and remove the two LaunchAgent files. Session history and settings stay." onClick={() => stop(true)}>Remove background items…</button>
+      <button type="button" disabled={busy} title={PLATFORM === 'windows' ? 'Stop everything and forget the permission. Session history and settings stay.' : 'Stop everything and remove the two LaunchAgent files. Session history and settings stay.'} onClick={() => stop(true)}>Remove background items…</button>
     </div>
   </section>;
 }

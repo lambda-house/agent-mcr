@@ -276,7 +276,7 @@ pub async fn open_session_memory_window(
     state: State<'_, SessionState>,
 ) -> Result<(), String> {
     let document = read_session_memory(key.clone(), provider, id, Some(true), access, state).await?;
-    if document.provenance != key || !std::path::Path::new(&key).extension().is_some_and(|ext| ext == "md") {
+    if document.provenance != key || std::path::Path::new(&key).extension().is_none_or(|ext| ext != "md") {
         return Err("Only Markdown memory files can open in a document window".into());
     }
     let path = std::fs::canonicalize(&key).map_err(|e| e.to_string())?;

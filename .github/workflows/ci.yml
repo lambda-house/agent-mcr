@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, windows-port, windows-port-b]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -46,5 +47,40 @@ jobs:
         run: cargo clippy --locked --all-targets
 
       - name: Test Rust backend
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
         working-directory: src-tauri
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1 --nocapture
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Lint Rust backend
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build Rust examples
+        working-directory: src-tauri
+        run: cargo build --locked --examples
+      - name: Test Rust backend
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        working-directory: src-tauri
+        run: cargo test --locked -- --test-threads=1 --nocapture

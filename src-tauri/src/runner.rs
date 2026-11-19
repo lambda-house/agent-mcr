@@ -18,13 +18,12 @@
 //! Anyone who can reach the socket is the user (same OS user, 0700 directory);
 //! the runner does no authorization of its own.
 
+use crate::ipc::{self, Listener, Stream};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -170,6 +169,48 @@ impl Scanner {
     }
 }
 
+struct DsrScanner {
+    matched: usize,
+}
+
+impl DsrScanner {
+    const NEEDLE: &'static [u8] = b"\x1b[6n";
+
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        let mut count = 0;
+        for &b in bytes {
+            if b == Self::NEEDLE[self.matched] {
+                self.matched += 1;
+                if self.matched == Self::NEEDLE.len() {
+                    count += 1;
+                    self.matched = 0;
+                }
+            } else {
+                self.matched = usize::from(b == Self::NEEDLE[0]);
+            }
+        }
+        count
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn handle_dsr(
+    dsr: &mut DsrScanner,
+    chunk: &[u8],
+    has_views: bool,
+    writer: &Mutex<Option<Box<dyn Write + Send>>>,
+) {
+    let count = dsr.feed(chunk);
+    if count > 0 && !has_views {
+        if let Some(w) = lock(writer).as_mut() {
+            for _ in 0..count {
+                let _ = w.write_all(b"\x1b[1;1R");
+            }
+            let _ = w.flush();
+        }
+    }
+}
+
 struct Output {
     ring: VecDeque<u8>,
     views: Vec<SyncSender<Arc<[u8]>>>,
@@ -180,9 +221,60 @@ struct Output {
 
 struct Session {
     info: Mutex<Info>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    #[cfg(windows)]
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    #[cfg(windows)]
+    job: Mutex<Option<WinJob>>,
     output: Mutex<Output>,
+}
+
+#[cfg(windows)]
+struct WinJob(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: Win32 job object handle is thread-safe for TerminateJobObject / CloseHandle.
+#[cfg(windows)]
+unsafe impl Send for WinJob {}
+
+#[cfg(windows)]
+impl Drop for WinJob {
+    fn drop(&mut self) {
+        // SAFETY: owned handle.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn assign_job(pid: Option<u32>) -> Result<WinJob, String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+    let pid = pid.ok_or("Child process id unknown")?;
+    // SAFETY: creating an anonymous job object.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(format!("Cannot create job object: {}", std::io::Error::last_os_error()));
+    }
+    let job = WinJob(job);
+    // SAFETY: opening child process to assign to job.
+    let proc = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+    if proc.is_null() {
+        return Err(format!("Cannot open child process {pid}: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: both handles are valid.
+    let ok = unsafe { AssignProcessToJobObject(job.0, proc) } != 0;
+    let err = std::io::Error::last_os_error();
+    // SAFETY: closing temporary process handle.
+    unsafe { CloseHandle(proc) };
+    if !ok {
+        return Err(format!("Cannot assign process {pid} to job object: {err}"));
+    }
+    Ok(job)
 }
 
 #[derive(Default)]
@@ -197,10 +289,35 @@ fn valid_id(id: &str) -> bool {
 }
 
 pub fn random_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let mut bytes = [0u8; 16];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
-        bytes[..8].copy_from_slice(&now_ms().to_le_bytes());
+    #[cfg(unix)]
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok();
+    #[cfg(windows)]
+    let ok = {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        // SAFETY: `bytes` is a 16-byte writable buffer; system-preferred RNG needs no handle.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        status == 0
+    };
+    #[cfg(not(any(unix, windows)))]
+    let ok = false;
+    if !ok {
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&seq.to_le_bytes());
         bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+        bytes[12..16].copy_from_slice(&(now_ms() as u32).to_le_bytes());
     }
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -259,6 +376,19 @@ impl Runner {
         }
         let mut child = pair.slave.spawn_command(cmd).map_err(|e| format!("Cannot start {}: {e}", req.argv[0]))?;
         drop(pair.slave);
+        #[cfg(windows)]
+        let killer = child.clone_killer();
+        // Note: portable-pty spawns the child before AssignProcessToJobObject runs;
+        // a descendant spawned in those microseconds before assignment is still
+        // covered by ClosePseudoConsole when master/writer are dropped on signal.
+        #[cfg(windows)]
+        let job = match assign_job(child.process_id()) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e);
+            }
+        };
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let info = Info {
@@ -276,8 +406,12 @@ impl Runner {
         };
         let session = Arc::new(Session {
             info: Mutex::new(info.clone()),
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            master: Mutex::new(Some(pair.master)),
+            writer: Mutex::new(Some(writer)),
+            #[cfg(windows)]
+            killer: Mutex::new(killer),
+            #[cfg(windows)]
+            job: Mutex::new(job),
             output: Mutex::new(Output {
                 ring: VecDeque::new(),
                 views: Vec::new(),
@@ -310,6 +444,8 @@ impl Runner {
     fn pump(&self, session: &Session, mut reader: Box<dyn Read + Send>) {
         let id = lock(&session.info).id.clone();
         let mut buf = vec![0u8; 64 * 1024];
+        #[cfg(windows)]
+        let mut dsr = DsrScanner { matched: 0 };
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -317,12 +453,14 @@ impl Runner {
             };
             let chunk: Arc<[u8]> = Arc::from(&buf[..n]);
             let mut signals = Vec::new();
+            let has_views;
             {
                 let mut out = lock(&session.output);
                 out.ring.extend(chunk.iter());
                 let excess = out.ring.len().saturating_sub(SCROLLBACK);
                 out.ring.drain(..excess);
                 out.views.retain(|v| v.try_send(chunk.clone()).is_ok());
+                has_views = !out.views.is_empty();
                 out.scanner.feed(&chunk, &mut signals);
                 let now = now_ms();
                 // Agents ring often; one bell event per second per session is enough
@@ -337,6 +475,10 @@ impl Runner {
                     keep
                 });
             }
+            #[cfg(windows)]
+            handle_dsr(&mut dsr, &chunk, has_views, &session.writer);
+            #[cfg(not(windows))]
+            let _ = has_views;
             lock(&session.info).last_output = now_ms();
             for signal in signals {
                 match signal {
@@ -356,6 +498,7 @@ impl Runner {
         out.views.clear();
     }
 
+    #[cfg(unix)]
     fn signal(&self, id: &str, name: &str) -> Result<(), String> {
         let session = self.get(id)?;
         let pid = {
@@ -376,7 +519,10 @@ impl Runner {
         // Ctrl-C semantics: the terminal's foreground process group. Otherwise the
         // whole group the child leads (it is a session leader in its own PTY).
         let group = if sig == libc::SIGINT {
-            lock(&session.master).process_group_leader().unwrap_or(pid)
+            lock(&session.master)
+                .as_ref()
+                .and_then(|m| m.process_group_leader())
+                .unwrap_or(pid)
         } else {
             pid
         };
@@ -385,6 +531,47 @@ impl Runner {
             return Err(std::io::Error::last_os_error().to_string());
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn signal(&self, id: &str, name: &str) -> Result<(), String> {
+        let session = self.get(id)?;
+        if lock(&session.info).exit.is_some() {
+            return Err("The session has ended".into());
+        }
+        match name {
+            "INT" => {
+                let mut writer = lock(&session.writer);
+                let Some(writer) = writer.as_mut() else {
+                    return Err("The session has ended".into());
+                };
+                writer.write_all(&[0x03]).and_then(|_| writer.flush()).map_err(|e| e.to_string())
+            }
+            "TERM" | "HUP" | "KILL" => {
+                // Close ConPTY handles and terminate the entire job tree; fail if TerminateJobObject fails.
+                let job_res = match lock(&session.job).take() {
+                    Some(job) => {
+                        // SAFETY: `job.0` is a valid job object handle.
+                        if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job.0, 1) } == 0 {
+                            Err(std::io::Error::last_os_error().to_string())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    None => Err("Job object unavailable for process-tree termination".into()),
+                };
+                let kill_res = lock(&session.killer).kill().map_err(|e| e.to_string());
+                lock(&session.writer).take();
+                lock(&session.master).take();
+                // TerminateJobObject kills the child too, so killer.kill() may see an already-exited process.
+                if job_res.is_ok() {
+                    Ok(())
+                } else {
+                    job_res.and(kill_res)
+                }
+            }
+            _ => Err(format!("Unknown signal {name}")),
+        }
     }
 
     fn control(self: &Arc<Self>, req: &Value) -> Result<Value, String> {
@@ -408,7 +595,11 @@ impl Runner {
                 let session = self.get(id()?)?;
                 let cols = req["cols"].as_u64().unwrap_or(80).clamp(10, 1000) as u16;
                 let rows = req["rows"].as_u64().unwrap_or(24).clamp(2, 500) as u16;
-                lock(&session.master)
+                let master = lock(&session.master);
+                let Some(master) = master.as_ref() else {
+                    return Err("The session has ended".into());
+                };
+                master
                     .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
                     .map_err(|e| e.to_string())?;
                 let mut info = lock(&session.info);
@@ -419,6 +610,9 @@ impl Runner {
                 let session = self.get(id()?)?;
                 let data = req["data"].as_str().ok_or("Missing data")?;
                 let mut writer = lock(&session.writer);
+                let Some(writer) = writer.as_mut() else {
+                    return Err("The session has ended".into());
+                };
                 writer.write_all(data.as_bytes()).and_then(|_| writer.flush()).map_err(|e| e.to_string())?;
                 Ok(json!({}))
             }
@@ -439,7 +633,7 @@ impl Runner {
         }
     }
 
-    fn attach(&self, id: &str, mut stream: UnixStream) -> std::io::Result<()> {
+    fn attach(&self, id: &str, mut stream: Stream) -> std::io::Result<()> {
         let session = match self.get(id) {
             Ok(s) => s,
             Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
@@ -464,6 +658,9 @@ impl Runner {
                     break;
                 }
                 let mut writer = lock(&typing.writer);
+                let Some(writer) = writer.as_mut() else {
+                    break;
+                };
                 if writer.write_all(&buf[..n]).and_then(|_| writer.flush()).is_err() {
                     break;
                 }
@@ -479,7 +676,7 @@ impl Runner {
     }
 
     /// The scrollback as it is now: a length line, then that many raw bytes.
-    fn snapshot(&self, id: &str, mut stream: UnixStream) -> std::io::Result<()> {
+    fn snapshot(&self, id: &str, mut stream: Stream) -> std::io::Result<()> {
         let session = match self.get(id) {
             Ok(s) => s,
             Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
@@ -490,7 +687,7 @@ impl Runner {
         stream.shutdown(std::net::Shutdown::Both)
     }
 
-    fn watch(&self, mut stream: UnixStream) -> std::io::Result<()> {
+    fn watch(&self, mut stream: Stream) -> std::io::Result<()> {
         let (tx, rx) = sync_channel::<Value>(1024);
         lock(&self.watchers).push(tx);
         writeln!(stream, "{}", json!({"ok": true}))?;
@@ -504,19 +701,22 @@ impl Runner {
     /// service. A hosted session, or any other program, gets nothing but
     /// `hello`: typing into a terminal answers its prompts, and `spawn` runs
     /// a command outside every agent's sandbox.
-    fn trusts(&self, stream: &UnixStream) -> bool {
-        if !crate::peer::is_this_program(stream) {
+    fn trusts(&self, peer: &crate::peer::Peer) -> bool {
+        if !peer.is_this_program() {
             return false;
         }
         let children: Vec<i32> = lock(&self.sessions).values().filter_map(|s| { let info = lock(&s.info); info.pid.filter(|_| info.exit.is_none()).map(|p| p as i32) }).collect();
-        crate::peer::pid(stream).is_some_and(|pid| crate::peer::ancestor_among(pid, &children).is_none())
+        matches!(peer.ancestor_among(&children), crate::peer::Ancestry::Outside)
     }
 
-    fn handle(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
-        if !crate::peer::same_user(&stream) {
+    fn handle(self: &Arc<Self>, stream: Stream, accepted_at: u64) -> std::io::Result<()> {
+        let Some(peer) = crate::peer::Peer::open(&stream, accepted_at) else {
+            return Ok(());
+        };
+        if !peer.same_user() {
             return Ok(());
         }
-        let trusted = self.trusts(&stream);
+        let trusted = self.trusts(&peer);
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
         loop {
@@ -551,19 +751,18 @@ impl Runner {
 /// Serve until idle. Refuses to start if another runner answers on `socket`.
 pub fn serve(socket: &Path) -> Result<(), String> {
     let dir = socket.parent().ok_or("Invalid socket path")?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    ipc::private_dir(dir)?;
     if let Ok(meta) = std::fs::symlink_metadata(socket) {
-        if UnixStream::connect(socket).is_ok() {
+        if Stream::connect(socket).is_ok() {
             return Err("A runner is already listening".into());
         }
-        if !meta.file_type().is_socket() {
+        if !ipc::is_socket(socket, &meta) {
             return Err("Refusing to replace a non-socket file".into());
         }
         std::fs::remove_file(socket).map_err(|e| e.to_string())?;
     }
-    let listener = UnixListener::bind(socket).map_err(|e| format!("Cannot listen on {}: {e}", socket.display()))?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    let listener = Listener::bind(socket).map_err(|e| format!("Cannot listen on {}: {e}", socket.display()))?;
+    ipc::private_file(socket)?;
     let runner = Arc::new(Runner::default());
 
     let idle = runner.clone();
@@ -585,11 +784,12 @@ pub fn serve(socket: &Path) -> Result<(), String> {
     });
 
     for stream in listener.incoming() {
+        let accepted_at = crate::peer::accept_time();
         let Ok(stream) = stream else { continue };
         let runner = runner.clone();
         runner.connections.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let _ = runner.handle(stream);
+            let _ = runner.handle(stream, accepted_at);
             runner.connections.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -598,13 +798,13 @@ pub fn serve(socket: &Path) -> Result<(), String> {
 
 /// A control connection.
 pub struct Client {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Stream>,
+    writer: Stream,
 }
 
 impl Client {
     pub fn connect(socket: &Path) -> Result<Self, String> {
-        let stream = UnixStream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
+        let stream = Stream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
         stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
         Ok(Self { reader: BufReader::new(stream.try_clone().map_err(|e| e.to_string())?), writer: stream })
@@ -627,8 +827,8 @@ impl Client {
 
 /// Open a stream connection (`attach` or `watch`). Returns the reader, which
 /// may already hold stream bytes past the handshake, and a writer.
-pub fn open_stream(socket: &Path, req: Value) -> Result<(BufReader<UnixStream>, UnixStream), String> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
+pub fn open_stream(socket: &Path, req: Value) -> Result<(BufReader<Stream>, Stream), String> {
+    let mut stream = Stream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
     writeln!(stream, "{req}").map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut line = Vec::new();
@@ -729,17 +929,72 @@ pub fn installed(unit: &Unit) -> bool {
     plist_path(unit).is_some_and(|p| p.exists())
 }
 
+#[cfg(unix)]
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks that the process exists
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: the handle is checked for null, used once and closed
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let running = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        CloseHandle(handle);
+        running
+    }
+}
+
+/// Ask a process to end (`hard`: force it). Windows has no gentle signal for a
+/// background process, so both end it outright.
+#[cfg(unix)]
+fn end_process(pid: i32, hard: bool) {
+    // SAFETY: the pid is the one the unit itself reported a moment ago
+    unsafe { libc::kill(pid, if hard { libc::SIGKILL } else { libc::SIGTERM }) };
+}
+
+#[cfg(windows)]
+fn end_process(pid: i32, _hard: bool) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    // SAFETY: the handle is checked for null, used once and closed
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
+
+/// A leftover socket file of a unit that is gone. Windows AF_UNIX sockets are plain files.
+fn is_socket_file(file_type: std::fs::FileType) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileTypeExt::is_socket(&file_type)
+    }
+    #[cfg(not(unix))]
+    {
+        file_type.is_file()
+    }
 }
 
 /// What is known of a unit without starting it.
 pub fn unit_status(socket: &Path, unit: &Unit) -> Value {
     let hello = Client::connect(socket).and_then(|mut c| c.call(json!({"op": "hello"}))).ok();
     let pid = hello.as_ref().and_then(|h| h["pid"].as_i64());
-    // When it started, as `ps` prints it
-    let since = pid.and_then(|pid| std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok())
+    // When it started, as `ps` prints it (Windows has no `ps`: unknown there)
+    let since = pid.filter(|_| cfg!(unix)).and_then(|pid| std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty());
     json!({
@@ -784,18 +1039,16 @@ pub fn stop_unit(socket: &Path, unit: &Unit, remove: bool) -> Result<(), String>
             !alive(pid)
         };
         if !ended(Duration::from_millis(500)) {
-            // SAFETY: the pid is the one the unit itself reported a moment ago
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+            end_process(pid, false);
             if !ended(Duration::from_secs(3)) {
-                // SAFETY: as above
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                end_process(pid, true);
                 if !ended(Duration::from_secs(2)) {
                     return Err(format!("The {} (pid {pid}) did not stop", unit.name));
                 }
             }
         }
     }
-    if std::fs::symlink_metadata(socket).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())) {
+    if std::fs::symlink_metadata(socket).is_ok_and(|m| is_socket_file(m.file_type())) {
         let _ = std::fs::remove_file(socket);
     }
     if remove && may_manage(socket) {
@@ -856,12 +1109,14 @@ fn check_protocol(hello: Value, unit: &Unit, protocol: u32) -> Result<Value, Str
 
 pub const LAUNCH_LABEL: &str = "cc.lambdahouse.agent-mcr.runner";
 
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// The LaunchAgent that runs the runner outside the app's process tree, so
 /// quitting or updating the app leaves agents running.
+#[cfg(target_os = "macos")]
 pub fn launch_agent_plist(unit: &Unit, exe: &Path, log: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -920,7 +1175,7 @@ fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -943,13 +1198,54 @@ fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
         .map_err(|e| format!("Cannot start the {}: {e}", unit.name))
 }
 
+#[cfg(windows)]
+fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+    };
+    let _ = unit.label;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if let Some(dir) = socket.parent() {
+        ipc::private_dir(dir)?;
+    }
+    let log_path = socket.with_extension("log");
+    let open_log = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| e.to_string())
+    };
+    let spawn_with = |flags: u32| -> Result<(), String> {
+        let log = open_log()?;
+        Command::new(&exe)
+            .arg(unit.flag)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log)
+            .creation_flags(flags)
+            .spawn()
+            .map(drop)
+            .map_err(|e| format!("Cannot start the {}: {e}", unit.name))
+    };
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    spawn_with(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn_with(base))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_socket(name: &str) -> std::path::PathBuf {
         // Socket paths are limited to ~100 bytes; keep them short
-        let dir = std::path::PathBuf::from(format!("/tmp/amcr-{}-{name}", std::process::id()));
+        let root = if cfg!(unix) {
+            std::path::PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!("amcr-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("r.sock")
     }
@@ -987,7 +1283,7 @@ mod tests {
         let path = socket.to_path_buf();
         std::thread::spawn(move || serve(&path).unwrap());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while UnixStream::connect(socket).is_err() {
+        while Stream::connect(socket).is_err() {
             assert!(Instant::now() < deadline, "runner did not listen");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1027,6 +1323,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawn_attach_type_replay_and_exit() {
         let socket = temp_socket("attach");
@@ -1069,6 +1366,54 @@ mod tests {
         assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn spawn_attach_type_replay_and_exit() {
+        let socket = temp_socket("attach");
+        serve_in_background(&socket);
+        let mut control = Client::connect(&socket).unwrap();
+        assert_eq!(control.call(json!({"op": "hello"})).unwrap()["protocol"], PROTOCOL);
+        let cwd = std::env::temp_dir().display().to_string();
+
+        let info = control
+            .call(json!({
+                "op": "spawn",
+                "id": "t1",
+                "argv": ["cmd.exe", "/v:on", "/c", "echo ready& set /p line=& echo got !line!& exit /b 3"],
+                "cwd": cwd,
+                "cols": 80,
+                "rows": 24
+            }))
+            .unwrap();
+        assert_eq!(info["id"], "t1");
+        assert!(info["pid"].as_u64().is_some());
+        assert!(control.call(json!({"op": "spawn", "id": "t1", "argv": ["cmd.exe", "/c", "exit 0"], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
+
+        let (mut out, mut input) = open_stream(&socket, json!({"op": "attach", "id": "t1"})).unwrap();
+        read_until(&mut out, "ready");
+        input.write_all(b"hello runner\r\n").unwrap();
+        read_until(&mut out, "got hello runner");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let list = control.call(json!({"op": "list"})).unwrap();
+            if !list["sessions"][0]["exit"].is_null() {
+                assert_eq!(list["sessions"][0]["exit"]["code"], 3);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let (mut late, _w) = open_stream(&socket, json!({"op": "attach", "id": "t1"})).unwrap();
+        let replay = read_until(&mut late, "got hello runner");
+        assert!(replay.contains("ready"));
+
+        control.call(json!({"op": "forget", "id": "t1"})).unwrap();
+        assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn control_writes_resizes_and_signals() {
         let socket = temp_socket("control");
@@ -1099,16 +1444,107 @@ mod tests {
         assert!(control.call(json!({"op": "nope"})).is_err());
     }
 
+    /// The number after the first `PID=` that is followed by digits and then a
+    /// non-digit, so a number split across reads is not taken half-read.
+    #[cfg(any(windows, test))]
+    fn pid_line(text: &str) -> Option<u32> {
+        text.match_indices("PID=").find_map(|(i, _)| {
+            let rest = &text[i + 4..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            (digits > 0 && digits < rest.len()).then(|| rest[..digits].parse().ok()).flatten()
+        })
+    }
+
+    #[test]
+    fn pid_line_finds_the_number_after_escape_sequences() {
+        assert_eq!(pid_line("\u{1b}[?25hPID=800\r\n"), Some(800));
+        assert_eq!(pid_line("('PID' + '=' + $p.Id)\r\nPID=12\r\n"), Some(12));
+        assert_eq!(pid_line("PID=80"), None, "the number may continue in the next read");
+        assert_eq!(pid_line("PID=\r\n"), None);
+        assert_eq!(pid_line("no pid here"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_writes_resizes_and_signals() {
+        let socket = temp_socket("control");
+        serve_in_background(&socket);
+        let mut control = Client::connect(&socket).unwrap();
+        let cwd = std::env::temp_dir().display().to_string();
+        control
+            .call(json!({"op": "spawn", "id": "cmd", "argv": ["cmd.exe", "/k"], "cwd": cwd, "cols": 80, "rows": 24}))
+            .unwrap();
+        let (mut out, _w) = open_stream(&socket, json!({"op": "attach", "id": "cmd"})).unwrap();
+        control.call(json!({"op": "write", "id": "cmd", "data": "echo typed by the service\r\n"})).unwrap();
+        read_until(&mut out, "typed by the service");
+        control.call(json!({"op": "resize", "id": "cmd", "cols": 120, "rows": 40})).unwrap();
+        // Spawn a descendant process inside the job; wait for a complete PID=<digits> line so cmd echo cannot match.
+        control.call(json!({"op": "write", "id": "cmd", "data": "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden powershell '-NoProfile -Command Start-Sleep 30'; Write-Output ('PID' + '=' + $p.Id)\"\r\n"})).unwrap();
+        // ConPTY can put the line after escape sequences on the same row, so look
+        // for PID= anywhere, and take the number only once a non-digit ends it.
+        out.get_ref().set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let desc_pid: u32 = loop {
+            if let Some(pid) = pid_line(&String::from_utf8_lossy(&seen)) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for PID= line; got {:?}", String::from_utf8_lossy(&seen));
+            match out.read(&mut buf) {
+                Ok(0) => panic!("EOF waiting for PID= line; got {:?}", String::from_utf8_lossy(&seen)),
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("{e}"),
+            }
+        };
+        // Open the descendant handle before TERM so an OpenProcess failure cannot be mistaken for exit.
+        let desc_proc = unsafe {
+            use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+            use windows_sys::Win32::System::Threading::OpenProcess;
+            OpenProcess(SYNCHRONIZE, 0, desc_pid)
+        };
+        assert!(!desc_proc.is_null(), "could not open descendant process {desc_pid}");
+        assert!(control.call(json!({"op": "forget", "id": "cmd"})).is_err(), "a running session can't be forgotten");
+        control.call(json!({"op": "signal", "id": "cmd", "signal": "TERM"})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let list = control.call(json!({"op": "list"})).unwrap();
+            let s = &list["sessions"][0];
+            if !s["exit"].is_null() {
+                assert_eq!(s["cols"], 120);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        unsafe {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            let waited = WaitForSingleObject(desc_proc, 5000);
+            CloseHandle(desc_proc);
+            assert_eq!(waited, WAIT_OBJECT_0, "descendant process {desc_pid} survived TERM");
+        }
+        assert!(control.call(json!({"op": "spawn", "argv": [], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
+        assert!(control.call(json!({"op": "spawn", "id": "../x", "argv": ["cmd.exe", "/c", "exit 0"], "cwd": cwd, "cols": 80, "rows": 24})).is_err());
+        assert!(control.call(json!({"op": "nope"})).is_err());
+    }
+
     #[test]
     fn a_second_runner_refuses_the_socket_and_plist_escapes_paths() {
         let socket = temp_socket("twice");
         serve_in_background(&socket);
         assert!(serve(&socket).unwrap_err().contains("already listening"));
-        let plist = launch_agent_plist(&RUNNER, Path::new("/A & B/Agent MCR.app/Contents/MacOS/agent-mcr"), Path::new("/tmp/r.log"));
-        assert!(plist.contains("<string>/A &amp; B/Agent MCR.app/Contents/MacOS/agent-mcr</string>"));
-        assert!(plist.contains("<string>--runner</string>"));
+        #[cfg(target_os = "macos")]
+        {
+            let plist = launch_agent_plist(&RUNNER, Path::new("/A & B/Agent MCR.app/Contents/MacOS/agent-mcr"), Path::new("/tmp/r.log"));
+            assert!(plist.contains("<string>/A &amp; B/Agent MCR.app/Contents/MacOS/agent-mcr</string>"));
+            assert!(plist.contains("<string>--runner</string>"));
+        }
     }
     /// Any other program of the same user is told the version and nothing else.
+    /// Unix-only: uses `/usr/bin/nc -U` to connect as a foreign process.
+    #[cfg(unix)]
     #[test]
     fn another_program_gets_hello_only() {
         if !Path::new("/usr/bin/nc").is_file() {
@@ -1138,6 +1574,53 @@ mod tests {
         }
         assert_eq!(Client::connect(&socket).unwrap().call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0, "nothing was started");
     }
+
+    #[test]
+    fn random_id_is_unique_across_rapid_calls() {
+        let mut prefixes = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let id = random_id();
+            assert_eq!(id.len(), 32);
+            assert!(prefixes.insert(id[..10].to_string()), "duplicate random_id prefix");
+        }
+    }
+
+    #[test]
+    fn dsr_handles_split_chunks_and_view_attachment() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let writer: Mutex<Option<Box<dyn Write + Send>>> =
+            Mutex::new(Some(Box::new(sink.clone())));
+        let mut dsr = DsrScanner { matched: 0 };
+
+        // Split across read chunks without a view attached -> answered once.
+        handle_dsr(&mut dsr, b"hello\x1b[", false, &writer);
+        assert!(sink.0.lock().unwrap().is_empty());
+        handle_dsr(&mut dsr, b"6nworld", false, &writer);
+        assert_eq!(&*sink.0.lock().unwrap(), b"\x1b[1;1R");
+
+        // Preceding ESC before ESC[6n still matches.
+        sink.0.lock().unwrap().clear();
+        handle_dsr(&mut dsr, b"\x1b\x1b[6n", false, &writer);
+        assert_eq!(&*sink.0.lock().unwrap(), b"\x1b[1;1R");
+
+        // With a view attached -> runner does not answer.
+        sink.0.lock().unwrap().clear();
+        handle_dsr(&mut dsr, b"\x1b[6n", true, &writer);
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
     /// A unit is installed, started, replaced or removed only for the app's
     /// own config folder, and never from a test. Without this, a harness in a
     /// temporary folder rewrote the real LaunchAgent to run a test binary.

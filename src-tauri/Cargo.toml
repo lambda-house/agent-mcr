@@ -43,6 +43,23 @@ glib-sys = "0.22.9"
 glib = "0.22.10"
 gobject-sys = "0.22.9"
 
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.2"
+sysinfo = "0.33"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

@@ -1,3 +1,4 @@
+import { homePath } from '../utils/paths';
 import { useMemo, useState } from 'react';
 import { Filter } from 'lucide-react';
 import SessionTree from './SessionTree';
@@ -9,7 +10,7 @@ import { shortPath } from '../utils/harness';
 const MAX_FOLDERS = 40;
 /** Folders whose sessions are shown without a click. */
 const OPEN_FOLDERS = 4;
-const tilde = (path: string) => path.replace(/^\/(Users|home)\/[^/]+/, '~') || 'Unknown folder';
+const tilde = (path: string) => homePath(path) || 'Unknown folder';
 
 /**
  * Search results by folder, in the same shape as the Live list: the folder's

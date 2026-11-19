@@ -1,6 +1,6 @@
 # Agent MCR
 
-**Agent Mission Control Room.** A local harness for a group of coding agents on a Mac.
+**Agent Mission Control Room.** A local harness for a group of coding agents on macOS or Windows.
 
 - **Sessions.** The Claude Code and Codex sessions on this machine: active and inactive, who started whom, models, tokens, tool calls, and ticket mentions.
 - **Live.** Claude Code, Codex and shell terminals running inside the app. They keep running when the app quits. Each shows what it is doing (working, idle, waiting for you), and the ones waiting for you are listed on top and raise a macOS notification. An earlier Claude or Codex session can be resumed here.
@@ -13,11 +13,13 @@ How it is built: [ARCHITECTURE.md](ARCHITECTURE.md). The design it grows towards
 
 ## Status
 
-Pre-release (0.1.1): macOS on Apple Silicon only. Builds are on the [releases page](https://github.com/lambda-house/agent-mcr/releases); they are not signed with a Developer ID and not notarized, so macOS asks you to allow the first launch (System Settings → Privacy & Security → Open Anyway). The app does not update itself.
+Pre-release (0.1.1): macOS on Apple Silicon; Windows support still needs validation on a real Windows machine. Builds are on the [releases page](https://github.com/lambda-house/agent-mcr/releases); they are not signed with a Developer ID and not notarized, so macOS asks you to allow the first launch (System Settings → Privacy & Security → Open Anyway). The app does not update itself.
 
 ## Build and run
 
-Needs Node.js, Rust and the Xcode command-line tools.
+Needs Node.js and Rust.
+
+On macOS, install the Xcode command-line tools:
 
 ```bash
 npm ci
@@ -27,6 +29,19 @@ npm test                 # frontend tests
 cd src-tauri && cargo test
 ```
 
+On Windows 10 1903+ or Windows 11 (x86_64), install the Microsoft C++ build tools, Rust's MSVC toolchain and WebView2 Runtime. In PowerShell, from the repository root:
+
+```powershell
+npm ci
+npm run tauri dev
+npm run build:win       # per-user NSIS installer under src-tauri/target/release/bundle/nsis
+npm test
+cd src-tauri
+cargo test
+```
+
+The Windows installer is unsigned; SmartScreen may warn. Its WebView2 bootstrapper downloads the runtime when needed.
+
 The app opens on **Sessions**. Reading transcripts is switched on in the app, after a native confirmation.
 
 ## Background processes
@@ -34,7 +49,7 @@ The app opens on **Sessions**. Reading transcripts is switched on in the app, af
 Hosted agents keep running when the app quits, because they don't run inside it. Two processes of the same binary do that work: the **runner** holds the terminals, the **harness service** tracks sessions and gives agents their tools. macOS starts them through two files in `~/Library/LaunchAgents` (`cc.lambdahouse.agent-mcr.runner.plist` and `…harness.plist`). They listen on sockets private to your user, never on the network, and exit ten minutes after the last session ends.
 
 - The app asks before it installs or starts them. Nothing else can: an outside supervisor is refused until you have allowed them.
-- The footer of the Live view opens **Background**: what runs, since when, from which files.
+- **Settings → Harnesses** has **Background**: what runs, since when, from which files.
 - **Stop everything** there ends every session and both processes. They stay off until you allow them again.
 - Quit (menu or Cmd-Q) tells you how many sessions keep running and offers to stop them. Quitting from the Dock doesn't ask.
 
@@ -62,19 +77,19 @@ To move a session you run in another terminal into the harness, close it there, 
 
 ## What is protected, and what is not
 
-Every agent runs as your macOS user. The harness limits what an agent can do through the harness; it can't wall one of your programs off from another.
+Every agent runs as your OS user. The harness limits what an agent can do through the harness; it can't wall one of your programs off from another.
 
 - Terminals (`runner.sock`) take requests only from Agent MCR itself: the app and its harness service. Any other program, and anything started inside a hosted session, is refused. So is every other user.
 - Starting, restarting and listing sessions (`harness.sock`) is the app's. A hosted session has the `mcr` tools and nothing else. A hook report counts for the session its process runs in, whatever it claims.
 - The supervisor tools belong to the Supervisor session. Agents outside the app get them only while **outside agents** is ticked. A program that a hosted agent starts and detaches from its session looks like an outside one, so leave the box off while agents work in folders you don't trust.
 - The Supervisor asks you before it types into a terminal (`terminal_write`), and it can't give a shell a task: both would run a command nobody approved. For the same reason a task can't start with `!`, `#` or `/`.
 - These checks stop a plain command from reaching the sockets. They don't stop a program written to get around them, because it runs as you. A shell command you approve in one agent can still do whatever you can, including to other sessions.
-- The two LaunchAgents (`~/Library/LaunchAgents/cc.lambdahouse.agent-mcr.runner.plist` and `.harness.plist`) don't start at login, but they stay when you delete the app. Remove them by hand.
+- On macOS the two LaunchAgents (`~/Library/LaunchAgents/cc.lambdahouse.agent-mcr.runner.plist` and `.harness.plist`) do not start at login and remain after deleting the app. Remove them by hand. On Windows, the app starts detached background processes instead.
 - A link inside an opened folder that points out of it is followed only to Markdown files and images.
 
 ## Where data lives
 
-`~/Library/Application Support/agent-mcr/` holds:
+The config directory is `~/Library/Application Support/agent-mcr/` on macOS and `%LOCALAPPDATA%\agent-mcr\` on Windows. It holds:
 
 - `access.json`: what you've allowed
 - `sessions/index.sqlite`: the transcript index, which contains private transcript content

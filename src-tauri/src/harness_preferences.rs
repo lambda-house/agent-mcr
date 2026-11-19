@@ -53,12 +53,18 @@ impl HarnessPreferences {
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), String> {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
         self.validate()?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         let tmp = dir.join("harness-preferences.json.tmp");
-        let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp).map_err(|e| e.to_string())?;
         file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
         std::fs::rename(tmp, dir.join("harness-preferences.json")).map_err(|e| e.to_string())
     }

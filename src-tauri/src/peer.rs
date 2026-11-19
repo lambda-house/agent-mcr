@@ -7,13 +7,143 @@
 //! only source of a caller's identity: nothing a caller says about itself is
 //! believed.
 
+use crate::ipc::Stream;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-/// The user and process that opened the connection.
+/// Parses `WSAIoctl(SIO_AF_UNIX_GETPEERPID)` output.
+/// On Windows, `afunix.sys` writes the `ULONG` pid into the zero-initialized
+/// output buffer and returns `rc = 0` while leaving `bytes_returned = 0`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_peer_pid(rc: i32, bytes_returned: u32, peer_pid: u32) -> Option<i32> {
+    if rc != 0 || (bytes_returned != 0 && bytes_returned != std::mem::size_of::<u32>() as u32) {
+        return None;
+    }
+    i32::try_from(peer_pid).ok().filter(|&p| p > 0)
+}
+
+/// Result of walking a peer's process ancestry against live session roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    Found(i32),
+    Outside,
+    Unknown,
+}
+
+/// Why a process's parent could not be read. `Foreign`: the process cannot be
+/// inside a session's tree (another user's, or already gone and reparented),
+/// so the walk ends outside. `Failed`: it could be inside, so the answer stays
+/// unknown and the caller is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreadable {
+    Foreign,
+    Failed,
+}
+
+/// What a failed `OpenProcess` on a recorded parent means. Windows does not
+/// re-parent orphans: a parent that is gone (`ERROR_INVALID_PARAMETER`, 87) or
+/// that this user may not open (`ERROR_ACCESS_DENIED`, 5: another account's or
+/// elevated) cannot be a session's process, so the walk ends outside, as it
+/// does on Unix at launchd. Any other error stays unknown.
+#[cfg(any(windows, test))]
+fn open_error(code: u32) -> Unreadable {
+    match code {
+        5 | 87 => Unreadable::Foreign,
+        _ => Unreadable::Failed,
+    }
+}
+
+/// Pure ancestry walk: `step(pid)` returns `Ok(Some(ppid))`, `Ok(None)` at a
+/// clean OS root, or `Err` when a link cannot be opened or fails checks.
+fn walk_ancestry(
+    mut pid: i32,
+    roots: &[i32],
+    mut step: impl FnMut(i32) -> Result<Option<i32>, Unreadable>,
+) -> Ancestry {
+    for _ in 0..32 {
+        if roots.contains(&pid) {
+            return Ancestry::Found(pid);
+        }
+        match step(pid) {
+            Ok(Some(up)) if up > 1 => pid = up,
+            Ok(_) => return Ancestry::Outside,
+            Err(Unreadable::Foreign) => return Ancestry::Outside,
+            Err(Unreadable::Failed) => return Ancestry::Unknown,
+        }
+    }
+    Ancestry::Unknown
+}
+
+/// Who owns a process, for telling an unreadable foreign process (`login` is
+/// root's: macOS refuses `proc_pidinfo` on it) from a failure on our own.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Gone,
+    Me,
+    Other,
+}
+
+/// One step up the tree on Unix. Sessions run as this user, so a process whose
+/// parent cannot be read is only "unknown" when it is ours and still there.
+#[cfg(unix)]
+fn unix_step(pid: i32, parent: impl Fn(i32) -> Option<i32>, owner: impl Fn(i32) -> Owner) -> Result<Option<i32>, Unreadable> {
+    match parent(pid) {
+        Some(up) => Ok(Some(up)),
+        None => Err(match owner(pid) {
+            Owner::Me => Unreadable::Failed,
+            Owner::Gone | Owner::Other => Unreadable::Foreign,
+        }),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn owner(pid: i32) -> Owner {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions
+    let me = unsafe { libc::geteuid() };
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(m) if m.uid() == me => Owner::Me,
+        Ok(_) => Owner::Other,
+        Err(_) => Owner::Gone,
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
+fn owner(pid: i32) -> Owner {
+    // SAFETY: geteuid has no preconditions
+    let me = unsafe { libc::geteuid() };
+    // `ps` reads any process, which proc_pidinfo does not for root's
+    let uid = std::process::Command::new("ps").args(["-o", "uid=", "-p", &pid.to_string()]).output().ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok());
+    match uid {
+        None => Owner::Gone,
+        Some(uid) if uid == me => Owner::Me,
+        Some(_) => Owner::Other,
+    }
+}
+
+/// Whether `created` is strictly earlier than `bound` (guards against PID reuse).
+#[cfg(any(windows, test))]
+pub fn created_before(created: u64, bound: u64) -> bool {
+    created < bound
+}
+
+/// Current timestamp in 100ns FILETIME units on Windows (0 on Unix).
+#[cfg(unix)]
+pub fn accept_time() -> u64 {
+    0
+}
+
+/// Current timestamp in 100ns FILETIME units on Windows.
+#[cfg(windows)]
+pub fn accept_time() -> u64 {
+    win::now_filetime()
+}
+#[cfg(target_os = "macos")]
+/// The user and process that opened the connection.
+fn credentials(stream: &Stream) -> Option<(u32, i32)> {
     let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
     // SAFETY: both pointers are valid for writes.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
@@ -26,8 +156,8 @@ fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
     (ok && pid > 0).then_some((uid, pid))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
+#[cfg(all(unix, not(target_os = "macos")))]
+fn credentials(stream: &Stream) -> Option<(u32, i32)> {
     // SAFETY: zeroed is a valid ucred, and `len` is its size.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -36,12 +166,14 @@ fn credentials(stream: &UnixStream) -> Option<(u32, i32)> {
 }
 
 /// The connection comes from a process of the user this process runs as.
-pub fn same_user(stream: &UnixStream) -> bool {
+#[cfg(unix)]
+pub fn same_user(stream: &Stream) -> bool {
     // SAFETY: plain syscall.
     credentials(stream).is_some_and(|(uid, _)| uid == unsafe { libc::getuid() })
 }
 
-pub fn pid(stream: &UnixStream) -> Option<i32> {
+#[cfg(unix)]
+pub fn pid(stream: &Stream) -> Option<i32> {
     credentials(stream).map(|(_, pid)| pid)
 }
 
@@ -54,7 +186,7 @@ pub fn parent(pid: i32) -> Option<i32> {
     (got == size).then_some(info.pbi_ppid as i32)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn parent(pid: i32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // "pid (comm) state ppid …": the command may hold spaces and brackets
@@ -70,7 +202,7 @@ pub fn program(pid: i32) -> Option<PathBuf> {
     (n > 0).then(|| PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).into_owned()))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn program(pid: i32) -> Option<PathBuf> {
     let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     // A program replaced on disk while it runs
@@ -78,13 +210,388 @@ pub fn program(pid: i32) -> Option<PathBuf> {
     Some(PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text)))
 }
 
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE,
+        INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SOCKET};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+        QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+
+    const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
+
+    pub fn now_filetime() -> u64 {
+        // SAFETY: zeroed FILETIME is valid.
+        let mut ft: FILETIME = unsafe { std::mem::zeroed() };
+        // SAFETY: `ft` is valid for writes.
+        unsafe { GetSystemTimeAsFileTime(&mut ft) };
+        ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+    }
+
+    pub(super) struct Handle(pub(super) HANDLE);
+
+    impl Handle {
+        pub(super) fn open_process(pid: u32) -> Option<Self> {
+            Self::open_process_code(pid).ok()
+        }
+
+        /// As `open_process`, with the Win32 error code when it fails.
+        pub(super) fn open_process_code(pid: u32) -> Result<Self, u32> {
+            // SAFETY: OpenProcess returns null on failure.
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                // SAFETY: plain call, read right after the failure
+                Err(unsafe { GetLastError() })
+            } else {
+                Ok(Self(handle))
+            }
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: owned handle.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    pub fn pid(stream: &Stream) -> Option<i32> {
+        let mut peer_pid: u32 = 0;
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: output buffer and length match u32; socket is a live AF_UNIX stream.
+        let rc = unsafe {
+            WSAIoctl(
+                stream.as_raw_socket() as SOCKET,
+                SIO_AF_UNIX_GETPEERPID,
+                std::ptr::null(),
+                0,
+                (&mut peer_pid as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        super::parse_peer_pid(rc, bytes_returned, peer_pid)
+    }
+
+    fn process_user_sid(process: HANDLE) -> Option<Vec<u8>> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `token` is valid for writes; `process` is a live handle.
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 || token.is_null() {
+            return None;
+        }
+        let _token = Handle(token);
+        let mut needed: u32 = 0;
+        // SAFETY: probing required buffer size.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        // SAFETY: `buf` has `needed` bytes.
+        if unsafe {
+            GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), needed, &mut needed)
+        } == 0
+        {
+            return None;
+        }
+        if (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
+            return None;
+        }
+        // SAFETY: `buf` holds a `TOKEN_USER` structure (read_unaligned avoids Vec<u8> alignment assumption).
+        let user = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_USER>()) };
+        let sid = user.User.Sid;
+        // SAFETY: checking SID validity and length before copying its bytes.
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return None;
+        }
+        // SAFETY: `sid` was validated by `IsValidSid`.
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: `sid` points to `len` readable bytes.
+        Some(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec())
+    }
+
+    pub struct Peer {
+        pub pid: i32,
+        handle: Handle,
+        created: u64,
+    }
+
+    impl Peer {
+        pub fn open(stream: &Stream, accepted_at: u64) -> Option<Self> {
+            let pid = pid(stream)?;
+            let pid_u32 = u32::try_from(pid).ok().filter(|&p| p > 0)?;
+            let handle = Handle::open_process(pid_u32)?;
+            let created = creation_time(handle.0)?;
+            if !super::created_before(created, accepted_at) {
+                return None;
+            }
+            Some(Self { pid, handle, created })
+        }
+
+        pub fn same_user(&self) -> bool {
+            same_user_handle(&self.handle)
+        }
+
+        pub fn is_this_program(&self) -> bool {
+            if !self.same_user() {
+                return false;
+            }
+            match (program_handle(&self.handle), std::env::current_exe()) {
+                (Some(theirs), Ok(ours)) => super::real(&theirs) == super::real(&ours),
+                _ => false,
+            }
+        }
+
+        pub fn ancestor_among(&self, roots: &[i32]) -> super::Ancestry {
+            walk_from(self.pid, self.created, roots)
+        }
+    }
+
+    /// Walk up from `pid`, created at `created`, checking each parent's
+    /// creation time against its child's.
+    fn walk_from(pid: i32, created: u64, roots: &[i32]) -> super::Ancestry {
+        let mut cur_created = created;
+        super::walk_ancestry(pid, roots, |cur_pid| {
+            if cur_pid <= 4 {
+                return Ok(None);
+            }
+            let (up_pid, _up_handle, up_created) = parent_with_handle(cur_pid, cur_created)?;
+            cur_created = up_created;
+            Ok(Some(up_pid))
+        })
+    }
+
+    /// The same walk as `Peer::ancestor_among`, from a pid.
+    #[cfg(test)]
+    pub fn ancestor_among(pid: i32, roots: &[i32]) -> super::Ancestry {
+        let Some(handle) = u32::try_from(pid).ok().filter(|&p| p > 0).and_then(Handle::open_process) else {
+            return super::Ancestry::Unknown;
+        };
+        let Some(created) = creation_time(handle.0) else {
+            return super::Ancestry::Unknown;
+        };
+        walk_from(pid, created, roots)
+    }
+
+    pub(super) fn same_user_handle(peer_proc: &Handle) -> bool {
+        let Some(mut theirs) = process_user_sid(peer_proc.0) else {
+            return false;
+        };
+        // SAFETY: pseudo-handle for current process; does not need closing.
+        let Some(mut mine) = process_user_sid(unsafe { GetCurrentProcess() }) else {
+            return false;
+        };
+        // SAFETY: both buffers are valid SIDs copied from GetTokenInformation.
+        unsafe {
+            IsValidSid(mine.as_mut_ptr().cast()) != 0
+                && IsValidSid(theirs.as_mut_ptr().cast()) != 0
+                && EqualSid(mine.as_mut_ptr().cast(), theirs.as_mut_ptr().cast()) != 0
+        }
+    }
+
+    pub(super) fn creation_time(process: HANDLE) -> Option<u64> {
+        // SAFETY: zeroed FILETIME is valid.
+        let mut created: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+        let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+        let mut user: FILETIME = unsafe { std::mem::zeroed() };
+        // SAFETY: all four pointers are valid for writes.
+        if unsafe { GetProcessTimes(process, &mut created, &mut exit, &mut kernel, &mut user) }
+            == 0
+        {
+            return None;
+        }
+        Some(((created.dwHighDateTime as u64) << 32) | (created.dwLowDateTime as u64))
+    }
+
+    fn parent_with_handle(pid: i32, child_created: u64) -> Result<(i32, Handle, u64), super::Unreadable> {
+        use super::Unreadable::{Failed, Foreign};
+        let child_pid = u32::try_from(pid).ok().filter(|&p| p > 0).ok_or(Failed)?;
+
+        // SAFETY: plain snapshot syscall.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap.is_null() || snap == INVALID_HANDLE_VALUE {
+            return Err(Failed);
+        }
+        let _snap = Handle(snap);
+
+        // SAFETY: zeroed PROCESSENTRY32W with dwSize set is required by Process32FirstW.
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: `snap` is a valid process snapshot and `entry.dwSize` is set.
+        if unsafe { Process32FirstW(snap, &mut entry) } == 0 {
+            return Err(Failed);
+        }
+        let mut ppid = None;
+        loop {
+            if entry.th32ProcessID == child_pid {
+                ppid = Some(entry.th32ParentProcessID);
+                break;
+            }
+            // SAFETY: `snap` and `entry` are valid from the previous call.
+            if unsafe { Process32NextW(snap, &mut entry) } == 0 {
+                break;
+            }
+        }
+        // This process itself is not in the snapshot: it may still be ours
+        let ppid = ppid.ok_or(Failed)?;
+        // No parent recorded: the root of the tree
+        if ppid == 0 || ppid == child_pid {
+            return Err(Foreign);
+        }
+        let parent_proc = Handle::open_process_code(ppid).map_err(super::open_error)?;
+        let parent_created = creation_time(parent_proc.0).ok_or(Failed)?;
+        // Windows reuses PIDs and does not re-parent orphans: a parent that started
+        // after the child is not its parent, whose real one has gone
+        if !super::created_before(parent_created, child_created) {
+            return Err(Foreign);
+        }
+        let ppid_i32 = i32::try_from(ppid).ok().filter(|&p| p > 0).ok_or(Failed)?;
+        Ok((ppid_i32, parent_proc, parent_created))
+    }
+
+    #[cfg(all(windows, test))]
+    pub fn parent(pid: i32) -> Option<i32> {
+        let child_pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
+        let child_proc = Handle::open_process(child_pid)?;
+        let child_created = creation_time(child_proc.0)?;
+        parent_with_handle(pid, child_created).ok().map(|(p, _, _)| p)
+    }
+
+    fn program_handle(handle: &Handle) -> Option<PathBuf> {
+        let mut cap = 512usize;
+        loop {
+            let mut buf = vec![0u16; cap];
+            let mut len = buf.len() as u32;
+            // SAFETY: `buf` has `len` u16 elements writable.
+            if unsafe { QueryFullProcessImageNameW(handle.0, 0, buf.as_mut_ptr(), &mut len) } != 0
+            {
+                return Some(PathBuf::from(OsString::from_wide(&buf[..len as usize])));
+            }
+            // SAFETY: plain GetLastError call.
+            if unsafe { GetLastError() } == ERROR_INSUFFICIENT_BUFFER && cap < 32_768 {
+                cap *= 2;
+                continue;
+            }
+            return None;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn program(pid: i32) -> Option<PathBuf> {
+        let pid = u32::try_from(pid).ok().filter(|&p| p > 0)?;
+        let handle = Handle::open_process(pid)?;
+        program_handle(&handle)
+    }
+}
+
+#[cfg(unix)]
+pub struct Peer {
+    pid: i32,
+    same_user: bool,
+    is_this_program: bool,
+}
+
+#[cfg(unix)]
+impl Peer {
+    pub fn open(stream: &Stream, _accepted_at: u64) -> Option<Self> {
+        let pid = pid(stream)?;
+        Some(Self {
+            pid,
+            same_user: same_user(stream),
+            is_this_program: is_this_program(stream),
+        })
+    }
+
+    pub fn same_user(&self) -> bool {
+        self.same_user
+    }
+
+    pub fn is_this_program(&self) -> bool {
+        self.is_this_program
+    }
+
+    pub fn ancestor_among(&self, roots: &[i32]) -> Ancestry {
+        walk_ancestry(self.pid, roots, |p| unix_step(p, parent, owner))
+    }
+}
+
+#[cfg(windows)]
+pub struct Peer(win::Peer);
+
+#[cfg(windows)]
+impl Peer {
+    pub fn open(stream: &Stream, accepted_at: u64) -> Option<Self> {
+        win::Peer::open(stream, accepted_at).map(Self)
+    }
+
+    pub fn same_user(&self) -> bool {
+        self.0.same_user()
+    }
+
+    pub fn is_this_program(&self) -> bool {
+        self.0.is_this_program()
+    }
+
+    pub fn ancestor_among(&self, roots: &[i32]) -> Ancestry {
+        self.0.ancestor_among(roots)
+    }
+}
+
+#[cfg(all(windows, test))]
+pub fn same_user(stream: &Stream) -> bool {
+    Peer::open(stream, accept_time()).is_some_and(|p| p.same_user())
+}
+
+#[cfg(all(windows, test))]
+pub fn pid(stream: &Stream) -> Option<i32> {
+    win::pid(stream)
+}
+
+#[cfg(all(windows, test))]
+pub fn parent(pid: i32) -> Option<i32> {
+    win::parent(pid)
+}
+
+#[cfg(all(windows, test))]
+pub fn program(pid: i32) -> Option<PathBuf> {
+    win::program(pid)
+}
+
 fn real(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The connection comes from this very program (the app, the harness service
 /// or one of its bridges), run by the same user.
-pub fn is_this_program(stream: &UnixStream) -> bool {
+#[cfg(unix)]
+pub fn is_this_program(stream: &Stream) -> bool {
     let Some((uid, pid)) = credentials(stream) else { return false };
     // SAFETY: plain syscall.
     if uid != unsafe { libc::getuid() } {
@@ -96,34 +603,119 @@ pub fn is_this_program(stream: &UnixStream) -> bool {
     }
 }
 
+/// The connection comes from this very program (the app, the harness service
+/// or one of its bridges), run by the same user.
+#[cfg(all(windows, test))]
+pub fn is_this_program(stream: &Stream) -> bool {
+    Peer::open(stream, accept_time()).is_some_and(|p| p.is_this_program())
+}
+
 /// The first of `roots` that `pid` is, or descends from.
-pub fn ancestor_among(mut pid: i32, roots: &[i32]) -> Option<i32> {
-    for _ in 0..32 {
-        if roots.contains(&pid) {
-            return Some(pid);
-        }
-        match parent(pid) {
-            Some(up) if up > 1 => pid = up,
-            _ => return None,
-        }
-    }
-    None
+#[cfg(test)]
+pub fn ancestor_among(pid: i32, roots: &[i32]) -> Ancestry {
+    #[cfg(unix)]
+    return walk_ancestry(pid, roots, |p| unix_step(p, parent, owner));
+    #[cfg(windows)]
+    win::ancestor_among(pid, roots)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn stream_pair() -> (Stream, Stream) {
+        Stream::pair().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn stream_pair() -> (Stream, Stream) {
+        let path = std::env::temp_dir().join(format!("mcr-peer-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = crate::ipc::Listener::bind(&path).unwrap();
+        let client = Stream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Return the accepted server stream first: on Windows AF_UNIX,
+        // SIO_AF_UNIX_GETPEERPID is populated on the accepted socket.
+        (server, client)
+    }
+
+    #[test]
+    fn created_before_rejects_equal_or_later_timestamps() {
+        assert!(created_before(99, 100));
+        assert!(!created_before(100, 100));
+        assert!(!created_before(101, 100));
+    }
+
+    #[test]
+    fn walk_ancestry_distinguishes_found_outside_and_unknown() {
+        // Reaches root pid 1 -> Outside
+        assert_eq!(walk_ancestry(10, &[99], |_| Ok(Some(1))), Ancestry::Outside);
+        // Clean OS root (Ok(None)) -> Outside
+        assert_eq!(walk_ancestry(10, &[99], |_| Ok(None)), Ancestry::Outside);
+        // Hits session root -> Found
+        assert_eq!(walk_ancestry(10, &[5], |p| Ok(Some(p - 5))), Ancestry::Found(5));
+        // Unreadable or failed creation-time check -> Unknown (never Outside)
+        assert_eq!(walk_ancestry(10, &[99], |_| Err(Unreadable::Failed)), Ancestry::Unknown);
+        // A foreign or vanished process in the chain is outside
+        assert_eq!(walk_ancestry(10, &[99], |_| Err(Unreadable::Foreign)), Ancestry::Outside);
+        // Exceeds 32-step depth limit -> Unknown
+        assert_eq!(walk_ancestry(100, &[999], |p| Ok(Some(p + 1))), Ancestry::Unknown);
+    }
+
+    #[test]
+    fn a_gone_or_forbidden_parent_is_outside_and_other_errors_unknown() {
+        assert_eq!(open_error(87), Unreadable::Foreign);
+        assert_eq!(open_error(5), Unreadable::Foreign);
+        assert_eq!(open_error(1), Unreadable::Failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_walk_tells_root_owned_from_failures_inside_the_tree() {
+        // 50 (ours) -> 40 (login, root's: parent unreadable); 99 is a session root never reached
+        let parents = |p: i32| match p { 50 => Some(40), _ => None };
+        let owner = |p: i32| match p { 40 => Owner::Other, _ => Owner::Me };
+        assert_eq!(walk_ancestry(50, &[99], |p| unix_step(p, parents, owner)), Ancestry::Outside);
+        // Our own process with an unreadable parent could be inside: unknown
+        let owner = |_: i32| Owner::Me;
+        assert_eq!(walk_ancestry(50, &[99], |p| unix_step(p, parents, owner)), Ancestry::Unknown);
+        // An ancestor that has gone (reparented) is outside
+        let owner = |_: i32| Owner::Gone;
+        assert_eq!(walk_ancestry(50, &[99], |p| unix_step(p, parents, owner)), Ancestry::Outside);
+        // Normal descent reaches the session root
+        let parents = |p: i32| Some(p - 10);
+        assert_eq!(walk_ancestry(50, &[30], |p| unix_step(p, parents, owner)), Ancestry::Found(30));
+    }
+
     #[test]
     fn a_connection_from_this_process_is_recognised() {
-        let (a, _b) = UnixStream::pair().unwrap();
+        let accepted_at = accept_time();
+        let (a, _b) = stream_pair();
         assert!(same_user(&a));
         assert_eq!(pid(&a), Some(std::process::id() as i32));
         assert!(is_this_program(&a));
+        let peer = Peer::open(&a, accepted_at).unwrap();
+        assert!(peer.same_user());
+        assert!(peer.is_this_program());
         let me = std::process::id() as i32;
-        assert_eq!(ancestor_among(me, &[me]), Some(me));
+        assert_eq!(peer.ancestor_among(&[me]), Ancestry::Found(me));
+        assert_eq!(program(me).map(|p| real(&p)), std::env::current_exe().ok().map(|p| real(&p)));
+        assert_eq!(ancestor_among(me, &[me]), Ancestry::Found(me));
         let up = parent(me).unwrap();
-        assert_eq!(ancestor_among(me, &[up]), Some(up));
-        assert_eq!(ancestor_among(me, &[]), None);
+        assert_eq!(ancestor_among(me, &[up]), Ancestry::Found(up));
+        assert_eq!(peer.ancestor_among(&[up]), Ancestry::Found(up));
+        assert_eq!(ancestor_among(me, &[]), Ancestry::Outside);
+        assert_eq!(peer.ancestor_among(&[]), Ancestry::Outside);
+    }
+
+    #[test]
+    fn parse_peer_pid_handles_afunix_bytes_returned() {
+        assert_eq!(parse_peer_pid(0, 0, 0), None);
+        assert_eq!(parse_peer_pid(0, 0, 6528), Some(6528));
+        assert_eq!(parse_peer_pid(0, 4, 6528), Some(6528));
+        assert_eq!(parse_peer_pid(-1, 4, 6528), None);
+        assert_eq!(parse_peer_pid(0, 2, 6528), None);
     }
 }

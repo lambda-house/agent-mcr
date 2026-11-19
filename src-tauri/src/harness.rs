@@ -6,7 +6,12 @@
 //! State comes from the agents' own hooks (`--harness-hook`), passed per
 //! launch; nothing is written into the user's agent config files.
 
-pub use crate::agents::{command_line, Launch};
+#[cfg(any(unix, test))]
+pub use crate::agents::command_line;
+#[cfg(any(windows, test))]
+pub use crate::agents::{cmd_line, windows_args};
+pub use crate::agents::Launch;
+use crate::ipc::{self, Listener, Stream};
 use crate::peer;
 use crate::memory::{self, Memory};
 use crate::slack::{self, Slack};
@@ -17,8 +22,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -166,6 +169,8 @@ pub const SUPERVISOR_SERVER: &str = "supervisor";
 
 /// The user's login shell from the account database: GUI apps and launchd
 /// jobs don't reliably have `$SHELL`.
+#[cfg(unix)]
+#[cfg(unix)]
 pub fn login_shell() -> String {
     // SAFETY: getpwuid returns a pointer into static storage or null; we copy
     // the string out immediately and don't call it concurrently from here.
@@ -183,14 +188,53 @@ pub fn login_shell() -> String {
         .unwrap_or_else(|| "/bin/zsh".into())
 }
 
+#[cfg(not(unix))]
+#[cfg(unix)]
+pub fn login_shell() -> String {
+    String::new()
+}
+
 fn new_uuid() -> String {
     let hex = runner::random_id();
     // Version 4, variant 1
     format!("{}-{}-4{}-a{}-{}", &hex[..8], &hex[8..12], &hex[13..16], &hex[17..20], &hex[20..32])
 }
 
-/// Every profile runs in a login shell, so agents see the PATH, keys and
+/// Windows launch argv + env: `powershell.exe -NoLogo` for shell,
+/// `cmd.exe /d /v:off /c %AMCR_LAUNCH%` with `AMCR_LAUNCH` for agents.
+#[cfg(any(windows, test))]
+pub fn windows_launch_for(l: &Launch) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+    let args = windows_args(l)?;
+    if l.profile == "shell" {
+        return Ok((args, BTreeMap::new()));
+    }
+    let mut env = BTreeMap::new();
+    env.insert("AMCR_LAUNCH".into(), cmd_line(&args)?);
+    Ok((
+        vec![
+            "cmd.exe".into(),
+            "/d".into(),
+            "/v:off".into(),
+            "/c".into(),
+            "%AMCR_LAUNCH%".into(),
+        ],
+        env,
+    ))
+}
+
+#[cfg(unix)]
+fn launch_for(l: &Launch) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+    Ok((argv_for(l)?, BTreeMap::new()))
+}
+
+#[cfg(windows)]
+fn launch_for(l: &Launch) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+    windows_launch_for(l)
+}
+
+/// Every profile runs in a login shell on Unix, so agents see the PATH, keys and
 /// version managers the user has in Terminal.
+#[cfg(unix)]
 pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
     let cmd = command_line(l)?;
     let mut shell = login_shell();
@@ -202,10 +246,19 @@ pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
     Ok(if cmd.is_empty() { vec![shell, "-l".into()] } else { vec![shell, "-l".into(), "-i".into(), "-c".into(), cmd] })
 }
 
+/// Claude hook command string for the current platform.
+pub fn claude_hook_command(exe: &str, event: &str, windows: bool) -> String {
+    if windows {
+        format!("\"{}\" --harness-hook {event}", exe.replace('\\', "/"))
+    } else {
+        format!("{} --harness-hook {event}", sh(exe))
+    }
+}
+
 /// Claude Code hooks for one launch (`--settings`): each reports to this
 /// service and prints nothing, so it never changes what the agent does.
 pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
-    let hook = |event: &str| json!([{ "hooks": [{ "type": "command", "command": format!("{} --harness-hook {event}", sh(exe)), "timeout": 5 }] }]);
+    let hook = |event: &str| json!([{ "hooks": [{ "type": "command", "command": claude_hook_command(exe, event, cfg!(windows)), "timeout": 5 }] }]);
     let mut hooks = serde_json::Map::new();
     for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop"] {
         hooks.insert(event.into(), hook(event));
@@ -334,11 +387,13 @@ pub struct Process {
 }
 
 /// `[[dd-]hh:]mm:ss[.cc]` as `ps` prints elapsed and processor time.
+#[cfg(any(unix, test))]
 fn clock_seconds(text: &str) -> f64 {
     let (days, rest) = text.split_once('-').map_or((0.0, text), |(d, r)| (d.parse().unwrap_or(0.0), r));
     rest.split(':').fold(0.0, |total, part| total * 60.0 + part.parse::<f64>().unwrap_or(0.0)) + days * 86_400.0
 }
 
+#[cfg(unix)]
 pub fn process_table() -> Vec<Process> {
     let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,etime=,time=,state=,command="]).output() else { return Vec::new() };
     String::from_utf8_lossy(&out.stdout)
@@ -357,10 +412,198 @@ pub fn process_table() -> Vec<Process> {
         .collect()
 }
 
+#[cfg(target_os = "windows")]
+fn windows_process_cpu_seconds(pid: u32) -> f64 {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return 0.0;
+        }
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+        );
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            return 0.0;
+        }
+        let to_ticks = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+        (to_ticks(kernel).saturating_add(to_ticks(user))) as f64 / 10_000_000.0
+    }
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn format_windows_command(cmd: &[String], exe: Option<&str>) -> String {
+    if cmd.is_empty() {
+        return exe.unwrap_or("").to_string();
+    }
+    cmd.iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '"') {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn map_windows_process(
+    pid: u32,
+    parent: Option<u32>,
+    run_time: u64,
+    cpu_seconds: f64,
+    stopped: bool,
+    cmd: &[String],
+    exe: Option<&str>,
+) -> Option<Process> {
+    let pid = i32::try_from(pid).ok().filter(|&p| p > 0)?;
+    let parent = parent.and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+    Some(Process {
+        pid,
+        parent,
+        elapsed: run_time,
+        cpu: cpu_seconds,
+        state: if stopped { "T" } else { "S" }.into(),
+        command: format_windows_command(cmd, exe),
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn process_table() -> Vec<Process> {
+    use sysinfo::{ProcessRefreshKind, ProcessStatus, RefreshKind, System, UpdateKind};
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)),
+    );
+    system
+        .processes()
+        .values()
+        .filter_map(|p| {
+            let pid = p.pid().as_u32();
+            let cmd: Vec<String> = p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+            let exe = p.exe().map(|path| path.to_string_lossy().into_owned());
+            map_windows_process(
+                pid,
+                p.parent().map(|pp| pp.as_u32()),
+                p.run_time(),
+                windows_process_cpu_seconds(pid),
+                matches!(p.status(), ProcessStatus::Stop),
+                &cmd,
+                exe.as_deref(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+pub fn process_table() -> Vec<Process> {
+    Vec::new()
+}
+
+/// Splits the first argument (supporting double-quoted paths with spaces) and returns `(first, rest_trimmed)`.
+fn split_first_arg(command: &str) -> (&str, &str) {
+    let trimmed = command.trim_start();
+    if let Some(after_quote) = trimmed.strip_prefix('"') {
+        if let Some(end) = after_quote.find('"') {
+            return (&after_quote[..end], after_quote[end + 1..].trim_start());
+        }
+    }
+    match trimmed.find(char::is_whitespace) {
+        Some(idx) => (&trimmed[..idx], trimmed[idx..].trim_start()),
+        None => (trimmed, ""),
+    }
+}
+
+fn shell_kind(command: &str) -> Option<&'static str> {
+    let (program, _) = split_first_arg(command);
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lower = base.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    match stem {
+        "bash" | "zsh" | "sh" | "dash" | "fish" => Some("posix"),
+        "cmd" => Some("cmd"),
+        "powershell" | "pwsh" => Some("powershell"),
+        _ => None,
+    }
+}
+
+fn match_shell_flag<'a>(kind: &str, rest: &'a str) -> Option<(bool, &'a str)> {
+    let mut cursor = rest.trim_start();
+    while !cursor.is_empty() {
+        let (tok, next) = split_first_arg(cursor);
+        match kind {
+            "posix" => {
+                return (tok.starts_with('-') && tok.contains('c')).then_some((false, next));
+            }
+            "cmd" => {
+                if !tok.starts_with('/') {
+                    return None;
+                }
+                if tok.eq_ignore_ascii_case("/c") {
+                    return Some((false, next));
+                }
+            }
+            "powershell" => {
+                let flag = tok.strip_prefix('-').or_else(|| tok.strip_prefix('/'))?;
+                if flag.eq_ignore_ascii_case("command") || flag.eq_ignore_ascii_case("c") {
+                    return Some((false, next));
+                }
+                if ["encodedcommand", "enc", "ec", "e"].iter().any(|k| flag.eq_ignore_ascii_case(k)) {
+                    return Some((true, next));
+                }
+                if ["executionpolicy", "ep", "windowstyle", "w", "inputformat", "if", "outputformat", "of"]
+                    .iter()
+                    .any(|k| flag.eq_ignore_ascii_case(k))
+                {
+                    let (_, after_val) = split_first_arg(next);
+                    cursor = after_val;
+                    continue;
+                }
+            }
+            _ => return None,
+        }
+        cursor = next;
+    }
+    None
+}
+
 fn is_command_shell(command: &str) -> bool {
-    let mut words = command.split_whitespace();
-    let name = words.next().unwrap_or("").rsplit('/').next().unwrap_or("");
-    ["bash", "zsh", "sh", "dash", "fish"].contains(&name) && words.next().is_some_and(|flag| flag.starts_with('-') && flag.contains('c'))
+    let (_, rest) = split_first_arg(command);
+    shell_kind(command).is_some_and(|kind| match_shell_flag(kind, rest).is_some())
+}
+
+fn extract_shell_command(command: &str) -> String {
+    let (_, rest) = split_first_arg(command);
+    if let Some(kind) = shell_kind(command) {
+        if let Some((encoded, body)) = match_shell_flag(kind, rest) {
+            if encoded {
+                return if kind == "powershell" { "powershell -EncodedCommand" } else { "<encoded command>" }.to_string();
+            }
+            if kind == "posix" {
+                if let Some((_, after_eval)) = body.rsplit_once("eval ") {
+                    return after_eval.to_string();
+                }
+            }
+            let body = body.trim();
+            if let Some(unquoted) = body.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                return unquoted.to_string();
+            }
+            return body.to_string();
+        }
+    }
+    command
+        .rsplit_once("eval ")
+        .map(|(_, c)| c)
+        .or(command.split_once("c ").map(|(_, c)| c))
+        .unwrap_or(command)
+        .to_string()
 }
 
 /// The shells running under an agent's process: each `sh -c …` among its
@@ -378,11 +621,17 @@ pub fn shells(table: &[Process], root: i32, now: u64) -> Vec<Shell> {
         }
         // What it runs: its first child, or else the text it was given
         let inner = children(pid).min_by_key(|p| p.pid).map(|p| {
-            let (program, rest) = p.command.split_once(' ').unwrap_or((&p.command, ""));
-            format!("{} {rest}", program.rsplit('/').next().unwrap_or(program))
+            let (program, rest) = split_first_arg(&p.command);
+            let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+            if rest.is_empty() { name.to_string() } else { format!("{name} {rest}") }
         });
-        let given = || process.command.rsplit_once("eval ").map(|(_, c)| c).or(process.command.split_once("c ").map(|(_, c)| c)).unwrap_or(&process.command).to_string();
-        let command: String = inner.unwrap_or_else(given).trim().chars().filter(|c| !c.is_control()).take(160).collect();
+        let command: String = inner
+            .unwrap_or_else(|| extract_shell_command(&process.command))
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(160)
+            .collect();
         // The whole tree under the shell: the work is usually in a grandchild
         let (mut cpu, mut stopped, mut tree) = (0.0, false, vec![pid]);
         while let Some(member) = tree.pop() {
@@ -826,18 +1075,41 @@ impl Note {
     }
 }
 
+fn folder_parts(path: &str) -> (bool, Vec<String>) {
+    let bytes = path.as_bytes();
+    let is_windows = path.starts_with(r"\\")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    let trimmed = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    };
+    let parts = trimmed
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .map(|p| if is_windows { p.to_ascii_lowercase() } else { p.to_string() })
+        .collect();
+    (is_windows, parts)
+}
+
 /// How the folder `theirs` lies to `mine`: `same`, `below` (inside mine) or
 /// `above` (it contains mine). Nothing when they are apart or one is unknown.
 pub fn folder_relation(mine: &str, theirs: &str) -> Option<&'static str> {
     if mine.is_empty() || theirs.is_empty() {
         return None;
     }
-    let (mine, theirs) = (Path::new(mine), Path::new(theirs));
+    let (mine_win, mine) = folder_parts(mine);
+    let (theirs_win, theirs) = folder_parts(theirs);
+    if mine_win != theirs_win || mine.is_empty() || theirs.is_empty() {
+        return None;
+    }
     if mine == theirs {
         Some("same")
-    } else if theirs.starts_with(mine) {
+    } else if theirs.starts_with(&mine) {
         Some("below")
-    } else if mine.starts_with(theirs) {
+    } else if mine.starts_with(&theirs) {
         Some("above")
     } else {
         None
@@ -1026,7 +1298,10 @@ impl Store {
     /// reports nothing, so it takes one only when its terminal shows the
     /// prompt (`at_prompt`): text typed into a start-up question would answer it.
     fn next(&mut self, session: &str, at_prompt: bool) -> Option<Task> {
-        let ready = self.sessions.get(session).is_some_and(|t| t.state == "idle" || (t.state == "unknown" && (!adapter(&t.profile).silent_until_first_turn() || at_prompt)));
+        let ready = self.sessions.get(session).is_some_and(|t| {
+            t.state == "idle"
+                || (t.state == "unknown" && (!adapter(&t.profile).detects_prompt() || at_prompt))
+        });
         if !ready || self.tasks.values().any(|t| t.session == session && t.state == "working") {
             return None;
         }
@@ -1891,8 +2166,14 @@ impl Harness {
         store.version += 1;
         if let Ok(bytes) = saved(&store) {
             let tmp = self.dir.join("harness-state.json.tmp");
-            use std::os::unix::fs::OpenOptionsExt;
-            let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(&bytes));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let written = opts.open(&tmp).and_then(|mut f| f.write_all(&bytes));
             if written.is_ok() {
                 let _ = std::fs::rename(&tmp, self.dir.join("harness-state.json"));
             }
@@ -2236,7 +2517,21 @@ impl Harness {
         let mcp = self.dir.join(if supervisor { "claude-supervisor-mcp.json" } else { "claude-mcp.json" });
         let plugin = self.dir.join("claude-plugin");
         let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
-        let argv = argv_for(&Launch {
+        if cfg!(windows) {
+            if let Some(text) = task {
+                if !agent.reports_from_start() && !agent.detects_prompt() {
+                    return Err(if profile == "shell" {
+                        "A shell has no session to resume and takes no task"
+                    } else {
+                        "This harness cannot accept a first task on Windows until its prompt is detected"
+                    }.into());
+                }
+                if agent.is_agent() {
+                    plain_prompt(text)?;
+                }
+            }
+        }
+        let (argv, mut spawn_env) = launch_for(&Launch {
             supervisor,
             plugin: &plugin.display().to_string(),
             note: agent.takes_note(&home),
@@ -2246,10 +2541,14 @@ impl Harness {
             mcp: &mcp.display().to_string(),
             agent_session: agent_session.as_deref(),
             resume,
-            task,
+            // Free text never goes in Windows argv; it is queued and typed when ready.
+            task: if cfg!(windows) { None } else { task },
             own_hooks: lock(&self.store).codex_hooks,
         })?;
+        spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
         let id = runner::random_id()[..12].to_string();
+        spawn_env.insert("AGENT_MCR_SESSION".into(), id.clone());
+        spawn_env.insert("AGENT_MCR_HARNESS".into(), socket(&self.dir).display().to_string());
         let name: String = req["name"].as_str().unwrap_or("").trim().chars().filter(|c| !c.is_control()).take(80).collect();
         let mut meta = json!({ "profile": profile, "label": label });
         if !name.is_empty() {
@@ -2266,19 +2565,16 @@ impl Harness {
             "id": id,
             "argv": argv,
             "cwd": dir.display().to_string(),
-            "env": {
-                "AGENT_MCR_PROFILE": profile,
-                "AGENT_MCR_SESSION": id,
-                "AGENT_MCR_HARNESS": socket(&self.dir).display().to_string(),
-            },
+            "env": spawn_env,
             "meta": meta,
             "cols": req["cols"].as_u64().unwrap_or(120),
             "rows": req["rows"].as_u64().unwrap_or(32),
         }))?;
         let now = now_ms();
         let first_task = task.map(|_| format!("t{}", &runner::random_id()[..10]));
+        let task_in_argv = task.is_some() && !cfg!(windows);
         self.update(|s| {
-            let state = match (agent.is_agent(), task.is_some()) {
+            let state = match (agent.is_agent(), task_in_argv) {
                 (true, true) => "working",
                 (true, false) if agent.reports_from_start() => "starting",
                 _ => "unknown",
@@ -2303,7 +2599,18 @@ impl Harness {
             if let (Some(text), Some(task_id)) = (task, first_task.clone()) {
                 s.tasks.insert(
                     task_id.clone(),
-                    Task { id: task_id, session: id.clone(), text: text.into(), state: "working".into(), created: now, started: now, finished: 0, result: None, by: assigner.clone(), told: false },
+                    Task {
+                        id: task_id,
+                        session: id.clone(),
+                        text: text.into(),
+                        state: if task_in_argv { "working".into() } else { "queued".into() },
+                        created: now,
+                        started: if task_in_argv { now } else { 0 },
+                        finished: 0,
+                        result: None,
+                        by: assigner.clone(),
+                        told: false,
+                    },
                 );
             }
         });
@@ -2360,7 +2667,7 @@ impl Harness {
         let (queued, unsure) = {
             let store = lock(&self.store);
             let queued = store.tasks.values().filter(|t| t.session == session && t.state == "queued").map(|t| t.created).min();
-            (queued, store.sessions.get(session).is_some_and(|t| adapter(&t.profile).silent_until_first_turn() && t.state == "unknown"))
+            (queued, store.sessions.get(session).is_some_and(|t| adapter(&t.profile).detects_prompt() && t.state == "unknown"))
         };
         let Some(queued) = queued else { return };
         let at_prompt = unsure && self.at_prompt(session);
@@ -2920,7 +3227,7 @@ impl Harness {
             }
             "wait_clear" => {
                 let id = text("wait")?;
-                if !lock(&self.store).waits.get(id).is_some_and(|w| w.session == me) {
+                if lock(&self.store).waits.get(id).is_none_or(|w| w.session != me) {
                     return Err(format!("No wait {id} of this session"));
                 }
                 self.update(|s| s.clear_wait(id, args["outcome"].as_str().unwrap_or(""), "")).map(|w| w.shown()).ok_or_else(|| format!("Wait {id} is already cleared"))?
@@ -3024,8 +3331,8 @@ impl Harness {
 
     /// The hosted session a connection comes from: its process descends from
     /// one of the runner's children. Nothing the caller says is trusted.
-    fn caller(&self, stream: &UnixStream) -> Result<String, String> {
-        match self.who(stream) {
+    fn caller(&self, peer: &peer::Peer) -> Result<String, String> {
+        match self.who(peer) {
             Caller::Session { id, .. } => Ok(id),
             Caller::Outside => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
             Caller::Unknown => Err("Cannot tell which process is calling".into()),
@@ -3033,23 +3340,26 @@ impl Harness {
     }
 
     /// Where a connection comes from, by the caller's process alone.
-    fn who(&self, stream: &UnixStream) -> Caller {
-        let Some(pid) = peer::pid(stream) else { return Caller::Unknown };
+    fn who(&self, peer: &peer::Peer) -> Caller {
         let Ok(list) = self.runner(json!({"op": "list"})) else { return Caller::Unknown };
         let live: Vec<(i32, &Value)> = list["sessions"]
             .as_array()
             .map(|all| all.iter().filter(|s| s["exit"].is_null()).filter_map(|s| Some((s["pid"].as_i64()? as i32, s))).collect())
             .unwrap_or_default();
         let roots: Vec<i32> = live.iter().map(|(pid, _)| *pid).collect();
-        match peer::ancestor_among(pid, &roots).and_then(|root| live.iter().find(|(pid, _)| *pid == root)) {
-            Some((_, s)) => Caller::Session { id: s["id"].as_str().unwrap_or("").into(), supervisor: s["meta"]["role"] == "supervisor" },
-            None => Caller::Outside,
+        match peer.ancestor_among(&roots) {
+            peer::Ancestry::Found(root) => match live.iter().find(|(pid, _)| *pid == root) {
+                Some((_, s)) => Caller::Session { id: s["id"].as_str().unwrap_or("").into(), supervisor: s["meta"]["role"] == "supervisor" },
+                None => Caller::Unknown,
+            },
+            peer::Ancestry::Outside => Caller::Outside,
+            peer::Ancestry::Unknown => Caller::Unknown,
         }
     }
 
-    fn agent(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream, mcp_client: bool) -> std::io::Result<()> {
+    fn agent(&self, mut reader: BufReader<Stream>, mut writer: Stream, mcp_client: bool, peer: &peer::Peer) -> std::io::Result<()> {
         // Refused callers still get a working MCP server whose tools say why
-        let me = self.caller(&writer);
+        let me = self.caller(peer);
         // The session has the tools for as long as a bridge of its is connected
         let bridged = |by: isize| {
             if let (true, Ok(id)) = (mcp_client, &me) {
@@ -3087,8 +3397,8 @@ impl Harness {
     /// The `memory` MCP server for one bridge (`--memory-mcp`). Memory is for
     /// hosted sessions: who calls is taken from the caller's process, as for
     /// `mcr`, and anybody else gets a server that lists nothing and says why.
-    fn memory_mcp(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
-        let me = self.caller(&writer);
+    fn memory_mcp(&self, mut reader: BufReader<Stream>, mut writer: Stream, peer: &peer::Peer) -> std::io::Result<()> {
+        let me = self.caller(peer);
         loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
@@ -3745,11 +4055,11 @@ impl Harness {
         }
     }
 
-    fn supervise(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream, cli: bool) -> std::io::Result<()> {
+    fn supervise(&self, mut reader: BufReader<Stream>, mut writer: Stream, peer: &peer::Peer, cli: bool) -> std::io::Result<()> {
         // Only the Supervisor session has these tools. An agent outside the
         // harness gets them when the operator allowed that, and not otherwise:
         // a worker's process that left its session looks like an outside one.
-        let who = self.who(&writer);
+        let who = self.who(peer);
         let refusal = || match &who {
             Caller::Session { supervisor: true, .. } => None,
             Caller::Session { .. } => Some("Refused: this is a worker session. Only the Supervisor session has the supervisor tools; use the mcr tools to reach other sessions."),
@@ -3782,8 +4092,11 @@ impl Harness {
         }
     }
 
-    fn handle(&self, stream: UnixStream) -> std::io::Result<()> {
-        if !peer::same_user(&stream) {
+    fn handle(&self, stream: Stream, accepted_at: u64) -> std::io::Result<()> {
+        let Some(peer) = peer::Peer::open(&stream, accepted_at) else {
+            return Ok(());
+        };
+        if !peer.same_user() {
             return Ok(());
         }
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -3798,19 +4111,19 @@ impl Harness {
                 return writeln!(writer, "{}", json!({"error": "Invalid request"}));
             };
             if req["op"] == "supervise" {
-                return self.supervise(reader, writer, req["cli"] == true);
+                return self.supervise(reader, writer, &peer, req["cli"] == true);
             }
             if req["op"] == "agent" {
-                return self.agent(reader, writer, req["cli"] != true);
+                return self.agent(reader, writer, req["cli"] != true, &peer);
             }
             if req["op"] == "memory" {
-                return self.memory_mcp(reader, writer);
+                return self.memory_mcp(reader, writer, &peer);
             }
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
                 self.control(&req)
             } else {
-                match (op, &*who.get_or_insert_with(|| self.who(&writer))) {
+                match (op, &*who.get_or_insert_with(|| self.who(&peer))) {
                     // A hook speaks for the session its process runs in, whatever it says
                     ("hook", Caller::Session { id, .. }) => {
                         self.hook(id, req["event"].as_str().unwrap_or(""), &req["payload"]);
@@ -3818,7 +4131,7 @@ impl Harness {
                     }
                     ("hook", _) => Ok(json!({})),
                     // Everything else is the app's: a hosted session has the tools instead
-                    (_, Caller::Outside) if peer::is_this_program(&writer) => self.control(&req),
+                    (_, Caller::Outside) if peer.is_this_program() => self.control(&req),
                     _ => Err(format!(
                         "Refused: only the Agent MCR app manages sessions, and only the copy that started this service ({}). After switching builds or moving the app, restart the background units",
                         std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
@@ -4087,22 +4400,23 @@ const AGENT: Server = Server { info: agent_info, tools: agent_tools };
 /// Serve until idle. Refuses to start if another service answers on the socket.
 pub fn serve(dir: &Path) -> Result<(), String> {
     let path = socket(dir);
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    ipc::private_dir(dir)?;
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        if UnixStream::connect(&path).is_ok() {
+        if Stream::connect(&path).is_ok() {
             return Err("A harness service is already listening".into());
         }
-        if !meta.file_type().is_socket() {
+        if !ipc::is_socket(&path, &meta) {
             return Err("Refusing to replace a non-socket file".into());
         }
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
-    let listener = UnixListener::bind(&path).map_err(|e| format!("Cannot listen on {}: {e}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    let listener = Listener::bind(&path).map_err(|e| format!("Cannot listen on {}: {e}", path.display()))?;
+    ipc::private_file(&path)?;
     // State and logs hold session names, messages and folders: the user's alone,
     // also when the folder's own mode is changed later
+    #[cfg(unix)]
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        use std::os::unix::fs::PermissionsExt;
         if entry.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 != 0) {
             let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
         }
@@ -4153,11 +4467,12 @@ pub fn serve(dir: &Path) -> Result<(), String> {
     });
 
     for stream in listener.incoming() {
+        let accepted_at = peer::accept_time();
         let Ok(stream) = stream else { continue };
         let harness = harness.clone();
         harness.connections.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let _ = harness.handle(stream);
+            let _ = harness.handle(stream, accepted_at);
             harness.connections.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -4169,7 +4484,7 @@ const BRIDGE_RETRY: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 struct BridgeState {
-    stream: Option<UnixStream>,
+    stream: Option<Stream>,
     /// The client's `initialize` and `notifications/initialized`, replayed to a restarted service
     initialize: Option<Vec<u8>>,
     initialized: Option<Vec<u8>>,
@@ -4181,7 +4496,7 @@ struct BridgeState {
 /// An agent's stdio ⇄ the service, kept across a service restart: the bridge
 /// reconnects, replays the MCP handshake and fails the calls that were in
 /// flight, so the agent keeps its tools instead of losing the server.
-fn bridge<R: Read + Send + 'static, W: Write + Send + 'static>(input: R, output: W, retry: Duration, connect: impl Fn() -> Result<UnixStream, String>) -> Result<(), String> {
+fn bridge<R: Read + Send + 'static, W: Write + Send + 'static>(input: R, output: W, retry: Duration, connect: impl Fn() -> Result<Stream, String>) -> Result<(), String> {
     let state = Arc::new((Mutex::new(BridgeState::default()), Condvar::new()));
     let output = Arc::new(Mutex::new(output));
     let emit = |output: &Mutex<W>, line: &[u8]| {
@@ -4294,9 +4609,9 @@ fn bridge<R: Read + Send + 'static, W: Write + Send + 'static>(input: R, output:
     }
 }
 
-fn bridge_to(path: PathBuf, op: &'static str) -> impl Fn() -> Result<UnixStream, String> {
+fn bridge_to(path: PathBuf, op: &'static str) -> impl Fn() -> Result<Stream, String> {
     move || {
-        let mut stream = UnixStream::connect(&path).map_err(|e| format!("Harness service unavailable: {e}"))?;
+        let mut stream = Stream::connect(&path).map_err(|e| format!("Harness service unavailable: {e}"))?;
         writeln!(stream, "{}", json!({ "op": op })).map_err(|e| e.to_string())?;
         Ok(stream)
     }
@@ -4337,7 +4652,7 @@ pub fn tool_cli(dir: &Path, name: &str, arguments: Option<String>, supervisor: b
         return Err("The arguments must be a JSON object".into());
     }
     let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
-    let stream = UnixStream::connect(path).map_err(|e| format!("Harness service unavailable: {e}"))?;
+    let stream = Stream::connect(path).map_err(|e| format!("Harness service unavailable: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(MAX_WAIT + 30)));
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream);
@@ -4414,7 +4729,7 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
     });
     let mut payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     trim_hook(event, &mut payload);
-    let Ok(mut stream) = UnixStream::connect(path) else { return };
+    let Ok(mut stream) = Stream::connect(path) else { return };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     if writeln!(stream, "{}", json!({"op": "hook", "session": session, "event": event, "payload": payload})).is_ok() {
@@ -4425,6 +4740,207 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder for a test that listens on a socket in it: `/tmp` on Unix, where
+    /// the macOS temp folder would make the path too long for `sun_path`.
+    fn socket_test_dir(prefix: &str) -> PathBuf {
+        let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
+        base.join(format!("{prefix}{}", runner::random_id()))
+    }
+
+    #[test]
+    fn windows_argv_and_claude_hooks_match_spec() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let (shell, shell_env) = windows_launch_for(&Launch { profile: "shell", ..Launch::default() }).unwrap();
+        assert_eq!(shell, vec!["powershell.exe", "-NoLogo"]);
+        assert!(shell_env.is_empty());
+        assert!(windows_launch_for(&Launch { profile: "shell", task: Some("hi"), ..Launch::default() }).is_err());
+
+        for profile in ["claude", "codex", "antigravity"] {
+            let (argv, env) = windows_launch_for(&Launch {
+                profile,
+                exe: "C:\\Program Files\\Agent MCR\\agent-mcr.exe",
+                settings: "C:\\cfg\\claude-hooks.json",
+                mcp: "C:\\cfg\\claude-mcp.json",
+                plugin: "C:\\cfg\\claude-plugin",
+                note: true,
+                supervisor: true,
+                agent_session: Some(id),
+                task: Some("ignored on windows"),
+                ..Launch::default()
+            }).unwrap();
+            assert_eq!(argv, vec!["cmd.exe", "/d", "/v:off", "/c", "%AMCR_LAUNCH%"]);
+            let line = env.get("AMCR_LAUNCH").expect("AMCR_LAUNCH env");
+            assert!(!line.contains("ignored on windows"));
+            assert!(!line.starts_with("\"\"") && !line.ends_with("\"\""));
+        }
+
+        let hook = claude_hook_command("C:\\Program Files\\Agent MCR\\agent-mcr.exe", "Stop", true);
+        assert_eq!(hook, "\"C:/Program Files/Agent MCR/agent-mcr.exe\" --harness-hook Stop");
+    }
+
+    #[test]
+    fn windows_first_task_gating_waits_for_prompt_not_startup_menu() {
+        let mut store = Store::default();
+        store.sessions.insert(
+            "agy1".into(),
+            Tracked { profile: "antigravity".into(), state: "unknown".into(), ..Tracked::default() },
+        );
+        store.tasks.insert(
+            "t1".into(),
+            Task { id: "t1".into(), session: "agy1".into(), text: "do work".into(), state: "queued".into(), created: 1, started: 0, finished: 0, result: None, by: String::new(), told: false },
+        );
+        // Folder-trust / permission menu on screen -> at_prompt is false -> must NOT deliver
+        let menu_screen = "Trust this folder? enter Confirm";
+        assert!(!adapter("antigravity").at_prompt(menu_screen));
+        assert!(store.next("agy1", adapter("antigravity").at_prompt(menu_screen)).is_none());
+        // Input box ready -> at_prompt is true -> delivers once
+        let ready_screen = "? for shortcuts";
+        assert!(adapter("antigravity").at_prompt(ready_screen));
+        assert_eq!(store.next("agy1", adapter("antigravity").at_prompt(ready_screen)).unwrap().id, "t1");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_line_preserves_argv_through_cmd_and_npm_shim() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+            let exe = std::env::current_exe().unwrap();
+            let find_probe = || {
+                let mut candidates = Vec::new();
+                if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+                    candidates.push(
+                        std::path::PathBuf::from(target_dir)
+                            .join("debug")
+                            .join("examples")
+                            .join("argv_probe.exe"),
+                    );
+                }
+                if let Some(p) = exe.parent().and_then(|p| p.parent()) {
+                    candidates.push(p.join("examples").join("argv_probe.exe"));
+                }
+                for ancestor in exe.ancestors() {
+                    if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
+                        candidates.push(ancestor.join("debug").join("examples").join("argv_probe.exe"));
+                    }
+                }
+                candidates.push(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("target")
+                        .join("debug")
+                        .join("examples")
+                        .join("argv_probe.exe"),
+                );
+                candidates.into_iter().find(|p| p.is_file())
+            };
+            let probe = find_probe().unwrap_or_else(|| {
+                let status = std::process::Command::new("cargo")
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .args(["build", "--example", "argv_probe"])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "failed to build argv_probe example");
+                find_probe().expect("argv_probe.exe missing after cargo build --example argv_probe")
+            });
+            assert!(probe.is_file(), "argv_probe.exe missing at {}", probe.display());
+
+            let dir = std::env::temp_dir().join(format!("mcr-probe-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let probe_copy = dir.join("argv_probe.exe");
+            std::fs::copy(&probe, &probe_copy).unwrap();
+            let shim = dir.join("argv_probe.cmd");
+            std::fs::write(&shim, "@\"%~dp0argv_probe.exe\" %*\r\n").unwrap();
+
+            let payload = vec![
+                "".to_string(),
+                "hello world".to_string(),
+                "héllo 世界".to_string(),
+                "C:\\dir with space\\".to_string(),
+                "a & b | c < d > e ^ f (g) !h!".to_string(),
+            ];
+
+            for prog in [&probe_copy, &shim] {
+                let mut full = vec![prog.display().to_string()];
+                full.extend(payload.iter().cloned());
+                let line = cmd_line(&full).unwrap();
+                let pair = native_pty_system()
+                    .openpty(PtySize { rows: 24, cols: 512, pixel_width: 0, pixel_height: 0 })
+                    .unwrap();
+                let mut cmd = CommandBuilder::new("cmd.exe");
+                cmd.args(["/d", "/v:off", "/c", "%AMCR_LAUNCH%"]);
+                cmd.env("AMCR_LAUNCH", &line);
+                let mut child = pair.slave.spawn_command(cmd).unwrap();
+                drop(pair.slave);
+                let mut reader = pair.master.try_clone_reader().unwrap();
+                let mut writer = pair.master.take_writer().unwrap();
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let captured_bg = captured.clone();
+                let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    let mut dsr_scan_from = 0usize;
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let mut guard = captured_bg.lock().unwrap();
+                                guard.extend_from_slice(&buf[..n]);
+                                while let Some(pos) = guard[dsr_scan_from..]
+                                    .windows(4)
+                                    .position(|w| w == b"\x1b[6n")
+                                {
+                                    let _ = writer.write_all(b"\x1b[1;1R");
+                                    let _ = writer.flush();
+                                    dsr_scan_from += pos + 4;
+                                }
+                            }
+                        }
+                    }
+                    let _ = eof_tx.send(());
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        drop(pair.master);
+                        let partial = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+                        panic!("cmd timed out for {}; read so far: {partial:?}", prog.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                drop(pair.master);
+                let _ = eof_rx.recv_timeout(Duration::from_secs(5));
+                let raw = captured.lock().unwrap().clone();
+                assert!(status.success(), "cmd failed for {} (output: {:?})", prog.display(), String::from_utf8_lossy(&raw));
+                let mut parser = vt100::Parser::new(
+                    std::num::NonZeroU16::new(24).unwrap(),
+                    std::num::NonZeroU16::new(512).unwrap(),
+                    0,
+                );
+                parser.process(&raw);
+                let text = parser.screen().contents();
+                let json_line = text
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| l.starts_with('[') && l.ends_with(']'))
+                    .unwrap_or_else(|| panic!("no JSON argv line in ConPTY output for {}: {text:?} (raw: {:?})", prog.display(), String::from_utf8_lossy(&raw)));
+                let got: Vec<String> = serde_json::from_str(json_line).unwrap();
+                assert_eq!(got, payload, "argv mismatch via {}", prog.display());
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("windows_cmd_line_preserves_argv_through_cmd_and_npm_shim timed out");
+    }
 
     #[test]
     fn disabled_profiles_are_refused_before_launch_and_cli_never_bypasses_approval() {
@@ -4461,10 +4977,16 @@ mod tests {
         assert!(command_line(&Launch { task: Some("x"), ..launch("shell") }).is_err());
         assert!(command_line(&Launch { resume: Some("x; rm -rf /"), ..launch("claude") }).is_err());
         assert!(command_line(&launch("rm -rf /")).is_err());
-        let argv = argv_for(&launch("claude")).unwrap();
-        assert_eq!(&argv[1..4], &["-l", "-i", "-c"]);
+        #[cfg(unix)]
+        {
+            let argv = argv_for(&launch("claude")).unwrap();
+            assert_eq!(&argv[1..4], &["-l", "-i", "-c"]);
+        }
         let hooks = claude_settings("/Apps/Agent MCR.app/agent-mcr", false);
+        #[cfg(unix)]
         assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "'/Apps/Agent MCR.app/agent-mcr' --harness-hook Stop");
+        #[cfg(windows)]
+        assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "\"/Apps/Agent MCR.app/agent-mcr\" --harness-hook Stop");
     }
 
     #[test]
@@ -4572,9 +5094,9 @@ mod tests {
 
     #[test]
     fn supervision_overview_and_lists_through_the_service() {
-        let dir = Path::new("/tmp").join(format!("mcr-overview-{}", runner::random_id()));
+        let dir = socket_test_dir("mcr-overview-");
         std::fs::create_dir_all(&dir).unwrap();
-        let listener = UnixListener::bind(dir.join("runner.sock")).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
         let server = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
@@ -4614,7 +5136,7 @@ mod tests {
         for catalog in [supervisor_tools(), agent_tools()] {
             assert!(catalog["tools"].as_array().unwrap().iter().any(|t| t["name"] == "overview"));
         }
-        let mut stream = UnixStream::connect(dir.join("runner.sock")).unwrap();
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
@@ -5126,6 +5648,10 @@ mod tests {
         assert_eq!(folder_relation("/w/app/src", "/w/app"), Some("above"));
         assert_eq!(folder_relation("/w/app", "/w/application"), None);
         assert_eq!(folder_relation("", "/w/app"), None);
+        assert_eq!(folder_relation(r"C:\Work\App", r"\\?\c:\work\app\src"), Some("below"));
+        assert_eq!(folder_relation(r"C:\Work\App", "C:/work/app/"), Some("same"));
+        assert_eq!(folder_relation(r"C:\Work\App\src", r"c:\work\app"), Some("above"));
+        assert_eq!(folder_relation(r"C:\Work\App", r"D:\Work\App"), None);
 
         let mut s = store_with("a", "working");
         s.sessions.get_mut("a").unwrap().cwd = "/w/app".into();
@@ -5334,6 +5860,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn memory_is_served_on_the_socket_and_refuses_a_caller_that_is_no_session() {
         let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
@@ -5341,9 +5868,9 @@ mod tests {
         let harness = Arc::new(Harness::open(&dir));
         // Not connected until the person connects it, and the app can ask
         assert_eq!(harness.control(&json!({"op": "memory_status"})).unwrap()["state"], "disconnected");
-        let (mut bridge, service) = UnixStream::pair().unwrap();
+        let (mut bridge, service) = Stream::pair().unwrap();
         let serving = harness.clone();
-        std::thread::spawn(move || serving.handle(service));
+        std::thread::spawn(move || serving.handle(service, now_ms()));
         let mut answers = BufReader::new(bridge.try_clone().unwrap());
         // This test is no hosted session: the server answers, lists nothing and says why
         writeln!(bridge, "{}", json!({"op": "memory"})).unwrap();
@@ -5368,12 +5895,12 @@ mod tests {
         let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let (mut agent, input) = UnixStream::pair().unwrap();
-        let (output, from_bridge) = UnixStream::pair().unwrap();
+        let listener = Listener::bind(&path).unwrap();
+        let (mut agent, input) = Stream::pair().unwrap();
+        let (output, from_bridge) = Stream::pair().unwrap();
         let mut from_bridge = BufReader::new(from_bridge);
         std::thread::spawn(move || bridge(input, output, Duration::from_secs(10), bridge_to(path, "memory")));
-        let line = |r: &mut BufReader<UnixStream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
+        let line = |r: &mut BufReader<Stream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
         let (first, _) = listener.accept().unwrap();
         let mut service = BufReader::new(first.try_clone().unwrap());
         writeln!(agent, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).unwrap();
@@ -5396,12 +5923,12 @@ mod tests {
         let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let (mut agent, input) = UnixStream::pair().unwrap();
-        let (output, from_bridge) = UnixStream::pair().unwrap();
+        let listener = Listener::bind(&path).unwrap();
+        let (mut agent, input) = Stream::pair().unwrap();
+        let (output, from_bridge) = Stream::pair().unwrap();
         let mut from_bridge = BufReader::new(from_bridge);
         std::thread::spawn(move || bridge(input, output, Duration::from_secs(10), bridge_to(path, "agent")));
-        let line = |r: &mut BufReader<UnixStream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
+        let line = |r: &mut BufReader<Stream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
 
         // First service: handshake, then it dies with a call in flight
         let (first, _) = listener.accept().unwrap();
@@ -5478,6 +6005,65 @@ mod tests {
         let at = |cpu: f64, now: u64| harness.with_activity(vec![Shell { pid: 20, command: String::new(), started: 0, cpu, stopped: false, quiet_since: now }], now)[0].quiet_since;
         assert_eq!((at(2.0, 1_000), at(2.0, 61_000), at(2.4, 90_000), at(2.4, 200_000)), (1_000, 1_000, 90_000, 90_000));
     }
+    #[test]
+    fn windows_process_mapping_units_and_missing_parents() {
+        assert!(map_windows_process(0, Some(1), 10, 1.5, false, &[], None).is_none());
+        assert!(map_windows_process(u32::MAX, Some(1), 10, 1.5, false, &[], None).is_none());
+        let proc = map_windows_process(
+            420,
+            None,
+            131,
+            2.75,
+            false,
+            &["C:\\Program Files\\Git\\bin\\bash.exe".into(), "-c".into(), "cargo test".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!((proc.pid, proc.parent, proc.elapsed, proc.cpu, proc.state.as_str()), (420, 0, 131, 2.75, "S"));
+        assert_eq!(proc.command, "\"C:\\Program Files\\Git\\bin\\bash.exe\" -c \"cargo test\"");
+
+        let fallback_exe = map_windows_process(421, Some(420), 5, 0.25, true, &[], Some("C:\\Windows\\System32\\cmd.exe")).unwrap();
+        assert_eq!((fallback_exe.parent, fallback_exe.state.as_str(), fallback_exe.command.as_str()), (420, "T", "C:\\Windows\\System32\\cmd.exe"));
+    }
+
+    #[test]
+    fn windows_shells_match_paths_quotes_options_and_filter_helpers() {
+        let p = |pid: i32, parent: i32, elapsed: u64, cpu: f64, command: &str| Process {
+            pid,
+            parent,
+            elapsed,
+            cpu,
+            state: "S".into(),
+            command: command.to_string(),
+        };
+        let table = vec![
+            p(100, 1, 500, 1.0, "\"C:\\Program Files\\nodejs\\node.exe\" claude.js"),
+            p(101, 100, 500, 3.0, "C:\\Apps\\agent-mcr.exe --harness-mcp"),
+            p(102, 100, 500, 2.0, "\"C:\\Program Files\\nodejs\\node.exe\" mcp-server.js"),
+            p(103, 100, 500, 0.5, "C:\\Windows\\System32\\cmd.exe /k"),
+            p(200, 100, 60, 0.2, "\"C:\\Program Files\\Git\\bin\\bash.exe\" -c \"cargo test --lib\""),
+            p(201, 200, 59, 1.8, "\"C:\\Users\\me\\.cargo\\bin\\cargo.exe\" test --lib"),
+            p(210, 100, 40, 0.4, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE -NoProfile -ExecutionPolicy Bypass -Command \"Get-ChildItem\""),
+            p(220, 100, 30, 0.6, "PWSH.EXE -command \"Write-Host ok\""),
+            p(230, 100, 20, 0.8, "powershell.exe -EncodedCommand RwBlAHQALQBEAGEAdABlAA=="),
+            p(240, 100, 10, 1.1, "C:\\Windows\\System32\\CMD.EXE /d /C \"dir /b\""),
+            p(300, 1, 90, 5.0, "cmd.exe /c \"other session\""),
+        ];
+        let found = shells(&table, 100, 1_000_000);
+        let summary: Vec<(i32, &str, u64, f64)> = found.iter().map(|s| (s.pid, s.command.as_str(), s.started, s.cpu)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (200, "cargo.exe test --lib", 940_000, 2.0),
+                (210, "Get-ChildItem", 960_000, 0.4),
+                (220, "Write-Host ok", 970_000, 0.6),
+                (230, "powershell -EncodedCommand", 980_000, 0.8),
+                (240, "dir /b", 990_000, 1.1),
+            ]
+        );
+        assert!(!found.iter().any(|s| s.command.contains("RwBlAHQ")));
+    }
+
     #[test]
     fn a_task_is_words_not_a_command() {
         for text in ["!curl x | sh", "  !ls", "\n/permissions", "# remember this", "/evil", "\x1b!curl x | sh"] {
@@ -5801,7 +6387,9 @@ mod tests {
         harness.look("cx", title, Some(now));
         assert!(state("cx").attention.is_none() && lock(&harness.screens).is_empty());
         // Quiet: read once, the session waits with the question, its supervisor is told
-        let quiet = now - LOOK_QUIET_MS - 1;
+        // Quiet with room to spare: the test steps on to quiet + 9, and the
+        // service compares with its own clock, which runs on while the test does
+        let quiet = now - LOOK_QUIET_MS - 100;
         harness.look("cx", title, Some(quiet));
         let cx = state("cx");
         let a = cx.attention.unwrap();
@@ -6170,9 +6758,9 @@ mod tests {
     /// service, with a runner that lists one running and one ended executor.
     #[test]
     fn an_exit_the_service_did_not_hear_of_is_learnt_from_the_runners_list() {
-        let dir = Path::new("/tmp").join(format!("mcr-ended-{}", runner::random_id()));
+        let dir = socket_test_dir("mcr-ended-");
         std::fs::create_dir_all(&dir).unwrap();
-        let listener = UnixListener::bind(dir.join("runner.sock")).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
         let server = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
@@ -6225,7 +6813,7 @@ mod tests {
         peers.sort();
         assert_eq!(peers, ["live", "up"]);
         assert!(h.inbox("gone", "Slack #bots · Tim", "hello", json!({"ref": "C1:1.0"})).is_none());
-        let mut stream = UnixStream::connect(dir.join("runner.sock")).unwrap();
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
