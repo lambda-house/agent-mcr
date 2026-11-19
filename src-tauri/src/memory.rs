@@ -282,13 +282,24 @@ fn discover(agent: &ureq::Agent, endpoint: &str, until: Instant) -> Result<Meta,
     Ok(meta)
 }
 
-/// What is known about the connection. No secret is in here.
+impl Meta {
+    /// The rule of `discover`, for a description that was kept: every address
+    /// is https, and a token goes nowhere but to the issuer itself.
+    fn sound(&self) -> bool {
+        let Some((issuer, _)) = split(&self.issuer).filter(|_| allowed(&self.issuer)) else { return false };
+        let own = |url: &str| allowed(url) && split(url).map(|(origin, _)| origin) == Some(issuer);
+        allowed(&self.authorization_endpoint) && own(&self.token_endpoint) && own(&self.registration_endpoint) && self.revocation_endpoint.as_deref().is_none_or(own)
+    }
+}
+
+/// What is known about the connection. No secret is in here, and nothing that
+/// says where a secret is sent: the file can be written by any process of the
+/// person, so the authorization server's addresses are kept with the tokens.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct State {
     /// "" (not connected), `connecting`, `connected`, `signed_out`
     state: String,
-    meta: Option<Meta>,
     since: u64,
     /// When the access token runs out (0: not told)
     access_expires: u64,
@@ -311,6 +322,8 @@ pub struct Link {
     agent: ureq::Agent,
     vault: Box<dyn Vault>,
     state: Mutex<State>,
+    /// The authorization server that was signed in to, as the vault holds it
+    meta: Mutex<Option<Meta>>,
     /// A refresh token is spent by its use, and a spent one ends the grant:
     /// one refresh at a time
     refreshing: Mutex<()>,
@@ -323,7 +336,7 @@ impl Link {
         if state.state == "connecting" {
             state.state = String::new();
         }
-        Self { dir: dir.to_path_buf(), endpoint: endpoint.to_string(), agent: agent(), vault, state: Mutex::new(state), refreshing: Mutex::new(()) }
+        Self { dir: dir.to_path_buf(), endpoint: endpoint.to_string(), agent: agent(), vault, state: Mutex::new(state), meta: Mutex::new(None), refreshing: Mutex::new(()) }
     }
 
     fn change(&self, with: impl FnOnce(&mut State)) {
@@ -348,9 +361,28 @@ impl Link {
     }
 
     fn forget_tokens(&self) {
-        for account in ["access", "refresh", "client"] {
+        for account in ["access", "refresh", "client", "meta"] {
             self.vault.delete(account);
         }
+        *lock(&self.meta) = None;
+    }
+
+    /// Where the tokens of this sign-in go: read from the vault, where the
+    /// sign-in put it, and held to the rule of the sign-in once more. Never
+    /// from the state file.
+    fn meta(&self) -> Option<Meta> {
+        let mut held = lock(&self.meta);
+        if held.is_none() {
+            *held = self.vault.get("meta").and_then(|text| serde_json::from_str::<Meta>(&text).ok()).filter(Meta::sound);
+        }
+        held.clone()
+    }
+
+    /// Keep the authorization server's description with the secrets.
+    fn keep_meta(&self, meta: &Meta) -> Result<(), String> {
+        self.vault.set("meta", &serde_json::to_string(meta).map_err(|e| e.to_string())?)?;
+        *lock(&self.meta) = Some(meta.clone());
+        Ok(())
     }
 
     /// The grant is gone: drop what is left of it and say so.
@@ -382,7 +414,9 @@ impl Link {
                 return Ok(access);
             }
         }
-        self.refresh(state.meta.as_ref().ok_or(Fail::NotConnected)?)
+        // Without a description that holds, there is nowhere a token may be sent
+        let Some(meta) = self.meta() else { return Err(self.signed_out()) };
+        self.refresh(&meta)
     }
 
     fn refresh(&self, meta: &Meta) -> Result<String, Fail> {
@@ -632,7 +666,7 @@ impl Memory {
         json!({
             "state": if state.state.is_empty() { "disconnected" } else { state.state.as_str() },
             "endpoint": self.link.endpoint,
-            "issuer": state.meta.as_ref().map(|m| m.issuer.clone()),
+            "issuer": if state.state == "connected" { self.link.meta().map(|m| m.issuer) } else { None },
             "since": state.since,
             "defaultMemory": DEFAULT_MEMORY,
             "problem": state.problem,
@@ -688,7 +722,6 @@ impl Memory {
         );
         link.change(|s| {
             s.state = "connecting".into();
-            s.meta = Some(meta.clone());
             s.problem = None;
         });
         let me = self.clone();
@@ -703,6 +736,7 @@ impl Memory {
                             return Err("The authorization server sent no refresh token".to_string());
                         }
                         me.link.vault.set("client", &client)?;
+                        me.link.keep_meta(&meta)?;
                         me.link.keep(&answer).map(|_| ())
                     });
                 page(back.browser, kept.is_ok());
@@ -802,11 +836,10 @@ impl Memory {
         self.flow.fetch_add(1, Ordering::SeqCst);
         let link = &self.link;
         let _one = lock(&link.refreshing);
-        let state = link.snapshot();
         let mut unrevoked = None;
         // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
-        if let (Some(url), Some(client), Some(token)) = (state.meta.as_ref().and_then(|m| m.revocation_endpoint.as_ref()), link.vault.get("client"), link.vault.get("refresh")) {
-            let sent = link.agent.post(url).timeout(FOR_THE_APP).send_form(&[("token", token.as_str()), ("token_type_hint", "refresh_token"), ("client_id", client.as_str())]);
+        if let (Some(url), Some(client), Some(token)) = (link.meta().and_then(|m| m.revocation_endpoint), link.vault.get("client"), link.vault.get("refresh")) {
+            let sent = link.agent.post(&url).timeout(FOR_THE_APP).send_form(&[("token", token.as_str()), ("token_type_hint", "refresh_token"), ("client_id", client.as_str())]);
             if sent.is_err() {
                 unrevoked = Some(Problem { kind: "not_revoked".into(), text: "The tokens are removed from this Mac, but the memory service did not confirm that the sign-in is revoked there. It may still be valid on that side: revoke it in the memory console.".into(), at: now_ms() });
             }
@@ -1562,6 +1595,42 @@ mod tests {
         assert!(told["result"]["content"][0]["text"].as_str().unwrap().starts_with("memory 'harness' has no model key yet"));
         assert_eq!(rig.memory.status()["problem"]["kind"], "no_model_key");
         assert_eq!(rig.state(), "connected");
+    }
+
+    #[test]
+    fn a_rewritten_state_file_does_not_say_where_the_refresh_token_goes() {
+        let rig = Rig::signed_in();
+        let endpoint = format!("{}/mcp", lock(&rig.world).base);
+        let elsewhere = serve();
+        let other = lock(&elsewhere).base.clone();
+        // Any process of the person can write the state file, a hosted agent included
+        let path = rig.dir.join("memory-state.json");
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state["meta"] = json!({"issuer": other, "authorizationEndpoint": format!("{other}/authorize"), "tokenEndpoint": format!("{other}/oauth/token"), "registrationEndpoint": format!("{other}/oauth/register"), "revocationEndpoint": format!("{other}/oauth/revoke")});
+        state["accessExpires"] = json!(1);
+        std::fs::write(&path, state.to_string()).unwrap();
+        // The service starts again and the access token is due
+        let again = Memory::with(&rig.dir, &endpoint, Box::new(rig.vault.clone()), None);
+        let told = again.handle(&Ok("s1".into()), &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "clock", "arguments": {}}})).unwrap();
+        assert_eq!(told["result"]["isError"], false, "{told}");
+        // The renewal went to the authorization server that was signed in to, and so does the revocation
+        assert_eq!(lock(&rig.world).count("POST /oauth/token"), 2);
+        assert_eq!(again.status()["issuer"], json!(lock(&rig.world).base));
+        again.disconnect();
+        assert_eq!(lock(&rig.world).revoked, ["refresh-secret-2"]);
+        assert!(lock(&elsewhere).seen.is_empty(), "{:?}", lock(&elsewhere).seen);
+
+        // What is kept with the secrets is held to the same rule as at the sign-in: a token
+        // address that is not the issuer's own gets nothing, and the sign-in is over
+        let rig = Rig::signed_in();
+        let base = lock(&rig.world).base.clone();
+        rig.vault.set("meta", &json!({"issuer": base, "authorizationEndpoint": format!("{base}/authorize"), "tokenEndpoint": format!("{other}/oauth/token"), "registrationEndpoint": format!("{base}/oauth/register")}).to_string()).unwrap();
+        let again = Memory::with(&rig.dir, &format!("{base}/mcp"), Box::new(rig.vault.clone()), None);
+        again.link.change(|s| s.access_expires = 1);
+        let told = again.handle(&Ok("s1".into()), &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "clock", "arguments": {}}})).unwrap();
+        assert_eq!(told["result"]["content"][0]["text"], Fail::SignedOut.text());
+        assert!(lock(&elsewhere).seen.is_empty());
+        assert!(rig.vault.0.lock().unwrap().is_empty());
     }
 
     #[test]
