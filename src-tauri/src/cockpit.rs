@@ -235,6 +235,9 @@ pub struct Facts {
     pub sessions: BTreeMap<String, Fact>,
     /// Every report the store still has, and the session that made it
     pub reports: BTreeMap<String, String>,
+    /// The hosted Supervisor session, when the caller knows it. The store
+    /// alone does not: who is the Supervisor is the runner's word
+    pub root: Option<String>,
 }
 
 /// A published entry whose text the harness knows to be behind (MCR-103): it
@@ -935,7 +938,12 @@ impl Cockpit {
         let typed_after = |session: &str, updated: u64| facts.sessions.get(session).filter(|f| !f.ended).and_then(|f| f.typed).filter(|at| *at > updated);
         let mut out = Vec::new();
         for (key, part) in &self.parts {
-            for t in part.tracks.iter().filter(|t| t.state == "waiting_human") {
+            // The operator talks to the Supervisor in its terminal all day: a
+            // line typed there says nothing about an entry of the Supervisor's
+            // own that points at the Supervisor itself. Such an entry is never
+            // marked as typed for; the Supervisor has read every such line
+            let own = |session: &str| key == ROOT && facts.root.as_deref() == Some(session);
+            for t in part.tracks.iter().filter(|t| t.state == "waiting_human" && !own(&t.lead)) {
                 if let Some(at) = typed_after(&t.lead, t.updated) {
                     out.push(Outdated { by: key.clone(), track: true, id: t.id.clone(), updated: t.updated, session: t.lead.clone(), typed: Some(at) });
                 }
@@ -943,7 +951,7 @@ impl Cockpit {
             for a in part.actions.iter().filter(|a| !a.place.session.is_empty()) {
                 let session = &a.place.session;
                 let typed = match facts.sessions.get(session) {
-                    Some(f) if !f.ended => match typed_after(session, a.updated) {
+                    Some(f) if !f.ended => match typed_after(session, a.updated).filter(|_| !own(session)) {
                         Some(at) => Some(at),
                         None => continue,
                     },
@@ -987,7 +995,11 @@ impl Cockpit {
         // What the harness knows better than the text, on the entry itself (MCR-103)
         let outdated = self.outdated(facts);
         let mark = |out: &mut Value, key: &str, track: bool, id: &str| {
-            if let Some(o) = outdated.iter().find(|o| o.by == key && o.track == track && o.id == id && below(&o.session)) {
+            // When the operator typed in a session is that session's own to tell:
+            // only for the reader's sessions. That a session an entry of the
+            // reader's part points at is no more is the reader's to know, also
+            // when the harness has forgotten it and can say nothing else of it
+            if let Some(o) = outdated.iter().find(|o| o.by == key && o.track == track && o.id == id && (o.typed.is_none() || below(&o.session))) {
                 match o.typed {
                     Some(at) => out["ownerTyped"] = json!(at),
                     None => out["sessionEnded"] = json!(true),
@@ -1440,6 +1452,30 @@ mod tests {
         assert!(read["actions"][0].get("ownerTyped").is_none());
         f.sessions.remove("ex");
         assert_eq!(c.read(&f, None)["actions"][0]["sessionEnded"], true);
+        // Also in the publisher's own read, which knows nothing else of a session the harness forgot
+        assert_eq!(c.read(&f, Some("sup"))["actions"][0]["sessionEnded"], true);
+    }
+
+    #[test]
+    fn what_the_owner_types_to_the_supervisor_marks_none_of_its_own_entries_that_point_at_itself() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        f.root = Some("root".into());
+        c.publish(&ROOT_WHO, &f, &json!({
+            "tracks": [{ "id": "mine", "title": "Mine", "lead": "root", "state": "waiting_human" }, { "id": "theirs", "title": "Theirs", "lead": "ex", "state": "waiting_human" }],
+            "actions": [
+                { "id": "here", "title": "Tell me", "kind": "typed_word", "where": { "session": "root" }, "say": "go", "risk": "reversible" },
+                { "id": "there", "title": "Tell it", "kind": "typed_word", "where": { "session": "ex" }, "say": "go", "risk": "reversible" },
+            ],
+        }), NOW).unwrap();
+        f.sessions.get_mut("root").unwrap().typed = Some(NOW + 5);
+        assert!(c.outdated(&f).is_empty(), "a line typed to the Supervisor is about anything");
+        // Its entries that point at another session are marked as any other
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 6);
+        assert_eq!(c.outdated(&f).iter().map(|o| (o.by.as_str(), o.id.as_str())).collect::<Vec<_>>(), [(ROOT, "theirs"), (ROOT, "there")]);
+        // And the Supervisor's session ending is still said of an action that points at it
+        f.sessions.get_mut("root").unwrap().ended = true;
+        assert!(c.outdated(&f).iter().any(|o| o.id == "here" && o.typed.is_none()));
     }
 
     #[test]
