@@ -8,7 +8,7 @@
 
 pub use crate::agents::{command_line, Launch};
 use crate::peer;
-use crate::memory::Memory;
+use crate::memory::{self, Memory};
 use crate::slack::{self, Slack};
 use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, adapters, profiles};
 use crate::runner::{self, lock, now_ms, Client, Unit};
@@ -210,8 +210,10 @@ pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
     for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop"] {
         hooks.insert(event.into(), hook(event));
     }
-    // The harness tools need no approval: they only reach other sessions' inboxes
-    let mut allow = vec![format!("mcp__{AGENT_SERVER}")];
+    // The harness tools need no approval: they only reach other sessions' inboxes.
+    // The memory tools need none either (owner's decision of 2026-11-19, MCR-49):
+    // they read and write the connected memory and run nothing here
+    let mut allow = vec![format!("mcp__{AGENT_SERVER}"), format!("mcp__{}", memory::SERVER)];
     if supervisor {
         // D5: the supervisor has the harness without a question per tool, except
         // typing into a terminal: that can run any command, so the operator is asked
@@ -222,9 +224,11 @@ pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
     json!({ "hooks": hooks, "permissions": { "allow": allow } })
 }
 
-/// Claude Code MCP config for one launch (`--mcp-config`): the harness tools.
+/// Claude Code MCP config for one launch (`--mcp-config`): the harness tools
+/// and the memory server. Both are bridges to this service; neither entry
+/// carries a credential.
 pub fn claude_mcp(exe: &str, supervisor: bool) -> Value {
-    let mut servers = json!({ AGENT_SERVER: { "command": exe, "args": ["--harness-mcp"] } });
+    let mut servers = json!({ AGENT_SERVER: { "command": exe, "args": ["--harness-mcp"] }, memory::SERVER: { "command": exe, "args": ["--memory-mcp"] } });
     if supervisor {
         servers[SUPERVISOR_SERVER] = json!({ "command": exe, "args": ["--supervise"] });
     }
@@ -4698,8 +4702,14 @@ mod tests {
         assert_eq!(claude, "exec claude --permission-mode acceptEdits --mcp-config '/cfg dir/claude-mcp.json' --settings '/cfg dir/claude-hooks.json'");
         let codex = command_line(&launch("codex")).unwrap();
         assert!(codex.contains(" -c 'mcp_servers.mcr.command=\"/Apps/Agent MCR.app/agent-mcr\"' -c 'mcp_servers.mcr.args=[\"--harness-mcp\"]'"), "{codex}");
-        assert_eq!(claude_settings("/x", false)["permissions"]["allow"], json!(["mcp__mcr"]));
+        assert_eq!(claude_settings("/x", false)["permissions"]["allow"], json!(["mcp__mcr", "mcp__memory"]));
         assert_eq!(claude_mcp("/x", false)["mcpServers"]["mcr"]["args"][0], "--harness-mcp");
+        // The memory server comes with every launch, the Supervisor's too, as a bridge: a program and one flag
+        assert!(codex.contains("' -c 'mcp_servers.memory.command=\"/Apps/Agent MCR.app/agent-mcr\"' -c 'mcp_servers.memory.args=[\"--memory-mcp\"]'"), "{codex}");
+        for supervisor in [false, true] {
+            assert_eq!(claude_mcp("/x", supervisor)["mcpServers"]["memory"], json!({"command": "/x", "args": ["--memory-mcp"]}));
+            assert!(claude_settings("/x", supervisor)["permissions"]["allow"].as_array().unwrap().contains(&json!("mcp__memory")));
+        }
         // Every agent kind is told about its peers, and Claude gets the skill
         let told = command_line(&Launch { plugin: "/cfg dir/claude-plugin", note: true, ..launch("claude") }).unwrap();
         assert!(told.contains(" --plugin-dir '/cfg dir/claude-plugin' --append-system-prompt 'You run in a terminal hosted by Agent MCR"), "{told}");

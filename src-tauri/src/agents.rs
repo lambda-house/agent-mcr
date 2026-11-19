@@ -465,11 +465,14 @@ impl Adapter for Codex {
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
         let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
-        // The harness tools, for this launch only (values are TOML; a JSON string is one)
+        // The harness tools and the memory server, for this launch only (values are TOML; a JSON string is one)
+        let memory = crate::memory::SERVER;
         let tools = format!(
-            "-c {} -c {}",
+            "-c {} -c {} -c {} -c {}",
             sh(&format!("mcp_servers.{AGENT_SERVER}.command={}", json!(l.exe))),
-            sh(&format!("mcp_servers.{AGENT_SERVER}.args=[\"--harness-mcp\"]"))
+            sh(&format!("mcp_servers.{AGENT_SERVER}.args=[\"--harness-mcp\"]")),
+            sh(&format!("mcp_servers.{memory}.command={}", json!(l.exe))),
+            sh(&format!("mcp_servers.{memory}.args=[\"--memory-mcp\"]"))
         );
         let mut cmd = format!("exec {head}");
         if l.resume.is_some() {
