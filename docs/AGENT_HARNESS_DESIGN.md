@@ -24,6 +24,7 @@
 | D12 | Local builds are the gate: `npm run build`, `npm test`, `cargo clippy --all-targets` and `cargo test` on the Mac. GitHub CI stays Linux-only and checks what compiles there; macOS-only modules are behind `cfg(target_os = "macos")` | 2026-11-13 |
 | D14 | Slack is connected natively by the harness service (MCR-26). It ships in 1.0 as a preview (owner, 2026-11-17, with executors and memory; MCR-25): off until connected, and marked Preview in the app. Amends D3a for Slack only: the Slack bot token and app-level token are held on this Mac, in the macOS Keychain. Posts go out as a bot, never as the user. A post that its channel's policy does not allow automatically is approved by the operator only (D6 extended): in the app, and in a Slack direct message from the bot once the operator has switched that on. Approval in Slack is off by default (owner, 2026-11-18). A message from the operator's own Slack account is the operator's request to the session that receives it; messages from other listed senders are data. D13 is reserved for the store-app decision of MCR-16 | 2026-11-17 |
 | D15 | Sessions form supervisor/executor trees (MCR-41). Any agent session can have executors: the operator creates one or connects an existing session in the app, and a hosted agent can create its own with `executor_create`. A supervising session gets the task tools (`task_assign`, `task_wait`, `task_status`, `session_status`, `session_result`, `terminal_read`) for its executors and theirs, and for nobody else; it never types into a terminal and never answers a permission prompt (D6). An executor's reports reach its supervisor as well as the operator. An agent starts executors only in its own folder or below it; anywhere else is the operator's action. The tree is bounded (5 levels, 12 executors per session). A supervisor that ends leaves its executors independent, and nothing attaches them again by itself. This widens D5a: creating sessions is no longer limited to the supervisor surface. The root Supervisor stays as it is. A session registers what it waits for outside itself (`wait_register`); a wait that runs past its time goes to the session's supervisor, or the root Supervisor, and after as long again to the operator (a mark on the session and a notification; when the session already waits on the operator for something else, the notification alone). What the session wrote about its wait is passed on quoted, as its words. A wait is at least five minutes, and one session's waits wake somebody at most four times an hour. A supervising session may end an idle executor it started itself (`executor_end`, MCR-46). Executors have no switch: they are always available and marked Preview in 1.0. D9 (groups) is not built; a supervisor's tree is the group for these tools | 2026-11-17 |
+| D16 | **Proposed, awaits the owner's signature** (MCR-49 slice 1; the owner's go of 2026-11-18 and decisions of 2026-11-19 are in MCR-49 comments 15591 and 15805). Memory reaches sessions as a local MCP server, `memory`, that the harness service serves and registers for every session it starts, next to `mcr`. The server is a router of connected memories whose contract is the teob memory MCP tools, passed through unchanged; slice 1 has one backend, the remote `mcp.memory.teob.cc`. Amends D3a for memory as D14 does for Slack: the operator signs in once (OAuth 2.1 with PKCE, loopback redirect) and the tokens are held on this Mac, in the macOS Keychain, by the service alone. No token reaches a session's configuration or environment. Replaces D3's gateway row for memory. Off until the operator connects it in the app after a native dialog; marked Preview. `mcp__memory` is pre-approved for Claude sessions, and a call that names no memory goes to `mcr-agents` (owner, 2026-11-19). Parked with the harness work: a tool allow-list, pinned descriptions and a per-session identity sent to the memory service | proposed 2026-11-19 |
 
 ### What is built (revision 5)
 
@@ -509,6 +510,31 @@ MCR-27 design → MCR-28 connect and Keychain → MCR-29 connector → MCR-30 st
 | Apps created from our manifest count as internal customer-built apps | Tier 3 history limits; the terms that apply to users' data | MCR-40: read the terms with the owner, ask Slack if unclear. The design holds at Tier 1 either way |
 | The acknowledgement deadline in Socket Mode is 3 s | Store before acknowledging | Measure store latency in MCR-29; it is a local write |
 | The operator answers approvals within minutes | "approve each" as a usable policy | Watch the age of pending posts; otherwise prefer the thread-reply policy |
+
+## Memory server (D16, MCR-49)
+
+Slice 1: one remote memory, the same for every session.
+
+| Part | State |
+|---|---|
+| `memory.rs` in the harness service: sign-in, token holder, MCP client over streamable HTTP, router | Built, tested against a fake authorization and MCP server on loopback |
+| `agent-mcr --memory-mcp`: a session's stdio to the service (`{"op":"memory"}`), through the same bridge as `mcr` | Built |
+| Registration for Claude (`claude-mcp.json`, `mcp__memory` allowed) and Codex (`-c mcp_servers.memory.*`) | Built |
+| Connect and Disconnect in Settings, User memories, after a native dialog | Built |
+| A live run with the operator's sign-in | Not done: it needs a build that runs as the service |
+| Several memories, the local backend, allow-list and pins, per-session identity, the command form for sessions without MCP | Not built |
+
+How it holds together:
+
+- **One holder of the sign-in.** The refresh token is spent by its use, and the memory service revokes the whole grant when a spent one comes back. So only the service refreshes, under one mutex, and the rotated token is written to the Keychain before the new access token is used. A refresh that the authorization server refuses ends in the state `signed_out`; it is not tried again, and only the operator signs in again.
+- **The sign-in.** Discovery follows RFC 9728 and RFC 8414. The token, registration and revocation addresses must be the issuer's own, every address is https, and redirects are not followed, so a token is never sent anywhere else. The answer comes to `127.0.0.1` on a port that listens for that one sign-in, at most five minutes. It must carry the `state` that was sent and the issuer's `iss` (RFC 9207): without `iss`, or with another, the sign-in ends and nothing is kept.
+- **Who may call.** As for `mcr`, the caller is the hosted session its process descends from, by the kernel's word. Anybody else gets a server that lists nothing and says why. The session's id is written to the service's log with the tool's name, and is not sent to the memory service.
+- **Not connected is said, not hidden.** The server always answers `initialize`. Its instructions say that memory is not connected and that the operator connects it in Agent MCR; `tools/list` is empty and a call is a tool error with the same words. `listChanged` stays false, so a running session gets the tools at its next restart.
+- **A session's start is not held up.** `initialize` waits four seconds for the memory service's own instructions, and a service that could not be reached is not asked again by the next sessions for twenty seconds.
+- **What memory returns is data.** The server's instructions say so in front of the memory service's own, which are passed on under "From the memory service".
+- **No model key.** The teob memory reports it as a failed tool result, not as an HTTP status. The result goes to the agent as it is, and the fact is kept as the connection's last problem for the operator.
+
+Facts the design depends on, as the memory side gave them on 2026-11-19 (teob-ai `703c5d8b`): registration is stateless and accepts a loopback redirect with any port; the access token lives one hour; every refresh rotates the refresh token; the server keeps no MCP session and answers in JSON.
 
 ## Engineering defaults
 
