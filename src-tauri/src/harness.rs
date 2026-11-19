@@ -3019,6 +3019,19 @@ impl Harness {
         Ok(())
     }
 
+    /// Raw input for a session, as `terminal_write` without `submit` sends
+    /// it (a key, an Enter). Under the writer's lock, and not while the
+    /// operator has an unsent line there: asked with the lock held, because
+    /// `place` sets the draft under the same lock.
+    fn write_raw(&self, session: &str, input: &str) -> Result<(), String> {
+        let writer = self.writer(session);
+        let _typing = lock(&writer);
+        if lock(&self.store).sessions.get(session).is_some_and(|t| t.draft) {
+            return Err(HELD_LINE.into());
+        }
+        self.type_into(session, input)
+    }
+
     /// The lock of the one who writes to a session's terminal now.
     fn writer(&self, session: &str) -> Arc<Mutex<()>> {
         lock(&self.writers).entry(session.to_string()).or_default().clone()
@@ -4637,13 +4650,11 @@ impl Harness {
                     return Err("Refused: the operator has an unsent line in that session's input box. Anything written there now would send it or be sent with it. Only the operator ends it: Enter or Ctrl+C in that terminal.".into());
                 }
                 refuse_if_waiting(id)?;
+                // Both ways ask for the draft again with the writer's lock
+                // held: a line placed since the check above would be sent by an Enter written now
                 match terminal_input(text("input")?, args["submit"] == true) {
                     (input, true) => self.submit(id, &input)?,
-                    (input, false) => {
-                        let writer = self.writer(id);
-                        let _typing = lock(&writer);
-                        self.type_into(id, &input)?;
-                    }
+                    (input, false) => self.write_raw(id, &input)?,
                 }
                 Ok(json!({ "written": true }))
             }
@@ -7251,6 +7262,22 @@ mod tests {
             other => panic!("typed into the operator's line: {other:?}"),
         }
         assert_eq!(lock(&harness.store).tasks.values().map(|t| t.state.clone()).collect::<Vec<_>>(), ["queued"]);
+        // An Enter a supervisor writes (`terminal_write`) while a click is at work: it
+        // waits for the writer's lock, and finds the line that was placed meanwhile
+        harness.update(|s| s.sessions.get_mut("lead").unwrap().draft = false);
+        let writer = harness.writer("lead");
+        let at_work = lock(&writer);
+        let enter = { let h = harness.clone(); std::thread::spawn(move || h.write_raw("lead", "\r")) };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!enter.is_finished(), "an Enter was written past the writer's lock");
+        harness.update(|s| s.sessions.get_mut("lead").unwrap().draft = true);
+        drop(at_work);
+        assert_eq!(enter.join().unwrap().unwrap_err(), HELD_LINE);
+        // Without a line there it is written
+        harness.update(|s| s.sessions.get_mut("lead").unwrap().draft = false);
+        harness.write_raw("lead", "x").unwrap();
+        assert_eq!(typed_so_far(&harness).pop().unwrap(), ("lead".to_string(), "x".to_string()));
+        lock(&harness.typed).as_mut().unwrap().pop();
         // Still: the task and its Enter, then the placed line, and no Enter after it
         let all = typed_so_far(&harness);
         assert_eq!(all.len(), 3, "{all:?}");

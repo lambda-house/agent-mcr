@@ -377,6 +377,10 @@ pub fn copyable(s: &str) -> Result<(), String> {
 /// the stronger warning. The owner's list (MCR-97): change it here only.
 pub const PLAIN_HOSTS: [&str; 2] = ["teob.atlassian.net", "github.com"];
 
+/// Paths on those hosts that still get the stronger warning: where one signs
+/// in, grants an app access or changes an account. The owner's list too.
+pub const GUARDED_PATHS: [&str; 4] = ["/login", "/oauth", "/apps", "/settings"];
+
 /// A link as the parser reads it: what is shown and what is opened are these
 /// parts, never the stored string.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -408,6 +412,10 @@ pub fn web_link(s: &str) -> Result<Link, String> {
     if url.port().is_some() {
         return Err("must not name a port".into());
     }
+    // The question shows host, path and query. A fragment would be opened and not shown
+    if url.fragment().is_some() {
+        return Err("must not hold a fragment (the part after #)".into());
+    }
     // `domain` is the host only when it is a name: a number address has none
     let host = match (url.domain(), url.host_str()) {
         (Some(name), _) => name.trim_end_matches('.').to_ascii_lowercase(),
@@ -419,7 +427,9 @@ pub fn web_link(s: &str) -> Result<Link, String> {
     if local || host.split('.').all(|label| label.bytes().all(|b| b.is_ascii_digit())) {
         return Err("names a host on this machine or in a local network".into());
     }
-    Ok(Link { href: url.as_str().to_string(), known: PLAIN_HOSTS.contains(&host.as_str()), host, path: url.path().to_string(), query: url.query().unwrap_or("").to_string() })
+    let path = url.path().to_string();
+    let guarded = GUARDED_PATHS.iter().any(|p| path.to_ascii_lowercase().starts_with(p));
+    Ok(Link { href: url.as_str().to_string(), known: PLAIN_HOSTS.contains(&host.as_str()) && !guarded, host, path, query: url.query().unwrap_or("").to_string() })
 }
 
 /// What a click in the panel asks for (MCR-97). It names an action by ids;
@@ -654,6 +664,11 @@ fn check_action(path: &str, a: &Action, part: &Part, old: Option<&Part>, who: &W
             }
             for (i, option) in a.options.iter().enumerate() {
                 placeable(option).or_else(|why| refuse(&format!("{path}.options[{i}]"), why))?;
+                // What a click places is the whole line with the service's frame: it must fit too,
+                // or the option would get a button that always refuses
+                if decision_line(&a.id, option).chars().count() > MAX_PLACED {
+                    return refuse(&format!("{path}.options[{i}]"), format!("is too long: with \"Decision {}: \" before it the line may hold {MAX_PLACED} characters", a.id));
+                }
             }
             if !a.recommended.is_empty() && !a.options.contains(&a.recommended) {
                 return refuse(&format!("{path}.recommended"), "is not one of the options");
@@ -1460,6 +1475,9 @@ mod tests {
         refused(action("typed_word", json!({ "where": { "session": "nobody" }, "say": "go" })), "not a session the harness tracks");
         // decision: choices, each a plain line
         with_action(action("decision", json!({ "options": ["Keep", "Drop"], "recommended": "Keep" }))).unwrap();
+        // An option is as long as the line a click builds from it lets it be: "Decision a1: " is 13 characters
+        with_action(action("decision", json!({ "options": ["Keep", "x".repeat(MAX_PLACED - 13)] }))).unwrap();
+        refused(action("decision", json!({ "options": ["Keep", "x".repeat(MAX_PLACED - 12)] })), "options[1] is too long");
         refused(action("decision", json!({ "options": ["Keep"] })), "2 to 6");
         refused(action("decision", json!({ "options": ["Keep", "Drop"], "recommended": "Wait" })), "recommended");
         refused(action("decision", json!({ "options": ["Keep", "#drop"] })), "options[1]");
@@ -1680,8 +1698,17 @@ mod tests {
 
     #[test]
     fn a_link_a_click_may_open_is_https_to_a_named_public_host() {
-        let link = web_link("https://GitHub.com/lambda-house/agent-mcr/pull/1?diff=split#files").unwrap();
-        assert_eq!((link.href.as_str(), link.host.as_str(), link.path.as_str(), link.query.as_str(), link.known), ("https://github.com/lambda-house/agent-mcr/pull/1?diff=split#files", "github.com", "/lambda-house/agent-mcr/pull/1", "diff=split", true));
+        let link = web_link("https://GitHub.com/lambda-house/agent-mcr/pull/1?diff=split").unwrap();
+        assert_eq!((link.href.as_str(), link.host.as_str(), link.path.as_str(), link.query.as_str(), link.known), ("https://github.com/lambda-house/agent-mcr/pull/1?diff=split", "github.com", "/lambda-house/agent-mcr/pull/1", "diff=split", true));
+        // What is opened is what is shown: host, path and query make up the whole address
+        assert_eq!(link.href, format!("https://{}{}?{}", link.host, link.path, link.query));
+        assert!(web_link("https://github.com/x/y#files").unwrap_err().contains("fragment"));
+        assert!(web_link("https://github.com/x/y#").is_err());
+        // Where one signs in, grants access or changes an account, also a known host gets the stronger warning
+        for guarded in ["https://github.com/login/oauth/authorize?client_id=x", "https://github.com/settings/tokens", "https://github.com/apps/some-app/installations/new", "https://github.com/LOGIN", "https://teob.atlassian.net/login?dest=x", "https://github.com/oauth"] {
+            assert!(!web_link(guarded).unwrap().known, "{guarded}");
+        }
+        assert!(web_link("https://github.com/lambda-house/settings-tool").unwrap().known);
         assert!(web_link("https://teob.atlassian.net/browse/MCR-97").unwrap().known);
         // Any other host is not known, also one that only looks like a known one
         for other in ["https://example.com/", "https://github.com.evil.example/", "https://gíthub.com/"] {
@@ -1724,6 +1751,12 @@ mod tests {
         assert_eq!(act(&c, &f, "sup", "pick", Act::Choose(1)), Ok(Deed::Type { session: "sup".into(), text: "Decision pick: Drop it".into() }));
         assert_eq!(act(&c, &f, "sup", "there", Act::Choose(0)), Ok(Deed::Type { session: "ex".into(), text: "Decision there: Yes".into() }));
         assert_eq!(act(&c, &f, ROOT, "next", Act::Choose(0)), Ok(Deed::Type { session: "root".into(), text: "Decision next: A".into() }));
+        // Whatever passed the publish is placed: the longest id with the longest option that goes with it
+        let long_id = "d".repeat(40);
+        let long_option = "x".repeat(MAX_PLACED - 51);
+        c.patch(&SUP, &f, &json!({ "action": { "id": long_id, "track": "t1", "title": "Long", "kind": "decision", "options": ["a", long_option], "risk": "reversible" } }), NOW).unwrap();
+        assert!(matches!(act(&c, &f, "sup", &long_id, Act::Choose(1)), Ok(Deed::Type { text, .. }) if text.chars().count() == MAX_PLACED));
+        assert!(matches!(act(&c, &f, "sup", &long_id, Act::Ask), Ok(Deed::Type { .. })));
         // "Ask more": a fixed sentence with the id, to the publisher
         assert_eq!(act(&c, &f, "sup", "a1", Act::Ask), Ok(Deed::Type { session: "sup".into(), text: "Explain cockpit action a1: what happens if I do it, and what if I do not?".into() }));
         assert!(matches!(act(&c, &f, "sup", "pr", Act::Link), Ok(Deed::Link(l)) if l.host == "github.com" && l.known));

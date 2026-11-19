@@ -171,7 +171,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
             <dt>Query</dt><dd>{link.query || '(none)'}</dd>
           </dl>
           <p>{from ? `Published ${from}.` : ''} An agent wrote this address. A link can carry data out in its path or query, and it acts with what your browser is signed in to.</p>
-          {!link.known && <p className="ck-link-warn" role="alert">This host is not on your list of known hosts. Open it only if you know this address and expected it.</p>}
+          {!link.known && <p className="ck-link-warn" role="alert">Look twice: this host is not on your list of known hosts, or the path is one where you sign in, grant an app access or change an account. Open it only if you know this address and expected it.</p>}
         </ConfirmDialog>
       )}
     </li>
