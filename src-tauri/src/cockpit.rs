@@ -56,7 +56,7 @@ fn zero(n: &u64) -> bool {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase", default)]
 pub struct WaitsOn {
     /// human | session | ci | timer | external
     pub kind: String,
@@ -71,7 +71,7 @@ pub struct WaitsOn {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Item {
     pub id: String,
     pub title: String,
@@ -88,7 +88,7 @@ pub struct Item {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Track {
     pub id: String,
     pub title: String,
@@ -108,7 +108,7 @@ pub struct Track {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Where {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub session: String,
@@ -120,7 +120,7 @@ pub struct Where {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Action {
     pub id: String,
     /// A track of the publisher's part; with `track_by`, of that part (root only)
@@ -175,7 +175,7 @@ pub struct Part {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct TrackRef {
     pub by: String,
     pub id: String,
@@ -231,8 +231,25 @@ pub struct Fact {
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub sessions: BTreeMap<String, Fact>,
-    /// Every report id the store still has
-    pub reports: BTreeSet<String>,
+    /// Every report the store still has, and the session that made it
+    pub reports: BTreeMap<String, String>,
+}
+
+/// The document as the store file holds it. Read leniently: a field this
+/// build does not know (a later build wrote it) is passed over, and a
+/// document it cannot read at all, or one of a later schema, is an empty
+/// cockpit. Never an error: an error here would fail the load of the whole
+/// store, and the service would start with no relations, messages or reports.
+pub fn load(stored: Value) -> Cockpit {
+    match serde_json::from_value::<Cockpit>(stored) {
+        Ok(cockpit) if cockpit.schema <= SCHEMA => cockpit,
+        _ => Cockpit::default(),
+    }
+}
+
+/// `load` for the store's field (`deserialize_with`).
+pub fn stored<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Cockpit, D::Error> {
+    Ok(load(Value::deserialize(from)?))
 }
 
 /// The caller, as the service knows it from its process.
@@ -259,10 +276,32 @@ fn text(path: &str, s: &str, max: usize, lines: bool) -> Result<(), String> {
     if s.chars().count() > max {
         return refuse(path, format!("is longer than {max} characters"));
     }
-    if s.chars().any(|c| (c.is_control() && !(lines && c == '\n')) || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+    if s.chars().any(|c| c.is_control() && !(lines && c == '\n')) {
         return refuse(path, if lines { "holds control characters" } else { "holds a line break or control characters" });
     }
-    Ok(())
+    // Separators that break a line unseen, direction overrides and isolates, tag characters
+    match s.chars().find(|c| matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{e0000}'..='\u{e0fff}')) {
+        Some(c) => refuse(path, format!("holds a character that cannot be seen (U+{:04X})", c as u32)),
+        None => Ok(()),
+    }
+}
+
+/// A string that may later be placed in an input box, copied as a command
+/// or opened: the operator must see every character of it. Refuses format
+/// and zero-width characters and private-use code points, which `text`
+/// leaves to shown text because other scripts and joined emoji need some of
+/// them. Not a full table of Unicode: unassigned code points are not known here.
+fn seen(path: &str, s: &str) -> Result<(), String> {
+    let hidden = |c: &char| {
+        matches!(*c,
+            '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff0}'..='\u{ffff}' | '\u{e000}'..='\u{f8ff}' | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}' | '\u{f0000}'..='\u{10ffff}')
+    };
+    match s.chars().find(hidden) {
+        Some(c) => refuse(path, format!("holds a character that cannot be seen (U+{:04X}); this text may be placed in an input box or copied", c as u32)),
+        None => Ok(()),
+    }
 }
 
 fn required(path: &str, s: &str, max: usize) -> Result<(), String> {
@@ -300,6 +339,7 @@ fn plain(path: &str, s: &str) -> Result<(), String> {
 /// A web link and nothing else: `http` or `https`, a host, no user or password.
 fn link(path: &str, s: &str) -> Result<(), String> {
     text(path, s, MAX_LINK, false)?;
+    seen(path, s)?;
     let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) else {
         return refuse(path, "must be an http or https link");
     };
@@ -319,6 +359,18 @@ fn session<'a>(path: &str, id: &str, facts: &'a Facts) -> Result<&'a Fact, Strin
     }
 }
 
+/// A session that is only named (an item's owner, who an item waits on):
+/// that gives nobody a right, so a session that has ended stays named, and
+/// so does one that was forgotten since it was stored (`kept`). The record
+/// of who did an item must not block every later change of the part.
+fn mention(path: &str, id: &str, facts: &Facts, kept: &BTreeSet<&str>) -> Result<(), String> {
+    if facts.sessions.contains_key(id) || kept.contains(id) {
+        Ok(())
+    } else {
+        refuse(path, format!("names {id:?}, which is not a session the harness tracks"))
+    }
+}
+
 /// A session the caller may point an action or a track at: itself or one
 /// below it. The root Supervisor: any.
 fn reach(path: &str, id: &str, who: &Who, facts: &Facts) -> Result<(), String> {
@@ -330,10 +382,14 @@ fn reach(path: &str, id: &str, who: &Who, facts: &Facts) -> Result<(), String> {
     }
 }
 
-fn check_track(path: &str, t: &Track, who: &Who, facts: &Facts) -> Result<(), String> {
+fn check_track(path: &str, t: &Track, old: Option<&Part>, kept: &BTreeSet<&str>, who: &Who, facts: &Facts) -> Result<(), String> {
     ident(&format!("{path}.id"), &t.id)?;
     required(&format!("{path}.title"), &t.title, MAX_TITLE)?;
-    reach(&format!("{path}.lead"), &t.lead, who, facts)?;
+    // A lead is checked when it is given or changed: a track whose lead has
+    // ended since keeps it, or nothing else of the part could be changed
+    if !old.is_some_and(|o| o.tracks.iter().any(|b| b.id == t.id && b.lead == t.lead)) {
+        reach(&format!("{path}.lead"), &t.lead, who, facts)?;
+    }
     list(&format!("{path}.refs"), &t.refs, MAX_LIST, MAX_REF)?;
     one_of(&format!("{path}.state"), &t.state, &TRACK_STATES)?;
     text(&format!("{path}.line"), &t.line, MAX_LINE, false)?;
@@ -353,7 +409,7 @@ fn check_track(path: &str, t: &Track, who: &Who, facts: &Facts) -> Result<(), St
             if item.owner.is_empty() {
                 return refuse(&format!("{path}.owner"), "is required: a session id, or \"human\"");
             }
-            session(&format!("{path}.owner"), &item.owner, facts)?;
+            mention(&format!("{path}.owner"), &item.owner, facts, kept)?;
         }
         one_of(&format!("{path}.state"), &item.state, &ITEM_STATES)?;
         text(&format!("{path}.next"), &item.next, MAX_LINE, false)?;
@@ -362,7 +418,7 @@ fn check_track(path: &str, t: &Track, who: &Who, facts: &Facts) -> Result<(), St
             one_of(&format!("{path}.kind"), &w.kind, &WAIT_KINDS)?;
             text(&format!("{path}.who"), &w.who, MAX_SHORT, false)?;
             if w.kind == "session" {
-                session(&format!("{path}.who"), &w.who, facts)?;
+                mention(&format!("{path}.who"), &w.who, facts, kept)?;
             }
             text(&format!("{path}.what"), &w.what, MAX_LINE, false)?;
         }
@@ -370,7 +426,7 @@ fn check_track(path: &str, t: &Track, who: &Who, facts: &Facts) -> Result<(), St
     Ok(())
 }
 
-fn check_action(path: &str, a: &Action, part: &Part, who: &Who, facts: &Facts, others: &BTreeMap<String, Part>) -> Result<(), String> {
+fn check_action(path: &str, a: &Action, part: &Part, old: Option<&Part>, who: &Who, facts: &Facts, others: &BTreeMap<String, Part>) -> Result<(), String> {
     ident(&format!("{path}.id"), &a.id)?;
     required(&format!("{path}.title"), &a.title, MAX_TITLE)?;
     if DERIVED_KINDS.contains(&a.kind.as_str()) {
@@ -408,7 +464,9 @@ fn check_action(path: &str, a: &Action, part: &Part, who: &Who, facts: &Facts, o
     if let Some((i, missing)) = a.blocks.iter().enumerate().find(|(_, b)| !has(b)) {
         return refuse(&format!("{path}.blocks[{i}]"), format!("names {missing:?}, which is not an item of that track"));
     }
-    if !a.place.session.is_empty() {
+    // Like a lead: checked when given or changed. The click checks it again (MCR-97)
+    let as_stored = old.is_some_and(|o| o.actions.iter().any(|b| b.id == a.id && b.place.session == a.place.session));
+    if !a.place.session.is_empty() && !as_stored {
         let at = format!("{path}.where.session");
         reach(&at, &a.place.session, who, facts)?;
         if !facts.sessions.get(&a.place.session).is_some_and(|f| f.agent) {
@@ -416,7 +474,9 @@ fn check_action(path: &str, a: &Action, part: &Part, who: &Who, facts: &Facts, o
         }
     }
     text(&format!("{path}.say"), &a.say, MAX_LINE, false)?;
+    seen(&format!("{path}.say"), &a.say)?;
     text(&format!("{path}.where.command"), &a.place.command, MAX_LINK, false)?;
+    seen(&format!("{path}.where.command"), &a.place.command)?;
     text(&format!("{path}.recommended"), &a.recommended, MAX_SHORT, false)?;
     text(&format!("{path}.why"), &a.why, MAX_WHY, false)?;
     text(&format!("{path}.detail"), &a.detail, MAX_DETAIL, true)?;
@@ -454,6 +514,7 @@ fn check_action(path: &str, a: &Action, part: &Part, who: &Who, facts: &Facts, o
             }
             for (i, option) in a.options.iter().enumerate() {
                 required(&format!("{path}.options[{i}]"), option, MAX_SHORT)?;
+                seen(&format!("{path}.options[{i}]"), option)?;
                 plain(&format!("{path}.options[{i}]"), option)?;
             }
             if !a.recommended.is_empty() && !a.options.contains(&a.recommended) {
@@ -476,7 +537,16 @@ fn check_action(path: &str, a: &Action, part: &Part, who: &Who, facts: &Facts, o
 }
 
 /// Whether one session's part may stand as it is. `others` are the other parts.
-fn check_part(part: &Part, who: &Who, facts: &Facts, others: &BTreeMap<String, Part>) -> Result<(), String> {
+/// `old` is what the session has published now: what stands there unchanged
+/// is not held against sessions that ended since.
+fn check_part(part: &Part, old: Option<&Part>, who: &Who, facts: &Facts, others: &BTreeMap<String, Part>) -> Result<(), String> {
+    let kept: BTreeSet<&str> = old
+        .into_iter()
+        .flat_map(|o| o.tracks.iter())
+        .flat_map(|t| t.items.iter())
+        .flat_map(|i| [Some(i.owner.as_str()), i.waits_on.as_ref().filter(|w| w.kind == "session").map(|w| w.who.as_str())])
+        .flatten()
+        .collect();
     if part.tracks.len() > MAX_TRACKS {
         return refuse("tracks", format!("has more than {MAX_TRACKS} entries"));
     }
@@ -485,14 +555,14 @@ fn check_part(part: &Part, who: &Who, facts: &Facts, others: &BTreeMap<String, P
     }
     let mut ids = BTreeSet::new();
     for (i, t) in part.tracks.iter().enumerate() {
-        check_track(&format!("tracks[{i}]"), t, who, facts)?;
+        check_track(&format!("tracks[{i}]"), t, old, &kept, who, facts)?;
         if !ids.insert(t.id.as_str()) {
             return refuse(&format!("tracks[{i}].id"), format!("{:?} is used twice", t.id));
         }
     }
     let mut ids = BTreeSet::new();
     for (i, a) in part.actions.iter().enumerate() {
-        check_action(&format!("actions[{i}]"), a, part, who, facts, others)?;
+        check_action(&format!("actions[{i}]"), a, part, old, who, facts, others)?;
         if !ids.insert(a.id.as_str()) {
             return refuse(&format!("actions[{i}].id"), format!("{:?} is used twice", a.id));
         }
@@ -520,8 +590,50 @@ fn clean(value: &mut Value) {
     }
 }
 
-fn parse<T: serde::de::DeserializeOwned>(path: &str, mut value: Value) -> Result<T, String> {
+const TRACK_FIELDS: [&str; 7] = ["id", "title", "lead", "refs", "state", "line", "items"];
+const ITEM_FIELDS: [&str; 7] = ["id", "title", "ref", "owner", "state", "waitsOn", "next"];
+const WAIT_FIELDS: [&str; 3] = ["kind", "who", "what"];
+const ACTION_FIELDS: [&str; 17] = ["id", "track", "trackBy", "item", "title", "kind", "where", "say", "options", "recommended", "why", "blocks", "risk", "amount", "urgency", "source", "detail"];
+const WHERE_FIELDS: [&str; 3] = ["session", "url", "command"];
+const ORDER_FIELDS: [&str; 2] = ["by", "id"];
+
+/// What a session sends has the fields of the schema and no others. The
+/// stored types do not say so themselves: they are also read from the store
+/// file, which must load whatever a later build wrote (`load`).
+fn known(path: &str, value: &Value, fields: &[&str]) -> Result<(), String> {
+    match value.as_object().into_iter().flatten().map(|(key, _)| key).find(|key| !fields.contains(&key.as_str())) {
+        Some(key) => refuse(path, format!("has no field {key:?}; it has: {}", fields.join(", "))),
+        None => Ok(()),
+    }
+}
+
+fn known_item(path: &str, item: &Value) -> Result<(), String> {
+    known(path, item, &ITEM_FIELDS)?;
+    known(&format!("{path}.waitsOn"), &item["waitsOn"], &WAIT_FIELDS)
+}
+
+fn known_track(path: &str, track: &Value) -> Result<(), String> {
+    known(path, track, &TRACK_FIELDS)?;
+    track["items"].as_array().into_iter().flatten().enumerate().try_for_each(|(i, item)| known_item(&format!("{path}.items[{i}]"), item))
+}
+
+fn known_action(path: &str, action: &Value) -> Result<(), String> {
+    known(path, action, &ACTION_FIELDS)?;
+    known(&format!("{path}.where"), &action["where"], &WHERE_FIELDS)
+}
+
+fn known_order(path: &str, entry: &Value) -> Result<(), String> {
+    known(path, entry, &ORDER_FIELDS)
+}
+
+/// One entry, or a list of them, as a session sent it: held to the schema's
+/// fields (`shape`), then read.
+fn parse<T: serde::de::DeserializeOwned>(path: &str, mut value: Value, shape: fn(&str, &Value) -> Result<(), String>) -> Result<T, String> {
     clean(&mut value);
+    match &value {
+        Value::Array(all) => all.iter().enumerate().try_for_each(|(i, entry)| shape(&format!("{path}[{i}]"), entry))?,
+        one => shape(path, one)?,
+    }
     serde_json::from_value(value).map_err(|e| format!("Refused: {path} does not fit the schema: {e}"))
 }
 
@@ -612,16 +724,20 @@ impl Cockpit {
             return refuse(extra, "is not a field of cockpit_publish (tracks, actions, order)");
         }
         let field = |name: &str| args.get(name).filter(|v| !v.is_null()).cloned().unwrap_or_else(|| json!([]));
-        let mut part = Part { tracks: parse("tracks", field("tracks"))?, actions: parse("actions", field("actions"))?, updated: 0 };
+        let mut part = Part { tracks: parse("tracks", field("tracks"), known_track)?, actions: parse("actions", field("actions"), known_action)?, updated: 0 };
         for track in part.tracks.iter_mut().filter(|t| t.lead.is_empty()) {
             track.lead = who.id.into();
         }
         let others = self.others(who.key());
-        check_part(&part, who, facts, &others)?;
+        check_part(&part, self.parts.get(who.key()), who, facts, &others)?;
         let order: Option<Vec<TrackRef>> = match args.get("order").filter(|v| !v.is_null()) {
             None => None,
             Some(_) if !who.root => return refuse("order", "is the Supervisor's: a session orders nothing but its own tracks, by their place in tracks"),
-            Some(given) => Some(serde_json::from_value(given.clone()).map_err(|e| format!("Refused: order does not fit the schema: {e}"))?),
+            // Not through `parse`: `by` is a field here, and a stamp everywhere else
+            Some(given) => {
+                given.as_array().into_iter().flatten().enumerate().try_for_each(|(i, entry)| known_order(&format!("order[{i}]"), entry))?;
+                Some(serde_json::from_value(given.clone()).map_err(|e| format!("Refused: order does not fit the schema: {e}"))?)
+            }
         };
         if let Some(order) = &order {
             for (i, r) in order.iter().enumerate() {
@@ -688,7 +804,7 @@ impl Cockpit {
             "track" => {
                 let id = entry(&args["track"])?;
                 let at = part.tracks.iter().position(|t| t.id == id);
-                let mut track: Track = parse("track", overlay(at.and_then(|i| serde_json::to_value(&part.tracks[i]).ok()), &args["track"]))?;
+                let mut track: Track = parse("track", overlay(at.and_then(|i| serde_json::to_value(&part.tracks[i]).ok()), &args["track"]), known_track)?;
                 if track.lead.is_empty() {
                     track.lead = who.id.into();
                 }
@@ -702,7 +818,7 @@ impl Cockpit {
                 let track = own_track(&part)?;
                 let items = &mut part.tracks[track].items;
                 let at = items.iter().position(|i| i.id == id);
-                let item: Item = parse("item", overlay(at.and_then(|i| serde_json::to_value(&items[i]).ok()), &args["item"]))?;
+                let item: Item = parse("item", overlay(at.and_then(|i| serde_json::to_value(&items[i]).ok()), &args["item"]), known_item)?;
                 match at {
                     Some(i) => items[i] = item,
                     None => items.push(item),
@@ -711,7 +827,7 @@ impl Cockpit {
             "action" => {
                 let id = entry(&args["action"])?;
                 let at = part.actions.iter().position(|a| a.id == id);
-                let action: Action = parse("action", overlay(at.and_then(|i| serde_json::to_value(&part.actions[i]).ok()), &args["action"]))?;
+                let action: Action = parse("action", overlay(at.and_then(|i| serde_json::to_value(&part.actions[i]).ok()), &args["action"]), known_action)?;
                 match at {
                     Some(i) => part.actions[i] = action,
                     None => part.actions.push(action),
@@ -735,7 +851,7 @@ impl Cockpit {
             }
         }
         // The whole part must still stand: an action of a removed track is refused here
-        check_part(&part, who, facts, &self.others(who.key()))?;
+        check_part(&part, self.parts.get(who.key()), who, facts, &self.others(who.key()))?;
         Ok(self.accept(who, part, now))
     }
 
@@ -795,8 +911,17 @@ impl Cockpit {
         let mut named: BTreeSet<&str> = BTreeSet::new();
         let mut tracks: Vec<(usize, Value)> = Vec::new();
         let mut actions: Vec<Value> = Vec::new();
-        // Open reports that a published action already stands for
-        let cited: BTreeSet<&str> = self.parts.iter().filter(|(k, _)| shown(k)).flat_map(|(_, p)| p.actions.iter()).flat_map(|a| a.source.iter().map(String::as_str)).collect();
+        // A published action stands for a report it names only when its
+        // publisher is the reporting session, a session above it or the
+        // Supervisor: otherwise any session could make another tree's
+        // "needs you" disappear by naming its id
+        let stands = |key: &str, report: &str| facts.reports.get(report).is_some_and(|by| key == ROOT || key == by || facts.sessions.get(by).is_some_and(|f| f.above.iter().any(|s| s == key)));
+        let cited: BTreeSet<&str> = self
+            .parts
+            .iter()
+            .filter(|(k, _)| shown(k))
+            .flat_map(|(key, p)| p.actions.iter().flat_map(|a| a.source.iter()).filter(|s| stands(key, s)).map(String::as_str))
+            .collect();
         for (key, part) in self.parts.iter().filter(|(k, _)| shown(k)) {
             if key != ROOT {
                 named.insert(key.as_str());
@@ -836,8 +961,9 @@ impl Cockpit {
                     out["trackMissing"] = json!(true);
                 }
                 // It says it comes from a report: whether that report is still open
-                if action.source.iter().any(|s| facts.reports.contains(s)) {
-                    let open = facts.sessions.values().any(|f| f.needs_human.as_ref().is_some_and(|(id, ..)| action.source.contains(id)));
+                let own: Vec<&String> = action.source.iter().filter(|s| stands(key, s)).collect();
+                if !own.is_empty() {
+                    let open = facts.sessions.values().any(|f| f.needs_human.as_ref().is_some_and(|(id, ..)| own.contains(&id)));
                     out["live"] = json!({ "reportOpen": open });
                 }
                 actions.push(out);
@@ -1187,7 +1313,7 @@ mod tests {
     fn harness_facts_are_joined_at_read_and_never_stored() {
         let c = published();
         let mut f = facts();
-        f.reports.insert("r1".into());
+        f.reports.insert("r1".into(), "peer".into());
         f.sessions.get_mut("ex").unwrap().prompt = Some(NOW + 1);
         f.sessions.get_mut("ex").unwrap().waits = vec![FactWait { id: "w1".into(), kind: "pipeline".into(), on: "CI run".into(), reference: "run 7".into(), since: NOW + 2, overdue: true }];
         f.sessions.get_mut("ex").unwrap().done = Some("r0".into());
@@ -1217,7 +1343,7 @@ mod tests {
         // A published action that names the report stands for it, and says whether it is still open
         let mut c = c;
         f.sessions.get_mut("sup").unwrap().needs_human = Some(("r2".into(), "Merge?".into(), NOW));
-        f.reports.insert("r2".into());
+        f.reports.insert("r2".into(), "sup".into());
         c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "source": ["r2", "MCR-95"] } }), NOW).unwrap();
         let read = c.read(&f, None);
         assert_eq!(read["actions"].as_array().unwrap().iter().filter(|a| a["kind"] == "report").count(), 1, "only the peer's");
@@ -1277,6 +1403,100 @@ mod tests {
         assert!(c.keep(|_| false));
         assert!(c.parts.contains_key(ROOT) && c.parts.len() == 1, "the Supervisor's part belongs to the role");
         assert!(c.order.is_empty() && c.version == version + 1);
+    }
+
+    #[test]
+    fn a_stored_document_this_build_cannot_read_costs_the_cockpit_alone() {
+        // A field a later build added: read, and the rest of the entry stays
+        let mut stored = serde_json::to_value(published()).unwrap();
+        stored["parts"]["sup"]["tracks"][0]["colour"] = json!("red");
+        stored["parts"]["sup"]["tracks"][0]["items"][0]["weight"] = json!(3);
+        stored["parts"]["sup"]["actions"][0]["where"]["pane"] = json!("left");
+        stored["later"] = json!(true);
+        let c = load(stored.clone());
+        assert_eq!((c.version, c.parts["sup"].tracks[0].items.len(), c.parts["sup"].actions[0].say.as_str()), (1, 2, "merge MCR-95"));
+        // What a session sends is still held to the schema
+        let mut c = c;
+        assert!(c.patch(&SUP, &facts(), &json!({ "track": { "id": "t1", "colour": "red" } }), NOW).unwrap_err().contains("colour"));
+        assert!(c.patch(&SUP, &facts(), &json!({ "item": { "id": "i1", "weight": 3 }, "of": "t1" }), NOW).unwrap_err().contains("weight"));
+        assert!(c.patch(&SUP, &facts(), &json!({ "action": { "id": "a1", "where": { "session": "ex", "pane": "left" } } }), NOW).unwrap_err().contains("pane"));
+        // A document of a later schema, or a damaged one: an empty cockpit, and no error
+        stored["schema"] = json!(SCHEMA + 1);
+        assert!(load(stored.clone()).parts.is_empty());
+        stored["schema"] = json!(SCHEMA);
+        stored["parts"]["sup"]["tracks"] = json!("all of them");
+        assert!(load(stored).parts.is_empty());
+        assert!(load(json!([1, 2])).parts.is_empty());
+    }
+
+    #[test]
+    fn a_session_that_ended_stays_named_where_it_gives_no_rights() {
+        let mut c = published();
+        let mut f = facts();
+        // `ex` did its item and was ended; then it is forgotten
+        f.sessions.get_mut("ex").unwrap().ended = true;
+        c.patch(&SUP, &f, &json!({ "item": { "id": "i1", "state": "done" }, "of": "t1" }), NOW + 1).unwrap();
+        c.patch(&SUP, &f, &json!({ "item": { "id": "i2", "waitsOn": { "kind": "session", "who": "ex" } }, "of": "t1" }), NOW + 2).unwrap();
+        f.sessions.remove("ex");
+        c.patch(&SUP, &f, &json!({ "track": { "id": "t1", "state": "done" } }), NOW + 3).unwrap();
+        c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "urgency": "now" } }), NOW + 4).unwrap();
+        let read = c.read(&f, None);
+        c.publish(&SUP, &f, &json!({ "tracks": read["tracks"], "actions": read["actions"] }), NOW + 5).unwrap();
+        assert_eq!((c.parts["sup"].tracks[0].lead.as_str(), c.parts["sup"].tracks[0].items[0].owner.as_str()), ("ex", "ex"));
+        // An ended session may be named as an owner anew; an unknown one, or a new lead or target, may not
+        f.sessions.insert("gone2".into(), Fact { ended: true, ..Fact::default() });
+        c.patch(&SUP, &f, &json!({ "item": { "id": "i3", "title": "Old", "owner": "gone2", "state": "done" }, "of": "t1" }), NOW + 6).unwrap();
+        assert!(c.patch(&SUP, &f, &json!({ "item": { "id": "i4", "title": "x", "owner": "nobody", "state": "done" }, "of": "t1" }), NOW).unwrap_err().contains("owner"));
+        assert!(c.patch(&SUP, &f, &json!({ "track": { "id": "t2", "title": "x", "state": "done", "lead": "ex" } }), NOW).unwrap_err().contains("tracks[1].lead"));
+        assert!(c.patch(&SUP, &f, &json!({ "track": { "id": "t1", "lead": "gone" } }), NOW).unwrap_err().contains("tracks[0].lead"));
+        assert!(c.patch(&SUP, &f, &json!({ "action": { "id": "a2", "track": "t1", "title": "x", "kind": "typed_word", "where": { "session": "ex" }, "say": "go", "risk": "reversible" } }), NOW).unwrap_err().contains("where.session"));
+        assert!(c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "where": { "session": "gone" } } }), NOW).unwrap_err().contains("where.session"));
+    }
+
+    #[test]
+    fn a_line_for_an_input_box_holds_nothing_the_operator_cannot_see() {
+        for hidden in ['\u{200b}', '\u{200d}', '\u{200e}', '\u{2060}', '\u{feff}', '\u{ad}', '\u{2028}', '\u{2029}', '\u{e0041}', '\u{e000}', '\u{61c}', '\u{fff9}', '\u{f0000}'] {
+            let line = format!("ok merge{hidden}and push");
+            for (a, place) in [
+                (action("typed_word", json!({ "where": { "session": "ex" }, "say": line })), "actions[0].say"),
+                (action("decision", json!({ "options": ["Keep", line] })), "actions[0].options[1]"),
+                (action("live_check", json!({ "detail": "x", "where": { "command": line } })), "where.command"),
+                (action("external", json!({ "where": { "url": format!("https://example.com/{hidden}") } })), "where.url"),
+            ] {
+                let err = with_action(a).unwrap_err();
+                assert!(err.contains(place) && err.contains("cannot be seen"), "{:x} {place}: {err}", hidden as u32);
+            }
+        }
+        // Text that is only shown: no separators that break a line unseen and no tag characters
+        for hidden in ['\u{2028}', '\u{2029}', '\u{e0041}', '\u{2066}'] {
+            assert!(with_action(action("decision", json!({ "options": ["a", "b"], "title": format!("Choose{hidden}now") }))).is_err(), "{:x}", hidden as u32);
+            assert!(with_action(action("decision", json!({ "options": ["a", "b"], "detail": format!("Choose{hidden}now") }))).is_err(), "{:x}", hidden as u32);
+        }
+        // Other scripts and joined emoji stay possible there
+        with_action(action("decision", json!({ "options": ["a", "b"], "title": "Wähle: 選択 👨\u{200d}👩\u{200d}👧" }))).unwrap();
+        with_action(action("typed_word", json!({ "where": { "session": "ex" }, "say": "übernimm main, s'il te plaît" }))).unwrap();
+    }
+
+    #[test]
+    fn only_the_reporter_or_a_session_above_it_stands_for_its_report() {
+        let mut c = published();
+        let mut f = facts();
+        f.reports.insert("r1".into(), "ex".into());
+        f.sessions.get_mut("ex").unwrap().needs_human = Some(("r1".into(), "Which key?".into(), NOW));
+        let derived = |c: &Cockpit, f: &Facts| c.read(f, None)["actions"].as_array().unwrap().iter().filter(|a| a["kind"] == "report").count();
+        // A session of another tree names the report: the service's own entry stays
+        c.publish(&Who { id: "peer", root: false }, &f, &json!({ "tracks": [{ "id": "p", "title": "Mine", "state": "moving" }], "actions": [{ "id": "quiet", "track": "p", "title": "Nothing to see", "kind": "decision", "options": ["a", "b"], "risk": "reversible", "source": ["r1"] }] }), NOW).unwrap();
+        assert_eq!(derived(&c, &f), 1);
+        let read = c.read(&f, None);
+        assert!(read["actions"].as_array().unwrap().iter().find(|a| a["id"] == "quiet").unwrap().get("live").is_none());
+        // Its supervisor does stand for it; so does the reporter itself, and the Supervisor
+        c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "source": ["r1"] } }), NOW).unwrap();
+        assert_eq!(derived(&c, &f), 0);
+        assert_eq!(c.read(&f, None)["actions"].as_array().unwrap().iter().find(|a| a["id"] == "a1").unwrap()["live"]["reportOpen"], true);
+        c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "source": [] } }), NOW).unwrap();
+        assert_eq!(derived(&c, &f), 1);
+        c.publish(&ROOT_WHO, &f, &json!({ "actions": [{ "id": "x", "title": "Answer", "kind": "decision", "options": ["a", "b"], "risk": "reversible", "source": ["r1"] }] }), NOW).unwrap();
+        assert_eq!(derived(&c, &f), 0);
     }
 
     #[test]

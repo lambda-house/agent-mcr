@@ -1162,7 +1162,9 @@ struct Store {
     codex_hooks_seen: String,
     waits: BTreeMap<String, Wait>,
     /// What sessions published for the operator (MCR-95). A
-    /// store from before it has none, and loads with an empty one
+    /// store from before it has none, and loads with an empty one; so does
+    /// one whose cockpit this build cannot read, without losing the rest
+    #[serde(deserialize_with = "cockpit::stored")]
     cockpit: Cockpit,
     /// Connected `mcr` bridges per session; `Tracked.tools` follows it
     #[serde(skip)]
@@ -1228,7 +1230,7 @@ impl Store {
                 (id.clone(), fact)
             })
             .collect();
-        cockpit::Facts { sessions, reports: self.reports.iter().map(|r| r.id.clone()).collect() }
+        cockpit::Facts { sessions, reports: self.reports.iter().map(|r| (r.id.clone(), r.session.clone())).collect() }
     }
 
     /// `target` is an executor of `me`, directly or further down.
@@ -5370,6 +5372,20 @@ mod tests {
         let restored: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
         assert_eq!((restored.cockpit.schema, restored.cockpit.version, restored.cockpit.parts["a"].tracks[0].id.as_str()), (cockpit::SCHEMA, 3, "t"));
         assert_eq!(restored.cockpit.parts[cockpit::ROOT].actions[0].id, "x");
+        // A cockpit this build cannot read costs the cockpit and nothing else of the store (MCR-95 review, 1)
+        let file = dir.join("harness-state.json");
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        state["cockpit"]["parts"]["a"]["tracks"][0]["colour"] = json!("red");
+        std::fs::write(&file, state.to_string()).unwrap();
+        let again = Harness::open(&dir);
+        assert_eq!(lock(&again.store).sessions["b"].supervisor.as_deref(), Some("a"));
+        assert_eq!(lock(&again.store).cockpit.parts["a"].tracks[0].id, "t");
+        state["cockpit"]["parts"]["a"]["tracks"] = json!("damaged");
+        std::fs::write(&file, state.to_string()).unwrap();
+        let again = Harness::open(&dir);
+        assert_eq!(lock(&again.store).sessions["b"].supervisor.as_deref(), Some("a"));
+        assert!(!lock(&again.store).reports.is_empty() && lock(&again.store).cockpit.parts.is_empty());
+        drop(again);
         for name in ["cockpit_publish", "cockpit_patch", "cockpit_read"] {
             assert!(supervisor_tools()["tools"].as_array().unwrap().iter().any(|t| t["name"] == name) && agent_tools()["tools"].as_array().unwrap().iter().any(|t| t["name"] == name));
             // They run nothing, so the Supervisor has them without a question, like its other tools
