@@ -73,6 +73,7 @@ A peer in your folder may be changing the same files. Take its role into account
 
 ## Say what you are doing
 - `set_status` when you start a piece of work and when it changes. Peers and the operator read it in the session list. Change `role` only when your part really changes.
+- When you name another session for the operator (one they must look at or act in), write it as `mcr:<id>` with its name after it, not as a bare id: the app shows that pointer as a link that opens the session.
 
 ## Reach a peer
 - By name or id, with these tools only. They work for every agent kind and are recorded; other messaging between sessions is not.
@@ -5201,6 +5202,8 @@ mod tests {
         assert!(reporting.starts_with("---\nname: reporting\ndescription: ") && reporting.contains("needs_human") && reporting.contains("expires_hours"));
         // When a status report fits, and what it is not (MCR-73)
         assert!(reporting.contains("`kind: \"status\"`") && reporting.contains("wait_register") && reporting.contains("set_status"));
+        // A session named for the operator is written as the pointer the app links (MCR-82)
+        assert!(body.contains("write it as `mcr:<id>` with its name after it, not as a bare id"));
         // Every tool the note and the guides name exists
         let tools = agent_tools();
         let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();

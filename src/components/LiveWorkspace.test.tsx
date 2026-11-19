@@ -10,7 +10,19 @@ vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<o
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // Terminals need a real canvas; the pane itself is exercised in the app
-vi.mock('./TerminalPane', () => ({ default: ({ id, onQuit }: { id: string; onQuit?: () => void }) => <div data-terminal={id}><button aria-label={`quit ${id}`} onClick={onQuit}/></div> }));
+// The link button stands for a click on `mcr:<linkTo>` in that terminal's text
+// and the stand-in takes the keyboard as the pane does: once per request, then says so. `mounts` counts its mounts.
+let linkTo = '';
+const focused: string[] = [];
+const mounts: string[] = [];
+vi.mock('./TerminalPane', async () => {
+  const { useEffect } = await import('react');
+  return { default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
+    useEffect(() => { mounts.push(id); }, [id]);
+    useEffect(() => { if (focusAt) { focused.push(id); onFocused?.(); } }, [focusAt]); // eslint-disable-line react-hooks/exhaustive-deps
+    return <div data-terminal={id} data-focus-at={focusAt ?? ''} data-links={['r1', 'e1', 's1', 'nobody'].filter(x => isSession?.(x)).join(' ')}><button aria-label={`quit ${id}`} onClick={onQuit}/><button aria-label={`link in ${id}`} onClick={() => onSession?.(linkTo)}/></div>;
+  } };
+});
 
 const running: Hosted = { id: 'r1', pid: 42, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec claude'], cwd: '/work/repo', started: 2, cols: 120, rows: 32, title: 'Fixing tests', lastOutput: 1, exit: null, meta: { label: 'Claude Code', profile: 'claude' } };
 const ended: Hosted = { ...running, id: 'e1', started: 1, title: '', exit: { code: 0, signal: null, at: 3 }, meta: { label: 'Shell', profile: 'shell' } };
@@ -170,6 +182,61 @@ describe('Live workspace', () => {
     await act(async () => item('Restart').click()); await flush();
     expect(host.querySelector('[data-terminal="r1"]')).toBeNull();
     expect([...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'))).toEqual(['s1', 'r2']);
+  });
+
+  it('follows a session pointer clicked in a terminal: that session is shown and its terminal takes the keyboard', async () => {
+    const shell: Hosted = { ...running, id: 's1', title: '', meta: { label: 'Shell', profile: 'shell' } };
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const shown = () => [...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'));
+    const pane = (id: string) => host.querySelector(`[data-terminal="${id}"]`) as HTMLElement;
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(shown()).toEqual(['r1']);
+    // Running sessions are links; an ended one and an id nobody has are not
+    expect(pane('r1').dataset.links).toBe('r1 s1');
+    expect(pane('r1').dataset.focusAt).toBe('');
+    focused.length = 0;
+    // One pane: the linked session takes it
+    linkTo = 's1';
+    await act(async () => button('link in r1').click()); await flush();
+    expect(shown()).toEqual(['s1']);
+    expect(row('Shell').closest('li')?.className).toContain('selected');
+    expect(focused).toEqual(['s1']);
+    // Served: the request is gone, so no later mount of that pane gets it
+    expect(pane('s1').dataset.focusAt).toBe('');
+    // Two panes, both shown: the click in one marks the other for the keyboard and moves nothing
+    await act(async () => button('Two columns').click()); await flush();
+    await act(async () => row('Fixing tests').click()); await flush();
+    const both = shown();
+    expect([...both].sort()).toEqual(['r1', 's1']);
+    linkTo = 'r1';
+    await act(async () => button('link in s1').click()); await flush();
+    expect(shown()).toEqual(both);
+    expect(focused).toEqual(['s1', 'r1']);
+    expect([pane('r1').dataset.focusAt, pane('s1').dataset.focusAt]).toEqual(['', '']);
+    // A pointer to a session that ended, or to nothing, does nothing
+    for (const id of ['e1', 'nobody']) {
+      linkTo = id;
+      await act(async () => button('link in s1').click()); await flush();
+      expect(shown()).toEqual(both);
+      expect(focused).toEqual(['s1', 'r1']);
+    }
+    // The linked session's pane mounted again later (here: the session forgotten from the list and back): no keyboard without a click
+    // A new status object makes the view read its list again
+    const reload = async (list: Hosted[]) => {
+      vi.mocked(harnessApi.list).mockResolvedValue(list);
+      vi.mocked(harnessApi.status).mockResolvedValue({ ...await harnessApi.status() });
+      await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush(); await flush();
+    };
+    await reload([ended, shell]);
+    expect(pane('r1')).toBeNull();
+    const before = mounts.filter(id => id === 'r1').length;
+    await reload([ended, shell, running]);
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(pane('r1')).not.toBeNull();
+    expect(mounts.filter(id => id === 'r1').length).toBe(before + 1);
+    expect(focused).toEqual(['s1', 'r1']);
   });
 
   it('drops a session the person quit from its own terminal', async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gist, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { gist, hostedLabel, hostedState, pastedImage, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -71,6 +71,24 @@ describe('session reference', () => {
     const named = (name: string) => sessionReference(hosted({ meta: { label: 'Claude Code', profile: 'claude', name } } as Partial<Hosted>));
     expect(named('Fixing tests')).toMatch(/^mcr:\S+ 'Fixing tests'$/);
     expect(named('a $(rm -rf ~) `id` \\ "b" \'c\'\nrm\u001b[0m')).toMatch(/^mcr:\S+ 'a \(rm -rf ~\) id {2}b crm\[0m'$/);
+  });
+});
+
+describe('session pointers in terminal text', () => {
+  const live = new Set(['a27f56d8749b', '5f7c7dccd5aa']);
+  const links = (text: string) => sessionLinks(text, id => live.has(id));
+  it('finds mcr:<id> of a known session, with where it is', () => {
+    expect(links('type this in mcr:a27f56d8749b now')).toEqual([{ start: 13, end: 29, id: 'a27f56d8749b' }]);
+    expect(links("(mcr:5f7c7dccd5aa 'Fixing tests'), then mcr:a27f56d8749b.").map(l => l.id)).toEqual(['5f7c7dccd5aa', 'a27f56d8749b']);
+  });
+  it('leaves an unknown id, a bare id and near misses as plain text', () => {
+    expect(links('mcr:000000000000')).toEqual([]);
+    expect(links('session a27f56d8749b')).toEqual([]);
+    expect(links('mcr:a27f56d8749')).toEqual([]);
+    expect(links('mcr:a27f56d8749b0')).toEqual([]);
+    expect(links('mcr:A27F56D8749B')).toEqual([]);
+    expect(links('xmcr:a27f56d8749b agent-mcr:a27f56d8749b')).toEqual([]);
+    expect(links('mcr:<id>')).toEqual([]);
   });
 });
 

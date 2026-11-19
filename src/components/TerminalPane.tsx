@@ -3,7 +3,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
-import { harnessApi, pastedImage, SESSION_DRAG_TYPE, shellQuote } from '../utils/harness';
+import { harnessApi, pastedImage, SESSION_DRAG_TYPE, sessionLinks, shellQuote } from '../utils/harness';
 import { isPaletteKey, PLATFORM } from '../utils/platform';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
@@ -38,13 +38,23 @@ function theme(element: HTMLElement) {
  * with no text is saved and its path typed. Ctrl-V reaches the agent as ^V
  * (Claude Code reads the clipboard image itself).
  */
-export default function TerminalPane({ id, active, onQuit }: {
+export default function TerminalPane({ id, active, onQuit, isSession, onSession, focusAt, onFocused }: {
   id: string; active: boolean;
   /** The session ended right after the person pressed keys in it: they quit the agent themselves */
   onQuit?: () => void;
+  /** Whether an id is a session the app can show: `mcr:<id>` in the output is then a link */
+  isSession?: (id: string) => boolean;
+  /** A click on such a link */
+  onSession?: (id: string) => void;
+  /** Changes when this terminal is to take the keyboard, as after a click on a link to its session */
+  focusAt?: number;
+  /** It took the keyboard for `focusAt`: the request is served and must not be handed to a later mount */
+  onFocused?: () => void;
 }) {
   const quit = useRef(onQuit);
   quit.current = onQuit;
+  const sessions = useRef({ isSession, onSession, onFocused });
+  sessions.current = { isSession, onSession, onFocused };
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
@@ -72,6 +82,30 @@ export default function TerminalPane({ id, active, onQuit }: {
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P
     t.attachCustomKeyEventHandler(e => !isPaletteKey(e, PLATFORM));
     term.current = t; fit.current = f;
+    // A session pointer in the output is a link to that session (MCR-82)
+    const links = t.registerLinkProvider({
+      provideLinks(y, done) {
+        const line = t.buffer.active.getLine(y - 1);
+        const known = sessions.current.isSession;
+        if (!line || !known) return done(undefined);
+        // The column of every character: a wide one takes two cells, and the second holds nothing
+        let text = '';
+        const columns: number[] = [];
+        for (let x = 0; x < line.length; x++) {
+          const cell = line.getCell(x);
+          if (!cell || cell.getWidth() === 0) continue;
+          const chars = cell.getChars() || ' ';
+          for (let i = 0; i < chars.length; i++) columns.push(x);
+          text += chars;
+        }
+        const found = sessionLinks(text, known).map(link => ({
+          range: { start: { x: columns[link.start] + 1, y }, end: { x: columns[link.end - 1] + 1, y } },
+          text: text.slice(link.start, link.end),
+          activate: () => sessions.current.onSession?.(link.id),
+        }));
+        done(found.length ? found : undefined);
+      },
+    });
     try { f.fit(); } catch { /* not laid out yet */ }
 
     let view: number | null = null;
@@ -155,7 +189,7 @@ export default function TerminalPane({ id, active, onQuit }: {
       element.removeEventListener('paste', onPaste, true);
       element.removeEventListener('dragover', onDragOver, true);
       element.removeEventListener('drop', onDrop, true);
-      typed.dispose(); keyed.dispose(); resized.dispose();
+      typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose();
       if (view !== null) void harnessApi.detach(view);
       t.dispose();
       term.current = null; fit.current = null; resend.current = () => {};
@@ -168,6 +202,13 @@ export default function TerminalPane({ id, active, onQuit }: {
     // (the session may have been resized from elsewhere while this pane was hidden)
     requestAnimationFrame(() => { try { fit.current?.fit(); } catch { /* hidden */ } resend.current(); term.current?.focus(); });
   }, [active]);
+
+  useEffect(() => {
+    if (!focusAt) return;
+    // After the click that asked for it: that click leaves the keyboard in the terminal it was made in
+    const frame = requestAnimationFrame(() => { term.current?.focus(); sessions.current.onFocused?.(); });
+    return () => cancelAnimationFrame(frame);
+  }, [focusAt]);
 
   return <div className="hs-terminal-wrap">
     <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
