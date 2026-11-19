@@ -33,7 +33,7 @@ export default function SessionTree({ all, matches, selected, select, live }: { 
       <div className="sc-tree-row" style={{paddingLeft:Math.min(depth,8)*16}}>
         <button className="sc-tree-toggle" aria-label={`${closed ? 'Expand' : 'Collapse'} ${title}`} aria-expanded={!closed} disabled={!node.children.length} onClick={() => setCollapsed(old => {const next=new Set(old);if(next.has(key))next.delete(key);else next.add(key);return next;})}>{node.children.length ? (closed ? <ChevronRight size={14}/> : <ChevronDown size={14}/>) : <span/>}</button>
         <button className={`sc-session hs-item ${hosted ? (rowIdle(hosted) ? 'idle' : '') : 'hs-resume'} ${selected === key ? 'selected' : ''}`} title={about(node,title)} onClick={() => select(key)}>
-          {hosted ? <HostedRow hosted={hosted} label={title} session={s}/> : <EarlierRow agent={s.provider} title={title} modified={s.modified}/>}
+          {hosted ? <HostedRow hosted={hosted} label={title} tooltip={about(node,title)} session={s}/> : <EarlierRow agent={s.provider} title={title} modified={s.modified}/>}
         </button>
       </div>
       {!closed && node.children.map(child => render(child,depth+1))}

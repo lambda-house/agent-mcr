@@ -69,6 +69,8 @@ describe('Command panel', () => {
     expect(live.querySelector('.hs-dot.waiting')).not.toBeNull();
     expect(live.querySelector('.hs-metrics')).not.toBeNull();
     expect([...live.querySelectorAll('small')].map(e => e.textContent)).toEqual(['2 tasks', 'Run the tests?']);
+    // The folder is in the option's name: the heading is not read with it
+    expect([live, earlier].map(r => r.getAttribute('aria-label'))).toEqual(['Reviewer, waiting for you, in ~/repo', 'Older work, in ~/repo']);
     // The earlier row: mark, title and age
     expect(earlier.classList.contains('hs-resume')).toBe(true);
     expect(earlier.querySelector('.hs-dot, .hs-metrics')).toBeNull();

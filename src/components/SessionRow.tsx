@@ -29,8 +29,10 @@ export function hostedDetail(h: Hosted, extra = ''): string {
  * A hosted session: the state dot, the agent mark and its name, then a line
  * only for what is there (figures, tasks, a prompt, waits, the agent's status).
  */
-export function HostedRow({ hosted: h, label, session, detail = hostedDetail(h), before, after, under }: {
+export function HostedRow({ hosted: h, label, tooltip = label, session, detail = hostedDetail(h), before, after, under }: {
   hosted: Hosted; label: string;
+  /** Shown over the name: the full name unless the row has more to say there */
+  tooltip?: string;
   /** The indexed conversation, for the figures; nothing is shown without it */
   session?: Session;
   detail?: string;
@@ -44,7 +46,7 @@ export function HostedRow({ hosted: h, label, session, detail = hostedDetail(h),
   return <>
     <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
     <span className="hs-item-text">
-      <strong title={label}>{before}<AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}{after}</strong>
+      <strong title={tooltip}>{before}<AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}{after}</strong>
       {under}
       {session && <SessionFigures session={session} cache={!h.exit}/>}
       {detail && <small>{detail}</small>}

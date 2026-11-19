@@ -56,6 +56,8 @@ describe('Sessions workspace', () => {
     expect(row.querySelector('.hs-dot.waiting')).not.toBeNull();
     expect(row.querySelector('strong')?.textContent?.trim()).toBe('Parser fixer');
     expect([...row.querySelectorAll('small')].map(e => e.textContent)).toEqual(['1 unread', 'Approve the command?']);
+    // The name's own tooltip must not hide the detail the row left out
+    expect(row.querySelector('strong')?.getAttribute('title')).toContain('120 tokens');
     // Selecting it still opens the conversation in the Journal
     await act(async () => (row as HTMLElement).click());
     expect(row.classList.contains('selected')).toBe(true);

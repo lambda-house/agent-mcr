@@ -475,8 +475,9 @@ export default function SessionCommandPanel({
                           if (session) return (
                             <Fragment key={item.id}>
                               {heading && <div className="cmd-dir" title={session.cwd} aria-hidden="true"><span className="hs-dir-path">{session.cwd ? shortPath(homePath(session.cwd)) : 'Unknown folder'}</span></div>}
-                              {/* The row of the Live list: the live one for a conversation that runs now, the earlier one otherwise */}
-                              <div {...option} className={cx('cmd-item cmd-item--session', !item.live && 'hs-resume', item.live && rowIdle(item.live) && 'idle', isActive && 'cmd-item--active')}>
+                              {/* The row of the Live list: the live one for a conversation that runs now, the earlier one otherwise.
+                                  The heading is not part of the option, so the option's name says the folder */}
+                              <div {...option} aria-label={[item.label, item.live ? STATE_LABEL[hostedState(item.live)] : '', session.cwd ? `in ${homePath(session.cwd)}` : ''].filter(Boolean).join(', ')} className={cx('cmd-item cmd-item--session', !item.live && 'hs-resume', item.live && rowIdle(item.live) && 'idle', isActive && 'cmd-item--active')}>
                                 {item.live
                                   ? <HostedRow hosted={item.live} label={item.label} session={session}/>
                                   : <EarlierRow agent={session.provider} title={item.label} modified={session.modified}/>}
