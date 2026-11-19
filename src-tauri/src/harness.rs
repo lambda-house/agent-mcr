@@ -6286,7 +6286,9 @@ mod tests {
         harness.look("cx", title, Some(now));
         assert!(state("cx").attention.is_none() && lock(&harness.screens).is_empty());
         // Quiet: read once, the session waits with the question, its supervisor is told
-        let quiet = now - LOOK_QUIET_MS - 1;
+        // Quiet with room to spare: the test steps on to quiet + 9, and the
+        // service compares with its own clock, which runs on while the test does
+        let quiet = now - LOOK_QUIET_MS - 100;
         harness.look("cx", title, Some(quiet));
         let cx = state("cx");
         let a = cx.attention.unwrap();
