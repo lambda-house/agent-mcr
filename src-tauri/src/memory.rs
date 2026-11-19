@@ -442,11 +442,19 @@ impl Link {
     fn refresh(&self, meta: &Meta, epoch: u64) -> Result<String, Fail> {
         let (Some(refresh), Some(client)) = (self.vault.get("refresh"), self.vault.get("client")) else { return Err(self.signed_out(epoch)) };
         let form = [("grant_type", "refresh_token"), ("refresh_token", refresh.as_str()), ("client_id", client.as_str()), ("resource", self.endpoint.as_str())];
-        let answer = match post_form(&self.agent, &meta.token_endpoint, &form) {
-            Ok(answer) => answer,
-            // The authorization server says no: the grant is over, and asking again would not help
-            Err(Http::Status(400 | 401)) => return Err(self.signed_out(epoch)),
-            Err(e) => return Err(e.fail("the authorization server")),
+        let sent = self.agent.post(&meta.token_endpoint).timeout(QUICK).set("Accept", "application/json").send_form(&form);
+        let answer = match sent {
+            Err(ureq::Error::Status(code @ (400 | 401), response)) => {
+                // RFC 6749, 5.2: the answer says why. Only `invalid_grant` says the grant is
+                // over, and then asking again would not help. Anything else is not worth the
+                // sign-in: it is kept, and the call is told
+                let error: String = response.into_json::<Value>().ok().and_then(|b| b["error"].as_str().map(|e| e.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(40).collect())).unwrap_or_default();
+                if error == "invalid_grant" {
+                    return Err(self.signed_out(epoch));
+                }
+                return Err(Fail::Refused(format!("the authorization server did not renew the sign-in (HTTP {code}{}{error}). The sign-in is kept", if error.is_empty() { "" } else { ", " })));
+            }
+            other => other.map_err(Http::from).and_then(json_of).map_err(|e| e.fail("the authorization server"))?,
         };
         // The answer may arrive after a disconnect, which did not wait for it
         let kept = {
@@ -474,7 +482,8 @@ impl Link {
     /// which ends its grant (RFC 7009). Whether it confirmed.
     fn revoke(&self, meta: &Meta, client: &str, token: &str) -> bool {
         let Some(url) = meta.revocation_endpoint.as_ref() else { return false };
-        self.agent.post(url).timeout(FOR_THE_APP).send_form(&[("token", token), ("token_type_hint", "refresh_token"), ("client_id", client)]).is_ok()
+        // Redirects are not followed, so a 3xx comes back as an answer: it revoked nothing
+        self.agent.post(url).timeout(FOR_THE_APP).send_form(&[("token", token), ("token_type_hint", "refresh_token"), ("client_id", client)]).is_ok_and(|answer| (200..300).contains(&answer.status()))
     }
 
     /// Keep what the token endpoint answered. The refresh token goes first:
@@ -1196,6 +1205,10 @@ mod tests {
         arrived: Vec<String>,
         /// The MCP side takes requests and does not answer
         hangs: bool,
+        /// What the token endpoint says to a renewal instead of renewing: (status, error)
+        token_error: Option<(u16, &'static str)>,
+        /// The revocation address has moved, it says
+        revoke_redirects: bool,
     }
 
     impl World {
@@ -1236,6 +1249,10 @@ mod tests {
                 res(201, json!({"client_id": "client-1"}))
             }
             "/oauth/token" if w.token_fails => res(503, Value::Null),
+            "/oauth/token" if w.token_error.is_some() && field("grant_type") == "refresh_token" => {
+                let (status, error) = w.token_error.unwrap();
+                res(status, json!({"error": error}))
+            }
             "/oauth/token" if field("grant_type") == "authorization_code" => {
                 // The code this server gives out is bound to the challenge it was asked with
                 let fits = field("code").strip_prefix("code.").is_some_and(|c| c == challenge(&field("code_verifier")));
@@ -1260,6 +1277,7 @@ mod tests {
                 }
             }
             "/oauth/revoke" if w.revoke_fails => res(503, Value::Null),
+            "/oauth/revoke" if w.revoke_redirects => res(302, Value::Null),
             "/oauth/revoke" => {
                 let token = field("token");
                 if token == w.refresh {
@@ -1652,6 +1670,39 @@ mod tests {
         rig.browse(&url, |_| {});
         rig.settle();
         assert_eq!(rig.state(), "connected");
+    }
+
+    #[test]
+    fn only_a_grant_that_is_over_signs_out() {
+        let rig = Rig::signed_in();
+        for refusal in [(400, "invalid_request"), (401, "invalid_client"), (400, "temporarily_unavailable")] {
+            {
+                let mut world = lock(&rig.world);
+                world.access = "access-secret-gone".into();
+                world.token_error = Some(refusal);
+            }
+            let told = rig.call("clock", json!({}));
+            let text = told["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(refusal.1) && text.contains("The sign-in is kept"), "{text}");
+            // Nothing is thrown away over an answer that does not say the grant ended
+            assert_eq!(rig.state(), "connected");
+            assert_eq!(rig.vault.get("refresh").as_deref(), Some("refresh-secret-1"));
+            assert_eq!(rig.memory.status()["problem"]["kind"], "refused");
+        }
+        // When it does say so, the sign-in is over
+        lock(&rig.world).token_error = Some((400, "invalid_grant"));
+        assert_eq!(rig.call("clock", json!({}))["result"]["content"][0]["text"], Fail::SignedOut.text());
+        assert_eq!(rig.state(), "signed_out");
+        assert!(rig.vault.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_revocation_that_is_sent_elsewhere_is_no_revocation() {
+        let rig = Rig::signed_in();
+        lock(&rig.world).revoke_redirects = true;
+        let status = rig.memory.disconnect();
+        assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_revoked")));
+        assert!(rig.vault.0.lock().unwrap().is_empty());
     }
 
     #[test]
