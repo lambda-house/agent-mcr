@@ -357,6 +357,20 @@ export function pastedImage(data: DataTransfer | null): File | null {
 export const subagentActive = (a: Subagent, now: number) => now - a.lastActivity < 90_000;
 
 
+/**
+ * The session pointers in a line of terminal text: `mcr:` and a session id,
+ * for the ids `known` says are sessions. `start` and `end` are indexes into
+ * `text` (`end` is past the last character). A bare id is not a pointer: only
+ * the `mcr:` form is, so other hex strings stay plain text.
+ */
+export function sessionLinks(text: string, known: (id: string) => boolean): { start: number; end: number; id: string }[] {
+  const found: { start: number; end: number; id: string }[] = [];
+  for (const m of text.matchAll(/(?<![\w:-])mcr:([0-9a-f]{12})(?![0-9a-f])/g)) {
+    if (known(m[1])) found.push({ start: m.index, end: m.index + m[0].length, id: m[1] });
+  }
+  return found;
+}
+
 /** The drag type of a session row; its text/plain data is the session's reference. */
 export const SESSION_DRAG_TYPE = 'application/x-mcr-session';
 

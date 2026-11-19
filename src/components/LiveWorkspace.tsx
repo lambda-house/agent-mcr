@@ -225,6 +225,10 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const select = (id: string) => {
     openItem({ kind: 'session', id });
   };
+  // A click on `mcr:<id>` in a terminal: that session is selected like its row, and its terminal takes the keyboard
+  const [linked, setLinked] = useState<{ id: string; at: number } | null>(null);
+  const isSession = (id: string) => hosted.some(h => h.id === id && !h.exit);
+  const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
   useEffect(() => {
     const acknowledge = () => {
@@ -894,7 +898,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               const el = slotEls[id];
               if (!el) return null;
               const isVisible = visibleSessions.has(id);
-              return createPortal(<TerminalPane key={id} id={id} active={active && isVisible} onQuit={() => { closing.current.add(id); void refresh(); }}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} active={active && isVisible} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined}/>, el, id);
             })}
           </>
         );
