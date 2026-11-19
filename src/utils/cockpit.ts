@@ -50,7 +50,11 @@ export interface Named {
   id: string; name: string;
   /** In the session list now and running: its row and its terminal can be opened */
   hosted?: Hosted;
-  /** `gone`: the harness has no such session any more */
+  /**
+   * `gone`: the harness has no such session any more. `running` without
+   * `hosted`: the service says it runs and the list has not shown it yet; it is
+   * not called ended for that
+   */
   standing: 'running' | 'ended' | 'gone';
 }
 
@@ -62,7 +66,8 @@ export interface Named {
 export function named(id: string, cockpit: Cockpit, hosted: Hosted[], label: (h: Hosted) => string): Named {
   if (id === ROOT_PART) {
     const root = hosted.find(h => !h.exit && isSupervisor(h));
-    return { id, name: 'Supervisor', hosted: root, standing: root ? 'running' : 'ended' };
+    // Ended only when the list shows that: a list that has not caught up proves nothing
+    return { id, name: 'Supervisor', hosted: root, standing: root || !hosted.some(h => h.exit && isSupervisor(h)) ? 'running' : 'ended' };
   }
   const h = hosted.find(x => x.id === id);
   const known = cockpit.sessions[id];

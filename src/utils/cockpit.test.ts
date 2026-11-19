@@ -51,7 +51,15 @@ describe('the join with the session list', () => {
 
   it('finds the root Supervisor behind its part key', () => {
     expect(named('supervisor', doc, hosted, label)).toMatchObject({ name: 'Supervisor', standing: 'running', hosted: { id: 'root' } });
-    expect(named('supervisor', doc, [hosted[0]], label).standing).toBe('ended');
+    // Not in the list yet is not ended; an exited Supervisor row is
+    expect(named('supervisor', doc, [hosted[0]], label)).toMatchObject({ standing: 'running', hosted: undefined });
+    expect(named('supervisor', doc, [{ ...hosted[1], exit: { code: 0, signal: null, at: 5 } }], label).standing).toBe('ended');
+  });
+
+  it('does not call a session ended because the list has not shown it yet', () => {
+    const late = named('a', doc, [], label);
+    expect(late).toEqual({ id: 'a', name: 'stale name', standing: 'running' });
+    expect(staleMarks({ by: 'a', updated: NOW }, doc, [], label, NOW)).toEqual([]);
   });
 });
 

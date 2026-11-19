@@ -102,6 +102,27 @@ it('says so when nothing is published, and when the cockpit cannot be read', asy
   expect(host.querySelector('[role="alert"]')!.textContent).toContain('could not be read');
 });
 
+it('does not say that nothing needs the person before it has read the cockpit, or when it cannot read it', async () => {
+  localStorage.setItem('hs-cockpit-closed', '1');
+  vi.mocked(harnessApi.cockpit).mockReturnValue(new Promise(() => {}));
+  await show();
+  expect(host.querySelector('.ck-head')!.textContent).toContain('reading');
+  expect(host.querySelector('.ck-head')!.textContent).not.toContain('nothing needs you');
+  act(() => root.unmount()); root = createRoot(host);
+  vi.mocked(harnessApi.cockpit).mockRejectedValue('Harness service unavailable');
+  await show();
+  expect(host.querySelector('.ck-head [role="alert"]')!.textContent).toBe('could not be read');
+  expect(host.querySelector('.ck-head')!.textContent).not.toContain('nothing needs you');
+});
+
+it('names a session the service says runs, and the list has not shown yet, without calling it ended', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, sessions: { ...doc.sessions, late: { name: 'Late one', state: 'working' } }, tracks: [{ id: 'l', title: 'Late track', lead: 'late', by: 'late', state: 'moving', updated: Date.now() }], actions: [] });
+  await show();
+  const track = host.querySelector('[data-track="l"]')!;
+  expect(track.querySelector('.ck-session')!.textContent).toBe('Late one');
+  expect(track.querySelector('.ck-stale')).toBeNull();
+});
+
 it('can be collapsed, and stays so', async () => {
   await show();
   await act(async () => (host.querySelector('.ck-head .ck-expand') as HTMLButtonElement).click());

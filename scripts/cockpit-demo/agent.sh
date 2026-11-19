@@ -23,10 +23,17 @@ say() { printf '%s\n' "$*"; }
 # An executor is told its part in its first task. Only a session without such a
 # task, in the Supervisor's folder, plays the Supervisor: its executors start in
 # that same folder, and must never start executors of their own in turn.
+# And never a session the harness says works for another: whatever its folder
+# or task, a session with a supervisor starts no executors here.
 role="${last#demo:}"
 if [ "$role" = "$last" ]; then
   role=""
-  [ "$(basename "$PWD")" = "supervisor" ] && role="supervisor"
+  if [ "$(basename "$PWD")" = "supervisor" ]; then
+    who="$(tool whoami '{}')"
+    if printf '%s' "$who" | grep -q '"supervisor": *null' && ! printf '%s' "$who" | grep -q '"supervisor": *"'; then
+      role="supervisor"
+    fi
+  fi
 fi
 
 say "Cockpit demo agent (${role:-idle}). No model is called here; this is a script."

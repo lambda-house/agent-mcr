@@ -26,6 +26,8 @@ const store = (key: string, value: string) => { try { localStorage.setItem(key, 
 
 /** A session's name as a link to it; plain text when it cannot be opened any more. */
 function SessionLink({ who, onSession }: { who: Named; onSession: (id: string) => void }) {
+  // Running by the service's word, not in the list yet: named, and not called ended
+  if (!who.hosted && who.standing === 'running') return <span className="ck-session you" title="Not in the session list yet">{who.name}</span>;
   if (!who.hosted) return <span className="ck-session gone" title={who.standing === 'gone' ? 'The harness has no such session any more' : 'This session ended'}>{who.name}{who.standing === 'gone' ? ' (gone)' : ' (ended)'}</span>;
   const h = who.hosted;
   return <button type="button" className="ck-session" title={`Open ${who.name}`} onClick={() => onSession(h.id)}>{who.name}</button>;
@@ -162,7 +164,8 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
 
   const actions = cockpit ? needsYouRows(cockpit) : [];
   const tracks = cockpit?.tracks ?? [];
-  const count = actions.length ? `${actions.length} need${actions.length === 1 ? 's' : ''} you` : 'nothing needs you';
+  // "Nothing needs you" is a claim: made only on a cockpit that was read, and read without an error just now
+  const count = error ? 'could not be read' : !cockpit ? 'reading…' : actions.length ? `${actions.length} need${actions.length === 1 ? 's' : ''} you` : 'nothing needs you';
   return (
     <>
       <section ref={box} className={`ck-panel${closed ? ' closed' : ''}`} aria-label="Cockpit" style={closed ? undefined : { height }}>
@@ -171,8 +174,8 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
             {closed ? <ChevronRight size={12}/> : <ChevronDown size={12}/>}
           </button>
           <strong>Cockpit</strong>
-          <span className={actions.length ? 'ck-count needs' : 'ck-count'}>{count}</span>
-          <span className="ck-count">{tracks.length} track{tracks.length === 1 ? '' : 's'}</span>
+          <span className={error || actions.length ? 'ck-count needs' : 'ck-count'} role={error ? 'alert' : undefined}>{count}</span>
+          {cockpit && <span className="ck-count">{error ? 'last read: ' : ''}{error && actions.length ? `${actions.length} needed you, ` : ''}{tracks.length} track{tracks.length === 1 ? '' : 's'}</span>}
           {cockpit?.updated ? <span className="ck-age" title="When a session last published">published {formatAge(cockpit.updated)}</span> : null}
         </header>
         {!closed && (
