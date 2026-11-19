@@ -368,7 +368,7 @@ export const harnessApi = {
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
   /** What sessions reported to the person, and the live notes of the bulletin board */
   board: () => invoke<Board>('harness_board'),
-  /** The cockpit: published tracks and actions with the service's own facts; nothing shows it yet (MCR-96) */
+  /** The cockpit: published tracks and actions with the service's own facts; `CockpitPanel` shows it over the Supervisor's terminal */
   cockpit: () => invoke<Cockpit>('harness_cockpit'),
   /** A note from the person; without a folder it is for every session */
   postNote: (text: string, hours: number, folder?: string) => invoke<void>('harness_note_post', { text, hours, folder: folder || null }),

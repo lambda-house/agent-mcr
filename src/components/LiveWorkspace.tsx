@@ -6,6 +6,7 @@ import { Button, Dialog } from '@/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
+import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou } from './SessionRow';
@@ -860,6 +861,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                     {sessionHeaderOverride
                       ? sessionHeaderOverride({ session: h, leafId: node.id, multiPane, isFocused, statsOpen: stats, toggleStats, controller, defaultRender: defaultHeader })
                       : defaultHeader()}
+                    {/* The cockpit sits over the Supervisor's own terminal and nowhere else (MCR-96) */}
+                    {!h.exit && isSupervisor(h) && <CockpitPanel active={active} hosted={hosted} label={sessionLabel} onSession={follow}/>}
                     <div className="hs-pane-body">
                       <PaneSlot sessionId={h.id} registerSlot={registerSlot}/>
                       {stats && isFocused && <SessionStats session={h} active={active}/>}

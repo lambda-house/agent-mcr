@@ -945,7 +945,9 @@ impl Cockpit {
                             named.insert(w.who.as_str());
                         }
                         Some(_) => {}
-                        // Nothing published: what its owner registered with wait_register stands in
+                        // Nothing published: what its owner registered with wait_register stands in.
+                        // Not on an item that is done: it waits for nothing
+                        None if item.state == "done" => {}
                         None => {
                             if let Some(w) = facts.sessions.get(&item.owner).filter(|f| !f.ended && below(&item.owner)).and_then(|f| f.waits.first()) {
                                 out["items"][i]["waitsOn"] = json!({ "kind": wait_kind(&w.kind), "what": w.on, "ref": w.reference, "since": w.since, "overdue": w.overdue, "derived": "wait", "wait": w.id });
@@ -1313,6 +1315,21 @@ mod tests {
         assert!(c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW + 100).unwrap_err().contains("ten minutes"));
         // Refused calls do not count, and the window moves on
         assert!(c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW + WRITE_WINDOW_MS + 100).is_ok());
+    }
+
+    #[test]
+    fn a_registered_wait_is_not_shown_on_an_item_that_is_done() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        c.publish(&SUP, &f, &json!({ "tracks": [{ "id": "t9", "title": "T", "lead": "ex", "state": "moving", "items": [
+            { "id": "a", "title": "A", "owner": "ex", "state": "done" },
+            { "id": "b", "title": "B", "owner": "ex", "state": "doing" },
+        ] }] }), NOW).unwrap();
+        f.sessions.get_mut("ex").unwrap().waits = vec![FactWait { id: "w1".into(), kind: "pipeline".into(), on: "CI run".into(), reference: String::new(), since: NOW, overdue: false }];
+        let read = c.read(&f, None);
+        let items = &read["tracks"][0]["items"];
+        assert!(items[0].get("waitsOn").is_none(), "{}", items[0]);
+        assert_eq!(items[1]["waitsOn"]["derived"], "wait");
     }
 
     #[test]
