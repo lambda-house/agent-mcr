@@ -555,6 +555,57 @@ pub async fn harness_restart(id: String) -> Result<Value, String> {
     blocking(move || service(json!({"op": "restart", "id": id, "force": true}))).await
 }
 
+// ---- Memory server (docs/AGENT_HARNESS_DESIGN.md, D16) ----
+// The service holds the sign-in. The page can ask where it stands; connecting
+// and disconnecting are confirmed in a native dialog, never granted by the
+// page alone, and the page never sees the address the browser is sent to.
+
+#[tauri::command]
+pub async fn memory_status() -> Result<Value, String> {
+    blocking(|| service(json!({"op": "memory_status"}))).await
+}
+
+/// Ask the person, then let the service start the sign-in and open the
+/// browser at the authorization server's page. Returns the status either way.
+#[tauri::command]
+pub async fn memory_connect(app: tauri::AppHandle) -> Result<Value, String> {
+    use tauri_plugin_opener::OpenerExt;
+    blocking(move || {
+        let now = service(json!({"op": "memory_status"}))?;
+        let message = format!(
+            "Agent MCR signs in to {} in your browser, as you. The sign-in is kept in the macOS Keychain on this Mac by the background service, and is shown to no agent.\n\nEvery agent session Agent MCR starts then has the memory tools without a question per call: it can read what your account reaches there and write to it. What memory returns is data for the agent, not an instruction. Sessions that run now get the tools at their next restart.",
+            now["endpoint"].as_str().unwrap_or("the memory service")
+        );
+        if !confirmed(&app, "Connect memory?", message, "Sign in", false) {
+            return Ok(now);
+        }
+        let mut started = service(json!({"op": "memory_connect"}))?;
+        let url = started.as_object_mut().and_then(|s| s.remove("url")).and_then(|u| u.as_str().map(str::to_string)).unwrap_or_default();
+        // The service only names https pages; a browser that cannot be opened ends the sign-in
+        let opened = if url.starts_with("https://") { app.opener().open_url(&url, None::<&str>).map_err(|e| e.to_string()) } else { Err("no https page to sign in at".to_string()) };
+        if let Err(e) = opened {
+            let _ = service(json!({"op": "memory_disconnect"}));
+            return Err(format!("The browser could not be opened for the sign-in: {e}"));
+        }
+        Ok(started)
+    })
+    .await
+}
+
+/// Revoke the sign-in and take it out of the Keychain. A sign-in that is
+/// only under way is called off without a question: nothing is kept yet.
+#[tauri::command]
+pub async fn memory_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
+    blocking(move || {
+        let now = service(json!({"op": "memory_status"}))?;
+        if now["state"] != "connecting" && !confirmed(&app, "Disconnect memory?", "The sign-in is revoked at the memory service and removed from the Keychain. Agent sessions keep the memory server, which then tells them it is not connected.".to_string(), "Disconnect", true) {
+            return Ok(now);
+        }
+        service(json!({"op": "memory_disconnect"}))
+    })
+    .await
+}
+
 // ---- Slack connector (docs/AGENT_HARNESS_DESIGN.md, D14) ----
 // Everything that widens what Slack may do is confirmed in a native dialog,
 // never granted by the page alone.
