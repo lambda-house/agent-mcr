@@ -42,7 +42,7 @@ const QUICK: Duration = Duration::from_secs(15);
 const FOR_THE_APP: Duration = Duration::from_secs(7);
 /// How long a session's `initialize` waits for the memory service. An agent
 /// shows a server that starts slowly as failed, so this stays short.
-const AT_START: Duration = Duration::from_secs(4);
+const AT_START: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 4000 });
 /// A memory service that could not be reached is not asked again for this
 /// long by other sessions that start: they would each wait in turn.
 const AWAY_FOR: Duration = Duration::from_secs(20);
@@ -561,13 +561,30 @@ impl RemoteMcp {
         answer.map(|a| (Some(a), session_id)).ok_or_else(|| Http::Transport("the answer is not the one asked for".into()))
     }
 
-    /// POST with the sign-in: a refused token is renewed once.
-    fn signed(&self, session: Option<&Session>, message: &Value, wait: Duration) -> Result<(Option<Value>, Option<String>), Fail> {
-        let token = self.link.bearer(None)?;
-        match self.post(&token, session, message, wait) {
+    /// The token for a call that must be answered by `until`. A renewal is
+    /// never cut short to make that time: a refresh token that was sent is
+    /// spent, so its answer has to be taken. When the time is short the
+    /// renewal runs on beside the call, which gives up alone.
+    fn token(&self, spent: Option<&str>, until: Instant) -> Result<String, Fail> {
+        // A call with time for a renewal waits for it itself
+        if left(until) > Duration::from_secs(10) {
+            return self.link.bearer(spent);
+        }
+        let (done, result) = std::sync::mpsc::channel();
+        let (link, spent) = (self.link.clone(), spent.map(str::to_string));
+        std::thread::spawn(move || {
+            let _ = done.send(link.bearer(spent.as_deref()));
+        });
+        result.recv_timeout(left(until)).unwrap_or_else(|_| Err(Fail::Unreachable("renewing the sign-in takes longer than this call may wait".into())))
+    }
+
+    /// POST with the sign-in, answered by `until`: a refused token is renewed once.
+    fn signed(&self, session: Option<&Session>, message: &Value, until: Instant) -> Result<(Option<Value>, Option<String>), Fail> {
+        let token = self.token(None, until)?;
+        match self.post(&token, session, message, left(until)) {
             Err(Http::Status(401)) => {
-                let token = self.link.bearer(Some(&token))?;
-                match self.post(&token, session, message, wait) {
+                let token = self.token(Some(&token), until)?;
+                match self.post(&token, session, message, left(until)) {
                     Err(Http::Status(401)) => Err(Fail::Refused("the memory service does not accept the renewed sign-in".into())),
                     other => other.map_err(Self::fail),
                 }
@@ -595,22 +612,28 @@ impl RemoteMcp {
         Ok(answer["result"].clone())
     }
 
-    /// The MCP session with the memory service, started when there is none.
-    fn session(&self, wait: Duration) -> Result<Session, Fail> {
-        let mut held = lock(&self.session);
-        let epoch = self.link.epoch();
-        if let Some(session) = held.as_ref().filter(|s| s.epoch == epoch) {
-            return Ok(session.clone());
-        }
+    /// Start an MCP session with the memory service; both messages are answered by `until`.
+    fn start(&self, epoch: u64, until: Instant) -> Result<Session, Fail> {
         let hello = json!({"jsonrpc": "2.0", "id": self.id(), "method": "initialize", "params": {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "agent-mcr", "version": env!("CARGO_PKG_VERSION")},
         }});
-        let (answer, id) = self.signed(None, &hello, wait)?;
+        let (answer, id) = self.signed(None, &hello, until)?;
         let info = Self::result(answer)?;
         let session = Session { epoch, id, version: info["protocolVersion"].as_str().unwrap_or(PROTOCOL_VERSION).to_string(), info };
-        self.signed(Some(&session), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), wait)?;
+        self.signed(Some(&session), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), until)?;
+        Ok(session)
+    }
+
+    /// The MCP session with the memory service, started when there is none.
+    fn session(&self) -> Result<Session, Fail> {
+        let mut held = lock(&self.session);
+        let epoch = self.link.epoch();
+        if let Some(session) = held.as_ref().filter(|s| s.epoch == epoch) {
+            return Ok(session.clone());
+        }
+        let session = self.start(epoch, Instant::now() + QUICK)?;
         *held = Some(session.clone());
         Ok(session)
     }
@@ -618,9 +641,9 @@ impl RemoteMcp {
     fn rpc(&self, method: &str, params: Value, wait: Duration) -> Result<Value, Fail> {
         let mut again = true;
         loop {
-            let session = self.session(QUICK)?;
+            let session = self.session()?;
             let message = json!({"jsonrpc": "2.0", "id": self.id(), "method": method, "params": params});
-            match self.signed(Some(&session), &message, wait) {
+            match self.signed(Some(&session), &message, Instant::now() + wait) {
                 // A memory service that keeps sessions no longer knows this one (404, as the
                 // MCP specification says): start one and ask once more. The teob memory keeps
                 // none and sends no session id, so this never runs against it
@@ -637,19 +660,44 @@ impl RemoteMcp {
     }
 }
 
+/// A mutex taken by `until` at the latest, or not at all.
+fn lock_until<T>(mutex: &Mutex<T>, until: Instant) -> Option<std::sync::MutexGuard<'_, T>> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() >= until => return None,
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 impl Backend for RemoteMcp {
     fn info(&self, wait: Duration) -> Result<Value, Fail> {
+        // After a service restart every bridge replays its handshake at once. They share
+        // one wait: whoever starts the session has `wait` for it in all, and the others
+        // wait no longer than that for the outcome
+        let until = Instant::now() + wait;
+        let slow = || Fail::Unreachable("the memory service is slow to answer".into());
+        let mut held = lock_until(&self.session, until).ok_or_else(slow)?;
+        let epoch = self.link.epoch();
+        if let Some(session) = held.as_ref().filter(|s| s.epoch == epoch) {
+            return Ok(session.info.clone());
+        }
+        // Looked at with the session in hand: the one before us may just have found it away
         if let Some((at, fail)) = lock(&self.away).as_ref() {
             if at.elapsed() < AWAY_FOR {
                 return Err(fail.clone());
             }
         }
-        let found = self.session(wait).map(|s| s.info);
+        let found = self.start(epoch, until);
         *lock(&self.away) = match &found {
             Err(fail @ Fail::Unreachable(_)) => Some((Instant::now(), fail.clone())),
             _ => None,
         };
-        found
+        let session = found?;
+        *held = Some(session.clone());
+        Ok(session.info)
     }
     fn list_tools(&self) -> Result<Value, Fail> {
         let (mut tools, mut cursor) = (Vec::new(), None::<String>);
@@ -1791,6 +1839,47 @@ mod tests {
         // A call still tries, and says what happened
         let told = away.handle(&Ok("s1".into()), &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         assert_eq!(told["error"]["code"], -32000);
+    }
+
+    #[test]
+    fn sessions_that_start_together_wait_once_together_not_once_each() {
+        let rig = Arc::new(Rig::signed_in());
+        // The memory service takes requests and does not answer; the service restarted and every bridge replays its handshake
+        lock(&rig.world).hangs = true;
+        let started = Instant::now();
+        let starts: Vec<_> = (0..8)
+            .map(|n| {
+                let rig = rig.clone();
+                std::thread::spawn(move || rig.memory.handle(&Ok(format!("s{n}")), &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).unwrap())
+            })
+            .collect();
+        for start in starts {
+            let hello = start.join().unwrap();
+            assert!(hello["result"]["instructions"].as_str().unwrap().contains("It did not answer when this session started"), "{hello}");
+        }
+        assert!(started.elapsed() < AT_START * 2, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_slow_renewal_does_not_hold_a_start_up_and_is_not_cut_short() {
+        let rig = Rig::signed_in();
+        rig.memory.link.change(|s| s.access_expires = 1);
+        lock(&rig.world).token_slow = AT_START * 3;
+        let started = Instant::now();
+        let hello = rig.ask("initialize", json!({}));
+        assert!(started.elapsed() < AT_START * 2, "{:?}", started.elapsed());
+        assert!(hello["result"]["instructions"].as_str().unwrap().contains("It did not answer when this session started"), "{hello}");
+        // The renewal was not given up half way: a refresh token that was sent is spent,
+        // so its answer is waited for and kept
+        let until = Instant::now() + Duration::from_secs(5);
+        while rig.vault.get("refresh").as_deref() != Some("refresh-secret-2") && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(rig.vault.get("refresh").as_deref(), Some("refresh-secret-2"));
+        assert_eq!(rig.state(), "connected");
+        lock(&rig.world).token_slow = Duration::ZERO;
+        std::thread::sleep(AWAY_FOR.min(Duration::from_millis(50)));
+        assert_eq!(rig.call("clock", json!({}))["result"]["isError"], false);
     }
 
     #[test]
