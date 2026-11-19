@@ -105,8 +105,8 @@ export function storeNoticeLines(n: StoreNotice): { what: string; kept: string }
     ? `The harness service could not read its state file${n.why ? ` (${n.why})` : ''} and started with an empty store: relations, messages, tasks, reports and notes from before are not loaded.`
     : `The harness service left out what it could not read of its state file: ${n.lost.join('; ')}. The rest is loaded.`;
   const kept = n.frozen
-    ? 'The file could not be kept aside, so the service saves nothing until it is restarted: free space or rights in its folder first.'
-    : `The file as it was found is kept at ${n.kept}`;
+    ? 'The file is left as it is and the service saves nothing until it is restarted: make the file readable and its folder writable first.'
+    : `The file as it was found is kept at ${n.kept}. To use it again, stop the background processes, put it back as harness-state.json (repaired, or with a build that reads it) and start them again: what was stored since is then replaced.`;
   return { what, kept };
 }
 

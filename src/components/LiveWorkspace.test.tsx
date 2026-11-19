@@ -69,6 +69,7 @@ describe('Live workspace', () => {
     const alert = host.querySelector('.hs-store-notice')!;
     expect(alert.textContent).toContain('tasks: t2; notes: all of it');
     expect(alert.textContent).toContain('/cfg/harness-state.unread-20261119-220000.json');
+    expect(alert.textContent).toContain('put it back as harness-state.json');
     await act(async () => (alert.querySelector('button') as HTMLButtonElement).click()); await flush();
     expect(harnessApi.storeNoticeSeen).toHaveBeenCalledTimes(1);
     expect(host.querySelector('.hs-store-notice')).toBeNull();
