@@ -117,6 +117,67 @@ export interface Note {
 }
 export interface Board { reports: Report[]; notes: Note[] }
 
+/**
+ * The cockpit (MCR-94, MCR-95): what sessions published for the person, joined by the
+ * service with what it knows itself. Everything a session wrote is text to show, never to run:
+ * `say`, `where.command` and `where.url` are strings, and a click must check them again.
+ */
+export type TrackState = 'moving' | 'waiting_human' | 'blocked' | 'parked' | 'done';
+export type ItemState = 'doing' | 'review' | 'ready' | 'waiting' | 'done';
+export interface CockpitWaitsOn {
+  kind: 'human' | 'session' | 'ci' | 'timer' | 'external';
+  /** With kind `session`: its id */
+  who?: string; what?: string; since?: number;
+  /** Set when the service took it from a wait the owner registered, not from published text */
+  derived?: 'wait'; wait?: string; ref?: string; overdue?: boolean;
+}
+export interface CockpitItem {
+  id: string; title: string; ref?: string;
+  /** A session id, or `human` */
+  owner: string; state: ItemState; waitsOn?: CockpitWaitsOn; next?: string;
+}
+export interface CockpitTrack {
+  id: string; title: string;
+  /** Session id */
+  lead: string; refs?: string[]; state: TrackState; line?: string; items?: CockpitItem[]; updated?: number;
+  /** The session that published it; `supervisor` for the root Supervisor */
+  by: string;
+}
+/** `answer_prompt` and `report` come from the service only (`derived`); sessions publish the others. */
+export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'answer_prompt' | 'report';
+export interface CockpitAction {
+  id: string; title: string; kind: CockpitActionKind;
+  track?: string; trackBy?: string; item?: string;
+  where?: { session?: string; url?: string; command?: string };
+  /** `typed_word`: the line for that session's input box, to be placed unsent */
+  say?: string; options?: string[]; recommended?: string; why?: string; blocks?: string[];
+  /** Absent on derived actions */
+  risk?: 'reversible' | 'irreversible' | 'spend'; amount?: string;
+  urgency?: 'now' | 'today' | 'whenever';
+  source?: string[]; detail?: string; since?: number; updated?: number;
+  by?: string;
+  /** Built by the service from a session's prompt or its open needs_human report */
+  derived?: 'prompt' | 'report';
+  /** Its track was removed since */
+  trackMissing?: boolean;
+  /** It names a report in `source`: whether that report is still open */
+  live?: { reportOpen: boolean };
+}
+/** What the service knows of a session the cockpit names. The details only where the reader may see them. */
+export interface CockpitSession {
+  name?: string; state?: string; ended?: boolean;
+  /** No such session any more */
+  gone?: boolean;
+  needsOperator?: boolean; doneReport?: string | null;
+  waits?: { id: string; kind: string; on: string; ref: string; since: number; overdue: boolean }[];
+}
+export interface Cockpit {
+  schema: number;
+  /** One up per accepted change: unchanged means nothing was published since */
+  version: number; updated: number;
+  tracks: CockpitTrack[]; actions: CockpitAction[]; sessions: Record<string, CockpitSession>;
+}
+
 /** How long until a moment: "in 20 min", "in 5 h", "in 3 days". */
 export function formatUntil(ms: number, now = Date.now()): string {
   const minutes = Math.round((ms - now) / 60000);
@@ -283,6 +344,8 @@ export const harnessApi = {
   resumable: () => invoke<{ sessions: Resumable[] }>('harness_resumable').then(r => r.sessions),
   /** What sessions reported to the person, and the live notes of the bulletin board */
   board: () => invoke<Board>('harness_board'),
+  /** The cockpit: published tracks and actions with the service's own facts; nothing shows it yet (MCR-96) */
+  cockpit: () => invoke<Cockpit>('harness_cockpit'),
   /** A note from the person; without a folder it is for every session */
   postNote: (text: string, hours: number, folder?: string) => invoke<void>('harness_note_post', { text, hours, folder: folder || null }),
   removeNote: (note: string) => invoke<void>('harness_note_remove', { note }),

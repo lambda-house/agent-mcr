@@ -440,6 +440,13 @@ pub async fn harness_board() -> Result<Value, String> {
     blocking(|| service(json!({"op": "board"}))).await
 }
 
+/// The cockpit (MCR-95): what sessions published for the person,
+/// joined with what the service knows. Text only: the page shows it.
+#[tauri::command]
+pub async fn harness_cockpit() -> Result<Value, String> {
+    blocking(|| service(json!({"op": "cockpit"}))).await
+}
+
 /// A note from the person on the bulletin board: `folder` empty means every session.
 #[tauri::command]
 pub async fn harness_note_post(text: String, hours: u64, folder: Option<String>) -> Result<(), String> {
