@@ -1181,10 +1181,11 @@ fn main() {
     // The harness service, the supervisor's MCP bridge and the agents' hook reporter
     #[cfg(unix)]
     match std::env::args().nth(1).as_deref() {
-        Some(flag @ ("--harness" | "--supervise" | "--harness-mcp")) => {
+        Some(flag @ ("--harness" | "--supervise" | "--harness-mcp" | "--memory-mcp")) => {
             let result = get_config_dir().map_err(|e| e.message).and_then(|dir| match flag {
                 "--harness" => harness::serve(&dir),
                 "--supervise" => harness::supervise_bridge(&dir),
+                "--memory-mcp" => harness::memory_bridge(&dir),
                 _ => harness::agent_bridge(&dir),
             });
             if let Err(e) = result {

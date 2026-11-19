@@ -8,6 +8,7 @@
 
 pub use crate::agents::{command_line, Launch};
 use crate::peer;
+use crate::memory::Memory;
 use crate::slack::{self, Slack};
 use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, adapters, profiles};
 use crate::runner::{self, lock, now_ms, Client, Unit};
@@ -1740,6 +1741,8 @@ pub struct Harness {
     subagents: Mutex<BTreeMap<String, (Instant, Vec<Subagent>)>>,
     /// The Slack connector (D14)
     slack: Arc<Slack>,
+    /// The memory server (D16): the sign-in and the router of the `memory` MCP server
+    memory: Arc<Memory>,
     /// Per session that has not reported yet: the output time at which its
     /// screen was last read for a prompt, and the question found (MCR-71)
     screens: Mutex<BTreeMap<String, Screen>>,
@@ -1874,7 +1877,7 @@ impl Harness {
         let mut store: Store = std::fs::read(dir.join("harness-state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) }
+        Self { dir: dir.to_path_buf(), store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) }
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
@@ -3077,6 +3080,22 @@ impl Harness {
         result
     }
 
+    /// The `memory` MCP server for one bridge (`--memory-mcp`). Memory is for
+    /// hosted sessions: who calls is taken from the caller's process, as for
+    /// `mcr`, and anybody else gets a server that lists nothing and says why.
+    fn memory_mcp(&self, mut reader: BufReader<UnixStream>, mut writer: UnixStream) -> std::io::Result<()> {
+        let me = self.caller(&writer);
+        loop {
+            let frame = match read_frame(&mut reader) {
+                Ok(Some(frame)) => frame,
+                Ok(None) | Err(_) => return Ok(()),
+            };
+            if let Some(reply) = self.memory.handle(&me, &frame) {
+                writeln!(writer, "{reply}")?;
+            }
+        }
+    }
+
     /// A task from a supervisor: for an agent, in words, and never while the
     /// session waits on the operator (D6). `by` is the hosted session that
     /// assigns it, known from its process, or empty.
@@ -3478,6 +3497,11 @@ impl Harness {
                     .collect();
                 Ok(json!({ "sessions": list }))
             }
+            // The memory server's connection, as the app sees and steers it. Only the app
+            // gets here (see `handle`), and it has asked the person before the last two
+            "memory_status" => Ok(self.memory.status()),
+            "memory_connect" => self.memory.connect(),
+            "memory_disconnect" => Ok(self.memory.disconnect()),
             // The Slack connector, as the app sees and steers it. Only the app gets here (see `handle`)
             "slack" => Ok(self.slack.status_live(self)),
             "slack_probe" | "slack_connect" => {
@@ -3774,6 +3798,9 @@ impl Harness {
             }
             if req["op"] == "agent" {
                 return self.agent(reader, writer, req["cli"] != true);
+            }
+            if req["op"] == "memory" {
+                return self.memory_mcp(reader, writer);
             }
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
@@ -4282,6 +4309,13 @@ pub fn supervise_bridge(dir: &Path) -> Result<(), String> {
 pub fn agent_bridge(dir: &Path) -> Result<(), String> {
     let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
     bridge(std::io::stdin(), std::io::stdout(), BRIDGE_RETRY, bridge_to(path, "agent"))
+}
+
+/// `--memory-mcp`: a hosted agent's stdio ⇄ the memory server in the service,
+/// which holds the sign-in. The bridge carries no credential and starts nothing.
+pub fn memory_bridge(dir: &Path) -> Result<(), String> {
+    let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
+    bridge(std::io::stdin(), std::io::stdout(), BRIDGE_RETRY, bridge_to(path, "memory"))
 }
 
 /// `--harness-tool <name> [json]`: one harness tool call from a shell, for a
@@ -5288,6 +5322,63 @@ mod tests {
         assert_eq!(asked_profile(&home, &json!({"resume": "", "profile": "pi"})).as_deref(), Some("pi"));
         assert_eq!(asked_profile(&home, &json!({})).as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn memory_is_served_on_the_socket_and_refuses_a_caller_that_is_no_session() {
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Arc::new(Harness::open(&dir));
+        // Not connected until the person connects it, and the app can ask
+        assert_eq!(harness.control(&json!({"op": "memory_status"})).unwrap()["state"], "disconnected");
+        let (mut bridge, service) = UnixStream::pair().unwrap();
+        let serving = harness.clone();
+        std::thread::spawn(move || serving.handle(service));
+        let mut answers = BufReader::new(bridge.try_clone().unwrap());
+        // This test is no hosted session: the server answers, lists nothing and says why
+        writeln!(bridge, "{}", json!({"op": "memory"})).unwrap();
+        let mut ask = |frame: Value| {
+            writeln!(bridge, "{frame}").unwrap();
+            let mut line = String::new();
+            answers.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let hello = ask(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}}));
+        assert_eq!(hello["result"]["serverInfo"]["name"], "agent-mcr-memory");
+        let why = hello["result"]["instructions"].as_str().unwrap().to_string();
+        assert!(why.contains("Cannot tell which process is calling") || why.contains("hosted by Agent MCR"), "{why}");
+        assert_eq!(ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))["result"]["tools"], json!([]));
+        let told = ask(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_list", "arguments": {}}}));
+        assert_eq!((told["result"]["isError"].clone(), told["result"]["content"][0]["text"].clone()), (json!(true), json!(why)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_bridge_replays_the_handshake_to_a_restarted_service() {
+        let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (mut agent, input) = UnixStream::pair().unwrap();
+        let (output, from_bridge) = UnixStream::pair().unwrap();
+        let mut from_bridge = BufReader::new(from_bridge);
+        std::thread::spawn(move || bridge(input, output, Duration::from_secs(10), bridge_to(path, "memory")));
+        let line = |r: &mut BufReader<UnixStream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
+        let (first, _) = listener.accept().unwrap();
+        let mut service = BufReader::new(first.try_clone().unwrap());
+        writeln!(agent, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).unwrap();
+        assert_eq!(line(&mut service)["op"], "memory");
+        assert_eq!(line(&mut service)["method"], "initialize");
+        writeln!(&first, "{}", json!({"jsonrpc": "2.0", "id": 1, "result": {}})).unwrap();
+        assert_eq!(line(&mut from_bridge)["id"], 1);
+        // The service restarts: the bridge finds the new one and says who it is and what was agreed
+        drop(service);
+        drop(first);
+        let (second, _) = listener.accept().unwrap();
+        let mut service = BufReader::new(second.try_clone().unwrap());
+        assert_eq!(line(&mut service)["op"], "memory");
+        assert_eq!(line(&mut service)["method"], "initialize");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

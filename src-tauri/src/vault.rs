@@ -13,6 +13,7 @@ pub trait Vault: Send + Sync {
 /// messages to the person ("Slack tokens").
 pub struct Keychain {
     pub service: &'static str,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub what: &'static str,
 }
 

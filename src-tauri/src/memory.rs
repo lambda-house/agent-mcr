@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 /// the backend, so it stays when a local memory serves the same tools.
 pub const SERVER: &str = "memory";
 pub const ENDPOINT: &str = "https://mcp.memory.teob.cc/mcp";
+#[cfg(not(test))]
 const KEYCHAIN_SERVICE: &str = "cc.lambdahouse.agent-mcr.memory";
 /// The memory a call goes to when it names none (owner's decision of 2026-11-19).
 const DEFAULT_MEMORY: &str = "mcr-agents";
