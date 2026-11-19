@@ -330,6 +330,11 @@ pub struct Link {
     /// Held while tokens are put into the vault or taken out of it, with the
     /// look at whether they still should be. Never held across the network
     keeping: Mutex<()>,
+    /// Counts the sign-ins and their ends (sign-in kept, signed out,
+    /// disconnected). What was started under one number is not kept, and
+    /// changes nothing, once the number has moved on: nobody has to wait for
+    /// a call that is under way
+    epoch: AtomicU64,
 }
 
 impl Link {
@@ -339,7 +344,7 @@ impl Link {
         if state.state == "connecting" {
             state.state = String::new();
         }
-        Self { dir: dir.to_path_buf(), endpoint: endpoint.to_string(), agent: agent(), vault, state: Mutex::new(state), meta: Mutex::new(None), refreshing: Mutex::new(()), keeping: Mutex::new(()) }
+        Self { dir: dir.to_path_buf(), endpoint: endpoint.to_string(), agent: agent(), vault, state: Mutex::new(state), meta: Mutex::new(None), refreshing: Mutex::new(()), keeping: Mutex::new(()), epoch: AtomicU64::new(0) }
     }
 
     fn change(&self, with: impl FnOnce(&mut State)) {
@@ -388,8 +393,19 @@ impl Link {
         Ok(())
     }
 
-    /// The grant is gone: drop what is left of it and say so.
-    fn signed_out(&self) -> Fail {
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// The grant is gone: drop what is left of it and say so. Only for the
+    /// sign-in the caller started under: after a disconnect or a new sign-in
+    /// there is nothing of the caller's to drop.
+    fn signed_out(&self, epoch: u64) -> Fail {
+        let _kept = lock(&self.keeping);
+        if self.epoch() != epoch {
+            return Fail::NotConnected;
+        }
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.forget_tokens();
         let problem = Problem { kind: "signed_out".into(), text: Fail::SignedOut.text(), at: now_ms() };
         self.change(|s| {
@@ -404,6 +420,7 @@ impl Link {
     /// refused: it is replaced unless somebody already did that.
     fn bearer(&self, spent: Option<&str>) -> Result<String, Fail> {
         let _one = lock(&self.refreshing);
+        let epoch = self.epoch();
         let state = self.snapshot();
         match state.state.as_str() {
             "connected" => {}
@@ -418,24 +435,39 @@ impl Link {
             }
         }
         // Without a description that holds, there is nowhere a token may be sent
-        let Some(meta) = self.meta() else { return Err(self.signed_out()) };
-        self.refresh(&meta)
+        let Some(meta) = self.meta() else { return Err(self.signed_out(epoch)) };
+        self.refresh(&meta, epoch)
     }
 
-    fn refresh(&self, meta: &Meta) -> Result<String, Fail> {
-        let (Some(refresh), Some(client)) = (self.vault.get("refresh"), self.vault.get("client")) else { return Err(self.signed_out()) };
+    fn refresh(&self, meta: &Meta, epoch: u64) -> Result<String, Fail> {
+        let (Some(refresh), Some(client)) = (self.vault.get("refresh"), self.vault.get("client")) else { return Err(self.signed_out(epoch)) };
         let form = [("grant_type", "refresh_token"), ("refresh_token", refresh.as_str()), ("client_id", client.as_str()), ("resource", self.endpoint.as_str())];
         let answer = match post_form(&self.agent, &meta.token_endpoint, &form) {
             Ok(answer) => answer,
             // The authorization server says no: the grant is over, and asking again would not help
-            Err(Http::Status(400 | 401)) => return Err(self.signed_out()),
+            Err(Http::Status(400 | 401)) => return Err(self.signed_out(epoch)),
             Err(e) => return Err(e.fail("the authorization server")),
         };
-        self.keep(&answer).map_err(|e| {
-            // A rotated token that could not be kept is lost, and the old one is spent
-            eprintln!("memory: the renewed sign-in could not be kept: {e}");
-            self.signed_out()
-        })
+        // The answer may arrive after a disconnect, which did not wait for it
+        let kept = {
+            let _kept = lock(&self.keeping);
+            (self.epoch() == epoch).then(|| self.keep(&answer))
+        };
+        match kept {
+            Some(Ok(access)) => Ok(access),
+            Some(Err(e)) => {
+                // A rotated token that could not be kept is lost, and the old one is spent
+                eprintln!("memory: the renewed sign-in could not be kept: {e}");
+                Err(self.signed_out(epoch))
+            }
+            None => {
+                // Not kept; and given back, in case the disconnect could not end the grant
+                if let Some(rotated) = answer["refresh_token"].as_str() {
+                    self.revoke(meta, &client, rotated);
+                }
+                Err(Fail::NotConnected)
+            }
+        }
     }
 
     /// Tell the authorization server that a refresh token is no longer wanted,
@@ -466,6 +498,8 @@ impl Link {
 
 #[derive(Clone)]
 struct Session {
+    /// The sign-in (`Link.epoch`) it was started under; of no use under another
+    epoch: u64,
     id: Option<String>,
     version: String,
     info: Value,
@@ -564,7 +598,8 @@ impl RemoteMcp {
     /// The MCP session with the memory service, started when there is none.
     fn session(&self, wait: Duration) -> Result<Session, Fail> {
         let mut held = lock(&self.session);
-        if let Some(session) = held.as_ref() {
+        let epoch = self.link.epoch();
+        if let Some(session) = held.as_ref().filter(|s| s.epoch == epoch) {
             return Ok(session.clone());
         }
         let hello = json!({"jsonrpc": "2.0", "id": self.id(), "method": "initialize", "params": {
@@ -574,7 +609,7 @@ impl RemoteMcp {
         }});
         let (answer, id) = self.signed(None, &hello, wait)?;
         let info = Self::result(answer)?;
-        let session = Session { id, version: info["protocolVersion"].as_str().unwrap_or(PROTOCOL_VERSION).to_string(), info };
+        let session = Session { epoch, id, version: info["protocolVersion"].as_str().unwrap_or(PROTOCOL_VERSION).to_string(), info };
         self.signed(Some(&session), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), wait)?;
         *held = Some(session.clone());
         Ok(session)
@@ -633,7 +668,10 @@ impl Backend for RemoteMcp {
         self.rpc("tools/call", json!({"name": name, "arguments": args}), CALL)
     }
     fn reset(&self) {
-        *lock(&self.session) = None;
+        // Not waited for: a session that is being started is of another sign-in by its number
+        if let Ok(mut held) = self.session.try_lock() {
+            *held = None;
+        }
         *lock(&self.away) = None;
     }
 }
@@ -643,7 +681,8 @@ impl Backend for RemoteMcp {
 pub struct Memory {
     link: Arc<Link>,
     backend: Box<dyn Backend>,
-    tools: Mutex<Option<(Instant, Value)>>,
+    /// The connected memory's tools, with the sign-in (`Link.epoch`) they were listed under
+    tools: Mutex<Option<(u64, Instant, Value)>>,
     /// The number of the sign-in under way; a later one, or a disconnect, ends it
     flow: AtomicU64,
 }
@@ -766,6 +805,7 @@ impl Memory {
                         link.revoke(&meta, &client, refresh);
                         return Err("The sign-in was called off".to_string());
                     }
+                    link.epoch.fetch_add(1, Ordering::SeqCst);
                     link.vault.set("client", &client)?;
                     link.keep_meta(&meta)?;
                     link.keep(&answer)?;
@@ -867,12 +907,14 @@ impl Memory {
     /// and the tokens leave the Keychain, whatever the server answers.
     pub fn disconnect(&self) -> Value {
         let link = &self.link;
-        let _one = lock(&link.refreshing);
-        // In one step with a sign-in that is about to keep its tokens (`keeping`):
-        // either it kept them and they are taken here, or it sees that it was called off
+        // In one step with a sign-in or a renewal that is about to keep its tokens
+        // (`keeping`): either it kept them and they are taken here, or it sees that
+        // it was called off. Nothing here waits for a call that is under way: the
+        // app waits ten seconds at most, and a renewal may take longer
         let held = {
             let _kept = lock(&link.keeping);
             self.flow.fetch_add(1, Ordering::SeqCst);
+            link.epoch.fetch_add(1, Ordering::SeqCst);
             let held = (link.meta(), link.vault.get("client"), link.vault.get("refresh"));
             link.forget_tokens();
             link.change(|s| {
@@ -901,14 +943,15 @@ impl Memory {
 
     /// The tools of the connected memory, asked at most once a minute.
     fn tool_list(&self) -> Result<Value, Fail> {
-        let mut held = lock(&self.tools);
-        if let Some((at, tools)) = held.as_ref() {
-            if at.elapsed() < TOOLS_FRESH {
+        let epoch = self.link.epoch();
+        if let Some((listed, at, tools)) = lock(&self.tools).as_ref() {
+            if *listed == epoch && at.elapsed() < TOOLS_FRESH {
                 return Ok(tools.clone());
             }
         }
+        // Asked without holding the list: a disconnect must not wait for the memory service
         let tools = self.backend.list_tools()?;
-        *held = Some((Instant::now(), tools.clone()));
+        *lock(&self.tools) = Some((epoch, Instant::now(), tools.clone()));
         Ok(tools)
     }
 
@@ -1659,6 +1702,33 @@ mod tests {
         rig.browse(&second, |_| {});
         rig.settle();
         assert_eq!(rig.state(), "connected");
+    }
+
+    #[test]
+    fn a_disconnect_does_not_wait_for_a_renewal_and_keeps_nothing_of_it() {
+        let rig = Arc::new(Rig::signed_in());
+        {
+            let mut world = lock(&rig.world);
+            world.access = "access-secret-gone".into();
+            world.token_slow = Duration::from_millis(700);
+            // The grant cannot be ended from here, so the renewal under way still gets its answer
+            world.revoke_fails = true;
+        }
+        let caller = { let rig = rig.clone(); std::thread::spawn(move || rig.call("clock", json!({}))) };
+        let until = Instant::now() + Duration::from_secs(3);
+        while lock(&rig.world).arrived.iter().filter(|p| p.as_str() == "/oauth/token").count() < 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The app waits ten seconds at most; a renewal may take longer than that
+        let started = Instant::now();
+        assert_eq!(rig.memory.disconnect()["state"], "disconnected");
+        assert!(started.elapsed() < Duration::from_millis(400), "{:?}", started.elapsed());
+        assert_eq!(caller.join().unwrap()["result"]["isError"], true);
+        // The renewal came back with a new pair after the disconnect: not kept, and given back
+        assert_eq!(lock(&rig.world).issued, 2);
+        assert!(rig.vault.0.lock().unwrap().is_empty(), "{:?}", rig.vault.0.lock().unwrap().keys());
+        assert_eq!(rig.state(), "disconnected");
+        assert_eq!(lock(&rig.world).count("POST /oauth/revoke"), 2);
     }
 
     #[test]
