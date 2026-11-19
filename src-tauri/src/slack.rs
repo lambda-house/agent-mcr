@@ -8,6 +8,7 @@
 //! status, tool result, log line or audit row carries them.
 
 use crate::runner::{lock, now_ms, random_id};
+use crate::vault::{Keychain, Vault};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -104,39 +105,6 @@ impl Web for Https {
             e => Err(Fail::Refused(format!("{e}{needed}"))),
         }
     }
-}
-
-/// Where the two tokens are kept.
-pub trait Vault: Send + Sync {
-    fn get(&self, account: &str) -> Option<String>;
-    fn set(&self, account: &str, secret: &str) -> Result<(), String>;
-    fn delete(&self, account: &str);
-}
-
-pub struct Keychain;
-
-#[cfg(target_os = "macos")]
-impl Vault for Keychain {
-    fn get(&self, account: &str) -> Option<String> {
-        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account).ok().and_then(|b| String::from_utf8(b).ok())
-    }
-    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, secret.as_bytes()).map_err(|e| format!("The Keychain refused the token: {e}"))
-    }
-    fn delete(&self, account: &str) {
-        let _ = security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, account);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-impl Vault for Keychain {
-    fn get(&self, _: &str) -> Option<String> {
-        None
-    }
-    fn set(&self, _: &str, _: &str) -> Result<(), String> {
-        Err(format!("Slack tokens are kept in the macOS Keychain ({KEYCHAIN_SERVICE}); this system has none"))
-    }
-    fn delete(&self, _: &str) {}
 }
 
 /// A live hosted session, as the connector needs it.
@@ -414,7 +382,7 @@ fn text_blocks(text: &str) -> Vec<Value> {
 
 impl Slack {
     pub fn open(dir: &Path) -> Self {
-        Self::with(dir, Box::new(Https::default()), Box::new(Keychain), 10_000)
+        Self::with(dir, Box::new(Https::default()), Box::new(Keychain { service: KEYCHAIN_SERVICE, what: "Slack tokens" }), 10_000)
     }
 
     fn with(dir: &Path, web: Box<dyn Web>, vault: Box<dyn Vault>, settle_after: u64) -> Self {

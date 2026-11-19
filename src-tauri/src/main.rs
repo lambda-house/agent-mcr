@@ -33,6 +33,7 @@ mod session_analysis;
 mod session_analysis_commands;
 mod session_mcp;
 mod slack;
+mod vault;
 mod session_commands;
 mod session_db;
 mod session_memory;
