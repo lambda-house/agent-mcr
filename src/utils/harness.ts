@@ -24,6 +24,8 @@ export interface Tracked {
   status?: string;
   /** The part it plays, in its own words or the supervisor's */
   role?: string;
+  /** The person has an unsent line in its input box: notices and tasks wait (MCR-85) */
+  draft?: boolean;
   /** The session it works for (id): that one gives it tasks and reads its results */
   supervisor?: string | null;
 }
@@ -522,4 +524,10 @@ export function shortPath(path: string): string {
   const parts = path.split(/[\\/]/);
   const separator = path.includes('\\') ? '\\' : '/';
   return parts.length > 3 ? `…${separator}${parts.slice(-2).join(separator)}` : path;
+}
+
+/** Why a session's messages or tasks are not typed into it yet: the person has
+ * a line there that is not sent, and the harness keeps out of it (MCR-85). */
+export function heldNote(h: Hosted): string {
+  return h.harness?.draft && !h.exit && (h.unread || h.openTasks) ? 'held: you have an unsent line here' : '';
 }

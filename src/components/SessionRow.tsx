@@ -3,7 +3,7 @@ import { Hourglass } from 'lucide-react';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
 import { formatAge } from '../utils/agent';
-import { formatUntil, harnessApi, hostedState, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
+import { formatUntil, harnessApi, heldNote, hostedState, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { Session } from '../utils/sessions';
 
 /**
@@ -22,7 +22,7 @@ export const rowIdle = (h: Hosted) => !needsYou(h) && (hostedState(h) === 'idle'
 export function hostedDetail(h: Hosted, extra = ''): string {
   return h.exit
     ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
-    : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', extra].filter(Boolean).join(' · ');
+    : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', heldNote(h), extra].filter(Boolean).join(' · ');
 }
 
 /**

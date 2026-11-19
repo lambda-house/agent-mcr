@@ -27,33 +27,146 @@ pub struct HarnessState {
     views: Mutex<BTreeMap<u64, (Stream, String)>>,
     next_view: AtomicU64,
     told: Told,
+    /// Sessions whose input box may hold a line the person has not sent (MCR-85)
+    drafts: std::sync::Arc<Mutex<BTreeMap<String, Draft>>>,
 }
 
-/// The word to the service that the person pressed Enter in a session, kept
-/// off the command that wrote the key: one worker thread makes the calls, and
-/// a session that already waits to be told is not queued twice. A session is
-/// taken off the waiting list before its call starts, so an Enter during the
-/// call is told again. The worker ends when the state is dropped.
+/// Whether a session's input box may hold text the person typed and has not
+/// sent, told from the keys `terminal_input` writes (MCR-85): the harness
+/// service types notices and tasks into idle sessions and never sees a key, so
+/// the app is the witness. It errs towards "unsent": a notice typed into a
+/// half-written line is submitted with it.
+#[derive(Default)]
+struct Draft {
+    /// Printable characters typed and not taken back with Backspace
+    chars: usize,
+    /// Something happened that the count cannot follow (a paste, a recalled
+    /// line, a word deleted): unsent until Enter or Ctrl+C
+    unknown: bool,
+    /// Earlier lines stepped back to with Up from an empty box and not yet
+    /// stepped forward again with Down
+    recalled: usize,
+    /// When the service was last told of this line
+    told: Option<std::time::Instant>,
+    /// A thread is telling the service again after a call that failed
+    retrying: bool,
+}
+
+/// While the person types on, the service is told again this often. It may
+/// have dropped the word (a key that answered a question is no line, and
+/// only the service knows that a session asks), or have been away.
+const DRAFT_RETELL: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Draft {
+    fn unsent(&self) -> bool {
+        self.unknown || self.chars > 0 || self.recalled > 0
+    }
+
+    /// What xterm sends by itself and nobody typed: focus and mouse reports,
+    /// and its answers to the agent's questions (cursor position `CSI … R`,
+    /// device attributes `CSI … c`, mode and status reports `CSI … y` and
+    /// `CSI … n`, window reports `CSI … t`, colours `OSC`, `DCS`).
+    fn report(data: &str) -> bool {
+        data == "\x1b[I"
+            || data == "\x1b[O"
+            || ["\x1b[<", "\x1b[M", "\x1b]", "\x1bP"].iter().any(|start| data.starts_with(start))
+            || (data.starts_with("\x1b[") && data.len() > 3 && data.ends_with(['R', 'c', 'y', 'n', 't']))
+    }
+
+    /// One chunk as xterm sends it: a key, a key's escape sequence or a paste.
+    fn key(&mut self, data: &str) {
+        // Enter sends the line; Ctrl+C empties the box in Claude Code and Codex
+        if data == "\r" || data == "\x03" {
+            *self = Draft { told: self.told, retrying: self.retrying, ..Draft::default() };
+        } else if let Some(pasted) = data.strip_prefix("\x1b[200~") {
+            self.unknown |= pasted != "\x1b[201~";
+        } else if Self::report(data) {
+            // Nobody typed it
+        } else if data.starts_with('\x1b') {
+            // Up recalls an earlier line into an empty box and Down steps
+            // forward again, to the empty box after as many (xterm also sends
+            // them for the wheel on an alternate screen: scrolling back and
+            // forth must not leave a line). Any other sequence in a line that
+            // has text may move or delete more than the count knows
+            // (Alt+Backspace); Escape too, which empties the box only when
+            // pressed twice and only in some agents
+            let stepping = self.chars == 0 && !self.unknown;
+            match data {
+                "\x1b[A" | "\x1bOA" if stepping => self.recalled += 1,
+                "\x1b[B" | "\x1bOB" if stepping => self.recalled = self.recalled.saturating_sub(1),
+                _ => self.unknown |= self.unsent(),
+            }
+        } else {
+            // Text typed into a recalled line: no longer a matter of stepping
+            self.unknown |= self.recalled > 0;
+            for c in data.chars() {
+                match c {
+                    '\x7f' | '\x08' => self.chars = self.chars.saturating_sub(1),
+                    c if c >= ' ' => self.chars += 1,
+                    // A line break inside a chunk is pasted text
+                    '\r' | '\n' => self.unknown = true,
+                    // Ctrl+U, Ctrl+W, Tab and the like: only a line with text can change
+                    _ => self.unknown |= self.unsent(),
+                }
+            }
+        }
+    }
+}
+
+/// After a word about an unsent line did not reach the service (it restarts
+/// at every rebuild): say it again every `pause` while the line is unsent,
+/// until a call succeeds or `tries` are used up. Without it a first key told
+/// to nobody, followed by a pause, would leave no hold.
+fn retell(drafts: std::sync::Arc<Mutex<BTreeMap<String, Draft>>>, id: String, pause: std::time::Duration, tries: usize, call: impl Fn(&str) -> bool + Send + 'static) {
+    let begun = drafts.lock().is_ok_and(|mut drafts| drafts.get_mut(&id).is_some_and(|draft| draft.unsent() && !std::mem::replace(&mut draft.retrying, true)));
+    if !begun {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..tries {
+            std::thread::sleep(pause);
+            let unsent = drafts.lock().is_ok_and(|drafts| drafts.get(&id).is_some_and(Draft::unsent));
+            if !unsent || call(&id) {
+                break;
+            }
+        }
+        if let Ok(mut drafts) = drafts.lock() {
+            if let Some(draft) = drafts.get_mut(&id) {
+                draft.retrying = false;
+            }
+        }
+    });
+}
+
+/// The word to the service about what the person did in a session's terminal
+/// (pressed Enter; has an unsent line or no longer has), kept off the command
+/// that wrote the key: one worker thread makes the calls, and a session that
+/// already waits to be told is not queued twice (an Enter among the keys is
+/// kept). A session is taken off the waiting list before its call starts, so
+/// a key during the call is told again. The worker ends when the state is dropped.
 #[derive(Default)]
 struct Told {
     queue: Mutex<Option<std::sync::mpsc::Sender<String>>>,
-    waiting: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Session id to whether an Enter is among what is to be told
+    waiting: std::sync::Arc<Mutex<BTreeMap<String, bool>>>,
 }
 
 impl Told {
     /// Never blocks on `call`, which runs on the worker (and is used only by the first one started).
-    fn tell(&self, id: String, call: impl Fn(&str) + Send + 'static) {
+    fn tell(&self, id: String, enter: bool, call: impl Fn(&str, bool) + Send + 'static) {
         let Ok(mut queue) = self.queue.lock() else { return };
         let Ok(mut waiting) = self.waiting.lock() else { return };
-        if !waiting.insert(id.clone()) {
+        if let Some(entered) = waiting.get_mut(&id) {
+            *entered |= enter;
             return;
         }
+        waiting.insert(id.clone(), enter);
         let id = match queue.as_ref().map(|tx| tx.send(id.clone())) {
             Some(Ok(())) => return,
             // The worker is gone, and what it had queued with it
             Some(Err(unsent)) => {
                 waiting.clear();
-                waiting.insert(id);
+                waiting.insert(id, enter);
                 unsent.0
             }
             None => id,
@@ -65,10 +178,8 @@ impl Told {
         let waiting = self.waiting.clone();
         std::thread::spawn(move || {
             for id in rx {
-                if let Ok(mut waiting) = waiting.lock() {
-                    waiting.remove(&id);
-                }
-                call(&id);
+                let enter = waiting.lock().ok().and_then(|mut waiting| waiting.remove(&id)).unwrap_or(false);
+                call(&id, enter);
             }
         });
     }
@@ -641,13 +752,36 @@ pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -
         views.remove(&view);
         return Err(format!("The terminal is detached: {e}"));
     }
-    if data == "\r" {
-        let id = id.clone();
-        drop(views);
-        // Only the attached human view submits here; harness injections use runner write.
+    let id = id.clone();
+    drop(views);
+    // Only the attached human view types here; harness injections use runner write
+    let enter = data == "\r";
+    let tell = state.drafts.lock().is_ok_and(|mut drafts| {
+        let draft = drafts.entry(id.clone()).or_default();
+        let was = draft.unsent();
+        draft.key(&data);
+        let unsent = draft.unsent();
+        let tell = enter || was != unsent || (unsent && draft.told.is_none_or(|at| at.elapsed() >= DRAFT_RETELL));
+        if !unsent {
+            drafts.remove(&id);
+        } else if tell {
+            draft.told = Some(std::time::Instant::now());
+        }
+        tell
+    });
+    if tell {
         // The key is written: a service that is slow or away must not hold the
-        // terminal or show as its error
-        state.told.tell(id, |id| drop(service(json!({"op": "operator_input", "id": id}))));
+        // terminal or show as its error. The worker reads the draft when it
+        // calls, so a late call tells the latest
+        let drafts = state.drafts.clone();
+        state.told.tell(id, enter, move |id, enter| {
+            let draft = drafts.lock().is_ok_and(|drafts| drafts.get(id).is_some_and(Draft::unsent));
+            // Two ops: a service of the build before takes every `operator_input` for an Enter
+            let op = if enter { "operator_input" } else { "operator_draft" };
+            if service(json!({"op": op, "id": id, "draft": draft})).is_err() && draft {
+                retell(drafts.clone(), id.to_string(), std::time::Duration::from_secs(2), 30, |id| service(json!({"op": "operator_draft", "id": id, "draft": true})).is_ok());
+            }
+        });
     }
     Ok(())
 }
@@ -717,6 +851,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_draft_follows_the_keys_and_errs_towards_unsent() {
+        let after = |keys: &[&str]| {
+            let mut draft = Draft::default();
+            for key in keys {
+                draft.key(key);
+            }
+            draft.unsent()
+        };
+        // Typing starts a line; Enter and Ctrl+C end it
+        assert!(!after(&[]));
+        assert!(after(&["h"]));
+        assert!(after(&["h", "i", " "]));
+        assert!(after(&["\u{43f}"]));
+        assert!(!after(&["h", "i", "\r"]));
+        assert!(!after(&["h", "i", "\x03"]));
+        // Backspace takes back what was typed, and no more than that
+        assert!(!after(&["h", "i", "\x7f", "\x7f"]));
+        assert!(after(&["h", "i", "\x7f"]));
+        assert!(!after(&["\x7f", "\x7f"]));
+        assert!(after(&["\x7f", "\x7f", "h"]));
+        // A paste, also one without the markers, cannot be counted back
+        assert!(after(&["\x1b[200~two\nlines\x1b[201~", "\x7f", "\x7f", "\x7f"]));
+        assert!(!after(&["\x1b[200~\x1b[201~"]));
+        assert!(after(&["a\rb"]));
+        assert!(!after(&["\x1b[200~text\x1b[201~", "\r"]));
+        // Keys that are not text start nothing: arrows aside, focus and mouse reports, Tab, Ctrl+U, Escape
+        for key in ["\x1b[D", "\x1b[C", "\x1b[B", "\x1b[I", "\x1b[O", "\x1b[<0;10;5M", "\t", "\x15", "\x1b", "\x04"] {
+            assert!(!after(&[key]), "{key:?}");
+        }
+        // Up recalls an earlier line into an empty box; Down as many times gives the empty box back
+        assert!(after(&["\x1b[A"]));
+        assert!(after(&["\x1bOA"]));
+        assert!(!after(&["\x1b[A", "\r"]));
+        assert!(!after(&["\x1b[A", "\x1b[B"]));
+        assert!(after(&["\x1b[A", "\x1b[A", "\x1bOB"]));
+        assert!(!after(&["\x1b[A", "\x1b[A", "\x1b[B", "\x1b[B", "\x1b[B"]));
+        // A recalled line that was edited is a line: stepping no longer ends it
+        assert!(after(&["\x1b[A", "x", "\x7f", "\x1b[B"]));
+        assert!(after(&["\x1b[A", "\x7f", "\x1b[B"]));
+        // Up in a line with text moves the cursor, it recalls nothing; Down does not end the line
+        assert!(after(&["h", "\x1b[A", "\x1b[B", "\x7f"]));
+        // The terminal's own answers to the agent are not keys, also in the middle of a line
+        for reply in ["\x1b[12;40R", "\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b]11;rgb:0000/0000/0000\x1b\\", "\x1b]10;rgb:ffff/ffff/ffff\x07", "\x1bP1$r0m\x1b\\", "\x1b[?2026;2$y", "\x1b[0n", "\x1b[8;24;80t"] {
+            assert!(!after(&[reply]), "{reply:?}");
+            assert!(!after(&["h", reply, "\x7f"]), "{reply:?}");
+        }
+        // Escape twice empties the box in Claude Code only: it stays a line here, and the hold is told
+        assert!(after(&["h", "\x1b", "\x1b", "\x7f"]));
+        // In a line with text, a key that deletes or moves by more than one
+        // character ends the count: Backspace to "empty" no longer proves it
+        for key in ["\x1b\x7f", "\x17", "\x15", "\x1b[D", "\t"] {
+            assert!(after(&["h", key, "\x7f"]), "{key:?}");
+        }
+        // A focus report in the middle of a line changes nothing
+        assert!(!after(&["h", "\x1b[O", "\x1b[I", "\x7f"]));
+    }
+
+    #[test]
+    fn a_word_about_a_line_that_did_not_reach_the_service_is_said_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pause = std::time::Duration::from_millis(5);
+        let drafts: std::sync::Arc<Mutex<BTreeMap<String, Draft>>> = Default::default();
+        let line = |id: &str| drafts.lock().unwrap().entry(id.into()).or_default().key("h");
+        let wait = |until: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !until() && start.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(pause);
+            }
+            assert!(until());
+        };
+        let idle = |id: &str| drafts.lock().unwrap().get(id).is_none_or(|d| !d.retrying);
+        // The service comes back at the third call: no call after it
+        line("a");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        retell(drafts.clone(), "a".into(), pause, 30, move |_| counted.fetch_add(1, Ordering::SeqCst) + 1 >= 3);
+        // One thread per session
+        retell(drafts.clone(), "a".into(), pause, 30, |_| panic!("a second thread"));
+        wait(&|| idle("a"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // The line was sent meanwhile: nothing more to say
+        line("b");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        retell(drafts.clone(), "b".into(), std::time::Duration::from_millis(50), 30, move |_| counted.fetch_add(1, Ordering::SeqCst) > 100);
+        drafts.lock().unwrap().get_mut("b").unwrap().key("\r");
+        assert!(drafts.lock().unwrap()["b"].retrying, "Enter keeps the thread known");
+        wait(&|| idle("b"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // It gives up after its tries, and no thread starts for a session without a line
+        line("c");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        retell(drafts.clone(), "c".into(), pause, 4, move |_| counted.fetch_add(1, Ordering::SeqCst) > 100);
+        wait(&|| idle("c"));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        retell(drafts.clone(), "nobody".into(), pause, 4, |_| panic!("no line"));
+    }
+
+    #[test]
+    fn an_enter_among_the_words_to_tell_is_kept() {
+        use std::sync::mpsc::channel;
+        let told = Told::default();
+        let (started_tx, started) = channel::<(String, bool)>();
+        let (release, released) = channel::<()>();
+        let released = Mutex::new(released);
+        let call = move |id: &str, enter: bool| {
+            started_tx.send((id.to_string(), enter)).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        };
+        let wait = std::time::Duration::from_secs(5);
+        // A first key is not an Enter
+        told.tell("a".into(), false, call);
+        assert_eq!(started.recv_timeout(wait).unwrap(), ("a".to_string(), false));
+        // During the call: a key, an Enter, a key. One call, and it says Enter
+        for enter in [false, true, false] {
+            told.tell("a".into(), enter, |_: &str, _: bool| panic!("a second worker"));
+        }
+        release.send(()).unwrap();
+        assert_eq!(started.recv_timeout(wait).unwrap(), ("a".to_string(), true));
+        release.send(()).unwrap();
+        assert!(started.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
     fn enter_is_told_to_the_service_off_the_command_and_repeats_are_dropped() {
         use std::sync::mpsc::channel;
         let told = Told::default();
@@ -724,19 +983,19 @@ mod tests {
         let (release, released) = channel::<()>();
         let released = Mutex::new(released);
         // A service that answers only when the test lets it
-        let call = move |id: &str| {
+        let call = move |id: &str, _: bool| {
             started_tx.send(id.to_string()).unwrap();
             released.lock().unwrap().recv().unwrap();
         };
         let wait = std::time::Duration::from_secs(5);
         // Returns although the call has not ended
-        told.tell("a".into(), call);
+        told.tell("a".into(), true, call);
         assert_eq!(started.recv_timeout(wait).unwrap(), "a");
         // Enters during the call: told once more, not three times; another session keeps its own
         for id in ["a", "a", "a", "b", "b"] {
-            told.tell(id.into(), |_: &str| panic!("a second worker"));
+            told.tell(id.into(), true, |_: &str, _: bool| panic!("a second worker"));
         }
-        assert_eq!(*told.waiting.lock().unwrap(), ["a".to_string(), "b".to_string()].into());
+        assert_eq!(told.waiting.lock().unwrap().keys().cloned().collect::<Vec<_>>(), ["a", "b"]);
         release.send(()).unwrap();
         assert_eq!(started.recv_timeout(wait).unwrap(), "a");
         release.send(()).unwrap();
@@ -745,7 +1004,7 @@ mod tests {
         release.send(()).unwrap();
         // Nothing queued is left over, and a later Enter is told again
         assert!(started.recv_timeout(std::time::Duration::from_millis(100)).is_err());
-        told.tell("a".into(), |_: &str| panic!("a second worker"));
+        told.tell("a".into(), true, |_: &str, _: bool| panic!("a second worker"));
         assert_eq!(started.recv_timeout(wait).unwrap(), "a");
         release.send(()).unwrap();
         // The worker ends with the state
