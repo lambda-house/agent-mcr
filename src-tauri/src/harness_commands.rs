@@ -26,6 +26,52 @@ const MAX_PASTED_IMAGE: usize = 30 * 1024 * 1024;
 pub struct HarnessState {
     views: Mutex<BTreeMap<u64, (Stream, String)>>,
     next_view: AtomicU64,
+    told: Told,
+}
+
+/// The word to the service that the person pressed Enter in a session, kept
+/// off the command that wrote the key: one worker thread makes the calls, and
+/// a session that already waits to be told is not queued twice. A session is
+/// taken off the waiting list before its call starts, so an Enter during the
+/// call is told again. The worker ends when the state is dropped.
+#[derive(Default)]
+struct Told {
+    queue: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    waiting: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
+}
+
+impl Told {
+    /// Never blocks on `call`, which runs on the worker (and is used only by the first one started).
+    fn tell(&self, id: String, call: impl Fn(&str) + Send + 'static) {
+        let Ok(mut queue) = self.queue.lock() else { return };
+        let Ok(mut waiting) = self.waiting.lock() else { return };
+        if !waiting.insert(id.clone()) {
+            return;
+        }
+        let id = match queue.as_ref().map(|tx| tx.send(id.clone())) {
+            Some(Ok(())) => return,
+            // The worker is gone, and what it had queued with it
+            Some(Err(unsent)) => {
+                waiting.clear();
+                waiting.insert(id);
+                unsent.0
+            }
+            None => id,
+        };
+        drop(waiting);
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let _ = tx.send(id);
+        *queue = Some(tx);
+        let waiting = self.waiting.clone();
+        std::thread::spawn(move || {
+            for id in rx {
+                if let Ok(mut waiting) = waiting.lock() {
+                    waiting.remove(&id);
+                }
+                call(&id);
+            }
+        });
+    }
 }
 
 fn socket() -> Result<PathBuf, String> {
@@ -65,7 +111,7 @@ pub async fn harness_status() -> Result<Value, String> {
         let settings = service(json!({"op": "settings"}))?;
         // The service can outlive an app update and return an older settings shape.
         let preferences = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
-        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"] }))
+        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"] }))
     })
     .await
 }
@@ -207,6 +253,34 @@ fn stop_for_quit(dir: Option<&std::path::Path>) {
             eprintln!("{e}");
         }
     }
+}
+
+/// Start Codex sessions with the harness's hooks, or stop that (MCR-74).
+/// Turning it on is confirmed in a native dialog, never by the page alone:
+/// from then on Codex asks the person to trust the hooks, and a Codex
+/// session nobody watches stops at that question until they have.
+#[tauri::command]
+pub async fn harness_codex_hooks(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    blocking(move || {
+        if on {
+            let mut dialog = app
+                .dialog()
+                .message("New Codex sessions will be started with four hooks that call Agent MCR and report the session's state: when it starts, takes a prompt, asks for approval and has used a tool. They never answer a prompt for you.\n\nCodex asks once to review them (\"Hooks need review\"). Start a Codex session yourself next and choose \"Trust all and continue\". Until you have, every new Codex session stops at that question, also one started by another agent. Codex asks again when Agent MCR runs from another location.\n\nRunning sessions are not changed.")
+                .title("Start Codex with Agent MCR's hooks?")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom("Use hooks".to_string(), "Cancel".to_string()));
+            if let Some(window) = app.get_webview_window("main") {
+                dialog = dialog.parent(&window);
+            }
+            if !dialog.blocking_show() {
+                return Ok(false);
+            }
+        }
+        service(json!({"op": "settings", "codexHooks": on})).map(|s| s["codexHooks"] == true)
+    })
+    .await
 }
 
 /// Let agents outside the harness use the supervisor tools, or stop that.
@@ -430,50 +504,69 @@ pub async fn slack_refresh() -> Result<Value, String> {
     blocking(|| service(json!({"op": "slack_refresh"}))).await
 }
 
-/// Change a channel's policy. Posting without approval, and letting other
-/// people's messages reach an agent, are asked about first.
+/// Change a channel's policy. Posting without approval, messages reaching the
+/// Supervisor, and letting other people's messages reach an agent, are asked about first.
 #[tauri::command]
 pub async fn slack_policy(app: tauri::AppHandle, channel: String, policy: Value) -> Result<Value, String> {
     valid_id(&channel)?;
     blocking(move || {
         let now = service(json!({"op": "slack"}))?;
         let current = now["channels"].as_array().and_then(|all| all.iter().find(|c| c["id"] == channel.as_str())).cloned().ok_or("No such channel")?;
-        let name = current["name"].as_str().unwrap_or("").to_string();
-        if let Some(posting @ ("auto" | "thread")) = policy["posting"].as_str().filter(|p| current["posting"] != *p) {
-            let what = if posting == "auto" {
-                format!("Sessions that may post to #{name} will post there without asking you. An agent can post anything it has read: file contents, credentials it came across, what other channels said.")
-            } else {
-                format!("A session will answer in #{name} without asking you, in threads where a sender on the channel's list addressed it. An agent can put anything it has read into such an answer. New messages outside those threads still wait for your approval.")
-            };
-            if !confirmed(&app, "Post without your approval?", what, "Allow", true) {
-                return Ok(now);
-            }
-        }
-        // Where posts go without approval, more sessions posting or another session answering is asked about too
-        let posting = policy["posting"].as_str().or(current["posting"].as_str()).unwrap_or("never");
-        if posting == "auto" || posting == "thread" {
-            let had: Vec<&str> = current["posters"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
-            let more = policy["posters"].as_array().is_some_and(|a| a.iter().filter_map(|v| v.as_str()).any(|p| !had.contains(&p)));
-            let other = policy["route"].as_str().is_some_and(|kind| kind != "none" && (current["route"]["kind"] != kind || (kind == "session" && current["route"]["session"] != policy["session"])));
-            if more || other {
-                let what = if more { "More sessions" } else { "Another session" };
-                if !confirmed(&app, "Let it post without your approval?", format!("{what} will be able to post to #{name} without asking you: this channel's policy sends posts {}.", if posting == "auto" { "at once" } else { "in threads at once" }), "Allow", true) {
-                    return Ok(now);
-                }
-            }
-        }
-        let operator = now["connection"]["operator"].as_str().unwrap_or("");
-        let had: Vec<&str> = current["senders"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
-        let added: Vec<&str> = policy["senders"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).filter(|u| *u != operator && !had.contains(u)).collect()).unwrap_or_default();
-        if !added.is_empty() {
-            let message = format!("Messages from {} in #{name} will reach an agent session. That agent can run commands as you, and it reads their messages as requests from Slack. Add only people you would let type into its terminal.", added.join(", "));
-            if !confirmed(&app, "Let other people's messages reach an agent?", message, "Allow", true) {
+        for (title, message) in policy_questions(&now, &current, &policy) {
+            if !confirmed(&app, title, message, "Allow", true) {
                 return Ok(now);
             }
         }
         service(json!({"op": "slack_policy", "channel": channel, "policy": policy}))
     })
     .await
+}
+
+/// What the person is asked in a native dialog before a channel's policy
+/// changes from `current` to what `policy` sets: a title and a text each, in
+/// the order they are asked. One "no" leaves the policy as it is.
+fn policy_questions(now: &Value, current: &Value, policy: &Value) -> Vec<(&'static str, String)> {
+    let mut ask = Vec::new();
+    let name = current["name"].as_str().unwrap_or("");
+    if let Some(posting @ ("auto" | "thread")) = policy["posting"].as_str().filter(|p| current["posting"] != *p) {
+        ask.push(("Post without your approval?", if posting == "auto" {
+            format!("Sessions that may post to #{name} will post there without asking you. An agent can post anything it has read: file contents, credentials it came across, what other channels said.")
+        } else {
+            format!("A session will answer in #{name} without asking you, in threads where a sender on the channel's list addressed it. An agent can put anything it has read into such an answer. New messages outside those threads still wait for your approval.")
+        }));
+    }
+    // Where posts go without approval, more sessions posting or another session answering is asked about too
+    let posting = policy["posting"].as_str().or(current["posting"].as_str()).unwrap_or("never");
+    if posting == "auto" || posting == "thread" {
+        let had: Vec<&str> = current["posters"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+        let more = policy["posters"].as_array().is_some_and(|a| a.iter().filter_map(|v| v.as_str()).any(|p| !had.contains(&p)));
+        let other = policy["route"].as_str().is_some_and(|kind| kind != "none" && (current["route"]["kind"] != kind || (kind == "session" && current["route"]["session"] != policy["session"])));
+        if more || other {
+            let what = if more { "More sessions" } else { "Another session" };
+            ask.push(("Let it post without your approval?", format!("{what} will be able to post to #{name} without asking you: this channel's policy sends posts {}.", if posting == "auto" { "at once" } else { "in threads at once" })));
+        }
+    }
+    let operator = now["connection"]["operator"].as_str().unwrap_or("");
+    let listed = |v: &Value| -> Vec<String> { v.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default() };
+    let had = listed(&current["senders"]);
+    // The Supervisor's session and task tools are allowed without prompts: what lands in
+    // its inbox is asked about, whoever is on the list now (MCR-38, finding 3)
+    if policy["route"] == "supervisor" && current["route"]["kind"] != "supervisor" {
+        let senders = if policy["senders"].is_array() { listed(&policy["senders"]) } else { had.clone() };
+        let others = senders.iter().filter(|u| u.as_str() != operator).count();
+        let who = match others {
+            0 => "Only you are on the channel's sender list now; anyone you add later reaches the Supervisor too.".to_string(),
+            1 => "One person besides you is on the channel's sender list, and their messages reach it as well.".to_string(),
+            n => format!("{n} people besides you are on the channel's sender list, and their messages reach it as well."),
+        };
+        ask.push(("Deliver Slack messages to the Supervisor?", format!("Messages from #{name} will land in the inbox of the Supervisor session. The Supervisor starts sessions and gives them tasks without asking you, so what is written in this channel can set agents to work on this Mac. {who}")));
+    }
+    let added: Vec<&str> = policy["senders"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).filter(|u| *u != operator && !had.iter().any(|h| h == u)).collect()).unwrap_or_default();
+    if !added.is_empty() {
+        let to = if policy["route"] == "supervisor" || (policy["route"].is_null() && current["route"]["kind"] == "supervisor") { "the Supervisor session, which starts sessions and gives them tasks without asking you" } else { "an agent session" };
+        ask.push(("Let other people's messages reach an agent?", format!("Messages from {} in #{name} will reach {to}. That agent can run commands as you, and it reads their messages as requests from Slack. Add only people you would let type into its terminal.", added.join(", "))));
+    }
+    ask
 }
 
 /// The person's decision on a post that waits: approve (with the text as they left it) or deny.
@@ -552,7 +645,9 @@ pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -
         let id = id.clone();
         drop(views);
         // Only the attached human view submits here; harness injections use runner write.
-        service(json!({"op": "operator_input", "id": id}))?;
+        // The key is written: a service that is slow or away must not hold the
+        // terminal or show as its error
+        state.told.tell(id, |id| drop(service(json!({"op": "operator_input", "id": id}))));
     }
     Ok(())
 }
@@ -620,6 +715,72 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enter_is_told_to_the_service_off_the_command_and_repeats_are_dropped() {
+        use std::sync::mpsc::channel;
+        let told = Told::default();
+        let (started_tx, started) = channel::<String>();
+        let (release, released) = channel::<()>();
+        let released = Mutex::new(released);
+        // A service that answers only when the test lets it
+        let call = move |id: &str| {
+            started_tx.send(id.to_string()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        };
+        let wait = std::time::Duration::from_secs(5);
+        // Returns although the call has not ended
+        told.tell("a".into(), call);
+        assert_eq!(started.recv_timeout(wait).unwrap(), "a");
+        // Enters during the call: told once more, not three times; another session keeps its own
+        for id in ["a", "a", "a", "b", "b"] {
+            told.tell(id.into(), |_: &str| panic!("a second worker"));
+        }
+        assert_eq!(*told.waiting.lock().unwrap(), ["a".to_string(), "b".to_string()].into());
+        release.send(()).unwrap();
+        assert_eq!(started.recv_timeout(wait).unwrap(), "a");
+        release.send(()).unwrap();
+        assert_eq!(started.recv_timeout(wait).unwrap(), "b");
+        assert!(told.waiting.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        // Nothing queued is left over, and a later Enter is told again
+        assert!(started.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        told.tell("a".into(), |_: &str| panic!("a second worker"));
+        assert_eq!(started.recv_timeout(wait).unwrap(), "a");
+        release.send(()).unwrap();
+        // The worker ends with the state
+        drop(told);
+        assert!(started.recv_timeout(wait).is_err());
+    }
+
+    #[test]
+    fn a_channel_policy_that_widens_what_slack_may_do_is_asked_about_first() {
+        let now = json!({"connection": {"operator": "UOP"}});
+        let current = json!({"id": "C1", "name": "ops", "posting": "approve", "posters": [], "senders": ["UOP"], "route": {"kind": "session", "session": "s1"}});
+        let titles = |current: &Value, policy: Value| policy_questions(&now, current, &policy).into_iter().map(|q| q.0).collect::<Vec<_>>();
+        // Nothing that widens: no question
+        assert!(titles(&current, json!({"listen": "mentions"})).is_empty());
+        assert!(titles(&current, json!({"route": "session", "session": "s2"})).is_empty());
+        assert!(titles(&current, json!({"route": "none"})).is_empty());
+        assert!(titles(&current, json!({"posting": "never", "senders": ["UOP"]})).is_empty());
+        // A route to the Supervisor is asked about, also when only the operator is a sender (MCR-38, finding 3)
+        assert_eq!(titles(&current, json!({"route": "supervisor"})), ["Deliver Slack messages to the Supervisor?"]);
+        let with_ann = json!({"id": "C1", "name": "ops", "posting": "approve", "posters": [], "senders": ["UOP", "UANN"], "route": {"kind": "none", "session": ""}});
+        let asked = policy_questions(&now, &with_ann, &json!({"route": "supervisor"}));
+        assert!(asked[0].1.contains("#ops") && asked[0].1.contains("One person besides you"), "{}", asked[0].1);
+        // Not asked again while it stays the route; a new sender then is, and the text names the Supervisor
+        let to_supervisor = json!({"id": "C1", "name": "ops", "posting": "approve", "posters": [], "senders": ["UOP"], "route": {"kind": "supervisor", "session": ""}});
+        assert!(titles(&to_supervisor, json!({"route": "supervisor"})).is_empty());
+        let asked = policy_questions(&now, &to_supervisor, &json!({"senders": ["UOP", "UANN"]}));
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].0 == "Let other people's messages reach an agent?" && asked[0].1.contains("the Supervisor session") && asked[0].1.contains("UANN"));
+        // The questions that were there before are still asked, in the same order
+        assert_eq!(titles(&current, json!({"posting": "auto"})), ["Post without your approval?"]);
+        assert_eq!(titles(&current, json!({"senders": ["UOP", "UANN"]})), ["Let other people's messages reach an agent?"]);
+        let auto = json!({"id": "C1", "name": "ops", "posting": "auto", "posters": [], "senders": ["UOP"], "route": {"kind": "session", "session": "s1"}});
+        assert_eq!(titles(&auto, json!({"posters": ["*"]})), ["Let it post without your approval?"]);
+        assert_eq!(titles(&auto, json!({"route": "supervisor", "senders": ["UOP", "UANN"]})), ["Let it post without your approval?", "Deliver Slack messages to the Supervisor?", "Let other people's messages reach an agent?"]);
+    }
 
     #[test]
     fn pasted_images_are_recognised_by_content() {

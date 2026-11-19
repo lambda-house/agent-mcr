@@ -9,7 +9,9 @@ export const HARNESS_PREFERENCES_CHANGED = 'harness-preferences-changed';
 export interface HostedExit { code: number; signal: string | null; at: number }
 /** Why a session needs the person: a prompt only they may answer, or a notification. */
 /** `assessment` and `report` come from the agent's own `report` tool: it needs the person, or finished a piece of work. */
-export interface Attention { kind: 'permission' | 'assessment' | 'notification'; text: string; since: number; report?: 'needs_human' | 'done' }
+export interface Attention { kind: 'permission' | 'assessment' | 'notification'; text: string; since: number; report?: 'needs_human' | 'done';
+  /** Read from the terminal by the harness, not reported by the agent */
+  guess?: boolean }
 /** What the harness service knows about a session (`harness::Tracked`). */
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';
@@ -78,6 +80,10 @@ export interface HarnessStatus {
   supervisorCommand?: string;
   /** The operator lets agents outside the harness use the supervisor tools */
   outsideSupervisors?: boolean;
+  /** New Codex sessions are started with the harness's hooks (the person trusts them once in Codex) */
+  codexHooks?: boolean;
+  /** A Codex hook has reported under this program's path: Codex runs them, so the person trusted them. Remembered after the sessions are gone */
+  codexHooksReporting?: boolean;
 }
 
 /** One of the app's two background processes, as found without starting it. */
@@ -91,7 +97,17 @@ export interface Background { consent: 'allowed' | 'stopped' | 'new'; units: Bac
 export const notAllowed = (e: unknown) => String(e instanceof Error ? e.message : e).includes('Background processes are not allowed');
 
 /** What an agent told the person with its `report` tool. */
-export interface Report { id: string; session: string; name: string; cwd: string; kind: 'needs_human' | 'done'; text: string; created: number }
+/** An executor in a status report, as the service knew it when the report was made. */
+export interface ExecutorLine { session: string; name: string; state: string; needsOperator: boolean; waits: string[] }
+export interface Report {
+  id: string; session: string; name: string; cwd: string; text: string; created: number;
+  /** `status` notifies nobody and marks nothing; the board holds the latest one of each session */
+  kind: 'needs_human' | 'done' | 'status';
+  /** The session it worked for when it reported (id) */
+  supervisor?: string;
+  /** On a status report of a supervising session */
+  executors?: ExecutorLine[];
+}
 /** A note on the bulletin board, read by sessions until it expires. */
 export interface Note {
   id: string; from: { id: string; name: string }; folder: string; scope: 'folder' | 'all'; text: string;
@@ -124,6 +140,61 @@ export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
   return open;
 }
 
+/** A report in its group: `depth` is the number of supervisors above its session inside the group. */
+export interface ReportRow { report: Report; depth: number }
+/**
+ * The reports of one supervisor and of the sessions below it, or (`session`
+ * empty) of the sessions that work for nobody and supervise nobody.
+ */
+export interface ReportGroup { session: string; name: string; live: boolean; rows: ReportRow[] }
+
+/**
+ * Reports by supervisor: a group per top session, with its own reports first
+ * and then each executor's, and theirs, in the order of the tree. Inside a
+ * session the status report comes first, then the rest, newest first. Who
+ * works for whom is what the session list says now; for a session that ended
+ * it is what its last report recorded. Groups with the newest report come
+ * first; sessions outside any tree are one last group, newest report first.
+ */
+export function reportGroups(reports: Report[], hosted: Hosted[]): ReportGroup[] {
+  const live = new Map(hosted.filter(h => !h.exit).map(h => [h.id, h]));
+  const own = new Map<string, Report[]>();
+  for (const r of reports) own.set(r.session, [...own.get(r.session) ?? [], r]);
+  const above = (id: string) => live.has(id) ? live.get(id)!.harness?.supervisor || '' : [...own.get(id) ?? []].reverse().find(r => r.supervisor)?.supervisor ?? '';
+  // Every session with a report, and the supervisors above them; a circle ends where it closes
+  const up = new Map<string, string>();
+  for (const id of own.keys()) {
+    const path = new Set<string>();
+    for (let at = id; at && !path.has(at) && !up.has(at); at = up.get(at)!) {
+      path.add(at);
+      const next = above(at);
+      up.set(at, path.has(next) ? '' : next);
+    }
+  }
+  const newest = (ids: string[]) => Math.max(0, ...ids.flatMap(id => (own.get(id) ?? []).map(r => r.created)));
+  const name = (id: string) => {
+    const h = hosted.find(x => x.id === id);
+    return h && isSupervisor(h) ? 'Supervisor' : (own.get(id) ?? []).slice(-1)[0]?.name || (h ? hostedLabel(h) : '') || id;
+  };
+  const rows = (id: string, depth: number): ReportRow[] => {
+    const mine = [...own.get(id) ?? []].reverse();
+    const status = mine.find(r => r.kind === 'status');
+    return [...status ? [status] : [], ...mine.filter(r => r !== status)].map(report => ({ report, depth }));
+  };
+  const below = (id: string) => [...up].filter(([, s]) => s === id).map(([child]) => child).sort((a, b) => name(a).localeCompare(name(b)) || a.localeCompare(b));
+  const tree = (id: string, depth: number): ReportRow[] => [...rows(id, depth), ...below(id).flatMap(child => tree(child, depth + 1))];
+  const members = (id: string): string[] => [id, ...below(id).flatMap(members)];
+  const tops = [...up].filter(([, s]) => !s).map(([id]) => id);
+  // A supervisor heads a group before any of its executors has reported
+  const supervises = (id: string) => below(id).length > 0 || [...live.values()].some(h => h.id === id ? isSupervisor(h) : h.harness?.supervisor === id) || (own.get(id) ?? []).some(r => r.executors?.length);
+  const groups = tops.filter(supervises)
+    .map(id => ({ group: { session: id, name: name(id), live: live.has(id), rows: tree(id, 0) }, at: newest(members(id)) }))
+    .sort((a, b) => b.at - a.at || a.group.session.localeCompare(b.group.session))
+    .map(g => g.group);
+  const alone = tops.filter(id => !supervises(id)).flatMap(id => own.get(id) ?? []).sort((a, b) => b.created - a.created);
+  return alone.length ? [...groups, { session: '', name: '', live: false, rows: alone.map(report => ({ report, depth: 0 })) }] : groups;
+}
+
 /** The Slack connector as the harness service reports it (decision D14). No token is in it. */
 export interface SlackConnection {
   team: string; url: string; botName: string; operator: string; operatorName: string; approveInSlack: boolean; connected: number;
@@ -135,6 +206,8 @@ export type SlackPosting = 'never' | 'approve' | 'thread' | 'auto';
 export interface SlackChannel {
   id: string; name: string; private: boolean; member: boolean; listen: SlackListen; senders: string[];
   route: { kind: 'none' | 'session' | 'supervisor'; session: string }; posting: SlackPosting; posters: string[]; skipped: boolean;
+  /** Why a message that arrives now would reach no session (its route names nobody who runs); the service's words */
+  routeProblem?: string | null;
 }
 export type SlackPostState = 'waiting' | 'approved' | 'sending' | 'sent' | 'denied' | 'cancelled' | 'failed' | 'unknown';
 export interface SlackPost {
@@ -144,6 +217,8 @@ export interface SlackPost {
 export interface SlackReceived {
   key: string; channel: string; channelName: string; user: string; userName: string; text: string; at: number;
   caughtUp: boolean; session?: string | null; held?: string | null;
+  /** The text was longer than what the service keeps */
+  cut?: boolean;
 }
 export interface SlackStatus {
   connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;
@@ -151,6 +226,10 @@ export interface SlackStatus {
   connectedAt?: number; eventsSeen?: number; actionsSeen?: number;
   /** Frames of any kind from Slack, the kind of the last one, and the last event that was not kept (type and why, never its text) */
   envelopesSeen?: number; lastEnvelope?: string; lastDropped?: string;
+  /** Slack asked to wait before giving these channels' history: their names and when they are read again */
+  catchUpWait?: { until: number; channels: string[] } | null;
+  /** Why the service could not write its Slack state; while set it sends and delivers nothing */
+  storeError?: string | null;
   channels: SlackChannel[]; users: Record<string, string>; posts: SlackPost[]; received: SlackReceived[];
   audit: { at: number; kind: string; text: string }[];
   counts: { sentWithoutApproval: number; refusedApprovals: number; deliveredFromStrangers: number; held: number; waiting: number };
@@ -194,6 +273,8 @@ export const harnessApi = {
   /** The hosted supervisor session: the running one, or a new one */
   /** Asks in a native dialog before turning it on; resolves to the setting as it is now */
   outsideSupervisors: (on: boolean) => invoke<boolean>('harness_outside_supervisors', { on }),
+  /** Asks in a native dialog before turning it on; resolves to the setting as it is afterwards */
+  codexHooks: (on: boolean) => invoke<boolean>('harness_codex_hooks', { on }),
   supervisor: (cols: number, rows: number) => invoke<Hosted>('harness_supervisor', { cols, rows }),
   /** End the agent and continue its conversation in a new process; the session id changes */
   restart: (id: string) => invoke<Hosted & { replaced: string; resumed: boolean }>('harness_restart', { id }),

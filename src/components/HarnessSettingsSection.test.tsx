@@ -7,7 +7,7 @@ import { harnessApi, type HarnessPreferences } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({
   ...await importOriginal<object>(),
-  harnessApi: { status: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn(), background: vi.fn(), stopBackground: vi.fn() },
+  harnessApi: { status: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn(), codexHooks: vi.fn(), background: vi.fn(), stopBackground: vi.fn() },
 }));
 const prefs: HarnessPreferences = {
   profiles: ['claude', 'codex', 'antigravity', 'pi', 'opencode', 'shell'].map(id => ({ id, label: id === 'shell' ? 'Terminal' : id, command: id === 'shell' ? '' : id, optional: ['antigravity', 'pi', 'opencode'].includes(id), canSupervise: id !== 'shell', taskTracking: ['claude', 'codex'].includes(id) })),
@@ -48,6 +48,36 @@ it('clears supervisor when its harness is disabled and retains state if saving f
   await act(async () => toggle('pi').click()); await flush();
   expect(host.querySelector('[role="alert"]')?.textContent).toContain('Disk is full');
   expect(toggle('pi').checked).toBe(false);
+});
+
+it('turns Codex hooks on only when the native question was answered yes, and says where the trust step stands', async () => {
+  await act(async () => root.render(<HarnessSettingsSection/>)); await flush();
+  const box = () => host.querySelector('input[aria-label="Use Codex hooks"]') as HTMLInputElement;
+  expect(box().checked).toBe(false);
+  expect(host.textContent).toContain('Off: Agent MCR reads a Codex prompt from its terminal instead, as a guess.');
+  // The person cancelled the native dialog: the command says the setting is still off
+  vi.mocked(harnessApi.codexHooks).mockResolvedValue(false);
+  await act(async () => box().click()); await flush();
+  expect(harnessApi.codexHooks).toHaveBeenLastCalledWith(true);
+  expect(box().checked).toBe(false);
+  // Allowed: on, and the trust step in Codex is still to do
+  vi.mocked(harnessApi.codexHooks).mockResolvedValue(true);
+  await act(async () => box().click()); await flush();
+  expect(box().checked).toBe(true);
+  expect(host.textContent).toContain('choose "Trust all and continue"');
+  // Off again needs no question
+  vi.mocked(harnessApi.codexHooks).mockResolvedValue(false);
+  await act(async () => box().click()); await flush();
+  expect(harnessApi.codexHooks).toHaveBeenLastCalledWith(false);
+  expect(box().checked).toBe(false);
+});
+
+it('says that Codex hooks report once a session has used them', async () => {
+  vi.mocked(harnessApi.status).mockResolvedValue({ runner: { protocol: 1, pid: 7, version: '0.1.0', exe: '/x' }, profiles: prefs.profiles, home: '/Users/me', codexHooks: true, codexHooksReporting: true });
+  await act(async () => root.render(<HarnessSettingsSection/>)); await flush();
+  expect((host.querySelector('input[aria-label="Use Codex hooks"]') as HTMLInputElement).checked).toBe(true);
+  expect(host.textContent).toContain('On, and Codex runs them: a session has reported through them.');
+  expect(host.textContent).not.toContain('Trust all and continue');
 });
 
 it('shows preference load failures', async () => {

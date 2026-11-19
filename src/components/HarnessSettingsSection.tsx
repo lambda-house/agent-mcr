@@ -3,6 +3,14 @@ import { SettingRow } from '@/ui';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type HarnessStatus, type HarnessPreferences } from '../utils/harness';
 import { BackgroundPanel } from './Background';
 
+/** What the switch does and where the person stands with Codex's own trust step. */
+export function codexHooksDescription(status: HarnessStatus): string {
+  const what = 'Start new Codex sessions with hooks that report their state to Agent MCR: the conversation from its start, and what Codex asks to approve. They never answer for you.';
+  if (!status.codexHooks) return `${what} Off: Agent MCR reads a Codex prompt from its terminal instead, as a guess.`;
+  if (status.codexHooksReporting) return `${what} On, and Codex runs them: a session has reported through them.`;
+  return `${what} On. Codex asks once to review them: start a Codex session and choose "Trust all and continue". Until then new Codex sessions stop at that question.`;
+}
+
 export default function HarnessSettingsSection() {
   const [prefs, setPrefs] = useState<HarnessPreferences | null>(null);
   const [status, setStatus] = useState<HarnessStatus | null>(null);
@@ -43,6 +51,12 @@ export default function HarnessSettingsSection() {
         </label>
       }/>)}
       {status && <SettingRow label="Outside agents" description="Allow connected agents outside Agent MCR to use supervisor tools." control={<input type="checkbox" aria-label="Allow outside agents" checked={!!status.outsideSupervisors} onChange={e => { void harnessApi.outsideSupervisors(e.target.checked).then(on => setStatus({ ...status, outsideSupervisors: on })).catch(e => setError(String(e))); }}/>}/>}
+      {status && <SettingRow label="Use Codex hooks" description={codexHooksDescription(status)} control={
+        <label className="settings-toggle">
+          <input type="checkbox" aria-label="Use Codex hooks" checked={!!status.codexHooks} onChange={e => { void harnessApi.codexHooks(e.target.checked).then(on => setStatus({ ...status, codexHooks: on })).catch(e => setError(String(e))); }}/>
+          <span className="settings-toggle-slider"/>
+        </label>
+      }/>}
       {status?.supervisorCommand && <SettingRow label="Supervisor setup command" description={status.supervisorCommand} control={<button type="button" onClick={() => { void navigator.clipboard.writeText(status.supervisorCommand!).then(() => setCopied(true)).catch(e => setError(String(e))); }}>{copied ? 'Copied' : 'Copy'}</button>}/>}
       <SettingRow label="Supervisor" description="Harness for the next supervisor session. Close the current supervisor to switch." control={
         <select aria-label="Supervisor harness" value={prefs.supervisorProfile ?? ''} disabled={saving} onChange={e => void save(prefs.enabledProfiles, e.target.value || null)}>

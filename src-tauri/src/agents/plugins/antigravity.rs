@@ -32,6 +32,9 @@ impl Adapter for Antigravity {
     fn at_prompt(&self, screen: &str) -> bool {
         screen.contains("? for shortcuts") && !screen.contains("esc to cancel") && !screen.contains("enter Confirm")
     }
+    fn sees_prompt(&self) -> bool {
+        true
+    }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Key("\x1b")
     }

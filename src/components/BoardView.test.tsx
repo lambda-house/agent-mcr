@@ -56,6 +56,36 @@ describe('Board view', () => {
     expect([...host.querySelectorAll('section[aria-label="Reports"] .hs-board-text')].map(e => e.textContent)).toEqual(['Merged', 'Tests pass']);
   });
 
+  it('groups reports by supervisor, with the status first and the executors under it', async () => {
+    const lead: Hosted = { ...session, id: 'lead', title: 'Lead', harness: { ...session.harness!, attention: null } };
+    const worker: Hosted = { ...session, id: 'w1', title: 'Worker', harness: { ...session.harness!, attention: null, supervisor: 'lead' } };
+    vi.mocked(harnessApi.list).mockResolvedValue([session, lead, worker]);
+    vi.mocked(harnessApi.board).mockResolvedValue({ ...board, reports: [
+      ...board.reports,
+      { id: 'r4', session: 'w1', name: 'Worker', cwd: '/Users/me/repo', kind: 'done', text: 'Parser fixed', created: 4, supervisor: 'lead' },
+      { id: 'r5', session: 'lead', name: 'Lead', cwd: '/Users/me/repo', kind: 'done', text: 'Round one reviewed', created: 5 },
+      { id: 'r6', session: 'lead', name: 'Lead', cwd: '/Users/me/repo', kind: 'status', text: 'One executor at work', created: 6, executors: [{ session: 'w1', name: 'Worker', state: 'working', needsOperator: false, waits: ['CI run 42'] }, { session: 'w2', name: 'Builder', state: 'waiting', needsOperator: true, waits: [] }] },
+    ] });
+    const onOpen = vi.fn();
+    await act(async () => root.render(<BoardView active onOpen={onOpen}/>)); await flush();
+    const groups = [...host.querySelectorAll('.hs-board-group')];
+    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Reports of Lead and its executors', 'Reports of sessions without a supervisor']);
+    const rows = [...groups[0].querySelectorAll('li')];
+    expect(rows.map(li => [li.querySelector('.hs-board-text')?.textContent, li.className, li.style.paddingLeft])).toEqual([
+      ['One executor at work', 'status', ''], ['Round one reviewed', '', ''], ['Parser fixed', '', '16px'],
+    ]);
+    // The status carries its executors as the harness recorded them, and marks nothing
+    expect([...rows[0].querySelectorAll('.hs-board-execs [role="listitem"]')].map(e => e.textContent)).toEqual(['Worker working · waited for: CI run 42', 'Builder needed you']);
+    expect(rows[0].querySelector('em')).toBeNull();
+    expect(groups[1].querySelectorAll('li').length).toBe(3);
+    await act(async () => (groups[0].querySelector('.hs-board-group-head button') as HTMLButtonElement).click());
+    expect(onOpen).toHaveBeenCalledWith('lead');
+    // The filter for the kind
+    const status = [...host.querySelectorAll('.hs-board-filter button')].find(b => b.textContent === 'Status') as HTMLButtonElement;
+    await act(async () => status.click());
+    expect([...host.querySelectorAll('section[aria-label="Reports"] .hs-board-text')].map(e => e.textContent)).toEqual(['One executor at work']);
+  });
+
   it('posts a note of the person for a folder sessions run in', async () => {
     vi.mocked(harnessApi.postNote).mockResolvedValue();
     await act(async () => root.render(<BoardView active onOpen={() => {}}/>)); await flush();

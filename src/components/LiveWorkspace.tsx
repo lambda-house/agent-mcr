@@ -378,7 +378,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     setError('');
     harnessApi.restart(h.id).then(async fresh => {
       await refresh();
-      setOpened(o => o.filter(x => x !== h.id));
+      // The new id takes the old one's place among the opened too: a pane that shows it without being the selected one needs its terminal
+      setOpened(o => o.map(x => x === h.id ? fresh.id : x));
       setLayout(l => replaceSessionInLayout(l, h.id, fresh.id));
       if (selected === h.id) select(fresh.id);
       if (!fresh.resumed) setError(`${sessionLabel(h)} had no saved conversation to continue: it started fresh in the same folder.`);

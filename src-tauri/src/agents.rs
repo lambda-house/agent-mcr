@@ -259,6 +259,9 @@ pub struct Launch<'a> {
     pub agent_session: Option<&'a str>,
     pub resume: Option<&'a str>,
     pub task: Option<&'a str>,
+    /// Pass the hooks that the agent runs only after the person trusted them
+    /// in the agent itself (Codex, MCR-74)
+    pub own_hooks: bool,
 }
 
 /// How the current turn of an agent is stopped.
@@ -308,6 +311,34 @@ pub trait Adapter: Sync {
     fn at_prompt(&self, _screen: &str) -> bool {
         false
     }
+    /// Whether `at_prompt` knows this program's input box at all. Where it
+    /// doesn't, the answer is always no and the screen is not read to ask
+    fn sees_prompt(&self) -> bool {
+        false
+    }
+    /// Launched as Supervisor so that `terminal_write` is the one tool left to
+    /// its own permission prompt: the operator approves each call (Claude:
+    /// `claude_settings` pre-approves every other supervisor tool). Only such
+    /// a Supervisor is listed that tool and may call it
+    fn asks_before_terminal_write(&self) -> bool {
+        false
+    }
+    /// Whether the terminal title says that the agent waits for the operator's
+    /// answer. `None`: its title says nothing about that
+    fn title_asks(&self, _title: &str) -> Option<bool> {
+        None
+    }
+    /// The question on screen, when the screen ends in one of the agent's own
+    /// prompts with numbered answers. Read from the terminal, so a guess: the
+    /// wording depends on the agent's version
+    fn question(&self, _screen: &str) -> Option<String> {
+        None
+    }
+    /// Whether a notification the agent sent to its terminal says that it
+    /// waits for an approval (for agents that report no prompts through hooks)
+    fn announces_approval(&self, body: &str) -> bool {
+        body.to_lowercase().contains("approv")
+    }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Signal("INT")
     }
@@ -330,6 +361,25 @@ pub trait Adapter: Sync {
         Vec::new()
     }
 }
+
+/// The last question on a screen that is followed by numbered answers: the
+/// question and what stands between it and the first answer (the command, the
+/// reason), on one line. Nothing when no answers follow, as then the agent
+/// only quoted the words.
+fn asked(screen: &str, is_question: impl Fn(&str) -> bool) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().map(|l| l.trim_matches(|c: char| c.is_whitespace() || "\u{2502}\u{2503}|".contains(c))).collect();
+    let at = lines.iter().rposition(|l| is_question(l))?;
+    let answers = lines[at..].iter().take(40).position(|l| l.trim_start_matches(['\u{203a}', '\u{276f}', '>', ' ']).starts_with("1."))?;
+    let text = lines[at..at + answers].iter().filter(|l| !l.is_empty()).copied().collect::<Vec<_>>().join(" ");
+    Some(text.chars().filter(|c| !c.is_control()).take(300).collect())
+}
+
+/// The event name Codex's own hooks report under (`--harness-hook`); which
+/// hook it was is in the payload's `hook_event_name`.
+pub const CODEX_HOOK: &str = "codex-hook";
+
+/// The Codex hooks the harness asks for.
+pub const CODEX_HOOKS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse"];
 
 pub struct Claude;
 pub struct Codex;
@@ -374,8 +424,18 @@ impl Adapter for Claude {
     fn names_conversation(&self) -> bool {
         true
     }
+    fn asks_before_terminal_write(&self) -> bool {
+        true
+    }
     fn reports_from_start(&self) -> bool {
         true
+    }
+    fn question(&self, screen: &str) -> Option<String> {
+        const TRUST: &str = "Is this a project you created or one you trust?";
+        asked(screen, |l| l.starts_with("Do you want to") || l.starts_with("Do you trust") || l.contains(TRUST)).or_else(|| {
+            // The folder question at start, whose answers are not numbered in every version
+            (screen.contains(TRUST) && screen.contains("Yes, I trust this folder")).then(|| TRUST.to_string())
+        })
     }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Key("\x1b")
@@ -424,6 +484,17 @@ impl Adapter for Codex {
             cmd += " resume";
         }
         cmd += &format!(" {flags} -c {} -c tui.notifications=true {tools}", sh(&notify));
+        // Codex's own hooks (MCR-74). Codex runs them only after the person
+        // trusted them in Codex; until then it asks at start, so they are
+        // passed only when the person turned them on. No Stop hook: the turn
+        // end stays with `notify`, which needs no trust, and must not be
+        // reported twice. The trust bypass flag is never passed
+        if l.own_hooks {
+            let command = json!(format!("{} --harness-hook {CODEX_HOOK}", sh(l.exe)));
+            for event in CODEX_HOOKS {
+                cmd += &format!(" -c {}", sh(&format!("hooks.{event}=[{{hooks=[{{type=\"command\",command={command},timeout=5}}]}}]")));
+            }
+        }
         if l.supervisor {
             cmd += &format!(" -c {} -c {}", sh(&format!("mcp_servers.supervisor.command={}", json!(l.exe))), sh("mcp_servers.supervisor.args=[\"--supervise\"]"));
         }
@@ -443,6 +514,34 @@ impl Adapter for Codex {
     }
     fn at_prompt(&self, screen: &str) -> bool {
         screen.contains("for shortcuts") && screen.lines().any(|l| l.starts_with('\u{203a}'))
+    }
+    fn sees_prompt(&self) -> bool {
+        true
+    }
+    /// Codex sets "[ ! ] Action Required" as the title while it waits for an answer
+    /// (after a glyph that blinks, before the folder). Nothing else: a
+    /// conversation may be titled with these words and more
+    fn title_asks(&self, title: &str) -> Option<bool> {
+        Some(title.trim_start_matches(|c: char| !c.is_alphanumeric()).split(" | ").next().unwrap_or("").trim() == "Action Required")
+    }
+    /// The wording of codex-cli 0.170; a turn's last message is announced the
+    /// same way and may hold any word
+    fn announces_approval(&self, body: &str) -> bool {
+        body.starts_with("Approval requested")
+    }
+    fn question(&self, screen: &str) -> Option<String> {
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
+            // The folder question at start (0.170 wording), whose answers may not be numbered
+            if self.at_prompt(screen) {
+                return None;
+            }
+            // Codex's review of hooks it has not run before, ours among them (MCR-74)
+            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
+                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
+            }
+            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
+            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        })
     }
     /// Codex takes one `developer_instructions` value: the operator's own, if set, stays
     fn takes_note(&self, home: &Path) -> bool {
@@ -690,6 +789,61 @@ mod tests {
         assert!(!adapter("codex").at_prompt("Do you trust the files in this folder?"));
         assert!(matches!(adapter("claude").interrupt(), Interrupt::Key("\x1b")));
         assert!(matches!(adapter("codex").interrupt(), Interrupt::Signal("INT")));
+    }
+
+    #[test]
+    fn a_prompt_is_recognised_from_the_title_and_the_screen() {
+        let codex = adapter("codex");
+        assert_eq!(codex.title_asks("[ ! ] Action Required | teob-ai"), Some(true));
+        assert_eq!(codex.title_asks("[ . ] Action Required | teob-ai"), Some(true));
+        // As recorded on 2026-11-18: the conversation's title stands between the words and the folder
+        assert_eq!(codex.title_asks("[ ! ] Action Required | Run ls and touch probe.txt | folder"), Some(true));
+        assert_eq!(codex.title_asks("\u{280f} Run ls and touch probe.txt | folder"), Some(false));
+        assert_eq!(codex.title_asks("\u{2807} Memory answer grounding | teob-ai"), Some(false));
+        // A conversation's own title may hold the words
+        assert_eq!(codex.title_asks("Action Required review | teob-ai"), Some(false));
+        assert_eq!(codex.title_asks("Review of Action Required"), Some(false));
+        assert_eq!(codex.title_asks("Action Required"), Some(true));
+        // What Codex announces to its terminal: an approval by its form, never by a word in a last message
+        assert!(codex.announces_approval("Approval requested: git push") && codex.announces_approval("Approval requested by reviewer"));
+        assert!(!codex.announces_approval("Done. The change is approved and merged.") && !codex.announces_approval("Agent turn complete"));
+        assert!(adapter("antigravity").announces_approval("Needs your approval"));
+        // Claude Code's title says nothing about prompts: its hooks do
+        assert_eq!(adapter("claude").title_asks("\u{2733} Action Required"), None);
+        assert_eq!(adapter("shell").title_asks("Action Required"), None);
+
+        let screen = "\u{2022} I will rebase first.\n\n  Would you like to run the following command?\n\n  Reason: the branch is behind\n\n  $ git rebase origin/main\n\n\u{203a} 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `git rebase` (p)\n  3. No, and tell Codex what to do differently (esc)\n";
+        assert_eq!(codex.question(screen).as_deref(), Some("Would you like to run the following command? Reason: the branch is behind $ git rebase origin/main"));
+        // Words the agent only quoted, with no answers under them, are not a prompt
+        assert_eq!(codex.question("\u{2022} Earlier I asked: Would you like to run the following command?\n\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
+        assert_eq!(codex.question("  Would you like to run the following command?\n  $ ls\n"), None);
+        assert_eq!(codex.question("\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
+        // The folder question at start, in the newer and the older wording
+        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n  Yes, continue\n  No, quit\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
+        assert_eq!(codex.question("Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, quit").as_deref(), Some("Do you trust the contents of this directory?"));
+        // As seen on 2026-11-18 (codex-cli 0.170): numbered answers
+        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
+        assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
+        // Codex's own review of hooks, as recorded on 2026-11-18 (it does not set the title)
+        let review = "  Hooks need review\n  4 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\u{203a} 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n";
+        assert_eq!(codex.question(review).as_deref(), Some("Hooks need review 4 hooks are new or changed. Hooks can run outside the sandbox after you trust them."));
+        // Long commands are cut, and control characters never get into a notice
+        let long = format!("Would you like to run the following command?\n$ echo {}\u{7}\n1. Yes, proceed (y)", "x".repeat(600));
+        let text = codex.question(&long).unwrap();
+        assert!(text.chars().count() == 300 && !text.contains('\u{7}'));
+
+        let claude = adapter("claude");
+        let trust = "\u{256d}\u{2500}\u{2500}\u{256e}\n\u{2502} Do you trust the files in this folder?   \u{2502}\n\u{2502} /Users/x/work                            \u{2502}\n\u{2502} \u{276f} 1. Yes, proceed                        \u{2502}\n\u{2502}   2. No, exit                            \u{2502}\n";
+        assert_eq!(claude.question(trust).as_deref(), Some("Do you trust the files in this folder? /Users/x/work"));
+        let edit = "Do you want to make this edit to main.rs?\n\u{276f} 1. Yes\n  2. Yes, allow all edits during this session\n  3. No";
+        assert_eq!(claude.question(edit).as_deref(), Some("Do you want to make this edit to main.rs?"));
+        assert_eq!(claude.question("> Do you want to know more?\n"), None);
+        // The folder question at start as seen on 2026-11-18, with and without numbers
+        let safety = "Quick safety check: Is this a project you created or one you trust?\n\n/Users/x/work\n\n\u{276f} 1. Yes, I trust this folder\n  2. No, exit\n";
+        assert_eq!(claude.question(safety).as_deref(), Some("Quick safety check: Is this a project you created or one you trust? /Users/x/work"));
+        assert_eq!(claude.question("Quick safety check: Is this a project you created or one you trust?\n\n  No, exit\n\u{276f} Yes, I trust this folder\n").as_deref(), Some("Is this a project you created or one you trust?"));
+        assert_eq!(claude.question("\u{23fa} I asked: Is this a project you created or one you trust?\n"), None);
+        assert_eq!(adapter("shell").question(screen), None);
         assert!(matches!(adapter("antigravity").interrupt(), Interrupt::Key("\x1b")));
         let agy_cmd = command_line(&Launch { profile: "antigravity", task: Some("hi"), ..Default::default() }).unwrap();
         assert!(agy_cmd.starts_with("exec agy ") && agy_cmd.contains("--prompt-interactive 'hi'"));

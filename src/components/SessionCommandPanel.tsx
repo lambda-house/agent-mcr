@@ -115,7 +115,7 @@ export default function SessionCommandPanel({
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.metaKey && !event.ctrlKey && !event.altKey && event.key.toLowerCase() === 's') {
+      if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 's') {
         event.preventDefault();
         onOpenChange(!open);
       }

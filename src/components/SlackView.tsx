@@ -56,6 +56,7 @@ function ChannelPolicy({ channel, status, sessions, busy, onChange }: { channel:
   };
   return <li className="hs-slack-channel">
     <strong>{channel.private ? '🔒 ' : '#'}{channel.name}{!channel.member && <em>the bot is no longer a member</em>}{channel.skipped && <em title="More messages arrived while disconnected than are read back">older messages were skipped</em>}</strong>
+    {channel.routeProblem && <p className="hs-slack-warning" role="status">{channel.routeProblem}. A message that arrives now is kept under Received and delivered to nobody; choose who gets them under Deliver to.</p>}
     <label>Listen
       <select value={channel.listen} disabled={busy || !channel.member} onChange={e => onChange({ listen: e.target.value as SlackChannel['listen'] })}>
         <option value="off">Off</option><option value="mentions">Only when the bot is mentioned</option><option value="all">Every message</option>
@@ -163,7 +164,7 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         <span className="hs-item-text">
           <strong>#{r.channelName} · {r.userName || r.user}{r.held ? <em>not delivered</em> : null}</strong>
           <span className="hs-board-text">{r.text}</span>
-          <small>{formatAge(r.at)}{r.caughtUp ? ' · read back after a gap' : ''} · {r.held ?? `delivered to ${sessionName(r.session)}`}</small>
+          <small>{formatAge(r.at)}{r.caughtUp ? ' · read back after a gap' : ''}{r.cut ? ' · a long text, cut here' : ''} · {r.held ?? `delivered to ${sessionName(r.session)}`}</small>
         </span>
       </div></li>)}</ul>
     </section>
@@ -188,10 +189,16 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         {status.link === 'connected' && !status.eventsSeen && channels.some(ch => ch.member && ch.listen !== 'off') && <p className="hs-slack-warning">
           Connected, but Slack has sent no event yet. If you wrote in a listened channel and nothing shows under Received, the Slack app is not subscribed to events: in the Slack app open Event Subscriptions, turn it on, and under "Subscribe to bot events" add <b>message.channels</b>, <b>message.groups</b>, <b>app_mention</b> and <b>member_joined_channel</b>; Socket Mode must be on. Save, and reinstall the app if Slack asks.
         </p>}
+        {status.storeError && <p className="hs-slack-warning" role="alert">
+          The Slack state could not be saved on this Mac ({status.storeError}). Nothing is sent or delivered until it can be saved; what you decide meanwhile is lost if the harness service restarts.
+        </p>}
+        {status.link !== 'off' && status.catchUpWait && status.catchUpWait.channels.length > 0 && <p className="hs-slack-warning" role="status">
+          Slack asked to wait before it gives the history of {status.catchUpWait.channels.map(n => `#${n}`).join(', ')}. What was written there while disconnected is read back {status.catchUpWait.until > Date.now() ? `at ${new Date(status.catchUpWait.until).toLocaleTimeString()}` : 'shortly'}; until then it may be missing under Received.
+        </p>}
         <label className="hs-slack-toggle"><input type="checkbox" checked={status.enabled} disabled={busy} onChange={e => run(() => slackApi.enable(e.target.checked))}/>
           Slack is on <small>Off: nothing is received, nothing is sent, and posts that wait are cancelled</small></label>
         <label className="hs-slack-toggle"><input type="checkbox" checked={c.approveInSlack} disabled={busy} onChange={e => run(() => slackApi.approval(e.target.checked))}/>
-          Approve in Slack too <small>The bot sends {c.operatorName || c.operator} a direct message with Approve and Deny for every post that waits. Its text is then in that direct message, also when you deny it</small></label>
+          Approve in Slack too <small>Off unless you switch it on: posts are approved here. When on, the bot sends {c.operatorName || c.operator} a direct message with Approve and Deny for every post that waits. Its text is then in that direct message, also when you deny it</small></label>
         <div className="hs-slack-actions">
           <button type="button" disabled={busy} onClick={() => run(slackApi.refresh)} title="Read again which channels the bot is a member of"><RefreshCw size={11}/> Channels</button>
           <button type="button" disabled={busy} onClick={() => run(slackApi.disconnect)}>Disconnect…</button>
