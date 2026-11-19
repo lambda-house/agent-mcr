@@ -39,3 +39,22 @@ impl Vault for Keychain {
     }
     fn delete(&self, _: &str) {}
 }
+
+/// A vault for tests: nothing leaves the process.
+#[cfg(test)]
+#[derive(Default)]
+pub struct Held(pub std::sync::Mutex<std::collections::BTreeMap<String, String>>);
+
+#[cfg(test)]
+impl Vault for Held {
+    fn get(&self, account: &str) -> Option<String> {
+        self.0.lock().unwrap().get(account).cloned()
+    }
+    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+        self.0.lock().unwrap().insert(account.into(), secret.into());
+        Ok(())
+    }
+    fn delete(&self, account: &str) {
+        self.0.lock().unwrap().remove(account);
+    }
+}

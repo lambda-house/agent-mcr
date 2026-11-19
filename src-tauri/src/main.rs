@@ -32,6 +32,8 @@ mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
 mod session_mcp;
+#[cfg(unix)]
+mod memory;
 mod slack;
 mod vault;
 mod session_commands;
