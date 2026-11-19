@@ -889,6 +889,8 @@ pub struct Tracked {
     pub draft: bool,
     /// When the app last said that `draft` changed
     pub typed: u64,
+    /// The operator was told that something waits for this draft (once per draft)
+    pub held_told: bool,
     /// The session it works for (MCR-41): that session has the task tools over it
     pub supervisor: Option<String>,
     /// The session that started it with `executor_create`, and may end it (MCR-46)
@@ -1211,6 +1213,7 @@ impl Store {
         }
         t.attention = None;
         t.draft = false;
+        t.held_told = false;
         if t.state != ENDED {
             t.state = ENDED.into();
             t.since = now_ms();
@@ -1224,6 +1227,31 @@ impl Store {
             }
         }
         true
+    }
+
+    /// Sessions where a message or a task has waited `HELD_TELL_MS` for the
+    /// operator's unsent line and nothing else stands in the way: each gets
+    /// the mark, once per draft. Returns id, label and supervisor of each.
+    fn overdue_holds(&mut self, now: u64) -> Vec<(String, String, Option<String>)> {
+        let old = |at: u64| now.saturating_sub(at) >= HELD_TELL_MS;
+        let waiting: BTreeSet<&str> = self
+            .messages
+            .values()
+            .filter(|m| m.read == 0 && !m.notified && old(m.created))
+            .map(|m| m.to.as_str())
+            .chain(self.tasks.values().filter(|t| t.state == "queued" && old(t.created)).map(|t| t.session.as_str()))
+            .collect();
+        let mut found = Vec::new();
+        for (id, t) in self.sessions.iter_mut().filter(|(id, _)| waiting.contains(id.as_str())) {
+            // Only where the draft is what holds it: a working session takes nothing anyway
+            if !(t.draft && !t.held_told && old(t.typed) && t.state == "idle" && t.attention.is_none()) {
+                continue;
+            }
+            t.held_told = true;
+            t.attention = Some(Attention { kind: "assessment".into(), text: HELD_MARK.into(), since: now, ..Attention::default() });
+            found.push((id.clone(), label(t), t.supervisor.clone()));
+        }
+        found
     }
 
     /// Levels of executors below a session.
@@ -1725,7 +1753,7 @@ impl Store {
             "openTasks": tasks, "unreadMessages": self.unread(id), "waits": waits,
             "lastOpenReport": self.open_report(id).map(|r| json!({"id": r.id, "kind": r.kind, "text": short_text(&r.text, 240), "ageSeconds": age_seconds(now, r.created)})),
             "attention": if attention.is_null() { Value::Null } else { json!({"kind": attention["kind"], "text": short_text(attention["text"].as_str().unwrap_or(""), 240), "ageSeconds": age_seconds(now, attention["since"].as_u64().unwrap_or(0))}) },
-            "needsOperator": !attention.is_null() && attention["kind"] != "notification", "executors": children,
+            "needsOperator": !attention.is_null() && attention["kind"] != "notification", "held": held_info(h, now), "executors": children,
         })
     }
 }
@@ -1791,9 +1819,25 @@ fn waiting_notice(who: &str, id: &str, attention: Option<&Attention>) -> String 
 
 /// How long after the harness typed into a session a prompt counts as its own.
 const INJECTED_PROMPT_MS: u64 = 10_000;
-/// How long after the operator emptied a line without sending it nothing is
-/// typed into that session: they may be starting the line again (MCR-85).
+/// How long after a line of the operator ended (emptied or sent) nothing is
+/// typed into that session: they may be starting it again (MCR-85).
 const DRAFT_QUIET_MS: u64 = 3_000;
+/// How long a message or a task waits for an unsent line before the operator
+/// is told about it. Nothing is typed then either.
+const HELD_TELL_MS: u64 = 60_000;
+/// The mark on a session whose unsent line keeps a message or a task waiting.
+const HELD_MARK: &str = "A message or a task waits for this session, and you have an unsent line in its input box. Nothing is typed into your line: press Enter to send it, or Ctrl+C to empty it, in this terminal";
+/// What a hold is, for the sessions that wait on it.
+const HELD_NOTE: &str = "The operator has an unsent line in this session's input box. No inbox notice or task is typed into it until they press Enter or Ctrl+C in that terminal; only the operator can do that";
+
+/// The hold of a session by the operator's unsent line, for who waits on it
+/// (`overview`, `session_status`, `list_peers`): null when there is none.
+fn held_info(harness: &Value, now: u64) -> Value {
+    if harness["draft"] != true {
+        return Value::Null;
+    }
+    json!({"seconds": age_seconds(now, harness["typed"].as_u64().unwrap_or(0)), "note": HELD_NOTE})
+}
 
 /// The agent moved on, so what it asked on screen is answered. What it
 /// reported itself (`report`) stays until the operator acts on it.
@@ -2835,6 +2879,22 @@ impl Harness {
     /// Waits that ran past their time: first the session's supervisor is
     /// told (or the root Supervisor), then, after as long again, the operator.
     /// A timer in the service, so nothing has to poll.
+    /// Tell the operator, once, that a message or a task has waited a while
+    /// for their unsent line (MCR-85), and the session's supervisor why its
+    /// idle executor takes nothing. Nothing is typed into the session.
+    fn tell_held(&self) {
+        let now = now_ms();
+        if !lock(&self.store).sessions.values().any(|t| t.draft && !t.held_told) {
+            return;
+        }
+        for (id, who, supervisor) in self.update(|s| s.overdue_holds(now)) {
+            notify_user(&format!("Agent MCR: {who} is held by your unsent line"), HELD_MARK);
+            if let Some(supervisor) = supervisor {
+                self.notice(&supervisor, format!("Your executor {who:?} (mcr:{id}) is idle but takes no message or task: {HELD_NOTE}. The operator was told."));
+            }
+        }
+    }
+
     fn escalate_waits(&self) {
         let now = now_ms();
         let due = |w: &Wait| w.cleared == 0 && match w.escalated {
@@ -3048,6 +3108,7 @@ impl Harness {
                             "role": if s["meta"]["role"] == "supervisor" { json!("supervisor") } else { h["role"].clone() },
                             "folder": folder_relation(&mine, s["cwd"].as_str().unwrap_or("")),
                             "needsOperator": !h["attention"].is_null() && h["attention"]["kind"] != "notification",
+                            "held": held_info(h, now_ms()),
                             "supervisor": h["supervisor"],
                             "relation": relation(s["id"].as_str().unwrap_or("")),
                         })
@@ -3759,6 +3820,11 @@ impl Harness {
                             if t.draft != draft {
                                 t.draft = draft;
                                 t.typed = now_ms();
+                                t.held_told = false;
+                                // The mark that said so goes with the line
+                                if !draft && t.attention.as_ref().is_some_and(|a| a.text == HELD_MARK) {
+                                    t.attention = None;
+                                }
                             }
                             if enter {
                                 t.injected = 0;
@@ -3874,6 +3940,7 @@ impl Harness {
         json!({
             "id": session["id"], "name": h["name"], "profile": h["profile"], "cwd": session["cwd"],
             "state": h["state"], "stateSince": h["since"], "stateFromHooks": h["precise"] == true && h["hooked"] == true, "stateNote": Self::state_note(session),
+            "held": held_info(h, now_ms()),
             "attention": h["attention"], "openTasks": session["openTasks"], "agentSession": h["agentSession"],
             "pid": session["pid"], "exit": session["exit"], "title": session["title"], "lastOutput": session["lastOutput"],
             "status": h["status"], "role": h["role"], "unread": session["unread"], "subagents": session["subagents"],
@@ -4209,8 +4276,8 @@ fn reads_screen(untracked: bool, unsure: bool, sees_prompt: bool) -> bool {
 
 /// Whether the harness must keep its hands off a session's input box
 /// (MCR-85): the operator has an unsent line there (`Tracked.draft`, the app's
-/// word), or emptied one without sending it less than `DRAFT_QUIET_MS` ago and
-/// may be starting it again. A notice or a task typed then would be mixed
+/// word), or a line ended less than `DRAFT_QUIET_MS` ago (emptied, and they
+/// may be starting it again; or sent, and the turn is about to start). A notice or a task typed then would be mixed
 /// into the operator's line and submitted with it. There is no time limit on
 /// a draft: typing into the line after all is what this is here to prevent.
 fn held(tracked: &Tracked, now: u64) -> bool {
@@ -4457,6 +4524,7 @@ pub fn serve(dir: &Path) -> Result<(), String> {
             stalls.nudge(&session);
         }
         stalls.tell_assigners();
+        stalls.tell_held();
         stalls.escalate_waits();
     });
 
@@ -6171,6 +6239,49 @@ mod tests {
         // An app of the build before sends no `draft`: its Enter ends a draft and never starts one
         harness.control(&json!({"op": "operator_input", "id": "notice"})).unwrap();
         assert!(!tracked("notice").draft);
+        // Who waits can see the hold, and since when
+        harness.update(|s| {
+            let t = s.sessions.get_mut("notice").unwrap();
+            (t.draft, t.typed) = (true, now_ms() - 90_000);
+        });
+        let info = held_info(&serde_json::to_value(tracked("notice")).unwrap(), now_ms());
+        assert_eq!((info["seconds"].as_u64(), info["note"].as_str()), (Some(90), Some(HELD_NOTE)));
+        assert!(held_info(&serde_json::to_value(tracked("asks")).unwrap(), now_ms())["seconds"].is_number());
+        assert!(held_info(&json!({"draft": false, "typed": 5}), now_ms()).is_null());
+
+        // The operator is told once when something has waited a minute for the line; nothing is typed
+        let told = |now: u64| harness.update(|s| s.overdue_holds(now)).into_iter().map(|(id, _, _)| id).collect::<Vec<_>>();
+        harness.update(|s| s.sessions.get_mut("notice").unwrap().supervisor = Some("asks".into()));
+        let first = lock(&harness.store).messages.values().find(|m| m.to == "notice").unwrap().created;
+        // The message is not a minute old yet
+        assert!(told(first + HELD_TELL_MS - 1).is_empty());
+        let later = now_ms() + HELD_TELL_MS;
+        assert_eq!(told(later), ["notice"]);
+        let mark = tracked("notice").attention.unwrap();
+        assert_eq!((mark.kind.as_str(), mark.text.as_str()), ("assessment", HELD_MARK));
+        assert!(told(later + HELD_TELL_MS).is_empty());
+        // Emptying the line takes the mark back; a new draft may be told again
+        assert_eq!(word("operator_draft", "notice", false), 1);
+        assert!(tracked("notice").attention.is_none() && !tracked("notice").held_told);
+        // Not told: nothing waits ("asks" has a draft and no message), the session works, or it already asks something
+        harness.update(|s| {
+            let t = s.sessions.get_mut("notice").unwrap();
+            (t.draft, t.typed, t.state) = (true, 1, "working".into());
+        });
+        assert!(told(later).is_empty());
+        harness.update(|s| {
+            let t = s.sessions.get_mut("notice").unwrap();
+            t.state = "idle".into();
+            t.attention = Some(Attention { kind: "permission".into(), text: "t".into(), since: 1, ..Attention::default() });
+        });
+        assert!(told(later).is_empty());
+        assert_eq!(tracked("notice").attention.unwrap().kind, "permission");
+        harness.update(|s| s.sessions.get_mut("notice").unwrap().attention = None);
+        assert_eq!(told(later), ["notice"]);
+        // Enter takes the mark back as any other
+        assert_eq!(word("operator_input", "notice", false), 1);
+        assert!(tracked("notice").attention.is_none());
+
         // An ended session has no line
         harness.update(|s| {
             s.sessions.get_mut("task").unwrap().draft = true;
