@@ -9,7 +9,7 @@ import SessionStats from './SessionStats';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou } from './SessionRow';
-import { canRestart, directorySections, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -608,6 +608,17 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         onPointerMove={e => { if (e.currentTarget.hasPointerCapture(e.pointerId)) resizeList(e.clientX, e.currentTarget); }}
         onDoubleClick={() => resizeList(null)}/>
       {error && <div className="hs-error" role="alert">{error}</div>}
+      {status?.storeNotice && (() => {
+        const notice = status.storeNotice;
+        const lines = storeNoticeLines(notice);
+        return (
+          <div className="hs-error hs-store-notice" role="alert">
+            <p>{lines.what}</p>
+            <p>{lines.kept}</p>
+            {!notice.frozen && <button type="button" onClick={() => { void harnessApi.storeNoticeSeen().then(left => { if (mounted.current) setStatus(s => s && { ...s, storeNotice: left }); }).catch(e => setError(String(e))); }}>Dismiss</button>}
+          </div>
+        );
+      })()}
       {pluginRegistry.getSidebarSections().map(section => (
         <div key={section.id} className="hs-plugin-sidebar-section">
           {section.render(controller)}

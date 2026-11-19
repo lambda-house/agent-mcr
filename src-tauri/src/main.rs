@@ -1280,6 +1280,7 @@ fn main() {
             harness_commands::harness_forget,
             harness_commands::harness_restart,
             harness_commands::harness_outside_supervisors,
+            harness_commands::harness_store_notice_seen,
             harness_commands::harness_codex_hooks,
             harness_commands::slack_status,
             harness_commands::slack_connect,
