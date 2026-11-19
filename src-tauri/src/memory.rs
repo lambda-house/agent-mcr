@@ -327,6 +327,9 @@ pub struct Link {
     /// A refresh token is spent by its use, and a spent one ends the grant:
     /// one refresh at a time
     refreshing: Mutex<()>,
+    /// Held while tokens are put into the vault or taken out of it, with the
+    /// look at whether they still should be. Never held across the network
+    keeping: Mutex<()>,
 }
 
 impl Link {
@@ -336,7 +339,7 @@ impl Link {
         if state.state == "connecting" {
             state.state = String::new();
         }
-        Self { dir: dir.to_path_buf(), endpoint: endpoint.to_string(), agent: agent(), vault, state: Mutex::new(state), meta: Mutex::new(None), refreshing: Mutex::new(()) }
+        Self { dir: dir.to_path_buf(), endpoint: endpoint.to_string(), agent: agent(), vault, state: Mutex::new(state), meta: Mutex::new(None), refreshing: Mutex::new(()), keeping: Mutex::new(()) }
     }
 
     fn change(&self, with: impl FnOnce(&mut State)) {
@@ -433,6 +436,13 @@ impl Link {
             eprintln!("memory: the renewed sign-in could not be kept: {e}");
             self.signed_out()
         })
+    }
+
+    /// Tell the authorization server that a refresh token is no longer wanted,
+    /// which ends its grant (RFC 7009). Whether it confirmed.
+    fn revoke(&self, meta: &Meta, client: &str, token: &str) -> bool {
+        let Some(url) = meta.revocation_endpoint.as_ref() else { return false };
+        self.agent.post(url).timeout(FOR_THE_APP).send_form(&[("token", token), ("token_type_hint", "refresh_token"), ("client_id", client)]).is_ok()
     }
 
     /// Keep what the token endpoint answered. The refresh token goes first:
@@ -726,39 +736,53 @@ impl Memory {
         });
         let me = self.clone();
         std::thread::spawn(move || {
+            let link = &me.link;
+            let called_off = || me.flow.load(Ordering::SeqCst) != flow;
             let outcome = me.returned(&listener, flow, &state, &meta.issuer).and_then(|back| {
-                let form = [("grant_type", "authorization_code"), ("code", back.code.as_str()), ("redirect_uri", redirect.as_str()), ("client_id", client.as_str()), ("code_verifier", verifier.as_str()), ("resource", me.link.endpoint.as_str())];
-                let kept = post_form(&me.link.agent, &meta.token_endpoint, &form)
-                    .map_err(|e| e.fail("the authorization server").text())
-                    .and_then(|answer| {
-                        // A sign-in with nothing to renew it would end within the hour, silently
-                        if !answer["refresh_token"].is_string() {
-                            return Err("The authorization server sent no refresh token".to_string());
-                        }
-                        me.link.vault.set("client", &client)?;
-                        me.link.keep_meta(&meta)?;
-                        me.link.keep(&answer).map(|_| ())
-                    });
-                page(back.browser, kept.is_ok());
-                kept
-            });
-            // A later sign-in or a disconnect took over: this one changes nothing
-            if me.flow.load(Ordering::SeqCst) != flow {
-                return;
-            }
-            match outcome {
-                Ok(()) => {
-                    me.backend.reset();
-                    *lock(&me.tools) = None;
-                    me.link.change(|s| {
+                // Called off while the browser was away: the code is not taken anywhere
+                if called_off() {
+                    page(back.browser, false);
+                    return Err("The sign-in was called off".to_string());
+                }
+                let form = [("grant_type", "authorization_code"), ("code", back.code.as_str()), ("redirect_uri", redirect.as_str()), ("client_id", client.as_str()), ("code_verifier", verifier.as_str()), ("resource", link.endpoint.as_str())];
+                let kept = post_form(&link.agent, &meta.token_endpoint, &form).map_err(|e| e.fail("the authorization server").text()).and_then(|answer| {
+                    // A sign-in with nothing to renew it would end within the hour, silently
+                    let Some(refresh) = answer["refresh_token"].as_str() else { return Err("The authorization server sent no refresh token".to_string()) };
+                    // Whether this sign-in still stands is looked at and acted on in one step
+                    // with a disconnect (`keeping`): what arrives for one that was called off
+                    // is never kept, and is revoked
+                    let kept = lock(&link.keeping);
+                    if called_off() {
+                        drop(kept);
+                        link.revoke(&meta, &client, refresh);
+                        return Err("The sign-in was called off".to_string());
+                    }
+                    link.vault.set("client", &client)?;
+                    link.keep_meta(&meta)?;
+                    link.keep(&answer)?;
+                    link.change(|s| {
                         s.state = "connected".into();
                         s.since = now_ms();
                         s.problem = None;
                     });
+                    Ok(())
+                });
+                page(back.browser, kept.is_ok());
+                kept
+            });
+            match outcome {
+                Ok(()) => {
+                    me.backend.reset();
+                    *lock(&me.tools) = None;
                 }
                 Err(text) => {
-                    me.link.forget_tokens();
-                    me.link.change(|s| {
+                    let _kept = lock(&link.keeping);
+                    // A later sign-in or a disconnect took over: this one changes nothing
+                    if called_off() {
+                        return;
+                    }
+                    link.forget_tokens();
+                    link.change(|s| {
                         s.state = String::new();
                         s.access_expires = 0;
                         s.problem = Some(Problem { kind: "sign_in".into(), text, at: now_ms() });
@@ -833,26 +857,36 @@ impl Memory {
     /// End the connection: the grant is revoked at the authorization server
     /// and the tokens leave the Keychain, whatever the server answers.
     pub fn disconnect(&self) -> Value {
-        self.flow.fetch_add(1, Ordering::SeqCst);
         let link = &self.link;
         let _one = lock(&link.refreshing);
-        let mut unrevoked = None;
-        // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
-        if let (Some(url), Some(client), Some(token)) = (link.meta().and_then(|m| m.revocation_endpoint), link.vault.get("client"), link.vault.get("refresh")) {
-            let sent = link.agent.post(&url).timeout(FOR_THE_APP).send_form(&[("token", token.as_str()), ("token_type_hint", "refresh_token"), ("client_id", client.as_str())]);
-            if sent.is_err() {
-                unrevoked = Some(Problem { kind: "not_revoked".into(), text: "The tokens are removed from this Mac, but the memory service did not confirm that the sign-in is revoked there. It may still be valid on that side: revoke it in the memory console.".into(), at: now_ms() });
-            }
-        }
-        link.forget_tokens();
+        // In one step with a sign-in that is about to keep its tokens (`keeping`):
+        // either it kept them and they are taken here, or it sees that it was called off
+        let held = {
+            let _kept = lock(&link.keeping);
+            self.flow.fetch_add(1, Ordering::SeqCst);
+            let held = (link.meta(), link.vault.get("client"), link.vault.get("refresh"));
+            link.forget_tokens();
+            link.change(|s| {
+                s.state = String::new();
+                s.since = 0;
+                s.access_expires = 0;
+                s.problem = None;
+            });
+            held
+        };
         self.backend.reset();
         *lock(&self.tools) = None;
-        link.change(|s| {
-            s.state = String::new();
-            s.since = 0;
-            s.access_expires = 0;
-            s.problem = unrevoked;
-        });
+        // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
+        if let (Some(meta), Some(client), Some(token)) = held {
+            if !link.revoke(&meta, &client, &token) {
+                let unrevoked = Problem { kind: "not_revoked".into(), text: "The tokens are removed from this Mac, but the memory service did not confirm that the sign-in is revoked there. It may still be valid on that side: revoke it in the memory console.".into(), at: now_ms() };
+                link.change(|s| {
+                    if s.state.is_empty() {
+                        s.problem = Some(unrevoked);
+                    }
+                });
+            }
+        }
         self.status()
     }
 
@@ -1056,6 +1090,12 @@ mod tests {
         deaf: bool,
         /// The tool list cannot be had
         list_fails: bool,
+        /// How long the token endpoint takes to answer
+        token_slow: Duration,
+        /// Paths of requests as they came in, before any wait
+        arrived: Vec<String>,
+        /// The MCP side takes requests and does not answer
+        hangs: bool,
     }
 
     impl World {
@@ -1199,6 +1239,18 @@ mod tests {
                     let mut body = vec![0u8; headers.get("content-length").and_then(|l| l.parse().ok()).unwrap_or(0)];
                     reader.read_exact(&mut body).unwrap();
                     let req = Req { method, path: target.split('?').next().unwrap_or("").to_string(), headers, body };
+                    let (slow, hangs) = {
+                        let mut w = lock(&world);
+                        w.arrived.push(req.path.clone());
+                        (w.token_slow, w.hangs)
+                    };
+                    if req.path == "/oauth/token" {
+                        std::thread::sleep(slow);
+                    }
+                    if req.path == "/mcp" && hangs {
+                        std::thread::sleep(Duration::from_secs(4));
+                        return;
+                    }
                     let out = route(&world, &req);
                     let mut stream = stream;
                     let session = out.session.map(|s| format!("Mcp-Session-Id: {s}\r\n")).unwrap_or_default();
@@ -1552,6 +1604,26 @@ mod tests {
         assert!(TcpStream::connect(redirect.strip_prefix("http://").unwrap().split('/').next().unwrap()).is_err());
         assert_eq!(rig.state(), "disconnected");
         assert!(rig.vault.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_disconnect_while_the_code_is_exchanged_leaves_no_grant_behind() {
+        let rig = Arc::new(Rig::new());
+        lock(&rig.world).token_slow = Duration::from_millis(400);
+        let url = rig.memory.connect().unwrap()["url"].as_str().unwrap().to_string();
+        // The browser came back; the token endpoint takes its time
+        let browser = { let rig = rig.clone(); std::thread::spawn(move || rig.browse(&url, |_| {})) };
+        let until = Instant::now() + Duration::from_secs(3);
+        while !lock(&rig.world).arrived.iter().any(|p| p == "/oauth/token") && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        rig.memory.disconnect();
+        assert!(browser.join().unwrap().contains("could not be completed"));
+        // The tokens that arrived for the sign-in that was called off: not kept, and revoked
+        assert_eq!(rig.state(), "disconnected");
+        assert!(rig.vault.0.lock().unwrap().is_empty(), "{:?}", rig.vault.0.lock().unwrap().keys());
+        assert_eq!(lock(&rig.world).revoked, ["refresh-secret-1"]);
+        assert!(lock(&rig.world).refresh.is_empty());
     }
 
     #[test]
