@@ -967,8 +967,8 @@ mod tests {
         assert!(codex.contains(&"mcp_servers.supervisor.command='C:\\Program Files\\Agent MCR\\agent-mcr.exe'".to_string()));
         assert!(codex.contains(&"mcp_servers.supervisor.args=['--supervise']".to_string()));
         // The memory server comes with a Windows launch too
-        assert!(codex.contains(&"mcp_servers.memory.command='C:\\Program Files\\Agent MCR\\agent-mcr.exe'".to_string()));
-        assert!(codex.contains(&"mcp_servers.memory.args=['--memory-mcp']".to_string()));
+        assert!(codex.contains(&"mcp_servers.mcr-memory.command='C:\\Program Files\\Agent MCR\\agent-mcr.exe'".to_string()));
+        assert!(codex.contains(&"mcp_servers.mcr-memory.args=['--memory-mcp']".to_string()));
         assert!(codex.iter().any(|a| a.starts_with("developer_instructions='You run in a terminal hosted by Agent MCR")));
         assert!(!codex.iter().any(|a| a.contains("never in argv")));
         assert!(cmd_line(&codex).is_ok());

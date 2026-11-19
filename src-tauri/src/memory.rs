@@ -1,4 +1,4 @@
-//! The memory server (MCR-49, D16): the `memory` MCP server every hosted
+//! The memory server (MCR-49, D16): the `mcr-memory` MCP server every hosted
 //! session gets next to `mcr`. Slice 1 is a router with one backend, the
 //! remote teob memory, whose tools are passed through unchanged.
 //!
@@ -24,9 +24,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The server's name in the agents' MCP configuration. It says nothing about
-/// the backend, so it stays when a local memory serves the same tools.
-pub const SERVER: &str = "memory";
+/// The server's name in the agents' MCP configuration: Claude's tools are
+/// `mcp__mcr-memory__*`. It names the host and not the backend, so it stays
+/// when a local memory serves the same tools. Not plain `memory` (owner's
+/// decision of 2026-11-19, MCR-80): that is a common name for a person's own
+/// MCP server, which ours would then replace or share its pre-approval with.
+pub const SERVER: &str = "mcr-memory";
 pub const ENDPOINT: &str = "https://mcp.memory.teob.cc/mcp";
 #[cfg(not(test))]
 const KEYCHAIN_SERVICE: &str = "cc.lambdahouse.agent-mcr.memory";
