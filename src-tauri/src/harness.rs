@@ -1841,6 +1841,9 @@ const STATE_FILE: &str = "harness-state.json";
 /// the file aside before it writes its own.
 const STORE_SCHEMA: u32 = 1;
 
+/// How a notice starts its reason when the file could not be opened at all.
+const CANNOT_OPEN: &str = "the file cannot be opened";
+
 /// How many left-out entries a notice names; the rest is a count.
 const NOTICE_ENTRIES: usize = 20;
 
@@ -1866,7 +1869,11 @@ impl StoreNotice {
     /// One line for the log and the notification.
     fn line(&self, file: &Path) -> String {
         let what = if self.kind == "unread" { format!("nothing of {} could be read ({}); the service started with an empty store", file.display(), self.why) } else { format!("{} was read without: {}", file.display(), self.lost.join("; ")) };
-        let kept = if self.frozen { "The file could not be kept aside, so the service writes no state in this run: free the folder and restart the service".to_string() } else { format!("The file as it was found is kept at {}", self.kept) };
+        let kept = if self.frozen {
+            format!("{} is left as it is and the service writes no state in this run: make the file readable and its folder writable, then restart the service", file.display())
+        } else {
+            format!("The file as it was found is kept at {}. To use it again, stop the background processes, put it back as {} (repaired, or with a build that reads it), and start them again: what was stored since is then replaced", self.kept, file.display())
+        };
         format!("{what}. {kept}.")
     }
 }
@@ -2396,7 +2403,10 @@ impl Harness {
         // What was found wrong: whether nothing was taken, what was left out, and why
         let (mut store, found) = match std::fs::read(&file) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Store::default(), None),
-            Err(e) => (Store::default(), Some((true, Vec::new(), format!("the file cannot be read ({:?})", e.kind())))),
+            // Not a damaged file: one this process could not open now (rights,
+            // an I/O error, a lock). It may be whole, so it stays where it is
+            // and nothing is written in this run
+            Err(e) => (Store::default(), Some((true, Vec::new(), format!("{CANNOT_OPEN} ({:?})", e.kind())))),
             Ok(bytes) => match read_store(&bytes) {
                 Ok((store, lost)) if lost.is_empty() => (store, None),
                 Ok((store, lost)) => (store, Some((false, lost, String::new()))),
@@ -2405,10 +2415,10 @@ impl Harness {
         };
         store.schema = STORE_SCHEMA;
         let mut frozen = false;
-        let partial = found.as_ref().is_some_and(|(whole, ..)| !whole);
+        let noticed = found.is_some();
         if let Some((whole, lost, why)) = found {
             // Before anything is written: the next update replaces the file
-            let kept = keep_aside(&file, whole);
+            let kept = if why.starts_with(CANNOT_OPEN) { None } else { keep_aside(&file, whole) };
             frozen = kept.is_none();
             let notice = StoreNotice { at: now_ms(), kind: if whole { "unread" } else { "partial" }.into(), kept: kept.map(|p| p.display().to_string()).unwrap_or_default(), lost, why, frozen };
             eprintln!("harness: {}", notice.line(&file));
@@ -2418,10 +2428,11 @@ impl Harness {
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
         let harness = Self { dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) };
-        if partial {
-            // Once the file is kept, the store goes to disk without the parts
-            // left out, so the next start finds a file it reads whole and
-            // keeps no second copy
+        if noticed {
+            // Once the file is kept, the store goes to disk with the notice
+            // and without the parts left out: the next start finds a file it
+            // reads whole, keeps no second copy, and still says what
+            // happened. `write` does nothing in a run that kept no file
             harness.write(&lock(&harness.store));
         }
         harness
@@ -5219,10 +5230,15 @@ mod tests {
             let aside = kept_aside(&dir);
             assert_eq!(aside.len(), 1, "{damaged:?}");
             assert_eq!(std::fs::read(&aside[0]).unwrap(), damaged);
-            assert!(!dir.join(STATE_FILE).exists(), "the unread file is not left where the next write goes");
             let notice = lock(&h.store).notice.clone().unwrap();
+            // What stands in its place is this run's own store, with the notice: a restart before any update still says it
+            let fresh: Store = serde_json::from_slice(&std::fs::read(dir.join(STATE_FILE)).unwrap()).unwrap();
+            assert_eq!(fresh.notice.as_ref(), Some(&notice));
+            assert_eq!(lock(&Harness::open(&dir).store).notice.as_ref(), Some(&notice));
+            assert_eq!(kept_aside(&dir).len(), 1);
             assert_eq!((notice.kind.as_str(), notice.kept.as_str(), notice.frozen), ("unread", aside[0].to_str().unwrap(), false));
             assert!(!notice.why.is_empty() && !notice.line(&dir.join(STATE_FILE)).contains("SECRET-WORD"), "{notice:?}");
+            assert!(notice.line(&dir.join(STATE_FILE)).contains("put it back as"), "the notice says how the kept file is used again");
             assert!(lock(&h.store).sessions.is_empty());
             // The service goes on and writes its own file; the kept one stays as it was
             h.update(|s| s.outside_supervisors = true);
@@ -5303,6 +5319,35 @@ mod tests {
         state["cockpit"] = Value::Null;
         let dir = state_dir(Some(state.to_string().as_bytes()));
         assert!(lock(&Harness::open(&dir).store).notice.is_none() && kept_aside(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that cannot be opened may be whole: it is not moved, and nothing is written next to it.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_file_that_cannot_be_opened_stays_in_place_and_the_run_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let good = full_state().to_string().into_bytes();
+        let dir = state_dir(Some(&good));
+        let file = dir.join(STATE_FILE);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // As root every file opens; the case cannot be made then
+        if std::fs::read(&file).is_ok() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let h = Harness::open(&dir);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(h.frozen && kept_aside(&dir).is_empty(), "a file that may be good is not moved aside");
+        let notice = lock(&h.store).notice.clone().unwrap();
+        assert!(notice.frozen && notice.kept.is_empty() && notice.why.starts_with(CANNOT_OPEN), "{notice:?}");
+        assert!(notice.line(&file).contains("is left as it is"));
+        h.update(|s| s.outside_supervisors = true);
+        assert_eq!(std::fs::read(&file).unwrap(), good);
+        // Readable again, the next start has all of it and no notice
+        drop(h);
+        let again = Harness::open(&dir);
+        assert!(lock(&again.store).notice.is_none() && lock(&again.store).sessions["b"].supervisor.as_deref() == Some("a"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
