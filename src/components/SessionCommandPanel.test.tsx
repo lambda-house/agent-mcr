@@ -7,6 +7,12 @@ import { harnessApi, type Hosted } from '../utils/harness';
 import type { Session } from '../utils/sessions';
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { list: vi.fn() } }));
+// happy-dom reports the platform of the machine the tests run on; each test names the one it means
+const platform = vi.hoisted(() => ({ current: 'macos' as 'macos' | 'windows' | 'linux' }));
+vi.mock('../utils/platform', async importOriginal => {
+  const actual = await importOriginal<typeof import('../utils/platform')>();
+  return { ...actual, get PLATFORM() { return platform.current; } };
+});
 
 const session = (id: string, title: string, modified: number): Session => ({
   id, provider: 'claude', parentId: null, name: id, cwd: '/Users/me/repo', title, model: 'opus', effort: '', started: '', updated: '', modified,
@@ -22,6 +28,7 @@ const flush = async () => { await act(async () => { await new Promise(resolve =>
 
 beforeEach(() => {
   vi.resetAllMocks();
+  platform.current = 'macos';
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
   vi.mocked(harnessApi.list).mockResolvedValue([hosted]);
@@ -98,5 +105,40 @@ describe('Command panel', () => {
       expect(saveAll.defaultPrevented).toBe(false);
     }
     expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  it('opens on Ctrl+Shift+P off macOS, even in a terminal, and leaves Ctrl+S (Save, shell history search) alone', async () => {
+    platform.current = 'windows';
+    const onOpenChange = vi.fn();
+    await act(async () => root.render(<SessionCommandPanel open={false} onOpenChange={onOpenChange} enabled sessions={[]}
+      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
+    const trigger = host.querySelector('.cmd-trigger-btn')!;
+    expect(trigger.querySelector('kbd')?.textContent).toBe('Ctrl+Shift+P');
+    expect(trigger.getAttribute('aria-keyshortcuts')).toBe('Control+Shift+P');
+    expect(trigger.getAttribute('title')).toContain('Ctrl+Shift+P');
+    expect(host.textContent).not.toContain('⌘');
+
+    const textarea = document.createElement('textarea');
+    host.appendChild(textarea);
+    textarea.focus();
+    for (const init of [{ key: 's', ctrlKey: true }, { key: 'S', ctrlKey: true, shiftKey: true }, { key: 's', metaKey: true }, { key: 'p', ctrlKey: true }]) {
+      const press = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true });
+      await act(async () => { textarea.dispatchEvent(press); });
+      expect(press.defaultPrevented).toBe(false);
+    }
+    expect(onOpenChange).not.toHaveBeenCalled();
+
+    const palette = new KeyboardEvent('keydown', { key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+    await act(async () => { textarea.dispatchEvent(palette); });
+    expect(palette.defaultPrevented).toBe(true);
+    expect(onOpenChange).toHaveBeenCalledWith(true);
+  });
+
+  it('shows Cmd+S on macOS', async () => {
+    await act(async () => root.render(<SessionCommandPanel open={false} onOpenChange={() => {}} enabled sessions={[]}
+      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
+    const trigger = host.querySelector('.cmd-trigger-btn')!;
+    expect(trigger.querySelector('kbd')?.textContent).toBe('⌘S');
+    expect(trigger.getAttribute('aria-keyshortcuts')).toBe('Meta+S');
   });
 });
