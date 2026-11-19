@@ -1,15 +1,16 @@
 import { homePath } from '../utils/paths';
 import { isPaletteKey, paletteShortcut, PLATFORM } from '../utils/platform';
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
+import { Fragment, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
 import { DescList, Kbd, ScrollArea, StatusDot, cx } from '@/ui';
 import { cacheState, compact, contextWindow, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
-import { harnessApi, hostedState, liveSessionLabel, runningFor, STATE_LABEL, type Hosted } from '../utils/harness';
+import { hostedState, liveSessionLabel, runningFor, shortPath, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { TopTabPlugin } from '../plugins/sdk';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
+import { EarlierRow, HostedRow, rowIdle, useHostedByConversation } from './SessionRow';
 import '../styles/harness.css';
 import '../styles/command-panel.css';
 
@@ -37,7 +38,6 @@ interface CommandEntry {
   id: string;
   group: 'Sessions' | 'Navigate' | 'Actions';
   label: string;
-  sub?: string;
   hint?: string;
   provider?: string;
   status?: string;
@@ -92,15 +92,7 @@ export default function SessionCommandPanel({
   topTabs,
 }: SessionCommandPanelProps) {
   // Hosted sessions, asked for each time the panel opens: their names and states win over the index's
-  const [hosted, setHosted] = useState<Hosted[]>([]);
-  useEffect(() => {
-    if (!open) return;
-    let live = true;
-    harnessApi.list().then(list => { if (live) setHosted(list); }).catch(() => { if (live) setHosted([]); });
-    return () => { live = false; };
-  }, [open]);
-  const liveByKey = useMemo(() => new Map(hosted.filter(h => !h.exit && h.harness?.agentSession)
-    .map(h => [`${h.harness?.profile || h.meta.profile}:${h.harness!.agentSession}`, h])), [hosted]);
+  const liveByKey = useHostedByConversation(open);
   const [query, setQuery] = useState('');
   const [quickFilter, setQuickFilter] = useState<QuickFilter>('all');
   const [active, setActive] = useState(0);
@@ -169,19 +161,19 @@ export default function SessionCommandPanel({
         // Running conversations first; the order is otherwise the index's
         .sort((a, b) => Number(liveByKey.has(sessionKey(b))) - Number(liveByKey.has(sessionKey(a))))
         .slice(0, 30);
+      // Under folder headings as in the Live list: a folder stands where its first session stood
+      const place = new Map<string, number>();
+      for (const s of matchingSessions) if (!place.has(s.cwd)) place.set(s.cwd, place.size);
+      matchingSessions.sort((a, b) => place.get(a.cwd)! - place.get(b.cwd)!);
 
       for (const s of matchingSessions) {
         const key = sessionKey(s);
         const live = liveByKey.get(key);
         const title = live ? liveSessionLabel(live, { [s.id]: formatSessionTitle(s) }) : formatSessionTitle(s);
-        const folder = s.cwd ? homePath(s.cwd) : '';
-        const age = s.modified ? formatAge(s.modified) : '';
-        const metaParts = [folder, s.model, age].filter(Boolean);
         next.push({
           id: `session:${key}`,
           group: 'Sessions',
           label: title,
-          sub: metaParts.join(' · '),
           provider: s.provider,
           status: rowStatus(s, live),
           session: s,
@@ -457,9 +449,7 @@ export default function SessionCommandPanel({
                           const index = flat.findIndex((candidate) => candidate.id === item.id);
                           const isActive = activeItem?.id === item.id;
                           const iconNode =
-                            item.kind === 'session' ? (
-                              <AgentMark profile={item.provider || 'shell'} size={17} />
-                            ) : item.id === 'nav:settings' ? (
+                            item.id === 'nav:settings' ? (
                               <Settings size={14} />
                             ) : item.id === 'action:refresh' ? (
                               <RefreshCw size={14} />
@@ -470,45 +460,39 @@ export default function SessionCommandPanel({
                             ) : (
                               <Activity size={14} />
                             );
+                          const session = item.session;
+                          // The folder is a heading over its sessions, as in the Live list, not a part of each row
+                          const heading = session && entry.items[entry.items.indexOf(item) - 1]?.session?.cwd !== session.cwd;
+                          const option = {
+                            id: `${id}-${item.id}`,
+                            'data-index': index,
+                            role: 'option',
+                            'aria-selected': isActive,
+                            onMouseMove: () => setActive(index),
+                            onClick: () => item.onRun(),
+                          };
+                          const enter = <span className="cmd-item__enter" aria-hidden="true"><Kbd>↵</Kbd></span>;
+                          if (session) return (
+                            <Fragment key={item.id}>
+                              {heading && <div className="cmd-dir" title={session.cwd} aria-hidden="true"><span className="hs-dir-path">{session.cwd ? shortPath(homePath(session.cwd)) : 'Unknown folder'}</span></div>}
+                              {/* The row of the Live list: the live one for a conversation that runs now, the earlier one otherwise */}
+                              <div {...option} className={cx('cmd-item cmd-item--session', !item.live && 'hs-resume', item.live && rowIdle(item.live) && 'idle', isActive && 'cmd-item--active')}>
+                                {item.live
+                                  ? <HostedRow hosted={item.live} label={item.label} session={session}/>
+                                  : <EarlierRow agent={session.provider} title={item.label} modified={session.modified}/>}
+                                {enter}
+                              </div>
+                            </Fragment>
+                          );
                           return (
-                            <div
-                              key={item.id}
-                              id={`${id}-${item.id}`}
-                              data-index={index}
-                              role="option"
-                              aria-selected={isActive}
-                              className={cx('cmd-item', isActive && 'cmd-item--active')}
-                              onMouseMove={() => setActive(index)}
-                              onClick={() => item.onRun()}
-                            >
-                              <span
-                                className={cx(
-                                  'cmd-item__icon',
-                                  item.kind === 'session' && 'cmd-item__icon--logo',
-                                  item.kind === 'session' &&
-                                    item.provider === 'codex' &&
-                                    'cmd-item__icon--codex',
-                                )}
-                                aria-hidden="true"
-                              >
-                                {iconNode}
-                              </span>
+                            <div key={item.id} {...option} className={cx('cmd-item', isActive && 'cmd-item--active')}>
+                              <span className="cmd-item__icon" aria-hidden="true">{iconNode}</span>
                               <span className="cmd-item__main">
                                 <span className="cmd-item__label">{item.label}</span>
-                                {item.sub && <span className="cmd-item__sub">{item.sub}</span>}
                               </span>
                               <span className="cmd-item__right">
-                                {item.session && <SessionFigures session={item.session} />}
-                                {item.status && (
-                                  <span className={cx(statusClass(item.status), item.live && 'cmd-status--live')} title={item.live ? 'Running in Live: the harness reports this state' : 'Guessed from the transcript'}>
-                                    {item.live ? <span className={`hs-dot ${item.status}`} aria-hidden="true" /> : item.status === 'working' && <StatusDot tone="success" size="sm" />}
-                                    {item.session ? statusText(item.status, item.live) : item.status}
-                                  </span>
-                                )}
                                 {item.hint && <span className="cmd-item__hint">{item.hint}</span>}
-                                <span className="cmd-item__enter" aria-hidden="true">
-                                  <Kbd>↵</Kbd>
-                                </span>
+                                {enter}
                               </span>
                             </div>
                           );

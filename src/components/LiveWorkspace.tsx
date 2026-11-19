@@ -1,14 +1,15 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Folder, FolderOpen, History, Hourglass, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
+import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import { BackgroundGate } from './Background';
-import SessionMetrics, { cacheClass, useSessionMetrics } from './SessionMetrics';
-import { canRestart, directorySections, executorsBelow, formatUntil, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
+import { EarlierRow, HostedRow, hostedDetail, needsYou } from './SessionRow';
+import { canRestart, directorySections, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -329,7 +330,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
   // Rows keep their place: running ones in the order they were started, ended ones after them.
   // One that needs the person is marked, not moved. The supervisor has its own tile above the list
-  const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
   const sorted = useMemo(() => hosted.filter(h => h.exit || !isSupervisor(h)).sort((a, b) => Number(!!a.exit) - Number(!!b.exit) || a.started - b.started || a.id.localeCompare(b.id)), [hosted]);
 
   const start = async (overrideProfile?: string, overrideCwd?: string, overrideResume?: string) => {
@@ -450,33 +450,18 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     const choices = supervisorChoices(h, candidates);
     const choice = (x: Hosted, withFolder: boolean) => <option key={x.id} value={x.id}>{sessionLabel(x)}{withFolder ? ` · ${shortPath(tildePath(x.cwd, home))}` : ''}</option>;
     const label = sessionLabel(h);
-    const detail = h.exit
-      ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
-      : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', referenced === h.id ? 'reference copied' : ''].filter(Boolean).join(' · ');
+    const detail = hostedDetail(h, referenced === h.id ? 'reference copied' : '');
     const subs = (h.subagents ?? []).filter(a => !a.finished);
     const shells = h.exit ? [] : h.shells ?? [];
-    const summary = sessionSummary(h, Date.now());
     return <li key={h.id} style={depth ? { ['--level' as string]: Math.min(depth, 4) } : undefined} data-depth={depth || undefined}
       className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now()), role, works, depth ? 'hs-nested' : ''].filter(Boolean).join(' ')}>
       <button className="hs-item" onClick={() => select(h.id)}
         draggable={!h.exit} onDragStart={e => { e.dataTransfer.setData(SESSION_DRAG_TYPE, h.id); e.dataTransfer.setData('text/plain', sessionReference(h, titles)); e.dataTransfer.effectAllowed = 'copy'; }}
         title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}${h.exit ? '' : '\nDrag into a terminal to point its agent at this session'}`}>
-        <span className={`hs-dot ${state}`} aria-label={STATE_LABEL[state]}/>
-        <span className="hs-item-text">
-          <strong title={label}>
-            {works && <span className="hs-rel executor" title={`Executor of ${names.get(h.harness?.supervisor ?? '') ?? 'a session'}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
-            <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/> {label}
-            {executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
-          </strong>
-          {elsewhere && <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>}
-          <SessionMetrics hosted={h} data={metrics}/>
-          {detail && <small>{detail}</small>}
-          {needsYou(h) && <small className="hs-needs">{h.harness?.attention?.text}</small>}
-          {!h.exit && (h.waits ?? []).map(w => <small key={w.id} className={`hs-wait${w.overdue ? ' overdue' : ''}`}
-            title={`Registered by the session ${formatAge(w.since)}: ${w.kind}${w.ref ? ` · ${w.ref}` : ''}\n${w.overdue ? `Expected to be over ${formatAge(w.expectBy)}${w.escalated ? `; ${w.escalated === 'operator' ? 'you were' : 'its supervisor was'} told` : ''}` : `Expected to be over ${formatUntil(w.expectBy)}`}`}>
-            <Hourglass size={10}/> waits for {w.on}{w.overdue ? ' · late' : ''}</small>)}
-          {summary && <small className="hs-status" title={summary.full || undefined}>{summary.lead && <span className="hs-lead">{summary.lead}</span>}{summary.text && <span>{summary.text}</span>}</small>}
-        </span>
+        <HostedRow hosted={h} label={label} session={indexedSession(h, metrics)} detail={detail}
+          before={works && <span className="hs-rel executor" title={`Executor of ${names.get(h.harness?.supervisor ?? '') ?? 'a session'}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
+          after={executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
+          under={elsewhere && <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>}/>
       </button>
       <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
       {binding === h.id && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
@@ -664,8 +649,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               {open && <ul aria-label={`Earlier sessions in ${d.path}`}>
                 {d.earlier.slice(0, 12).map(r => <li key={r.id}>
                   <button type="button" className="hs-item hs-resume" disabled={!status || starting} title={`Continue this ${r.agent === 'claude' ? 'Claude' : 'Codex'} session here${maybeOpenElsewhere(r, Date.now()) ? '. It changed minutes ago: close it in its other terminal first' : ''}\n${r.id}`} onClick={() => void start(undefined, r.cwd, r.id)}>
-                    <span className="hs-item-text"><strong><AgentMark profile={r.agent}/> {titles[r.id] || r.title || `${r.agent === 'claude' ? 'Claude' : 'Codex'} session`}</strong></span>
-                    <small>{formatAge(r.modified)}{maybeOpenElsewhere(r, Date.now()) ? ' · open elsewhere?' : ''}</small>
+                    <EarlierRow agent={r.agent} title={titles[r.id] || r.title || `${r.agent === 'claude' ? 'Claude' : 'Codex'} session`} modified={r.modified} note={maybeOpenElsewhere(r, Date.now()) ? ' · open elsewhere?' : ''}/>
                   </button>
                 </li>)}
                 {d.earlier.length > 12 && <li className="hs-earlier-more">{d.earlier.length - 12} older: use search</li>}

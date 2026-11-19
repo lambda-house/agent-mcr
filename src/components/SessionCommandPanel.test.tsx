@@ -24,6 +24,7 @@ const hosted: Hosted = { id: 'h1', pid: 42, argv: ['claude'], cwd: '/Users/me/re
   meta: { label: 'Claude Code', profile: 'claude', name: 'Reviewer' }, harness: { profile: 'claude', state: 'working', agentSession: 'b' } as Hosted['harness'] };
 
 let root: Root; let host: HTMLDivElement;
+const name = (row: Element) => row.querySelector('strong')?.textContent?.trim();
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
 
 beforeEach(() => {
@@ -42,14 +43,43 @@ describe('Command panel', () => {
       directory="" onClearDirectory={() => {}} onSelectSession={onSelectSession} onOpenLive={onOpenLive} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
     await flush();
     const rows = [...document.querySelectorAll('[role="option"]')].filter(r => r.id.includes('session:'));
-    expect(rows.map(r => r.querySelector('.cmd-item__label')?.textContent)).toEqual(['Reviewer', 'Older work']);
-    expect(rows[0].querySelector('.cmd-status--live')?.textContent).toBe('working');
+    expect(rows.map(name)).toEqual(['Reviewer', 'Older work']);
+    expect(rows[0].querySelector('.hs-dot.working')?.getAttribute('aria-label')).toBe('working');
     // The preview keeps the transcript's own title and spells out the context
     expect(document.querySelector('.cmd-preview')?.textContent).toContain('Fix the parser');
     expect(document.querySelector('.cmd-preview')?.textContent).toContain('2 compactions');
     await act(async () => (rows[0] as HTMLElement).click());
     expect(onOpenLive).toHaveBeenCalledWith('h1');
     expect(onSelectSession).not.toHaveBeenCalled();
+  });
+
+  it('draws a found session as the Live list does: its row under the folder, nothing more', async () => {
+    const waiting: Hosted = { ...hosted, openTasks: 2, harness: { profile: 'claude', state: 'waiting', agentSession: 'b', attention: { kind: 'permission', text: 'Run the tests?' } } as Hosted['harness'] };
+    vi.mocked(harnessApi.list).mockResolvedValue([waiting]);
+    const elsewhere = { ...session('c', 'Other folder', 3), cwd: '/Users/me/other' };
+    await act(async () => root.render(<SessionCommandPanel open hideTrigger onOpenChange={() => {}} enabled sessions={[elsewhere, session('a', 'Older work', 2), session('b', 'Fix the parser', 1)]}
+      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
+    await flush();
+    const list = document.querySelector('[role="listbox"]')!;
+    // The running one first, and its folder's other session with it; then the other folder
+    const order = [...list.querySelectorAll('.cmd-dir, [role="option"][id*="session:"]')].map(e => e.matches('.cmd-dir') ? `[${e.textContent}]` : name(e));
+    expect(order).toEqual(['[~/repo]', 'Reviewer', 'Older work', '[~/other]', 'Other folder']);
+    const [live, earlier] = [...list.querySelectorAll('[role="option"]')];
+    // The live row: dot, name, figures, and a line only for what is there
+    expect(live.querySelector('.hs-dot.waiting')).not.toBeNull();
+    expect(live.querySelector('.hs-metrics')).not.toBeNull();
+    expect([...live.querySelectorAll('small')].map(e => e.textContent)).toEqual(['2 tasks', 'Run the tests?']);
+    // The earlier row: mark, title and age
+    expect(earlier.classList.contains('hs-resume')).toBe(true);
+    expect(earlier.querySelector('.hs-dot, .hs-metrics')).toBeNull();
+    expect(earlier.querySelectorAll('small').length).toBe(1);
+    // Neither names the folder, the model or the state in words: those are the heading, the preview and the dot
+    for (const row of [live, earlier]) {
+      expect(row.textContent).not.toContain('repo');
+      expect(row.textContent).not.toContain('opus');
+      expect(row.querySelector('.cmd-status, .cmd-item__sub')).toBeNull();
+    }
+    expect(document.querySelector('.cmd-preview')?.textContent).toContain('opus');
   });
 
   it('uses the same display name as the Live sidebar for supervisor sessions and omits ticket pills', async () => {
@@ -60,7 +90,7 @@ describe('Command panel', () => {
       directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
     await flush();
     const rows = [...document.querySelectorAll('[role="option"]')].filter(r => r.id.includes('session:'));
-    expect(rows.map(r => r.querySelector('.cmd-item__label')?.textContent)).toEqual(['Supervisor']);
+    expect(rows.map(name)).toEqual(['Supervisor']);
     expect(document.querySelector('.cmd-preview__tickets')).toBeNull();
     expect(document.body.textContent).not.toContain('MCR-24');
     expect(document.body.textContent).not.toContain('MEM-12');
