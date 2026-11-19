@@ -86,6 +86,28 @@ export interface HarnessStatus {
   codexHooks?: boolean;
   /** A Codex hook has reported under this program's path: Codex runs them, so the person trusted them. Remembered after the sessions are gone */
   codexHooksReporting?: boolean;
+  /** What the service could not read of its state file at its last start, until the person has seen it */
+  storeNotice?: StoreNotice | null;
+}
+
+/** The service's word about a state file it could not read whole (MCR-99). Part names and ids only, never stored text. */
+export interface StoreNotice {
+  at: number; kind: 'unread' | 'partial';
+  /** Where the file is kept as it was found; empty when it could not be kept */
+  kept: string; lost: string[]; why: string;
+  /** The file could not be kept aside, so the service saves nothing in this run */
+  frozen: boolean;
+}
+
+/** What the Live view says for a notice: what happened, then where the file is. */
+export function storeNoticeLines(n: StoreNotice): { what: string; kept: string } {
+  const what = n.kind === 'unread'
+    ? `The harness service could not read its state file${n.why ? ` (${n.why})` : ''} and started with an empty store: relations, messages, tasks, reports and notes from before are not loaded.`
+    : `The harness service left out what it could not read of its state file: ${n.lost.join('; ')}. The rest is loaded.`;
+  const kept = n.frozen
+    ? 'The file could not be kept aside, so the service saves nothing until it is restarted: free space or rights in its folder first.'
+    : `The file as it was found is kept at ${n.kept}`;
+  return { what, kept };
 }
 
 /** One of the app's two background processes, as found without starting it. */
@@ -334,6 +356,8 @@ export const harnessApi = {
   /** Connect a session to a supervising one (asked in a native dialog; null when the person said no), or detach it */
   bind: (id: string, supervisor: string | null) => invoke<Hosted | null>('harness_bind', { id, supervisor }),
   /** The hosted supervisor session: the running one, or a new one */
+  /** The person has read the notice; resolves to the notice as it is afterwards (one the service still has to say stays) */
+  storeNoticeSeen: () => invoke<StoreNotice | null>('harness_store_notice_seen'),
   /** Asks in a native dialog before turning it on; resolves to the setting as it is now */
   outsideSupervisors: (on: boolean) => invoke<boolean>('harness_outside_supervisors', { on }),
   /** Asks in a native dialog before turning it on; resolves to the setting as it is afterwards */

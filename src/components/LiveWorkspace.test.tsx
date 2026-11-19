@@ -6,7 +6,7 @@ import LiveWorkspace from './LiveWorkspace';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type Hosted } from '../utils/harness';
 import { pickDirectory } from '../utils/tauri';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), storeNoticeSeen: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // Terminals need a real canvas; the pane itself is exercised in the app
@@ -58,6 +58,30 @@ describe('Live workspace', () => {
     expect(host.querySelector('.hs-pane:not([hidden]) .hs-pane-title strong')?.textContent).toBe('Fix authentication retries');
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} titles={{ conversation: 'Repair the cache' }}/>)); await flush();
     expect(host.querySelector('.hs-item strong')?.textContent?.trim()).toBe('Repair the cache');
+  });
+
+  it('says that the service could not read its state file, where the file is kept, and lets the person put that away', async () => {
+    const status = await vi.mocked(harnessApi.status)();
+    const notice = { at: 1, kind: 'partial' as const, kept: '/cfg/harness-state.unread-20261119-220000.json', lost: ['tasks: t2', 'notes: all of it'], why: '', frozen: false };
+    vi.mocked(harnessApi.status).mockResolvedValue({ ...status, storeNotice: notice });
+    vi.mocked(harnessApi.storeNoticeSeen).mockResolvedValue(null);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const alert = host.querySelector('.hs-store-notice')!;
+    expect(alert.textContent).toContain('tasks: t2; notes: all of it');
+    expect(alert.textContent).toContain('/cfg/harness-state.unread-20261119-220000.json');
+    await act(async () => (alert.querySelector('button') as HTMLButtonElement).click()); await flush();
+    expect(harnessApi.storeNoticeSeen).toHaveBeenCalledTimes(1);
+    expect(host.querySelector('.hs-store-notice')).toBeNull();
+  });
+
+  it('keeps saying that the service saves nothing while it could not keep the unread file', async () => {
+    const status = await vi.mocked(harnessApi.status)();
+    vi.mocked(harnessApi.status).mockResolvedValue({ ...status, storeNotice: { at: 1, kind: 'unread', kept: '', lost: [], why: 'Syntax error at line 1 column 3', frozen: true } });
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const alert = host.querySelector('.hs-store-notice')!;
+    expect(alert.textContent).toContain('started with an empty store');
+    expect(alert.textContent).toContain('saves nothing');
+    expect(alert.querySelector('button')).toBeNull();
   });
 
   it('keeps the app visible when a legacy service returns no launch profiles', async () => {

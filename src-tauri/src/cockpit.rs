@@ -240,6 +240,12 @@ pub struct Facts {
 /// document it cannot read at all, or one of a later schema, is an empty
 /// cockpit. Never an error: an error here would fail the load of the whole
 /// store, and the service would start with no relations, messages or reports.
+/// Whether `load` takes a stored document as it is. The store asks, so that
+/// a document it drops is kept aside with the file first (MCR-99).
+pub fn readable(stored: &Value) -> bool {
+    Cockpit::deserialize(stored).is_ok_and(|c| c.schema <= SCHEMA)
+}
+
 pub fn load(stored: Value) -> Cockpit {
     match serde_json::from_value::<Cockpit>(stored) {
         Ok(cockpit) if cockpit.schema <= SCHEMA => cockpit,

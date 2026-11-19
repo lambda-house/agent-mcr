@@ -222,7 +222,7 @@ pub async fn harness_status() -> Result<Value, String> {
         let settings = service(json!({"op": "settings"}))?;
         // The service can outlive an app update and return an older settings shape.
         let preferences = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
-        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"] }))
+        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"], "storeNotice": settings["storeNotice"] }))
     })
     .await
 }
@@ -396,6 +396,13 @@ pub async fn harness_codex_hooks(app: tauri::AppHandle, on: bool) -> Result<bool
 
 /// Let agents outside the harness use the supervisor tools, or stop that.
 /// Turning it on is confirmed in a native dialog, never by the page alone.
+/// The person has read what the service left out of its state file (MCR-99).
+/// Answers the notice as it is afterwards: one the service still has to say stays.
+#[tauri::command]
+pub async fn harness_store_notice_seen() -> Result<Value, String> {
+    blocking(|| service(json!({"op": "settings", "storeNoticeSeen": true})).map(|s| s["storeNotice"].clone())).await
+}
+
 #[tauri::command]
 pub async fn harness_outside_supervisors(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
     use tauri::Manager;

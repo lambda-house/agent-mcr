@@ -131,6 +131,8 @@
 
 .hs-section-label { font-size: 12px; font-weight: 500; color: var(--text-faint); padding: 4px 8px 0; letter-spacing: 0.01em; }
 .hs-error { margin: 4px 0; padding: 7px 9px; border: 1px solid var(--danger-line); border-radius: 8px; background: var(--danger-soft); color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
+.hs-store-notice p { margin: 0 0 4px; }
+.hs-store-notice button { height: 22px; padding: 0 8px; border: 1px solid var(--danger-line); border-radius: 6px; background: transparent; color: inherit; font-size: 11px; }
 .hs-list ul { list-style: none; margin: 0; padding: 2px 0; overflow-x: hidden; overflow-y: auto; flex: 1; min-width: 0; scrollbar-width: none; }
 .hs-list ul::-webkit-scrollbar { display: none; }
 .hs-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; border-radius: 8px; min-width: 0; max-width: 100%; transition: background .12s ease; }
