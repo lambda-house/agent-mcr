@@ -884,6 +884,11 @@ pub struct Tracked {
     pub injected: u64,
     /// When its last turn ended
     pub turn_ended: u64,
+    /// The operator has a line in its input box that is not sent yet, by the
+    /// app's word (`operator_draft`, MCR-85): nothing is typed into it meanwhile
+    pub draft: bool,
+    /// When the app last said that `draft` changed
+    pub typed: u64,
     /// The session it works for (MCR-41): that session has the task tools over it
     pub supervisor: Option<String>,
     /// The session that started it with `executor_create`, and may end it (MCR-46)
@@ -1205,6 +1210,7 @@ impl Store {
             return false;
         }
         t.attention = None;
+        t.draft = false;
         if t.state != ENDED {
             t.state = ENDED.into();
             t.since = now_ms();
@@ -1785,6 +1791,9 @@ fn waiting_notice(who: &str, id: &str, attention: Option<&Attention>) -> String 
 
 /// How long after the harness typed into a session a prompt counts as its own.
 const INJECTED_PROMPT_MS: u64 = 10_000;
+/// How long after the operator emptied a line without sending it nothing is
+/// typed into that session: they may be starting the line again (MCR-85).
+const DRAFT_QUIET_MS: u64 = 3_000;
 
 /// The agent moved on, so what it asked on screen is answered. What it
 /// reported itself (`report`) stays until the operator acts on it.
@@ -2663,6 +2672,10 @@ impl Harness {
             (queued, store.sessions.get(session).is_some_and(|t| adapter(&t.profile).detects_prompt() && t.state == "unknown"))
         };
         let Some(queued) = queued else { return };
+        // The operator is writing there: the task stays queued, the timer comes back
+        if lock(&self.store).sessions.get(session).is_some_and(|t| held(t, now_ms())) {
+            return;
+        }
         let at_prompt = unsure && self.at_prompt(session);
         let Some(task) = self.update(|s| s.next(session, at_prompt)) else {
             if unsure && !at_prompt && now_ms().saturating_sub(queued) > 15_000 {
@@ -2709,6 +2722,11 @@ impl Harness {
                 return;
             }
             let Some(t) = store.sessions.get(session) else { return };
+            // Into a line the operator is writing the notice would be sent with
+            // it (MCR-85): the message stays not notified, the timer comes back
+            if held(t, now_ms()) {
+                return;
+            }
             // An agent without state tracking (no turn-end hooks) is only seen
             // through its screen; a shell has no input box (`at_prompt` is false)
             let agent = adapter(&t.profile);
@@ -2719,7 +2737,7 @@ impl Harness {
         let at_prompt = reads_screen(untracked, unsure, sees) && self.at_prompt(session);
         let from = self.update(|s| {
             let t = s.sessions.get(session)?;
-            if !notice_ready(untracked, unsure, at_prompt, &t.state) {
+            if !notice_ready(untracked, unsure, at_prompt, &t.state) || held(t, now_ms()) {
                 return None;
             }
             let mut from: Vec<String> = Vec::new();
@@ -3719,16 +3737,34 @@ impl Harness {
                 let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
                 Ok(json!({"profiles": profiles(), "enabledProfiles": prefs.enabled_profiles, "supervisorProfile": prefs.supervisor_profile}))
             }
-            "operator_input" => {
+            // The operator pressed Enter in a terminal (`operator_input`) or
+            // started or emptied a line there without sending it
+            // (`operator_draft`, MCR-85). `draft` is whether the input box may
+            // hold unsent text now; an app of the build before sends none
+            "operator_input" | "operator_draft" => {
                 let id = id()?;
+                let enter = req["op"] == "operator_input";
+                // A key pressed while the session asks something answers the
+                // question (often without Enter) and starts no line. The app
+                // cannot know that; it says so again when the person types on
+                let asks = |t: &Tracked| t.attention.as_ref().is_some_and(|a| a.kind == "permission");
+                let draft = req["draft"].as_bool().unwrap_or(false) && !lock(&self.store).sessions.get(id).is_some_and(|t| !t.draft && asks(t));
                 // Sent at every Enter in a terminal, and most change nothing: the store is written only for one that does
-                let changes = lock(&self.store).sessions.get(id).is_some_and(|t| t.injected != 0 || t.attention.as_ref().is_some_and(|a| a.kind != "permission"));
+                let changes = lock(&self.store).sessions.get(id).is_some_and(|t| {
+                    t.state != ENDED && (t.draft != draft || (enter && (t.injected != 0 || t.attention.as_ref().is_some_and(|a| a.kind != "permission"))))
+                });
                 if changes {
                     self.update(|s| {
                         if let Some(t) = s.sessions.get_mut(id) {
-                            t.injected = 0;
-                            if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
-                                t.attention = None;
+                            if t.draft != draft {
+                                t.draft = draft;
+                                t.typed = now_ms();
+                            }
+                            if enter {
+                                t.injected = 0;
+                                if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
+                                    t.attention = None;
+                                }
                             }
                         }
                     });
@@ -4169,6 +4205,16 @@ impl slack::Host for Harness {
 /// screen is what tells (`notice_ready`) and the adapter knows the input box.
 fn reads_screen(untracked: bool, unsure: bool, sees_prompt: bool) -> bool {
     (untracked || unsure) && sees_prompt
+}
+
+/// Whether the harness must keep its hands off a session's input box
+/// (MCR-85): the operator has an unsent line there (`Tracked.draft`, the app's
+/// word), or emptied one without sending it less than `DRAFT_QUIET_MS` ago and
+/// may be starting it again. A notice or a task typed then would be mixed
+/// into the operator's line and submitted with it. There is no time limit on
+/// a draft: typing into the line after all is what this is here to prevent.
+fn held(tracked: &Tracked, now: u64) -> bool {
+    tracked.draft || now.saturating_sub(tracked.typed) < DRAFT_QUIET_MS
 }
 
 fn notice_ready(untracked: bool, unsure: bool, at_prompt: bool, state: &str) -> bool {
@@ -6024,6 +6070,114 @@ mod tests {
         assert_eq!(lock(&harness.store).sessions["typed"].injected, 0);
         assert_eq!((enter("reported"), enter("reported")), (1, 0));
         assert!(lock(&harness.store).sessions["reported"].attention.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_typed_into_a_session_while_the_operator_has_an_unsent_line() {
+        // The pure part: an unsent line holds without a time limit, an emptied one for the quiet time
+        let now = 10_000_000;
+        let at = |draft: bool, typed: u64| Tracked { draft, typed, ..Tracked::default() };
+        assert!(!held(&Tracked::default(), now));
+        assert!(held(&at(true, 0), now));
+        assert!(held(&at(true, now - 3_600_000), now));
+        assert!(held(&at(false, now - DRAFT_QUIET_MS + 1), now));
+        assert!(!held(&at(false, now - DRAFT_QUIET_MS), now));
+
+        // Through the service: no runner here, so a delivery that is tried
+        // fails, and that is how the test tells a try from a hold
+        let dir = std::env::temp_dir().join(format!("agent-mcr-draft-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let task = |id: &str, session: &str| Task {
+            id: id.into(),
+            session: session.into(),
+            text: "do it".into(),
+            state: "queued".into(),
+            created: now_ms(),
+            started: 0,
+            finished: 0,
+            result: None,
+            by: String::new(),
+            told: false,
+        };
+        harness.update(|s| {
+            for id in ["notice", "task"] {
+                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "idle".into(), ..Tracked::default() });
+            }
+            s.post(Message { to: "notice".into(), text: "hello".into(), ..Message::default() });
+            s.tasks.insert("t1".into(), task("t1", "task"));
+        });
+        let word = |op: &str, id: &str, draft: bool| {
+            let before = lock(&harness.store).version;
+            harness.control(&json!({"op": op, "id": id, "draft": draft})).unwrap();
+            lock(&harness.store).version - before
+        };
+        let tracked = |id: &str| lock(&harness.store).sessions[id].clone();
+        let notified = || lock(&harness.store).messages.values().any(|m| m.notified);
+        let task_state = || lock(&harness.store).tasks["t1"].state.clone();
+
+        // The first key of a line: written once, and a repeat changes nothing
+        assert_eq!((word("operator_draft", "notice", true), word("operator_draft", "notice", true)), (1, 0));
+        assert_eq!(word("operator_draft", "task", true), 1);
+        assert_eq!(word("operator_draft", "nobody", true), 0);
+        // A draft is not an Enter: a report mark stays
+        harness.update(|s| s.sessions.get_mut("notice").unwrap().attention = Some(Attention { kind: "assessment".into(), text: "t".into(), since: 1, ..Attention::default() }));
+        assert_eq!(word("operator_draft", "notice", true), 0);
+        assert!(tracked("notice").attention.is_some());
+        harness.update(|s| s.sessions.get_mut("notice").unwrap().attention = None);
+
+        // Held: the message is not marked notified, nothing was typed, the session stays idle; the task stays queued
+        harness.nudge("notice");
+        harness.pump("task");
+        assert!(!notified());
+        assert_eq!((tracked("notice").injected, tracked("notice").state.as_str()), (0, "idle"));
+        assert_eq!((task_state().as_str(), tracked("task").injected), ("queued", 0));
+
+        // The line was emptied without sending it: still held for the quiet time
+        assert_eq!(word("operator_draft", "notice", false), 1);
+        assert!(!tracked("notice").draft && tracked("notice").typed > 0);
+        harness.nudge("notice");
+        assert_eq!(tracked("notice").injected, 0);
+        // After the quiet time the notice is typed (here: tried, and taken back when the runner is not there)
+        harness.update(|s| s.sessions.get_mut("notice").unwrap().typed = now_ms() - DRAFT_QUIET_MS);
+        harness.nudge("notice");
+        assert!(tracked("notice").injected > 0);
+        assert_eq!((notified(), tracked("notice").state.as_str()), (false, "idle"));
+
+        // Enter sends the line: the draft is over with the same word, and the task is tried
+        assert_eq!(word("operator_input", "task", false), 1);
+        assert!(!tracked("task").draft);
+        harness.update(|s| s.sessions.get_mut("task").unwrap().typed = now_ms() - DRAFT_QUIET_MS);
+        harness.pump("task");
+        assert_eq!(task_state(), "failed");
+
+        // A key that answers a question starts no line; the next word, after the answer, does
+        harness.update(|s| {
+            let asking = Tracked { profile: "claude".into(), state: "waiting".into(), attention: Some(Attention { kind: "permission".into(), text: "t".into(), since: 1, ..Attention::default() }), ..Tracked::default() };
+            s.sessions.insert("asks".into(), asking);
+        });
+        assert_eq!(word("operator_draft", "asks", true), 0);
+        assert!(!tracked("asks").draft);
+        harness.update(|s| s.sessions.get_mut("asks").unwrap().attention = None);
+        assert_eq!(word("operator_draft", "asks", true), 1);
+        // A line begun before the question stays one
+        harness.update(|s| s.sessions.get_mut("asks").unwrap().attention = Some(Attention { kind: "permission".into(), text: "t".into(), since: 1, ..Attention::default() }));
+        assert_eq!(word("operator_draft", "asks", true), 0);
+        assert!(tracked("asks").draft);
+
+        // An Enter told late, when the next line is already begun, keeps the hold
+        assert_eq!(word("operator_input", "notice", true), 1);
+        assert!(tracked("notice").draft);
+        // An app of the build before sends no `draft`: its Enter ends a draft and never starts one
+        harness.control(&json!({"op": "operator_input", "id": "notice"})).unwrap();
+        assert!(!tracked("notice").draft);
+        // An ended session has no line
+        harness.update(|s| {
+            s.sessions.get_mut("task").unwrap().draft = true;
+            s.end("task");
+        });
+        assert!(!tracked("task").draft);
+        assert_eq!(word("operator_draft", "task", true), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

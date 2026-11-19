@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gist, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { gist, heldNote, hostedLabel, hostedState, pastedImage, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -187,5 +187,18 @@ describe('choosing a supervisor', () => {
     expect(supervisorChoices(me, [session('a', '/other', 'A')])).toEqual({ here: [], elsewhere: [expect.objectContaining({ id: 'a' })] });
     expect(supervisorChoices(me, [session('a', '/w', 'A')]).elsewhere).toEqual([]);
     expect(supervisorChoices(me, [])).toEqual({ here: [], elsewhere: [] });
+  });
+});
+
+describe('heldNote', () => {
+  const session = (draft: boolean, over: Partial<Hosted> = {}) => hosted({ harness: { name: '', profile: 'claude', state: 'idle', draft } as Hosted['harness'], ...over });
+  it('says that messages or tasks wait for the unsent line, and nothing otherwise', () => {
+    expect(heldNote(session(true, { unread: 1 }))).toBe('held: you have an unsent line here');
+    expect(heldNote(session(true, { openTasks: 2 }))).toBe('held: you have an unsent line here');
+    // Nothing waits, no draft, or the session has ended
+    expect(heldNote(session(true))).toBe('');
+    expect(heldNote(session(false, { unread: 1 }))).toBe('');
+    expect(heldNote(session(true, { unread: 1, exit: { code: 0, signal: null, at: 1 } }))).toBe('');
+    expect(heldNote(hosted({ unread: 1 }))).toBe('');
   });
 });
