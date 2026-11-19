@@ -37,6 +37,9 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const SIGN_IN_LIMIT: Duration = Duration::from_secs(300);
 const TOOLS_FRESH: Duration = Duration::from_secs(60);
 const QUICK: Duration = Duration::from_secs(15);
+/// What the app waits for is answered inside the control client's ten
+/// seconds: starting a sign-in (discovery and registration) and a disconnect.
+const FOR_THE_APP: Duration = Duration::from_secs(7);
 /// How long a session's `initialize` waits for the memory service. An agent
 /// shows a server that starts slowly as failed, so this stays short.
 const AT_START: Duration = Duration::from_secs(4);
@@ -220,8 +223,13 @@ fn json_of(response: ureq::Response) -> Result<Value, Http> {
     serde_json::from_slice(&body(response)?).map_err(|_| Http::Transport("the answer is not JSON".into()))
 }
 
-fn get_json(agent: &ureq::Agent, url: &str) -> Result<Value, Http> {
-    json_of(agent.get(url).timeout(QUICK).set("Accept", "application/json").call()?)
+fn get_json(agent: &ureq::Agent, url: &str, wait: Duration) -> Result<Value, Http> {
+    json_of(agent.get(url).timeout(wait).set("Accept", "application/json").call()?)
+}
+
+/// What is left of a time budget, never nothing: a request with no time fails at once.
+fn left(until: Instant) -> Duration {
+    until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))
 }
 
 fn post_form(agent: &ureq::Agent, url: &str, form: &[(&str, &str)]) -> Result<Value, Http> {
@@ -242,11 +250,11 @@ pub struct Meta {
 }
 
 /// RFC 9728 (the resource names its authorization server), then RFC 8414.
-fn discover(agent: &ureq::Agent, endpoint: &str) -> Result<Meta, Fail> {
+fn discover(agent: &ureq::Agent, endpoint: &str, until: Instant) -> Result<Meta, Fail> {
     let refused = |text: &str| Fail::Refused(text.to_string());
     let (origin, path) = split(endpoint).filter(|_| allowed(endpoint)).ok_or_else(|| refused("the memory address is not an https address"))?;
-    let resource = get_json(agent, &format!("{origin}/.well-known/oauth-protected-resource{path}"))
-        .or_else(|_| get_json(agent, &format!("{origin}/.well-known/oauth-protected-resource")))
+    let resource = get_json(agent, &format!("{origin}/.well-known/oauth-protected-resource{path}"), left(until))
+        .or_else(|_| get_json(agent, &format!("{origin}/.well-known/oauth-protected-resource"), left(until)))
         .map_err(|e| e.fail("the memory service's description"))?;
     if resource["resource"] != endpoint {
         return Err(refused("the memory service describes another resource than the one asked"));
@@ -254,7 +262,7 @@ fn discover(agent: &ureq::Agent, endpoint: &str) -> Result<Meta, Fail> {
     let issuer = resource["authorization_servers"][0].as_str().ok_or_else(|| refused("the memory service names no authorization server"))?;
     let (issuer_origin, issuer_path) = split(issuer).filter(|_| allowed(issuer)).ok_or_else(|| refused("the authorization server is not an https address"))?;
     let issuer_path = issuer_path.trim_end_matches('/');
-    let found = get_json(agent, &format!("{issuer_origin}/.well-known/oauth-authorization-server{issuer_path}")).map_err(|e| e.fail("the authorization server's description"))?;
+    let found = get_json(agent, &format!("{issuer_origin}/.well-known/oauth-authorization-server{issuer_path}"), left(until)).map_err(|e| e.fail("the authorization server's description"))?;
     if found["issuer"] != issuer {
         return Err(refused("the authorization server describes another issuer than the one the memory service names"));
     }
@@ -644,7 +652,8 @@ impl Memory {
         }
         let flow = self.flow.fetch_add(1, Ordering::SeqCst) + 1;
         let link = &self.link;
-        let meta = discover(&link.agent, &link.endpoint).map_err(|e| e.text())?;
+        let until = Instant::now() + FOR_THE_APP;
+        let meta = discover(&link.agent, &link.endpoint, until).map_err(|e| e.text())?;
         let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("No local address for the sign-in's answer: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let redirect = format!("http://127.0.0.1:{port}/callback");
@@ -652,7 +661,7 @@ impl Memory {
         let registered = link
             .agent
             .post(&meta.registration_endpoint)
-            .timeout(QUICK)
+            .timeout(left(until))
             .send_json(json!({
                 "client_name": "Agent MCR",
                 "redirect_uris": [redirect],
@@ -749,8 +758,16 @@ impl Memory {
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let mut line = String::new();
-            if BufReader::new(&stream).take(16 * 1024).read_line(&mut line).is_err() {
-                continue;
+            {
+                // The whole request is read: closing on unread bytes can cost the browser its answer
+                let mut request = BufReader::new(&stream).take(16 * 1024);
+                if request.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut header = String::new();
+                while request.read_line(&mut header).is_ok_and(|n| n > 0) && !header.trim().is_empty() {
+                    header.clear();
+                }
             }
             let target = line.split_whitespace().nth(1).unwrap_or("");
             let (path, params) = target.split_once('?').unwrap_or((target, ""));
@@ -786,16 +803,12 @@ impl Memory {
         let link = &self.link;
         let _one = lock(&link.refreshing);
         let state = link.snapshot();
-        let client = link.vault.get("client");
-        let mut left = None;
-        if let (Some(url), Some(client)) = (state.meta.as_ref().and_then(|m| m.revocation_endpoint.as_ref()), client.as_ref()) {
-            for (account, hint) in [("refresh", "refresh_token"), ("access", "access_token")] {
-                let Some(token) = link.vault.get(account) else { continue };
-                // RFC 7009: the answer has no body worth reading
-                let sent = link.agent.post(url).timeout(QUICK).send_form(&[("token", token.as_str()), ("token_type_hint", hint), ("client_id", client.as_str())]);
-                if sent.is_err() && account == "refresh" {
-                    left = Some(Problem { kind: "not_revoked".into(), text: "The tokens are removed from this Mac, but the memory service did not confirm that the sign-in is revoked there. It ends by itself when it is not renewed; you can also revoke it in the memory console.".into(), at: now_ms() });
-                }
+        let mut unrevoked = None;
+        // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
+        if let (Some(url), Some(client), Some(token)) = (state.meta.as_ref().and_then(|m| m.revocation_endpoint.as_ref()), link.vault.get("client"), link.vault.get("refresh")) {
+            let sent = link.agent.post(url).timeout(FOR_THE_APP).send_form(&[("token", token.as_str()), ("token_type_hint", "refresh_token"), ("client_id", client.as_str())]);
+            if sent.is_err() {
+                unrevoked = Some(Problem { kind: "not_revoked".into(), text: "The tokens are removed from this Mac, but the memory service did not confirm that the sign-in is revoked there. It may still be valid on that side: revoke it in the memory console.".into(), at: now_ms() });
             }
         }
         link.forget_tokens();
@@ -805,7 +818,7 @@ impl Memory {
             s.state = String::new();
             s.since = 0;
             s.access_expires = 0;
-            s.problem = left;
+            s.problem = unrevoked;
         });
         self.status()
     }
@@ -1451,7 +1464,7 @@ mod tests {
         let rig = Rig::signed_in();
         rig.ask("tools/list", json!({}));
         assert_eq!(rig.memory.disconnect()["state"], "disconnected");
-        assert_eq!(lock(&rig.world).revoked, ["refresh-secret-1", "access-secret-1"]);
+        assert_eq!(lock(&rig.world).revoked, ["refresh-secret-1"]);
         assert!(rig.vault.0.lock().unwrap().is_empty());
         assert!(rig.memory.status()["problem"].is_null());
         assert_eq!(rig.ask("tools/list", json!({}))["result"]["tools"], json!([]));
