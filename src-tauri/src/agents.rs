@@ -221,7 +221,7 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
         (docs_hits, "Docs"),
         (data_hits, "Data"),
     ];
-    scope_counts.sort_by(|a, b| b.0.cmp(&a.0));
+    scope_counts.sort_by_key(|c| std::cmp::Reverse(c.0));
     let tags = scope_counts
         .into_iter()
         .filter(|(c, _)| *c > 0)
@@ -303,6 +303,18 @@ pub trait Adapter: Sync {
     /// The input box is on screen (the markers depend on the agent's version).
     /// False when unsure: text typed into a menu would answer it
     fn at_prompt(&self, _screen: &str) -> bool {
+        false
+    }
+    /// Whether `at_prompt` knows this program's input box at all. Where it
+    /// doesn't, the answer is always no and the screen is not read to ask
+    fn sees_prompt(&self) -> bool {
+        false
+    }
+    /// Launched as Supervisor so that `terminal_write` is the one tool left to
+    /// its own permission prompt: the operator approves each call (Claude:
+    /// `claude_settings` pre-approves every other supervisor tool). Only such
+    /// a Supervisor is listed that tool and may call it
+    fn asks_before_terminal_write(&self) -> bool {
         false
     }
     /// Whether the terminal title says that the agent waits for the operator's
@@ -405,6 +417,9 @@ impl Adapter for Claude {
     fn names_conversation(&self) -> bool {
         true
     }
+    fn asks_before_terminal_write(&self) -> bool {
+        true
+    }
     fn reports_from_start(&self) -> bool {
         true
     }
@@ -491,6 +506,9 @@ impl Adapter for Codex {
     }
     fn at_prompt(&self, screen: &str) -> bool {
         screen.contains("for shortcuts") && screen.lines().any(|l| l.starts_with('\u{203a}'))
+    }
+    fn sees_prompt(&self) -> bool {
+        true
     }
     /// Codex sets "[ ! ] Action Required" as the title while it waits for an answer
     /// (after a glyph that blinks, before the folder). Nothing else: a

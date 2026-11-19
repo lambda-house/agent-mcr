@@ -26,6 +26,52 @@ const MAX_PASTED_IMAGE: usize = 30 * 1024 * 1024;
 pub struct HarnessState {
     views: Mutex<BTreeMap<u64, (UnixStream, String)>>,
     next_view: AtomicU64,
+    told: Told,
+}
+
+/// The word to the service that the person pressed Enter in a session, kept
+/// off the command that wrote the key: one worker thread makes the calls, and
+/// a session that already waits to be told is not queued twice. A session is
+/// taken off the waiting list before its call starts, so an Enter during the
+/// call is told again. The worker ends when the state is dropped.
+#[derive(Default)]
+struct Told {
+    queue: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    waiting: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
+}
+
+impl Told {
+    /// Never blocks on `call`, which runs on the worker (and is used only by the first one started).
+    fn tell(&self, id: String, call: impl Fn(&str) + Send + 'static) {
+        let Ok(mut queue) = self.queue.lock() else { return };
+        let Ok(mut waiting) = self.waiting.lock() else { return };
+        if !waiting.insert(id.clone()) {
+            return;
+        }
+        let id = match queue.as_ref().map(|tx| tx.send(id.clone())) {
+            Some(Ok(())) => return,
+            // The worker is gone, and what it had queued with it
+            Some(Err(unsent)) => {
+                waiting.clear();
+                waiting.insert(id);
+                unsent.0
+            }
+            None => id,
+        };
+        drop(waiting);
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let _ = tx.send(id);
+        *queue = Some(tx);
+        let waiting = self.waiting.clone();
+        std::thread::spawn(move || {
+            for id in rx {
+                if let Ok(mut waiting) = waiting.lock() {
+                    waiting.remove(&id);
+                }
+                call(&id);
+            }
+        });
+    }
 }
 
 fn socket() -> Result<PathBuf, String> {
@@ -596,7 +642,9 @@ pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -
         let id = id.clone();
         drop(views);
         // Only the attached human view submits here; harness injections use runner write.
-        service(json!({"op": "operator_input", "id": id}))?;
+        // The key is written: a service that is slow or away must not hold the
+        // terminal or show as its error
+        state.told.tell(id, |id| drop(service(json!({"op": "operator_input", "id": id}))));
     }
     Ok(())
 }
@@ -665,6 +713,43 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enter_is_told_to_the_service_off_the_command_and_repeats_are_dropped() {
+        use std::sync::mpsc::channel;
+        let told = Told::default();
+        let (started_tx, started) = channel::<String>();
+        let (release, released) = channel::<()>();
+        let released = Mutex::new(released);
+        // A service that answers only when the test lets it
+        let call = move |id: &str| {
+            started_tx.send(id.to_string()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        };
+        let wait = std::time::Duration::from_secs(5);
+        // Returns although the call has not ended
+        told.tell("a".into(), call);
+        assert_eq!(started.recv_timeout(wait).unwrap(), "a");
+        // Enters during the call: told once more, not three times; another session keeps its own
+        for id in ["a", "a", "a", "b", "b"] {
+            told.tell(id.into(), |_: &str| panic!("a second worker"));
+        }
+        assert_eq!(*told.waiting.lock().unwrap(), ["a".to_string(), "b".to_string()].into());
+        release.send(()).unwrap();
+        assert_eq!(started.recv_timeout(wait).unwrap(), "a");
+        release.send(()).unwrap();
+        assert_eq!(started.recv_timeout(wait).unwrap(), "b");
+        assert!(told.waiting.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        // Nothing queued is left over, and a later Enter is told again
+        assert!(started.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        told.tell("a".into(), |_: &str| panic!("a second worker"));
+        assert_eq!(started.recv_timeout(wait).unwrap(), "a");
+        release.send(()).unwrap();
+        // The worker ends with the state
+        drop(told);
+        assert!(started.recv_timeout(wait).is_err());
+    }
 
     #[test]
     fn a_channel_policy_that_widens_what_slack_may_do_is_asked_about_first() {

@@ -288,6 +288,15 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
     })
 }
 
+/// The agent kind a `session_create` starts: the resumed transcript's, as
+/// `create` takes it, else `profile`. `None`: no such transcript (`create` says so).
+fn asked_profile(home: &Path, args: &Value) -> Option<String> {
+    match args["resume"].as_str().filter(|s| !s.is_empty()) {
+        Some(id) => find_resumable(home, id).map(|r| r.agent.to_string()),
+        None => Some(args["profile"].as_str().unwrap_or("").to_string()),
+    }
+}
+
 /// A command an agent started in a shell and that is still running, from the
 /// process table (so, unlike subagents, verified to be alive).
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -2387,7 +2396,7 @@ impl Harness {
     /// on a prompt (D6) or into a shell, where it would run as a command.
     fn nudge(&self, session: &str) {
         let pending = |s: &Store| s.messages.values().any(|m| m.to == session && m.read == 0 && !m.notified);
-        let (untracked, unsure) = {
+        let (untracked, unsure, sees) = {
             let store = lock(&self.store);
             if !pending(&store) {
                 return;
@@ -2396,9 +2405,11 @@ impl Harness {
             // An agent without state tracking (no turn-end hooks) is only seen
             // through its screen; a shell has no input box (`at_prompt` is false)
             let agent = adapter(&t.profile);
-            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown")
+            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown", agent.sees_prompt())
         };
-        let at_prompt = (untracked || unsure) && self.at_prompt(session);
+        // Not read where no input box is known: this runs at every timer tick
+        // while a message waits, and a snapshot is up to 4 MB
+        let at_prompt = reads_screen(untracked, unsure, sees) && self.at_prompt(session);
         let from = self.update(|s| {
             let t = s.sessions.get(session)?;
             if !notice_ready(untracked, unsure, at_prompt, &t.state) {
@@ -3400,14 +3411,18 @@ impl Harness {
             }
             "operator_input" => {
                 let id = id()?;
-                self.update(|s| {
-                    if let Some(t) = s.sessions.get_mut(id) {
-                        t.injected = 0;
-                        if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
-                            t.attention = None;
+                // Sent at every Enter in a terminal, and most change nothing: the store is written only for one that does
+                let changes = lock(&self.store).sessions.get(id).is_some_and(|t| t.injected != 0 || t.attention.as_ref().is_some_and(|a| a.kind != "permission"));
+                if changes {
+                    self.update(|s| {
+                        if let Some(t) = s.sessions.get_mut(id) {
+                            t.injected = 0;
+                            if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
+                                t.attention = None;
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 Ok(json!({}))
             }
             // What the app shows of the reports and the bulletin board
@@ -3534,6 +3549,11 @@ impl Harness {
                 _ => Ok(()),
             }
         };
+        // The agent kind a first task would go to
+        let tasked = match name {
+            "session_create" if args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => dirs::home_dir().and_then(|home| asked_profile(&home, args)),
+            _ => None,
+        };
         match name {
             "profiles_list" => Ok(json!({ "profiles": crate::harness_preferences::HarnessPreferences::load(&self.dir)?.profiles() })),
             "overview" => {
@@ -3549,11 +3569,11 @@ impl Harness {
                 out["tasks"] = json!(tasks);
                 Ok(out)
             }
-            "session_create" if args["profile"] == "shell" && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+            "session_create" if tasked.as_deref() == Some("shell") => {
                 Err("Refused: a task for a shell is a command, and commands need the operator. Start the shell without one; terminal_write asks the operator.".into())
             }
             // No turn-end signal: the task would stay open for good
-            "session_create" if !adapter(args["profile"].as_str().unwrap_or("")).is_agent() && args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+            "session_create" if tasked.as_deref().is_some_and(|p| !adapter(p).is_agent()) => {
                 Err("Refused: the harness can't tell when this agent finishes a turn, so it takes no task. Start it without one and work in its terminal.".into())
             }
             "session_create" if args["task"].as_str().is_some_and(|t| plain_prompt(t).is_err()) => plain_prompt(args["task"].as_str().unwrap_or("")).map(|_| json!({})),
@@ -3692,7 +3712,7 @@ impl Harness {
             return Err("Refused: terminal_write is unavailable through the CLI; ask the operator to use the terminal or an MCP client that asks for approval.".into());
         }
         match who {
-            Caller::Session { id, .. } if lock(&self.store).sessions.get(id).is_some_and(|t| t.profile == "claude") => Ok(()),
+            Caller::Session { id, .. } if lock(&self.store).sessions.get(id).is_some_and(|t| adapter(&t.profile).asks_before_terminal_write()) => Ok(()),
             _ => Err("Refused: terminal_write is only available to a hosted Claude supervisor (which asks the operator for permission). Use task_assign or ask the operator to type into the terminal.".into()),
         }
     }
@@ -3722,9 +3742,13 @@ impl Harness {
                 if name == "terminal_write" {
                     self.allows_terminal_write(&who, cli)?;
                 }
-                self.tool(name, &args)
+                let out = self.tool(name, &args)?;
+                Ok(if name == "session_resumable" && !summaries_for(&who) { without_summaries(out) } else { out })
             };
+            // A caller that would be refused `terminal_write` is not listed it either
+            let unlisted = frame["method"] == "tools/list" && self.allows_terminal_write(&who, cli).is_err();
             if let Some(reply) = protocol.dispatch_for(&SUPERVISOR, frame, call) {
+                let reply = if unlisted { without_terminal_write(reply) } else { reply };
                 writeln!(writer, "{reply}")?;
             }
         }
@@ -3828,6 +3852,12 @@ impl slack::Host for Harness {
 /// Whether an inbox notice may be typed now. A session with state tracking
 /// takes it when idle (or, before its first report, at its input box); one
 /// without (Antigravity, OpenCode, Pi) only when `at_prompt` sees the input box.
+/// Whether `nudge` has to read the session's screen to decide: only where the
+/// screen is what tells (`notice_ready`) and the adapter knows the input box.
+fn reads_screen(untracked: bool, unsure: bool, sees_prompt: bool) -> bool {
+    (untracked || unsure) && sees_prompt
+}
+
 fn notice_ready(untracked: bool, unsure: bool, at_prompt: bool, state: &str) -> bool {
     if untracked {
         at_prompt
@@ -3868,6 +3898,32 @@ fn has_session_workspace(dir: &Path) -> bool {
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .is_some_and(|v| v["session_workspace"] == true)
+}
+
+/// Whether a caller of the Supervisor surface gets what a transcript says of
+/// itself in `session_resumable`: its title, the guessed role and the tags.
+/// Only the hosted Supervisor session, which chooses a conversation to resume
+/// by its title, and only while the Sessions grant is on (the `resumable` op
+/// leaves the text out without it). An outside agent with the supervisor
+/// tools gets ids, folders and times (owner's decision of 2026-11-18, MCR-76).
+fn summaries_for(who: &Caller) -> bool {
+    matches!(who, Caller::Session { supervisor: true, .. })
+}
+
+/// A `tools/list` answer of the Supervisor surface without `terminal_write`.
+fn without_terminal_write(mut reply: Value) -> Value {
+    if let Some(tools) = reply.get_mut("result").and_then(|r| r.get_mut("tools")).and_then(Value::as_array_mut) {
+        tools.retain(|t| t["name"] != "terminal_write");
+    }
+    reply
+}
+
+/// A `resumable` answer with ids, folders and times only.
+fn without_summaries(mut out: Value) -> Value {
+    for r in out.get_mut("sessions").and_then(Value::as_array_mut).into_iter().flatten().filter_map(Value::as_object_mut) {
+        r.retain(|key, _| !matches!(key.as_str(), "title" | "role" | "tags"));
+    }
+    out
 }
 
 fn plain_prompt(text: &str) -> Result<(), String> {
@@ -5164,6 +5220,17 @@ mod tests {
         for profile in ["opencode", "pi", "shell"] {
             assert!(!adapter(profile).at_prompt(prompt), "{profile} must not take a notice while unsure");
         }
+        // The screen of a program whose input box is not known is never read for a notice (MCR-76)
+        let codex_prompt = "\u{203a} Ask Codex to do anything\n  ? for shortcuts";
+        for agent in adapters() {
+            let id = agent.id();
+            assert_eq!(agent.sees_prompt(), ["codex", "antigravity"].contains(&id), "{id}");
+            assert!(agent.sees_prompt() || !(agent.at_prompt(prompt) || agent.at_prompt(codex_prompt)), "{id} finds a prompt it says it cannot see");
+            let untracked = !agent.is_agent();
+            assert_eq!(reads_screen(untracked, false, agent.sees_prompt()), id == "antigravity", "{id}");
+            assert_eq!(reads_screen(untracked, agent.silent_until_first_turn(), agent.sees_prompt()), ["codex", "antigravity"].contains(&id), "{id}");
+        }
+        assert!(adapter("codex").at_prompt(codex_prompt));
         // Untracked: the screen decides, whatever the (never updated) state
         assert!(notice_ready(true, false, true, "unknown"));
         assert!(!notice_ready(true, false, false, "idle"));
@@ -5171,6 +5238,22 @@ mod tests {
         assert!(notice_ready(false, false, false, "idle"));
         assert!(!notice_ready(false, false, true, "working"));
         assert!(notice_ready(false, true, true, "unknown"));
+    }
+
+    /// MCR-76, finding 8 of MCR-50 comment 15629: what Antigravity's `at_prompt`
+    /// does with its own markers when they are printed text. It records the
+    /// function as it is; whether the last screen can occur was not seen live.
+    #[test]
+    fn antigravity_prompt_markers_are_looked_for_anywhere_on_the_screen() {
+        let agy = adapter("antigravity");
+        let status = "? for shortcuts  accept-edits · Gemini";
+        // Printed while a turn runs, or over a menu it knows: not taken for the input box
+        assert!(!agy.at_prompt("The footer reads ? for shortcuts when idle\n> \nesc to cancel  plan · Gemini"));
+        assert!(!agy.at_prompt("The footer reads ? for shortcuts when idle\n> Yes, I trust this folder\n  ↑/↓ Navigate · enter Confirm"));
+        // The other way round it errs to the safe side: no notice while such words are in view
+        assert!(!agy.at_prompt(&format!("Press esc to cancel a turn\n> \n{status}")));
+        // A screen that shows neither menu marker with the words printed above it is taken for the input box
+        assert!(agy.at_prompt("The footer reads ? for shortcuts when idle\n  1. Allow once\n  2. Deny\n  ↑/↓ Navigate"));
     }
 
     #[test]
@@ -5197,6 +5280,13 @@ mod tests {
         assert!(find_resumable(&home, c).is_none());
         assert!(find_resumable(&home, "../../etc/passwd").is_none());
         assert!(resumable(&home, now_ms() + 60_000, 10).is_empty());
+        // A first task goes to the agent of the resumed transcript, whatever `profile` says (MCR-76)
+        assert_eq!(asked_profile(&home, &json!({"resume": a, "task": "go"})).as_deref(), Some("claude"));
+        assert_eq!(asked_profile(&home, &json!({"resume": b, "profile": "shell"})).as_deref(), Some("codex"));
+        assert!(asked_profile(&home, &json!({"resume": c})).is_none());
+        assert_eq!(asked_profile(&home, &json!({"profile": "shell"})).as_deref(), Some("shell"));
+        assert_eq!(asked_profile(&home, &json!({"resume": "", "profile": "pi"})).as_deref(), Some("pi"));
+        assert_eq!(asked_profile(&home, &json!({})).as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -5311,6 +5401,47 @@ mod tests {
     }
 
     #[test]
+    fn a_first_task_is_refused_by_the_agent_kind_the_session_will_have() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-create-task-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let refused = |args: Value| harness.tool("session_create", &args).unwrap_err();
+        assert!(refused(json!({"profile": "shell", "cwd": "/tmp", "task": "ls"})).contains("a task for a shell"));
+        assert!(refused(json!({"profile": "pi", "cwd": "/tmp", "task": "go"})).contains("can't tell when this agent finishes"));
+        // A resume names no profile: it is not taken for a shell (MCR-76), and an id without a transcript is `create`'s to refuse
+        let none = "00000000-0000-4000-8000-000000000000";
+        assert_eq!(refused(json!({"resume": none, "task": "go"})), format!("No Claude or Codex session {none} to resume"));
+        assert!(refused(json!({"resume": none, "task": "!ls"})).contains("Refused"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_operators_enter_writes_the_store_only_when_it_changes_something() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-enter-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let mark = |kind: &str| Some(Attention { kind: kind.into(), text: "t".into(), since: 1, ..Attention::default() });
+        harness.update(|s| {
+            s.sessions.insert("quiet".into(), Tracked { profile: "claude".into(), ..Tracked::default() });
+            s.sessions.insert("asked".into(), Tracked { profile: "claude".into(), attention: mark("permission"), ..Tracked::default() });
+            s.sessions.insert("typed".into(), Tracked { profile: "claude".into(), injected: 5, ..Tracked::default() });
+            s.sessions.insert("reported".into(), Tracked { profile: "claude".into(), attention: mark("assessment"), ..Tracked::default() });
+        });
+        let enter = |id: &str| {
+            let before = lock(&harness.store).version;
+            harness.control(&json!({"op": "operator_input", "id": id})).unwrap();
+            lock(&harness.store).version - before
+        };
+        // Nothing to take back: no write. A permission prompt is not answered by this op
+        assert_eq!((enter("quiet"), enter("asked"), enter("nobody")), (0, 0, 0));
+        assert!(lock(&harness.store).sessions["asked"].attention.is_some());
+        // What the harness typed and the report mark are taken back, once
+        assert_eq!((enter("typed"), enter("typed")), (1, 0));
+        assert_eq!(lock(&harness.store).sessions["typed"].injected, 0);
+        assert_eq!((enter("reported"), enter("reported")), (1, 0));
+        assert!(lock(&harness.store).sessions["reported"].attention.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn non_claude_supervisor_cannot_use_terminal_write() {
         let dir = std::env::temp_dir().join(format!("agent-mcr-sup-tw-{}", runner::random_id()));
         let harness = Harness::open(&dir);
@@ -5319,6 +5450,18 @@ mod tests {
             s.sessions.insert("sup-codex".into(), Tracked { name: "sup".into(), profile: "codex".into(), ..Tracked::default() });
             s.sessions.insert("sup-pi".into(), Tracked { name: "sup".into(), profile: "pi".into(), ..Tracked::default() });
         });
+        // The adapter says it, not a profile name: only Claude is launched to ask the operator for this tool
+        for agent in adapters() {
+            assert_eq!(agent.asks_before_terminal_write(), agent.id() == "claude", "{}", agent.id());
+        }
+        // Who is refused the tool is not listed it
+        let listed = |reply: Value| reply["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "terminal_write");
+        let reply = json!({"jsonrpc": "2.0", "id": 1, "result": supervisor_tools()});
+        let all = reply["result"]["tools"].as_array().unwrap().len();
+        assert!(listed(reply.clone()) && !listed(without_terminal_write(reply.clone())));
+        assert_eq!(without_terminal_write(reply)["result"]["tools"].as_array().unwrap().len(), all - 1);
+        let error = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32002, "message": "x"}});
+        assert_eq!(without_terminal_write(error.clone()), error);
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, false).is_ok());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: true }, true).is_err());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }, false).is_err());
@@ -5327,6 +5470,22 @@ mod tests {
         assert!(harness.allows_terminal_write(&Caller::Outside, false).is_err());
         assert!(harness.allows_terminal_write(&Caller::Unknown, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_supervisor_surface_lists_resumable_sessions_without_transcript_text() {
+        // What the control op answers for the app while the Sessions grant is on
+        let r = Resumable { agent: "claude", id: "a".into(), cwd: "/work/app".into(), modified: 7, title: Some("Rotate the signing key".into()), role: Some("reviewer".into()), tags: vec!["Rust".into()] };
+        let app = json!({ "sessions": [r, Resumable { agent: "codex", id: "b".into(), cwd: "/work".into(), modified: 5, title: None, role: None, tags: vec![] }] });
+        assert_eq!(app["sessions"][0]["title"], "Rotate the signing key");
+        let tool = without_summaries(app);
+        assert_eq!(tool, json!({ "sessions": [{"agent": "claude", "id": "a", "cwd": "/work/app", "modified": 7}, {"agent": "codex", "id": "b", "cwd": "/work", "modified": 5}] }));
+        assert_eq!(without_summaries(json!({})), json!({}));
+        // Only the hosted Supervisor session keeps them; an outside agent does not
+        assert!(summaries_for(&Caller::Session { id: "sup".into(), supervisor: true }));
+        for who in [Caller::Session { id: "w".into(), supervisor: false }, Caller::Outside, Caller::Unknown] {
+            assert!(!summaries_for(&who));
+        }
     }
 
     #[test]

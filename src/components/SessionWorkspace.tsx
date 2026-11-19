@@ -129,7 +129,8 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     </header>
     <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
     {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
-    {globalOverlays.map(o => o.render({
+    {/* Only while Sessions is shown: an overlay may listen for keys (the command panel's Cmd+S), and over Documents those are the editor's */}
+    {active && globalOverlays.map(o => o.render({
       enabled,
       sessions: data.sessions,
       directory,

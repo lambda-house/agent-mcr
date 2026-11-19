@@ -1,9 +1,10 @@
 // @vitest-environment happy-dom
-import { act } from 'react';
+import { act, useEffect } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionWorkspace from './SessionWorkspace';
 import { sessionApi, type Session } from '../utils/sessions';
+import { createPlugin, pluginRegistry } from '../plugins';
 vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
@@ -30,6 +31,26 @@ describe('Sessions workspace', () => {
     expect(host.textContent).toContain('Fix CORE-123');expect(host.textContent).toContain('<script>untrusted()</script>');expect(host.querySelector('script')).toBeNull();
     await act(async () => button('linked work').click());expect(host.textContent).toContain('CORE-123');
     expect(host.querySelector('.sc-ticket-list button')).toBeNull();
+  });
+  it('mounts the global overlays only while Sessions is shown, so their keys stay free over Documents', async () => {
+    const onKey = vi.fn();
+    function Overlay() { useEffect(() => { window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, []); return <div data-overlay="test"/>; }
+    pluginRegistry.register(createPlugin({ id: 'test-overlay', name: 'Test overlay', setup(api) { api.registerGlobalOverlay({ id: 'test-overlay', render: () => <Overlay key="test-overlay"/> }); } }));
+    const cmdS = () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true }));
+    try {
+      await act(async () => root.render(<SessionWorkspace active={false} onClose={() => {}}/>)); await flush();
+      expect(host.querySelector('[data-overlay]')).toBeNull();
+      await act(async () => { cmdS(); });
+      expect(onKey).not.toHaveBeenCalled();
+      // The built-in command panel is one of them: Cmd+S over Documents is Save, not the palette
+      expect(document.querySelector('.cmd-panel, [role="dialog"]')).toBeNull();
+      await act(async () => root.render(<SessionWorkspace active onClose={() => {}}/>)); await flush();
+      expect(host.querySelector('[data-overlay]')).not.toBeNull();
+      await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' })); });
+      expect(onKey).toHaveBeenCalledTimes(1);
+      await act(async () => root.render(<SessionWorkspace active={false} onClose={() => {}}/>)); await flush();
+      expect(host.querySelector('[data-overlay]')).toBeNull();
+    } finally { pluginRegistry.unregister('test-overlay'); }
   });
   it('does not read transcripts before access is enabled', async () => {
     vi.mocked(sessionApi.access).mockResolvedValue(false);

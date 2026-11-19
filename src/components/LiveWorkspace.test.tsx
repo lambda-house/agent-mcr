@@ -152,6 +152,26 @@ describe('Live workspace', () => {
     expect(harnessApi.forget).not.toHaveBeenCalledWith('e1');
   });
 
+  it('gives a session restarted in a pane that is not the selected one its terminal', async () => {
+    const shell: Hosted = { ...ended, id: 's1', started: 3, exit: null };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const item = (text: string) => [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes(text)) as HTMLButtonElement;
+    // Two panes: the shell in the first (and selected), the agent in the second
+    await act(async () => row('Fixing tests').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    await act(async () => button('Two columns').click()); await flush();
+    expect([...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'))).toEqual(['s1', 'r1']);
+    const fresh: Hosted = { ...running, id: 'r2' };
+    vi.mocked(harnessApi.restart).mockResolvedValue({ ...fresh, replaced: 'r1', resumed: true });
+    await act(async () => button('Actions for Fixing tests').click());
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, fresh]);
+    await act(async () => item('Restart').click()); await flush();
+    expect(host.querySelector('[data-terminal="r1"]')).toBeNull();
+    expect([...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'))).toEqual(['s1', 'r2']);
+  });
+
   it('drops a session the person quit from its own terminal', async () => {
     vi.mocked(harnessApi.forget).mockResolvedValue();
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();

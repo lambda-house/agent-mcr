@@ -87,4 +87,16 @@ describe('Command panel', () => {
     expect(cmdS.defaultPrevented).toBe(true);
     expect(onOpenChange).toHaveBeenCalledWith(true);
   });
+
+  it('leaves Cmd+Shift+S (Save All) alone', async () => {
+    const onOpenChange = vi.fn();
+    await act(async () => root.render(<SessionCommandPanel open={false} hideTrigger onOpenChange={onOpenChange} enabled sessions={[]}
+      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
+    for (const key of ['s', 'S']) {
+      const saveAll = new KeyboardEvent('keydown', { key, metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      await act(async () => { window.dispatchEvent(saveAll); });
+      expect(saveAll.defaultPrevented).toBe(false);
+    }
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
 });
