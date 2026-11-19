@@ -164,6 +164,8 @@ export interface CockpitTrack {
   lead: string; refs?: string[]; state: TrackState; line?: string; items?: CockpitItem[]; updated?: number;
   /** The session that published it; `supervisor` for the root Supervisor */
   by: string;
+  /** From the service, never published: the operator pressed Enter in its lead's terminal at this time, after it was last published as waiting for them (MCR-103) */
+  ownerTyped?: number;
 }
 /** `answer_prompt` and `report` come from the service only (`derived`); sessions publish the others. */
 export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'answer_prompt' | 'report';
@@ -182,6 +184,10 @@ export interface CockpitAction {
   derived?: 'prompt' | 'report';
   /** Its track was removed since */
   trackMissing?: boolean;
+  /** From the service, never published: the operator pressed Enter in `where.session` at this time, after the action was last published (MCR-103) */
+  ownerTyped?: number;
+  /** From the service: `where.session` has ended or is gone */
+  sessionEnded?: boolean;
   /** It names a report in `source`: whether that report is still open */
   live?: { reportOpen: boolean };
 }

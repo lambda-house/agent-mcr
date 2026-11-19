@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
-import { ACTION_KIND, actionSource, liveFacts, named, needsYouRows, staleMarks, TRACK_STATE, trackWaits, type Named } from '../utils/cockpit';
+import { ACTION_KIND, actionSource, liveFacts, named, needsYouRows, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
 import { harnessApi, type Cockpit, type CockpitAction, type CockpitTrack, type Hosted } from '../utils/harness';
 
 /**
@@ -46,11 +46,15 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   const who = (id: string) => named(id, cockpit, hosted, label);
   const at = a.where?.session ? who(a.where.session) : null;
   const track = a.track ? cockpit.tracks.find(t => t.id === a.track && (!a.trackBy || t.by === a.trackBy)) : undefined;
-  const urgency = a.derived === 'prompt' ? 'now' : a.urgency ?? (a.derived === 'report' ? 'today' : '');
+  // An action the harness knows to be behind keeps its text and loses its urgency
+  const awaits = stillAwaits(a);
+  const urgency = !awaits ? '' : a.derived === 'prompt' ? 'now' : a.urgency ?? (a.derived === 'report' ? 'today' : '');
   return (
-    <li className={`ck-action${a.derived ? ' derived' : ''}`} data-action={a.id}>
+    <li className={`ck-action${a.derived ? ' derived' : ''}${awaits ? '' : ' behind'}`} data-action={a.id}>
       <div className="ck-action-head">
         {urgency && <span className={`ck-urgency ${urgency}`}>{urgency}</span>}
+        {a.ownerTyped && !a.sessionEnded && <span className="ck-live answered" title="From the harness: you pressed Enter in that session's terminal after this was published. Its publisher was told to update it">you typed there {formatAge(a.ownerTyped)}</span>}
+        {a.sessionEnded && <span className="ck-live answered" title="From the harness: the session this points you at has ended or is gone. Its publisher was told">its session ended</span>}
         <strong>{a.title}</strong>
         <span className="ck-kind">{ACTION_KIND[a.kind]}</span>
         {at && <SessionLink who={at} onSession={onSession}/>}
@@ -59,7 +63,9 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
       {a.detail && <p className={a.derived ? 'ck-fact' : undefined}>{a.detail}</p>}
       {a.why && <p>{a.why}</p>}
       {a.say && <p className="ck-say"><span>To type{at ? ` in ${at.name}` : ''}:</span> <code>{a.say}</code></p>}
-      {a.options && <p className="ck-options">{a.options.map(o => <span key={o} className={o === a.recommended ? 'recommended' : undefined}>{o}{o === a.recommended ? ' (recommended)' : ''}</span>)}</p>}
+      {/* A list to read, not buttons: nothing here is clicked (the clicks are MCR-97) */}
+      {a.options && <ul className="ck-options" aria-label="Options">{a.options.map(o => <li key={o} className={o === a.recommended ? 'recommended' : undefined}>{o}{o === a.recommended ? ' (recommended)' : ''}</li>)}</ul>}
+      {a.options && <p className="ck-source">Answer in {at ? at.name : a.by ? `the terminal of ${who(a.by).name}` : 'the publishing session'}: these are not buttons yet.</p>}
       {a.where?.command && <p className="ck-say"><span>To run yourself:</span> <code>{a.where.command}</code></p>}
       {a.where?.url && <p className="ck-say"><span>At:</span> <code>{a.where.url}</code></p>}
       <p className="ck-source">
@@ -82,17 +88,21 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
   const lead = who(t.lead);
   const waits = trackWaits(t, id => who(id).name);
   const items = t.items ?? [];
+  const state = trackStateShown(t);
+  // Who wrote the text is not always who leads the work: the Supervisor publishes tracks led by others
+  const publishedByOther = t.by !== t.lead;
   return (
-    <li className={`ck-track ${t.state}`} data-track={t.id}>
+    <li className={`ck-track ${t.state}${state.tone === 'stale' ? ' stale' : ''}`} data-track={t.id}>
       <div className="ck-track-line">
         <button type="button" className="ck-expand" aria-expanded={open} aria-label={`${open ? 'Hide' : 'Show'} the items of ${t.title}`} disabled={!items.length} onClick={() => setOpen(o => !o)}>
           {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}
         </button>
-        <span className={`ck-state ${t.state}`}>{TRACK_STATE[t.state]}</span>
+        <span className={`ck-state ${state.tone}`} title={state.tone === 'answered' ? 'From the harness: you pressed Enter in the lead session\'s terminal after this track was published as waiting for you. Its publisher was told to update it' : undefined}>{state.text}</span>
         <strong>{t.title}</strong>
+        {publishedByOther && <span className="ck-role">lead</span>}
         <SessionLink who={lead} onSession={onSession}/>
         <Stale marks={staleMarks(t, cockpit, hosted, label)}/>
-        <span className="ck-age" title={`Published by ${who(t.by).name}`}>{t.updated ? formatAge(t.updated) : ''}</span>
+        <span className="ck-age">{publishedByOther ? `by ${who(t.by).name} · ` : ''}{t.updated ? formatAge(t.updated) : ''}</span>
       </div>
       {(t.line || waits.length > 0) && <div className="ck-track-sub">
         {t.line && <span className="ck-line">{t.line}</span>}
@@ -165,7 +175,9 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
   const actions = cockpit ? needsYouRows(cockpit) : [];
   const tracks = cockpit?.tracks ?? [];
   // "Nothing needs you" is a claim: made only on a cockpit that was read, and read without an error just now
-  const count = error ? 'could not be read' : !cockpit ? 'reading…' : actions.length ? `${actions.length} need${actions.length === 1 ? 's' : ''} you` : 'nothing needs you';
+  // Counted: what still stands. An action you already typed for is shown, and not counted
+  const open = actions.filter(stillAwaits).length;
+  const count = error ? 'could not be read' : !cockpit ? 'reading…' : open ? `${open} need${open === 1 ? 's' : ''} you` : actions.length ? 'nothing new needs you' : 'nothing needs you';
   return (
     <>
       <section ref={box} className={`ck-panel${closed ? ' closed' : ''}`} aria-label="Cockpit" style={closed ? undefined : { height }}>
@@ -174,7 +186,7 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
             {closed ? <ChevronRight size={12}/> : <ChevronDown size={12}/>}
           </button>
           <strong>Cockpit</strong>
-          <span className={error || actions.length ? 'ck-count needs' : 'ck-count'} role={error ? 'alert' : undefined}>{count}</span>
+          <span className={error || open ? 'ck-count needs' : 'ck-count'} role={error ? 'alert' : undefined}>{count}</span>
           {cockpit && <span className="ck-count">{error ? 'last read: ' : ''}{error && actions.length ? `${actions.length} needed you, ` : ''}{tracks.length} track{tracks.length === 1 ? '' : 's'}</span>}
           {cockpit?.updated ? <span className="ck-age" title="When a session last published">published {formatAge(cockpit.updated)}</span> : null}
         </header>

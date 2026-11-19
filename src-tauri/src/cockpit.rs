@@ -32,7 +32,7 @@ const RISKS: [&str; 3] = ["reversible", "irreversible", "spend"];
 const URGENCIES: [&str; 3] = ["now", "today", "whenever"];
 /// Fields the service writes. They are taken out of what a session sends, so
 /// a document that was read can be published back.
-const STAMPS: [&str; 5] = ["updated", "since", "by", "live", "trackMissing"];
+const STAMPS: [&str; 7] = ["updated", "since", "by", "live", "trackMissing", "ownerTyped", "sessionEnded"];
 
 const MAX_TRACKS: usize = 12;
 const MAX_ITEMS: usize = 30;
@@ -226,6 +226,8 @@ pub struct Fact {
     /// Its open `done` report
     pub done: Option<String>,
     pub waits: Vec<FactWait>,
+    /// When the operator last pressed Enter in its terminal, by the app's word
+    pub typed: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -233,6 +235,25 @@ pub struct Facts {
     pub sessions: BTreeMap<String, Fact>,
     /// Every report the store still has, and the session that made it
     pub reports: BTreeMap<String, String>,
+}
+
+/// A published entry whose text the harness knows to be behind (MCR-103): it
+/// says the operator is awaited in a session, and the operator has typed
+/// there since it was last published, or that session is no more. Made at
+/// every read from the facts, never stored and never taken from a publisher.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Outdated {
+    /// The part it is in: a session id, or `ROOT`
+    pub by: String,
+    /// A track; otherwise an action
+    pub track: bool,
+    pub id: String,
+    /// The entry's stamp this is said about: a publish after it makes it a new entry
+    pub updated: u64,
+    /// The session the entry points the operator at
+    pub session: String,
+    /// When the operator typed there; `None`: the session ended or is gone
+    pub typed: Option<u64>,
 }
 
 /// The document as the store file holds it. Read leniently: a field this
@@ -906,6 +927,41 @@ impl Cockpit {
         true
     }
 
+    /// The entries the harness knows to be behind their text, see `Outdated`:
+    /// an action with a session to act in, and a track that says it waits
+    /// for the operator, by its lead. An ended lead is not one: the track
+    /// may wait for the operator elsewhere.
+    pub fn outdated(&self, facts: &Facts) -> Vec<Outdated> {
+        let typed_after = |session: &str, updated: u64| facts.sessions.get(session).filter(|f| !f.ended).and_then(|f| f.typed).filter(|at| *at > updated);
+        let mut out = Vec::new();
+        for (key, part) in &self.parts {
+            for t in part.tracks.iter().filter(|t| t.state == "waiting_human") {
+                if let Some(at) = typed_after(&t.lead, t.updated) {
+                    out.push(Outdated { by: key.clone(), track: true, id: t.id.clone(), updated: t.updated, session: t.lead.clone(), typed: Some(at) });
+                }
+            }
+            for a in part.actions.iter().filter(|a| !a.place.session.is_empty()) {
+                let session = &a.place.session;
+                let typed = match facts.sessions.get(session) {
+                    Some(f) if !f.ended => match typed_after(session, a.updated) {
+                        Some(at) => Some(at),
+                        None => continue,
+                    },
+                    _ => None,
+                };
+                out.push(Outdated { by: key.clone(), track: false, id: a.id.clone(), updated: a.updated, session: session.clone(), typed });
+            }
+        }
+        out
+    }
+
+    /// Whether the document points the operator at a session: an action to
+    /// do there, or a track it leads that says it waits for them. The
+    /// service keeps the time of an Enter there exactly for such a session.
+    pub fn points_at(&self, session: &str) -> bool {
+        self.parts.values().any(|p| p.actions.iter().any(|a| a.place.session == session) || p.tracks.iter().any(|t| t.lead == session && t.state == "waiting_human"))
+    }
+
     /// The document as it is shown: the published parts flattened, in order,
     /// joined with what the harness knows. `reader` is a hosted session that
     /// is not the Supervisor: it gets its own part and those of the sessions
@@ -928,6 +984,16 @@ impl Cockpit {
             .filter(|(k, _)| shown(k))
             .flat_map(|(key, p)| p.actions.iter().flat_map(|a| a.source.iter()).filter(|s| stands(key, s)).map(String::as_str))
             .collect();
+        // What the harness knows better than the text, on the entry itself (MCR-103)
+        let outdated = self.outdated(facts);
+        let mark = |out: &mut Value, key: &str, track: bool, id: &str| {
+            if let Some(o) = outdated.iter().find(|o| o.by == key && o.track == track && o.id == id && below(&o.session)) {
+                match o.typed {
+                    Some(at) => out["ownerTyped"] = json!(at),
+                    None => out["sessionEnded"] = json!(true),
+                }
+            }
+        };
         for (key, part) in self.parts.iter().filter(|(k, _)| shown(k)) {
             if key != ROOT {
                 named.insert(key.as_str());
@@ -936,6 +1002,7 @@ impl Cockpit {
                 named.insert(track.lead.as_str());
                 let mut out = json!(track);
                 out["by"] = json!(key);
+                mark(&mut out, key, true, &track.id);
                 for (i, item) in track.items.iter().enumerate() {
                     if item.owner != "human" {
                         named.insert(item.owner.as_str());
@@ -961,6 +1028,7 @@ impl Cockpit {
             for action in &part.actions {
                 let mut out = json!(action);
                 out["by"] = json!(key);
+                mark(&mut out, key, false, &action.id);
                 if !action.place.session.is_empty() {
                     named.insert(action.place.session.as_str());
                 }
@@ -1315,6 +1383,63 @@ mod tests {
         assert!(c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW + 100).unwrap_err().contains("ten minutes"));
         // Refused calls do not count, and the window moves on
         assert!(c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW + WRITE_WINDOW_MS + 100).is_ok());
+    }
+
+    #[test]
+    fn what_the_owner_did_in_a_session_is_marked_on_the_entries_that_await_them_there() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        c.publish(&SUP, &f, &json!({
+            "tracks": [{ "id": "t1", "title": "Waits", "lead": "ex", "state": "waiting_human" }, { "id": "t2", "title": "Moves", "lead": "ex", "state": "moving" }],
+            "actions": [
+                action("typed_word", json!({ "where": { "session": "ex" }, "say": "merge" })),
+                action("decision", json!({ "id": "a2", "options": ["a", "b"] })),
+            ],
+        }), NOW).unwrap();
+        // Nothing typed, or typed before the publish: the text stands
+        assert!(c.outdated(&f).is_empty());
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW);
+        assert!(c.outdated(&f).is_empty());
+        let plain = c.read(&f, None);
+        assert!(plain["tracks"][0].get("ownerTyped").is_none() && plain["actions"][0].get("ownerTyped").is_none());
+        // Typed after it: the waiting track and the action that points there, not the moving track or the action without a session
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 5);
+        let marks = c.outdated(&f);
+        assert_eq!(marks.iter().map(|o| (o.track, o.id.as_str(), o.session.as_str(), o.typed)).collect::<Vec<_>>(), [(true, "t1", "ex", Some(NOW + 5)), (false, "a1", "ex", Some(NOW + 5))]);
+        assert!(c.points_at("ex") && !c.points_at("sup") && !c.points_at("peer"));
+        let read = c.read(&f, None);
+        assert_eq!((&read["tracks"][0]["ownerTyped"], &read["actions"][0]["ownerTyped"]), (&json!(NOW + 5), &json!(NOW + 5)));
+        assert!(read["tracks"][1].get("ownerTyped").is_none() && read["actions"][1].get("ownerTyped").is_none());
+        // The published text is not rewritten, and the mark does not come back in through a publish
+        assert_eq!(read["tracks"][0]["state"], "waiting_human");
+        let mut back = json!({ "tracks": read["tracks"], "actions": read["actions"] });
+        back["tracks"][0]["line"] = json!("still waits");
+        c.publish(&SUP, &f, &back, NOW + 10).unwrap();
+        assert!(!serde_json::to_string(&c).unwrap().contains("ownerTyped"));
+        // The publisher changed the track: its mark is gone. The action it did not change keeps its own
+        let read = c.read(&f, None);
+        assert!(read["tracks"][0].get("ownerTyped").is_none());
+        assert_eq!(read["actions"][0]["ownerTyped"], json!(NOW + 5));
+        // A publisher cannot set the mark itself
+        assert!(c.patch(&SUP, &f, &json!({ "action": { "id": "a2", "ownerTyped": 1, "sessionEnded": true } }), NOW + 11).is_ok());
+        assert!(!serde_json::to_string(&c).unwrap().contains("sessionEnded"));
+    }
+
+    #[test]
+    fn an_action_whose_session_ended_or_is_gone_says_so() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        c.publish(&SUP, &f, &json!({ "tracks": [track()], "actions": [action("typed_word", json!({ "where": { "session": "ex" }, "say": "merge" }))] }), NOW).unwrap();
+        assert!(c.read(&f, None)["actions"][0].get("sessionEnded").is_none());
+        f.sessions.get_mut("ex").unwrap().ended = true;
+        // Also when the owner had typed there before it ended: ended is what counts
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 5);
+        assert_eq!(c.outdated(&f), [Outdated { by: "sup".into(), track: false, id: "a1".into(), updated: NOW, session: "ex".into(), typed: None }]);
+        let read = c.read(&f, None);
+        assert_eq!(read["actions"][0]["sessionEnded"], true);
+        assert!(read["actions"][0].get("ownerTyped").is_none());
+        f.sessions.remove("ex");
+        assert_eq!(c.read(&f, None)["actions"][0]["sessionEnded"], true);
     }
 
     #[test]

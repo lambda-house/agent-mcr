@@ -123,6 +123,64 @@ it('names a session the service says runs, and the list has not shown yet, witho
   expect(track.querySelector('.ck-stale')).toBeNull();
 });
 
+it('shows that the owner typed in a session instead of repeating that it waits for them (MCR-103)', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({
+    ...doc,
+    tracks: [{ ...doc.tracks[0], ownerTyped: Date.now() - 60000 }],
+    actions: [{ ...doc.actions[0], ownerTyped: Date.now() - 60000 }, { id: 'other', title: 'Another thing', kind: 'live_check', by: 'r1', urgency: 'whenever', updated: Date.now() }],
+  });
+  await show();
+  // The action stays in sight, after what still stands, without its urgency and not counted
+  expect([...host.querySelectorAll('.ck-action')].map(a => a.getAttribute('data-action'))).toEqual(['other', 'word']);
+  const word = host.querySelector('[data-action="word"]')!;
+  expect(word.classList.contains('behind')).toBe(true);
+  expect(word.querySelector('.ck-urgency')).toBeNull();
+  expect(word.querySelector('.ck-live.answered')!.textContent).toContain('you typed there');
+  expect(host.querySelector('.ck-head')!.textContent).toContain('1 needs you');
+  // The track loses the red state and the "waits on you"
+  const track = host.querySelector('[data-track="store"]')!;
+  expect(track.querySelector('.ck-state.answered')!.textContent).toContain('you typed');
+  expect(track.querySelector('.ck-state.waiting_human')).toBeNull();
+  expect(track.textContent).not.toContain('waits on you');
+});
+
+it('says nothing new needs the owner when every action is one they already typed for', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ ...doc.actions[0], ownerTyped: Date.now() }] });
+  await show();
+  expect(host.querySelector('.ck-head .ck-count')!.textContent).toBe('nothing new needs you');
+  expect(host.querySelector('.ck-head .ck-count')!.classList.contains('needs')).toBe(false);
+});
+
+it('says that the session of an action has ended', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ ...doc.actions[0], where: { session: 'old' }, sessionEnded: true }] });
+  await show();
+  const word = host.querySelector('[data-action="word"]')!;
+  expect(word.querySelector('.ck-live.answered')!.textContent).toBe('its session ended');
+  expect(word.querySelector('.ck-urgency')).toBeNull();
+});
+
+it('draws the options of a decision as a list to read, with nothing that looks or works like a button', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ id: 'pick', title: 'Pick one', kind: 'decision', by: 'supervisor', options: ['MCR-102 launchd labels', 'MCR-97 click actions'], recommended: 'MCR-102 launchd labels', urgency: 'today', updated: Date.now() }] });
+  await show();
+  const pick = host.querySelector('[data-action="pick"]')!;
+  expect([...pick.querySelectorAll('ul.ck-options > li')].map(o => o.textContent)).toEqual(['MCR-102 launchd labels (recommended)', 'MCR-97 click actions']);
+  expect(pick.querySelector('button')).toBeNull();
+  expect(pick.querySelector('.ck-options span')).toBeNull();
+  expect(pick.textContent).toContain('not buttons yet');
+});
+
+it('names the publisher apart from the lead when the Supervisor published a track another session leads', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, tracks: [{ ...doc.tracks[0], by: 'supervisor' }, { ...doc.tracks[0], id: 'own' }], actions: [] });
+  await show();
+  const led = host.querySelector('[data-track="store"]')!;
+  expect(led.querySelector('.ck-role')!.textContent).toBe('lead');
+  expect(led.querySelector('.ck-age')!.textContent).toContain('by Supervisor');
+  // Published by its own lead: one name says both
+  const own = host.querySelector('[data-track="own"]')!;
+  expect(own.querySelector('.ck-role')).toBeNull();
+  expect(own.querySelector('.ck-age')!.textContent).not.toContain('by ');
+});
+
 it('can be collapsed, and stays so', async () => {
   await show();
   await act(async () => (host.querySelector('.ck-head .ck-expand') as HTMLButtonElement).click());

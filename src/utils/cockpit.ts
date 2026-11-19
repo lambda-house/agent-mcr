@@ -30,10 +30,25 @@ export function urgencyRank(a: CockpitAction): number {
 /** Since when an action stands: what the service saw for a derived one, else when it was first published. */
 export const actionSince = (a: CockpitAction) => a.since || a.updated || 0;
 
-/** "Needs you": by urgency, then the oldest first. An action without a time comes last in its group. */
+/**
+ * An action that still stands as published. Not one the harness knows to be
+ * behind: the operator typed into its session since it was published, or
+ * that session is no more (MCR-103). Such a row stays in sight, after the
+ * others and without its urgency, until its publisher updates or removes it.
+ */
+export const stillAwaits = (a: CockpitAction) => !a.ownerTyped && !a.sessionEnded;
+
+/** "Needs you": what still stands first, by urgency, then the oldest first. An action without a time comes last in its group. */
 export function needsYouRows(cockpit: Cockpit): CockpitAction[] {
   const age = (a: CockpitAction) => actionSince(a) || Number.MAX_SAFE_INTEGER;
-  return [...cockpit.actions].sort((a, b) => urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
+  return [...cockpit.actions].sort((a, b) => Number(!stillAwaits(a)) - Number(!stillAwaits(b)) || urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
+}
+
+/** How a track's state reads: the published word, unless the harness knows that the operator has answered in its lead's terminal since. */
+export function trackStateShown(t: CockpitTrack, now = Date.now()): { text: string; tone: CockpitTrack['state'] | 'answered' | 'stale' } {
+  if (t.state === 'waiting_human' && t.ownerTyped) return { text: `you typed ${formatAge(t.ownerTyped, now)}`, tone: 'answered' };
+  if (t.updated && now - t.updated > STALE_AFTER_MS && t.state !== 'done' && t.state !== 'parked') return { text: `stale: ${TRACK_STATE[t.state]}`, tone: 'stale' };
+  return { text: TRACK_STATE[t.state], tone: t.state };
 }
 
 export const ACTION_KIND: Record<CockpitAction['kind'], string> = {
@@ -105,6 +120,8 @@ export function trackWaits(track: CockpitTrack, name: (id: string) => string): s
   for (const item of track.items ?? []) {
     const w = item.waitsOn;
     if (!w || item.state === 'done') continue;
+    // The operator has typed in the lead's terminal since: "waits on you" is no longer the harness's to repeat
+    if (w.kind === 'human' && track.ownerTyped) continue;
     const on = w.kind === 'human' ? 'you' : w.kind === 'session' && w.who ? name(w.who) : w.what || w.kind;
     if (!out.includes(on)) out.push(on);
   }

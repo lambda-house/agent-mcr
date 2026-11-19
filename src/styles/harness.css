@@ -543,10 +543,15 @@
 .ck-fact { font-style: italic; }
 .ck-say span { color: var(--sc-muted); }
 .ck-say code { padding: 1px 5px; border-radius: 4px; background: var(--layer-1); font-size: 11.5px; user-select: text; }
-.ck-options { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
-.ck-action .ck-options { margin-top: 5px; }
-.ck-options span { padding: 0 7px; border: 1px solid var(--line); border-radius: 8px; }
-.ck-options span.recommended { border-color: var(--sc-accent); }
+/* Options are read, not pressed: a plain list, so nothing looks like a button that is none */
+.ck-body ul.ck-options { margin: 3px 0 0; padding-left: 18px; list-style: disc; }
+.ck-options li.recommended { font-weight: 600; }
+.ck-action.behind { border-left-color: var(--line); }
+.ck-action.behind > .ck-action-head strong { font-weight: 500; color: var(--sc-muted); }
+.ck-live.answered { color: var(--sc-accent); border-color: var(--sc-accent); }
+.ck-state.answered { background: var(--layer-1); color: var(--sc-accent); min-width: 0; white-space: nowrap; }
+.ck-state.stale { background: var(--layer-1); color: var(--danger); min-width: 0; white-space: nowrap; }
+.ck-role { color: var(--sc-muted); font-size: 10.5px; }
 .ck-source { display: flex; gap: 10px; flex-wrap: wrap; color: var(--sc-muted); font-size: 11px; }
 .ck-risk.irreversible, .ck-risk.spend { color: var(--danger); }
 .ck-stale { color: var(--danger); font-size: 11px; }

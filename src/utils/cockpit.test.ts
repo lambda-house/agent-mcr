@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionSource, liveFacts, named, needsYouRows, STALE_AFTER_MS, staleMarks, trackWaits, urgencyRank } from './cockpit';
+import { actionSource, liveFacts, named, needsYouRows, STALE_AFTER_MS, staleMarks, stillAwaits, trackStateShown, trackWaits, urgencyRank } from './cockpit';
 import type { Cockpit, CockpitAction, Hosted } from './harness';
 
 const NOW = 100 * 3600_000;
@@ -85,4 +85,37 @@ it('says whom a track waits on from its open items, you first, each once', () =>
     { id: '5', title: 'five', owner: 'a', state: 'done', waitsOn: { kind: 'timer', what: 'never shown' } },
   ] }, id => `S-${id}`);
   expect(waits).toEqual(['you', 'CI run 7', 'S-b']);
+});
+
+describe('what the harness knows to be behind (MCR-103)', () => {
+  it('puts an action the owner already typed for, or whose session ended, after what still stands', () => {
+    const rows = needsYouRows(cockpit({ actions: [
+      action('typed-now', { urgency: 'now', updated: 1, ownerTyped: 5 }),
+      action('ended-now', { urgency: 'now', updated: 2, sessionEnded: true }),
+      action('whenever', { urgency: 'whenever', updated: 3 }),
+      action('today', { urgency: 'today', updated: 4 }),
+    ] }));
+    expect(rows.map(a => a.id)).toEqual(['today', 'whenever', 'typed-now', 'ended-now']);
+    expect(rows.map(stillAwaits)).toEqual([true, true, false, false]);
+  });
+
+  it('reads a waiting track as answered once the owner typed in its lead, and an old one as stale', () => {
+    const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'waiting_human' as const, updated: NOW - 40 * 60000 };
+    expect(trackStateShown(track, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human' });
+    expect(trackStateShown({ ...track, ownerTyped: NOW - 36 * 60000 }, NOW)).toEqual({ text: 'you typed 36 min ago', tone: 'answered' });
+    // Only a track that says it waits for the owner is answered by their typing
+    expect(trackStateShown({ ...track, state: 'moving', ownerTyped: NOW }, NOW).tone).toBe('moving');
+    expect(trackStateShown({ ...track, state: 'moving', updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'stale: moving', tone: 'stale' });
+    expect(trackStateShown({ ...track, updated: NOW - STALE_AFTER_MS - 1 }, NOW).tone).toBe('stale');
+    // What rests is not stale for resting
+    expect(trackStateShown({ ...track, state: 'parked', updated: 1 }, NOW).tone).toBe('parked');
+    expect(trackStateShown({ ...track, state: 'done', updated: 1 }, NOW).tone).toBe('done');
+  });
+
+  it('no longer says that a track waits on the owner once they typed there', () => {
+    const items = [{ id: '1', title: 'one', owner: 'human', state: 'waiting' as const, waitsOn: { kind: 'human' as const, what: 'a word' } }, { id: '2', title: 'two', owner: 'a', state: 'waiting' as const, waitsOn: { kind: 'ci' as const, what: 'CI' } }];
+    const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'waiting_human' as const, items };
+    expect(trackWaits(track, id => id)).toEqual(['you', 'CI']);
+    expect(trackWaits({ ...track, ownerTyped: 5 }, id => id)).toEqual(['CI']);
+  });
 });
