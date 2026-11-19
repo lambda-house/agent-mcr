@@ -4703,6 +4703,13 @@ pub fn hook_bridge(event: &str, argument: Option<String>) {
 mod tests {
     use super::*;
 
+    /// A folder for a test that listens on a socket in it: `/tmp` on Unix, where
+    /// the macOS temp folder would make the path too long for `sun_path`.
+    fn socket_test_dir(prefix: &str) -> PathBuf {
+        let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
+        base.join(format!("{prefix}{}", runner::random_id()))
+    }
+
     #[test]
     fn windows_argv_and_claude_hooks_match_spec() {
         let id = "11111111-2222-3333-4444-555555555555";
@@ -5049,7 +5056,7 @@ mod tests {
 
     #[test]
     fn supervision_overview_and_lists_through_the_service() {
-        let dir = std::env::temp_dir().join(format!("mcr-overview-{}", runner::random_id()));
+        let dir = socket_test_dir("mcr-overview-");
         std::fs::create_dir_all(&dir).unwrap();
         let listener = Listener::bind(dir.join("runner.sock")).unwrap();
         let server = std::thread::spawn(move || {
@@ -6646,7 +6653,7 @@ mod tests {
     /// service, with a runner that lists one running and one ended executor.
     #[test]
     fn an_exit_the_service_did_not_hear_of_is_learnt_from_the_runners_list() {
-        let dir = std::env::temp_dir().join(format!("mcr-ended-{}", runner::random_id()));
+        let dir = socket_test_dir("mcr-ended-");
         std::fs::create_dir_all(&dir).unwrap();
         let listener = Listener::bind(dir.join("runner.sock")).unwrap();
         let server = std::thread::spawn(move || {

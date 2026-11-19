@@ -260,7 +260,9 @@ pub struct Launch<'a> {
     pub resume: Option<&'a str>,
     pub task: Option<&'a str>,
     /// Pass the hooks that the agent runs only after the person trusted them
-    /// in the agent itself (Codex, MCR-74)
+    /// in the agent itself (Codex, MCR-74). Unix only for now: see
+    /// docs/WINDOWS_PORT.md, "Not on Windows yet"
+    #[cfg_attr(windows, allow(dead_code))]
     pub own_hooks: bool,
 }
 
@@ -378,7 +380,8 @@ fn asked(screen: &str, is_question: impl Fn(&str) -> bool) -> Option<String> {
 /// hook it was is in the payload's `hook_event_name`.
 pub const CODEX_HOOK: &str = "codex-hook";
 
-/// The Codex hooks the harness asks for.
+/// The Codex hooks the harness asks for (Unix launches only, like `own_hooks`).
+#[cfg_attr(windows, allow(dead_code))]
 pub const CODEX_HOOKS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse"];
 
 pub struct Claude;

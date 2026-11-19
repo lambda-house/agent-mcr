@@ -165,6 +165,10 @@ Cross-clippy and Mac tests prove that Windows code compiles and that the pure fu
 | R2 | | Dropped (no AF_UNIX in Wine) | |
 | R3 | pending (after the final merge) | | |
 
+## Not on Windows yet
+
+- Codex's own hooks (MCR-74, merged from main on 2026-11-19). `windows_args` does not pass them, so the "Use Codex hooks" switch has no effect on Windows and Codex sessions there rely on the MCR-71 screen fallback (`Harness::look`). The hook command must quote the program path (`Agent MCR` has a space), and `cmd_line` refuses `"` in any argument, so passing them needs another route (for example a short path or a launcher script), with a test through `windows_args`.
+
 ## Manual test list (needs a real Windows 10 1903+ / 11 machine)
 
 1. Install with the NSIS installer as a normal user; app starts; WebView2 present; no SmartScreen bypass needed beyond "Run anyway".
