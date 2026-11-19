@@ -1,17 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import ConfirmDialog from './ConfirmDialog';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
-import { ACTION_KIND, actionSource, liveFacts, named, needsYouRows, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
-import { harnessApi, type Cockpit, type CockpitAction, type CockpitTrack, type Hosted } from '../utils/harness';
+import { ACTION_KIND, actionSource, clickable, foldRows, liveFacts, named, needsYouRows, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
+import { harnessApi, type Cockpit, type CockpitAct, type CockpitAction, type CockpitLink, type CockpitTrack, type Hosted } from '../utils/harness';
 
 /**
  * The cockpit above the Supervisor's terminal (MCR-96): what needs the
  * person, then every track on one line. It only reads. What a session
  * published is shown as its text with who said it and when; what the harness
  * knows of a session is drawn as a chip (`ck-live`) and comes from the session
- * list at every display. Nothing here runs or types a published line: a
- * session's name opens that session, and that is the only click.
+ * list at every display.
+ *
+ * Clicks (MCR-97) name an action by ids and the stamp on screen; the service
+ * acts on its own stored text after checking it again. A click never sends:
+ * a line is placed in an input box unsent and the person presses Enter. The
+ * page gives no text, session, link or command to the backend.
  */
 
 const HEIGHT_KEY = 'hs-cockpit-height';
@@ -45,10 +50,41 @@ function Stale({ marks }: { marks: string[] }) {
 function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: CockpitAction; cockpit: Cockpit; hosted: Hosted[]; label: (h: Hosted) => string; onSession: (id: string) => void }) {
   const who = (id: string) => named(id, cockpit, hosted, label);
   const at = a.where?.session ? who(a.where.session) : null;
+  const publisher = a.by ? who(a.by) : null;
   const track = a.track ? cockpit.tracks.find(t => t.id === a.track && (!a.trackBy || t.by === a.trackBy)) : undefined;
   // An action the harness knows to be behind keeps its text and loses its urgency
   const awaits = stillAwaits(a);
   const urgency = !awaits ? '' : a.derived === 'prompt' ? 'now' : a.urgency ?? (a.derived === 'report' ? 'today' : '');
+  // What a click did, or why the service refused it: said on the row, in the service's words
+  const [said, setSaid] = useState<{ text: string; bad: boolean } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [explain, setExplain] = useState(false);
+  const [link, setLink] = useState<CockpitLink | null>(null);
+  const alive = useRef(true);
+  useEffect(() => () => { alive.current = false; }, []);
+  // A click names the action by ids and the stamp that is on screen; nothing of its text leaves the page
+  const act = (what: CockpitAct, option?: number) => {
+    if (!a.by || !a.updated || busy) return;
+    setBusy(true); setSaid(null);
+    Promise.resolve().then(() => harnessApi.cockpitAct(a.by!, a.id, a.updated!, what, option))
+      .then(done => {
+        if (!alive.current) return;
+        if (done.link) setLink(done.link);
+        if (done.placed) {
+          setSaid({ text: `Placed in the input box of ${who(done.placed).name}, not sent. Press Enter there to send it, Ctrl+C to clear it.`, bad: false });
+          onSession(done.placed);
+        }
+        if (done.opened) setSaid({ text: `Opened ${done.opened} in your browser.`, bad: false });
+        if (done.copied) setSaid({ text: 'Copied. Nothing was run.', bad: false });
+      })
+      .catch(e => { if (alive.current) setSaid({ text: String(e), bad: true }); })
+      .finally(() => { if (alive.current) setBusy(false); });
+  };
+  // A risk the publisher declared adds caution. "reversible" is its claim and is not repeated as a comfort
+  const caution = a.risk === 'irreversible' ? 'irreversible' : a.risk === 'spend' ? `spends ${a.amount ?? ''}`.trim() : '';
+  // Where a choice lands: the session the action names, else its publisher's own box
+  const choiceBox = at ?? publisher;
+  const from = publisher ? `from ${publisher.name}` : '';
   return (
     <li className={`ck-action${a.derived ? ' derived' : ''}${awaits ? '' : ' behind'}`} data-action={a.id}>
       <div className="ck-action-head">
@@ -59,18 +95,66 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         <span className="ck-kind">{ACTION_KIND[a.kind]}</span>
         {at && <SessionLink who={at} onSession={onSession}/>}
         {at?.hosted && <Live h={at.hosted}/>}
+        {caution && <span className="ck-risk caution">{caution}</span>}
       </div>
-      {a.detail && <p className={a.derived ? 'ck-fact' : undefined}>{a.detail}</p>}
+      {a.derived && a.detail && <p className="ck-fact">{a.detail}</p>}
       {a.why && <p>{a.why}</p>}
-      {a.say && <p className="ck-say"><span>To type{at ? ` in ${at.name}` : ''}:</span> <code>{a.say}</code></p>}
-      {/* A list to read, not buttons: nothing here is clicked (the clicks are MCR-97) */}
-      {a.options && <ul className="ck-options" aria-label="Options">{a.options.map(o => <li key={o} className={o === a.recommended ? 'recommended' : undefined}>{o}{o === a.recommended ? ' (recommended)' : ''}</li>)}</ul>}
-      {a.options && <p className="ck-source">Answer in {at ? at.name : a.by ? `the terminal of ${who(a.by).name}` : 'the publishing session'}: these are not buttons yet.</p>}
-      {a.where?.command && <p className="ck-say"><span>To run yourself:</span> <code>{a.where.command}</code></p>}
-      {a.where?.url && <p className="ck-say"><span>At:</span> <code>{a.where.url}</code></p>}
+      {/* The whole line, never cut: what is read here is what a click places */}
+      {a.say && (
+        <div className="ck-click">
+          <p className="ck-say"><span>Line for {at ? at.name : 'that session'}:</span> <code>{a.say}</code></p>
+          {clickable(a, 'say') && at?.hosted && (
+            <p className="ck-buttons">
+              <button type="button" className="ck-do" disabled={busy} onClick={() => act('place')}>Place in {at.name}, unsent{caution ? ` (${caution})` : ''}</button>
+              <span className="ck-from">{from}. Nothing is sent: you press Enter there.</span>
+            </p>
+          )}
+          {a.unclickable?.includes('say') && <p className="ck-source">No button: this line holds characters that are not placed by a click. Type it yourself if it is right.</p>}
+        </div>
+      )}
+      {a.options && (
+        <div className="ck-click">
+          {clickable(a, 'options') && choiceBox?.hosted ? (
+            <>
+              <p className="ck-buttons ck-choices">
+                {a.options.map((o, i) => <button key={o} type="button" className="ck-do" disabled={busy} onClick={() => act('choose', i)}>{o}{o === a.recommended ? ' (recommended by its publisher)' : ''}</button>)}
+              </p>
+              <p className="ck-from">{from}. A click places <code>Decision {a.id}: …</code> with your choice in the input box of {choiceBox.name}, unsent{caution ? ` (${caution})` : ''}: you press Enter there.</p>
+            </>
+          ) : (
+            <>
+              <ul className="ck-options" aria-label="Options">{a.options.map(o => <li key={o}>{o}{o === a.recommended ? ' (recommended by its publisher)' : ''}</li>)}</ul>
+              <p className="ck-source">{a.unclickable?.includes('options') ? 'No buttons: an option holds characters that are not placed by a click.' : !awaits ? 'No buttons: this is behind what happened since.' : 'No buttons: the session to answer in does not run.'} Answer in {choiceBox ? choiceBox.name : 'the publishing session'} yourself.</p>
+            </>
+          )}
+        </div>
+      )}
+      {a.where?.command && (
+        <div className="ck-click">
+          <p className="ck-say"><span>Command, for you to run yourself:</span> <code>{a.where.command}</code></p>
+          {clickable(a, 'command') && <p className="ck-buttons"><button type="button" className="ck-do" disabled={busy} onClick={() => act('copy')}>Copy</button><span className="ck-from">{from}. It is copied, never run.</span></p>}
+        </div>
+      )}
+      {a.where?.url && (
+        <div className="ck-click">
+          <p className="ck-say"><span>Link:</span> <code>{a.where.url}</code></p>
+          {clickable(a, 'url')
+            ? <p className="ck-buttons"><button type="button" className="ck-do" disabled={busy} onClick={() => act('link')}>Open link…</button><span className="ck-from">{from}. You are shown where it goes first.</span></p>
+            : <p className="ck-source">No button: this is not a link a click opens (https, a public host name, no port).</p>}
+        </div>
+      )}
+      {!a.derived && (a.detail || clickable(a, 'ask')) && (
+        <div className="ck-click">
+          <p className="ck-buttons">
+            {a.detail && <button type="button" className="ck-do quiet" aria-expanded={explain} onClick={() => setExplain(x => !x)}>{explain ? 'Hide the explanation' : 'Explain'}</button>}
+            {clickable(a, 'ask') && publisher?.hosted && <button type="button" className="ck-do quiet" disabled={busy} onClick={() => act('ask')}>Ask {publisher.name} more</button>}
+          </p>
+          {explain && a.detail && <p className="ck-detail">{a.detail}</p>}
+        </div>
+      )}
+      {said && <p className={said.bad ? 'ck-said bad' : 'ck-said'} role={said.bad ? 'alert' : 'status'}>{said.text}</p>}
       <p className="ck-source">
-        {actionSource(a, a.by ? who(a.by).name : 'a session')}
-        {a.risk && <span className={`ck-risk ${a.risk}`}>{a.risk === 'spend' ? `spends ${a.amount ?? ''}`.trim() : a.risk}</span>}
+        {actionSource(a, publisher ? publisher.name : 'a session')}
         {track && <span>track: {track.title}</span>}
         {a.trackMissing && <span className="ck-stale">its track was removed</span>}
         {a.blocks?.length ? <span>blocks: {a.blocks.join(', ')}</span> : null}
@@ -78,6 +162,18 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         {a.live && !a.live.reportOpen && <span className="ck-stale">the report it names is closed</span>}
         {!a.derived && <Stale marks={staleMarks(a, cockpit, hosted, label)}/>}
       </p>
+      {link && (
+        <ConfirmDialog title="Open this link in your browser?" confirmLabel="Open link" cancelIsDefault
+          onCancel={() => setLink(null)} onConfirm={() => { setLink(null); act('open'); }}>
+          <dl className="ck-link">
+            <dt>Host</dt><dd>{link.host}</dd>
+            <dt>Path</dt><dd>{link.path || '/'}</dd>
+            <dt>Query</dt><dd>{link.query || '(none)'}</dd>
+          </dl>
+          <p>{from ? `Published ${from}.` : ''} An agent wrote this address. A link can carry data out in its path or query, and it acts with what your browser is signed in to.</p>
+          {!link.known && <p className="ck-link-warn" role="alert">This host is not on your list of known hosts. Open it only if you know this address and expected it.</p>}
+        </ConfirmDialog>
+      )}
     </li>
   );
 }
@@ -173,6 +269,9 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
   }, []);
 
   const actions = cockpit ? needsYouRows(cockpit) : [];
+  // Publishers whose rows beyond the first few were unfolded
+  const [unfolded, setUnfolded] = useState<ReadonlySet<string>>(new Set());
+  const { shown, folded } = foldRows(actions, unfolded);
   const tracks = cockpit?.tracks ?? [];
   // "Nothing needs you" is a claim: made only on a cockpit that was read, and read without an error just now
   // Counted: what still stands. An action you already typed for is shown, and not counted
@@ -197,7 +296,8 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
             {/* Side by side in a wide pane, so the tracks stay in sight under any number of actions */}
             {actions.length > 0 && <div className="ck-col">
               <h3>Needs you</h3>
-              <ul className="ck-actions">{actions.map(a => <ActionRow key={`${a.by ?? ''}:${a.id}`} action={a} cockpit={cockpit!} hosted={hosted} label={label} onSession={onSession}/>)}</ul>
+              <ul className="ck-actions">{shown.map(a => <ActionRow key={`${a.by ?? ''}:${a.id}:${a.updated ?? 0}`} action={a} cockpit={cockpit!} hosted={hosted} label={label} onSession={onSession}/>)}</ul>
+              {[...folded].map(([by, n]) => <button key={by} type="button" className="ck-do quiet ck-more" onClick={() => setUnfolded(u => new Set([...u, by]))}>{n} more from {named(by, cockpit!, hosted, label).name}</button>)}
             </div>}
             {tracks.length > 0 && <div className="ck-col">
               <h3>Tracks</h3>

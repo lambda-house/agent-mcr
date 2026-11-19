@@ -10,32 +10,42 @@ interface ConfirmDialogProps {
   confirmLabel: string;
   onConfirm: () => void;
   onCancel: () => void;
+  /**
+   * Cancel is the default button: it has the focus, and Enter cancels. For a
+   * question where going ahead by habit would do harm (opening a link an
+   * agent wrote). The action then takes a click, or a deliberate Tab.
+   */
+  cancelIsDefault?: boolean;
   children: React.ReactNode;
 }
 
 /**
  * A modal question with an action button and Cancel, in the platform's order
- * (see ACTION_BUTTON_FIRST). The action is the default button, Escape cancels.
+ * (see ACTION_BUTTON_FIRST). The action is the default button unless
+ * `cancelIsDefault` says otherwise; Escape cancels.
  */
 const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   title,
   confirmLabel,
   onConfirm,
   onCancel,
+  cancelIsDefault = false,
   children,
 }) => {
   const dialogRef = useRef<HTMLDivElement>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const defaultRef = cancelIsDefault ? cancelRef : confirmRef;
   const titleId = useId();
 
   // The default button takes the focus; what had it gets it back
   useEffect(() => {
     const previous = document.activeElement;
-    confirmRef.current?.focus();
+    defaultRef.current?.focus();
     return () => {
       if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
     };
-  }, []);
+  }, [defaultRef]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -51,7 +61,7 @@ const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
         const focused = document.activeElement;
         const button = focused instanceof HTMLButtonElement && dialogRef.current?.contains(focused)
           ? focused
-          : confirmRef.current;
+          : defaultRef.current;
         button?.click();
       } else if (e.key === 'Tab' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         // The focus moves between the dialog's buttons only
@@ -68,13 +78,13 @@ const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
 
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [onCancel]);
+  }, [onCancel, defaultRef]);
 
   const confirmButton = (
     <button
       key="confirm"
       ref={confirmRef}
-      className="modal-btn modal-btn-primary"
+      className={cancelIsDefault ? 'modal-btn modal-btn-secondary' : 'modal-btn modal-btn-primary'}
       onClick={onConfirm}
       type="button"
     >
@@ -82,7 +92,7 @@ const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
     </button>
   );
   const cancelButton = (
-    <button key="cancel" className="modal-btn modal-btn-secondary" onClick={onCancel} type="button">
+    <button key="cancel" ref={cancelRef} className={cancelIsDefault ? 'modal-btn modal-btn-primary' : 'modal-btn modal-btn-secondary'} onClick={onCancel} type="button">
       Cancel
     </button>
   );

@@ -188,9 +188,17 @@ export interface CockpitAction {
   ownerTyped?: number;
   /** From the service: `where.session` has ended or is gone */
   sessionEnded?: boolean;
+  /** From the service: which of its texts a click would refuse (stored under an earlier rule). Shown as text, no button */
+  unclickable?: ('say' | 'options' | 'url' | 'command')[];
   /** It names a report in `source`: whether that report is still open */
   live?: { reportOpen: boolean };
 }
+/** A link as the service's parser reads it: what the question shows and what is opened (MCR-97). */
+export interface CockpitLink { href: string; host: string; path: string; query: string; known: boolean }
+/** What a click in the cockpit asks for. `open` opens the link the service names for that action. */
+export type CockpitAct = 'place' | 'choose' | 'ask' | 'link' | 'open' | 'copy';
+export interface CockpitActed { placed?: string; link?: CockpitLink; opened?: string; copied?: boolean }
+
 /** What the service knows of a session the cockpit names. The details only where the reader may see them. */
 export interface CockpitSession {
   name?: string; state?: string; ended?: boolean;
@@ -376,6 +384,12 @@ export const harnessApi = {
   board: () => invoke<Board>('harness_board'),
   /** The cockpit: published tracks and actions with the service's own facts; `CockpitPanel` shows it over the Supervisor's terminal */
   cockpit: () => invoke<Cockpit>('harness_cockpit'),
+  /**
+   * A click in the cockpit (MCR-97). Ids only: the part, the action, the stamp
+   * the panel showed, and for `choose` the option's place in the list. No text,
+   * session, link or command is ever sent from the page; the service takes them from its store.
+   */
+  cockpitAct: (by: string, id: string, updated: number, act: CockpitAct, option?: number) => invoke<CockpitActed>('harness_cockpit_act', { by, id, updated, act, option: option ?? null }),
   /** A note from the person; without a folder it is for every session */
   postNote: (text: string, hours: number, folder?: string) => invoke<void>('harness_note_post', { text, hours, folder: folder || null }),
   removeNote: (note: string) => invoke<void>('harness_note_remove', { note }),

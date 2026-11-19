@@ -454,6 +454,83 @@ pub async fn harness_cockpit() -> Result<Value, String> {
     blocking(|| service(json!({"op": "cockpit"}))).await
 }
 
+/// A click in the cockpit (MCR-97). The page names the action (`by`, `id`,
+/// the stamp it showed) and what was clicked; it supplies no text, no
+/// session, no link and no command. The service resolves all of those from
+/// what is stored and checks them again.
+///
+/// * `place`, `choose`, `ask`: the service puts a line in a session's input
+///   box, unsent. Answers `{placed: session}`.
+/// * `link`: answers the link's parts as the parser reads them, for the
+///   question the page shows. Opens nothing.
+/// * `open`: asks the service for the same link again and opens the
+///   parser's own serialisation in the browser. Answers `{opened: host}`.
+/// * `copy`: puts the stored command on the clipboard. Answers `{copied: true}`.
+#[tauri::command]
+pub async fn harness_cockpit_act(app: tauri::AppHandle, state: tauri::State<'_, HarnessState>, by: String, id: String, updated: u64, act: String, option: Option<u64>) -> Result<Value, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let drafts = state.drafts.clone();
+    blocking(move || {
+        let ask = |act: &str| service(json!({"op": "cockpit_act", "by": by, "id": id, "updated": updated, "act": act, "option": option}));
+        match act.as_str() {
+            "place" | "choose" | "ask" => {
+                let out = ask(&act)?;
+                // The box now holds text no key of the person's put there: the
+                // witness cannot count it back with Backspace, so it stays an
+                // unsent line until Enter or Ctrl+C (MCR-85)
+                if let Some(session) = out["placed"].as_str() {
+                    runner::lock(&drafts).entry(session.to_string()).or_default().unknown = true;
+                }
+                Ok(json!({ "placed": out["placed"] }))
+            }
+            "link" => Ok(json!({ "link": ask("link")?["link"] })),
+            "open" => {
+                let link = ask("link")?["link"].clone();
+                let href = link["href"].as_str().ok_or("The service named no link")?;
+                app.opener().open_url(href, None::<&str>).map_err(|e| format!("The link could not be opened: {e}"))?;
+                Ok(json!({ "opened": link["host"] }))
+            }
+            "copy" => {
+                let out = ask("copy")?;
+                to_clipboard(out["copy"].as_str().ok_or("The service named no command")?)?;
+                Ok(json!({ "copied": true }))
+            }
+            _ => Err("Unknown click".into()),
+        }
+    })
+    .await
+}
+
+/// Text to the system clipboard, through the platform's own tool: the app
+/// has no clipboard library, and the page is not given the text to copy.
+fn to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let feed = |mut command: Command, bytes: &[u8]| -> Result<(), String> {
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
+        child.stdin.take().ok_or("no input")?.write_all(bytes).map_err(|e| e.to_string())?;
+        match child.wait() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!("it ended with {status}")),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    let done = if cfg!(target_os = "macos") {
+        feed(Command::new("/usr/bin/pbcopy"), text.as_bytes())
+    } else if cfg!(windows) {
+        // clip.exe reads UTF-16 with a byte order mark; anything else goes through the console's code page
+        let wide: Vec<u8> = std::iter::once(0xFEFFu16).chain(text.encode_utf16()).flat_map(u16::to_le_bytes).collect();
+        feed(Command::new("clip.exe"), &wide)
+    } else {
+        feed(Command::new("wl-copy"), text.as_bytes()).or_else(|_| {
+            let mut xclip = Command::new("xclip");
+            xclip.args(["-selection", "clipboard"]);
+            feed(xclip, text.as_bytes())
+        })
+    };
+    done.map_err(|e| format!("The command could not be copied: {e}"))
+}
+
 /// A note from the person on the bulletin board: `folder` empty means every session.
 #[tauri::command]
 pub async fn harness_note_post(text: String, hours: u64, folder: Option<String>) -> Result<(), String> {

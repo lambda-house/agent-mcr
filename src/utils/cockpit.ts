@@ -38,10 +38,46 @@ export const actionSince = (a: CockpitAction) => a.since || a.updated || 0;
  */
 export const stillAwaits = (a: CockpitAction) => !a.ownerTyped && !a.sessionEnded;
 
-/** "Needs you": what still stands first, by urgency, then the oldest first. An action without a time comes last in its group. */
+/**
+ * "Needs you": what the harness itself saw (a prompt, an open report) first,
+ * whatever a session published as urgent; then what still stands, by urgency,
+ * then the oldest first; what is behind last. Urgency is a publisher's claim:
+ * it orders published rows among themselves and never puts one above the
+ * harness's own. An action without a time comes last in its group.
+ */
 export function needsYouRows(cockpit: Cockpit): CockpitAction[] {
   const age = (a: CockpitAction) => actionSince(a) || Number.MAX_SAFE_INTEGER;
-  return [...cockpit.actions].sort((a, b) => Number(!stillAwaits(a)) - Number(!stillAwaits(b)) || urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
+  return [...cockpit.actions].sort((a, b) => Number(!a.derived) - Number(!b.derived) || Number(!stillAwaits(a)) - Number(!stillAwaits(b)) || urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
+}
+
+/** How many published rows of one publisher are shown before the rest folds. */
+export const ROWS_PER_PUBLISHER = 3;
+
+/**
+ * The rows that are shown at once, and per publisher how many are folded
+ * away: one session cannot push the others, or the harness's own rows, out
+ * of sight by publishing many. `open` holds the publishers whose rows were unfolded.
+ */
+export function foldRows(rows: CockpitAction[], open: ReadonlySet<string>): { shown: CockpitAction[]; folded: Map<string, number> } {
+  const seen = new Map<string, number>();
+  const folded = new Map<string, number>();
+  const shown = rows.filter(a => {
+    if (a.derived || !a.by) return true;
+    const n = (seen.get(a.by) ?? 0) + 1;
+    seen.set(a.by, n);
+    if (n <= ROWS_PER_PUBLISHER || open.has(a.by)) return true;
+    folded.set(a.by, (folded.get(a.by) ?? 0) + 1);
+    return false;
+  });
+  return { shown, folded };
+}
+
+/** Whether a click on this part of a published action is offered: it still stands, the panel knows its stamp, and the service has not said that its text would be refused. */
+export function clickable(a: CockpitAction, part: 'say' | 'options' | 'url' | 'command' | 'ask'): boolean {
+  if (a.derived || !a.by || !a.updated) return false;
+  if (part === 'ask') return true;
+  if ((part === 'say' || part === 'options') && !stillAwaits(a)) return false;
+  return !a.unclickable?.includes(part);
 }
 
 /** How a track's state reads: the published word, unless the harness knows that the operator has answered in its lead's terminal since. */

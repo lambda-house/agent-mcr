@@ -313,6 +313,13 @@ pub trait Adapter: Sync {
     fn at_prompt(&self, _screen: &str) -> bool {
         false
     }
+    /// Positive proof that the agent's input box is on screen, for a line the
+    /// operator's click places there (MCR-97). Stricter than `at_prompt` and
+    /// apart from it, so that tasks and notices keep their own rule. False
+    /// when unsure: in a menu the characters of a line act as keys
+    fn input_box(&self, _screen: &str) -> bool {
+        false
+    }
     /// Whether `at_prompt` knows this program's input box at all. Where it
     /// doesn't, the answer is always no and the screen is not read to ask
     fn sees_prompt(&self) -> bool {
@@ -388,9 +395,30 @@ pub struct Claude;
 pub struct Codex;
 pub struct Shell;
 
+/// Claude Code's empty input box at the bottom of the screen, as recorded on
+/// 2026-11-19 from three idle sessions: a rule, the prompt mark alone on its
+/// line, a rule, then the mode line. The upper rule may carry the session's
+/// name before its last dash; that name is text a session chooses, so it
+/// neither makes nor breaks the match. A menu draws no such box, and where
+/// it marks its choice with the same mark ("❯ 1. Yes") the last line that
+/// starts with the mark is not the mark alone. Output above that only draws
+/// a box does not count: the box must be the last thing but two lines.
+fn claude_input_box(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let Some(last) = lines.iter().rposition(|l| !l.is_empty()) else { return false };
+    let lines = &lines[..=last];
+    let Some(at) = lines.iter().rposition(|l| l.trim_start().starts_with('\u{276f}')) else { return false };
+    let rule = |l: &str| l.chars().count() >= 20 && l.chars().all(|c| c == '\u{2500}');
+    let named_rule = |l: &str| l.starts_with("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}") && l.ends_with('\u{2500}') && l.chars().count() >= 20;
+    lines[at] == "\u{276f}" && at >= 1 && named_rule(lines[at - 1]) && lines.get(at + 1).is_some_and(|l| rule(l)) && lines.len() - (at + 2) <= 2
+}
+
 impl Adapter for Claude {
     fn profile(&self) -> Profile {
         Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits", optional: false, can_supervise: true, task_tracking: true }
+    }
+    fn input_box(&self, screen: &str) -> bool {
+        claude_input_box(screen)
     }
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
@@ -517,6 +545,11 @@ impl Adapter for Codex {
     }
     fn at_prompt(&self, screen: &str) -> bool {
         screen.contains("for shortcuts") && screen.lines().any(|l| l.starts_with('\u{203a}'))
+    }
+    /// As for a task. Codex shows a suggestion in an empty box, so the line
+    /// after the mark proves nothing about emptiness: that is the app's witness
+    fn input_box(&self, screen: &str) -> bool {
+        self.at_prompt(screen)
     }
     fn sees_prompt(&self) -> bool {
         true
@@ -755,6 +788,39 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn claudes_input_box_is_proved_by_its_frame_at_the_bottom_and_by_nothing_else() {
+        let rule = "\u{2500}".repeat(80);
+        let named = |name: &str| format!("{} {name} \u{2500}", "\u{2500}".repeat(76 - name.chars().count()));
+        let mode = "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)";
+        let idle = |upper: &str| format!("(text)\n\u{273b} Brewed for 34s \u{b7} done 4:37 PM\n\n                                        \u{2714} Update installed \u{b7} /restart to apply\n{upper}\n\u{276f}\n{rule}\n{mode}\n");
+        // As recorded from three idle sessions on 2026-11-19: with and without a name in the upper rule
+        for upper in [rule.clone(), named("EVSE fix"), named("TEOB Rust Workspace")] {
+            assert!(claude_input_box(&idle(&upper)), "{upper}");
+            assert!(Claude.input_box(&idle(&upper)));
+        }
+        // A name a session chose cannot make a box where there is none, or hide one
+        assert!(claude_input_box(&idle(&named("\u{276f} 1. Yes"))));
+        // Text in the box, or a suggestion drawn in it: not an empty box
+        assert!(!claude_input_box(&idle(&rule).replace("\n\u{276f}\n", "\n\u{276f} half a line\n")));
+        // A menu: its choice carries the same mark
+        let menu = format!("(text)\n{rule}\n Bash command\n   cargo test\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n\n Esc to cancel\n");
+        assert!(!claude_input_box(&menu));
+        // Output that draws a box, with a menu under it
+        assert!(!claude_input_box(&format!("{rule}\n\u{276f}\n{rule}\n{menu}")));
+        // Output that draws a box, with more than the mode line under it
+        assert!(!claude_input_box(&format!("{rule}\n\u{276f}\n{rule}\n one\n two\n three\n")));
+        // No rules, a short rule, another mark, nothing
+        assert!(!claude_input_box("\u{276f}\n"));
+        assert!(!claude_input_box(&format!("{}\n\u{276f}\n{}\n", "\u{2500}".repeat(5), "\u{2500}".repeat(5))));
+        assert!(!claude_input_box(&idle(&rule).replace('\u{276f}', ">")));
+        assert!(!claude_input_box(""));
+        // Other programs: Codex by its own marks, a shell never
+        assert!(Codex.input_box("\u{203a} Ask Codex to do anything\n\n  ? for shortcuts\n") && !Codex.input_box(&idle(&rule)));
+        assert!(!Shell.input_box(&idle(&rule)) && !adapter("agy").input_box(&idle(&rule)));
+    }
 
     #[test]
     fn transcript_summary_takes_title_role_and_tags_from_the_head() {
