@@ -249,6 +249,37 @@ export const slackApi = {
   decide: (post: string, approve: boolean, text?: string, reason?: string) => invoke<SlackStatus>('slack_decide', { post, approve, text: text ?? null, reason: reason || null }),
 };
 
+/** The memory server's connection (D16), as the service reports it. It never carries a token. */
+export interface MemoryStatus {
+  state: 'disconnected' | 'connecting' | 'connected' | 'signed_out';
+  endpoint: string;
+  issuer?: string | null;
+  /** When it was connected, ms; 0 when it is not */
+  since: number;
+  /** The memory a call goes to when it names none */
+  defaultMemory: string;
+  /** The last thing that went wrong, in the service's words */
+  problem?: { kind: string; text: string; at: number } | null;
+}
+
+/** One line on where the memory connection stands, for Settings. */
+export function memoryStateLine(status: MemoryStatus): string {
+  switch (status.state) {
+    case 'connected': return `Connected to ${status.endpoint}. New and restarted sessions have the memory tools; a call that names no memory goes to ${status.defaultMemory}.`;
+    case 'connecting': return 'Waiting for the sign-in in your browser. It is given up after five minutes.';
+    case 'signed_out': return 'The sign-in is no longer valid. Sign in again; until then sessions are told that memory is not available.';
+    default: return 'Not connected. Agent sessions have a memory server that tells them so.';
+  }
+}
+
+export const memoryApi = {
+  status: () => invoke<MemoryStatus>('memory_status'),
+  /** Asks in a native dialog, then opens the browser; resolves to the status either way */
+  connect: () => invoke<MemoryStatus>('memory_connect'),
+  /** Asks in a native dialog unless a sign-in is only under way */
+  disconnect: () => invoke<MemoryStatus>('memory_disconnect'),
+};
+
 export const harnessApi = {
   status: () => invoke<HarnessStatus>('harness_status'),
   preferences: () => invoke<HarnessPreferences>('harness_preferences'),
