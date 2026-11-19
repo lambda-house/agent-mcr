@@ -694,7 +694,6 @@ impl Memory {
         if self.connected() {
             return Err("Memory is already connected".into());
         }
-        let flow = self.flow.fetch_add(1, Ordering::SeqCst) + 1;
         let link = &self.link;
         let until = Instant::now() + FOR_THE_APP;
         let meta = discover(&link.agent, &link.endpoint, until).map_err(|e| e.text())?;
@@ -730,10 +729,20 @@ impl Memory {
             enc(SCOPE),
             enc(&link.endpoint),
         );
-        link.change(|s| {
-            s.state = "connecting".into();
-            s.problem = None;
-        });
+        // Only a sign-in that can start takes over from one that is under way: a Connect
+        // that failed above has changed nothing. In one step with a sign-in that is
+        // about to keep its tokens, so two cannot both end as connected
+        let flow = {
+            let _kept = lock(&link.keeping);
+            if self.connected() {
+                return Err("Memory is already connected".into());
+            }
+            link.change(|s| {
+                s.state = "connecting".into();
+                s.problem = None;
+            });
+            self.flow.fetch_add(1, Ordering::SeqCst) + 1
+        };
         let me = self.clone();
         std::thread::spawn(move || {
             let link = &me.link;
@@ -1624,6 +1633,32 @@ mod tests {
         assert!(rig.vault.0.lock().unwrap().is_empty(), "{:?}", rig.vault.0.lock().unwrap().keys());
         assert_eq!(lock(&rig.world).revoked, ["refresh-secret-1"]);
         assert!(lock(&rig.world).refresh.is_empty());
+    }
+
+    #[test]
+    fn a_connect_that_fails_early_leaves_the_sign_in_under_way_alone() {
+        let rig = Rig::new();
+        let url = rig.memory.connect().unwrap()["url"].as_str().unwrap().to_string();
+        // A second Connect that gets no further than the authorization server's description
+        lock(&rig.world).meta = json!({"code_challenge_methods_supported": ["plain"]});
+        assert!(rig.memory.connect().is_err());
+        lock(&rig.world).meta = json!({});
+        // The first is still listening and its answer still connects
+        assert_eq!(rig.state(), "connecting");
+        assert!(rig.browse(&url, |_| {}).contains("Memory is connected"));
+        rig.settle();
+        assert_eq!(rig.state(), "connected");
+
+        // A second Connect that does start takes over: the first one's address is closed
+        let rig = Rig::new();
+        let first = rig.memory.connect().unwrap()["url"].as_str().unwrap().to_string();
+        let second = rig.memory.connect().unwrap()["url"].as_str().unwrap().to_string();
+        std::thread::sleep(Duration::from_millis(200));
+        let redirect = query(first.split_once('?').unwrap().1).into_iter().find(|(k, _)| k == "redirect_uri").unwrap().1;
+        assert!(TcpStream::connect(redirect.strip_prefix("http://").unwrap().split('/').next().unwrap()).is_err());
+        rig.browse(&second, |_| {});
+        rig.settle();
+        assert_eq!(rig.state(), "connected");
     }
 
     #[test]
