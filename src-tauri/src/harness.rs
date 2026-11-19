@@ -3209,14 +3209,24 @@ impl Harness {
             told.retain(|k| found.iter().any(|o| key(o) == *k));
             found.into_iter().filter(|o| !told.contains(&key(o))).collect()
         };
+        // Who would be told, looked up without writing: an entry nobody can be
+        // told about stays news at every tick, and `update` writes the whole
+        // state file and wakes every waiter
+        let receiver = |s: &Store, o: &cockpit::Outdated| {
+            let to = if o.by == cockpit::ROOT { root.clone() } else { Some(o.by.clone()) };
+            to.filter(|to| s.sessions.get(to).is_some_and(|t| t.state != ENDED))
+        };
+        let news: Vec<cockpit::Outdated> = {
+            let store = lock(&self.store);
+            news.into_iter().filter(|o| receiver(&store, o).is_some()).collect()
+        };
         if news.is_empty() {
             return;
         }
         let posted: Vec<(ToldOutdated, String)> = self.update(|s| {
             let mut posted = Vec::new();
             for o in &news {
-                let to = if o.by == cockpit::ROOT { root.clone() } else { Some(o.by.clone()) };
-                let Some(to) = to.filter(|to| s.sessions.get(to).is_some_and(|t| t.state != ENDED)) else { continue };
+                let Some(to) = receiver(s, o) else { continue };
                 // The harness's own sentence: sessions are named by id, never by a label an agent wrote
                 let entry = format!("{} {:?}", if o.track { "track" } else { "action" }, o.id);
                 let text = match o.typed {
@@ -6949,8 +6959,12 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(3));
         harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        // And a tick with nobody to tell writes nothing: it comes every three seconds
+        let before = lock(&harness.store).version;
+        tick(None);
         tick(None);
         assert!(to("other").is_empty());
+        assert_eq!(lock(&harness.store).version, before);
         // Once it runs, it is told, once
         tick(Some("other"));
         tick(Some("other"));
