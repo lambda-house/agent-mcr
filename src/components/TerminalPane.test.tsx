@@ -71,14 +71,19 @@ describe('session pointers in a terminal', () => {
   });
 
   it('takes the keyboard when asked to, once per request, and gives its provider back', async () => {
-    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live}/>)); await frame();
-    expect(screen.focused).toBe(0);
-    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live} focusAt={5}/>)); await frame();
-    expect(screen.focused).toBe(1);
-    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live} focusAt={5}/>)); await frame();
-    expect(screen.focused).toBe(1);
-    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live} focusAt={6}/>)); await frame();
-    expect(screen.focused).toBe(2);
+    let served = 0;
+    const pane = (focusAt?: number) => <TerminalPane id="t1" active={false} isSession={live} focusAt={focusAt} onFocused={() => { served++; }}/>;
+    await act(async () => root.render(pane())); await frame();
+    expect([screen.focused, served]).toEqual([0, 0]);
+    await act(async () => root.render(pane(5))); await frame();
+    expect([screen.focused, served]).toEqual([1, 1]);
+    await act(async () => root.render(pane(5))); await frame();
+    expect([screen.focused, served]).toEqual([1, 1]);
+    await act(async () => root.render(pane(6))); await frame();
+    expect([screen.focused, served]).toEqual([2, 2]);
+    // The request taken back, as the app does once it is served: nothing more
+    await act(async () => root.render(pane())); await frame();
+    expect([screen.focused, served]).toEqual([2, 2]);
     expect(screen.providers).toBe(1);
     await act(async () => root.render(<div/>));
     expect(screen.providers).toBe(0);

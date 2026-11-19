@@ -38,7 +38,7 @@ function theme(element: HTMLElement) {
  * with no text is saved and its path typed. Ctrl-V reaches the agent as ^V
  * (Claude Code reads the clipboard image itself).
  */
-export default function TerminalPane({ id, active, onQuit, isSession, onSession, focusAt }: {
+export default function TerminalPane({ id, active, onQuit, isSession, onSession, focusAt, onFocused }: {
   id: string; active: boolean;
   /** The session ended right after the person pressed keys in it: they quit the agent themselves */
   onQuit?: () => void;
@@ -48,11 +48,13 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
   onSession?: (id: string) => void;
   /** Changes when this terminal is to take the keyboard, as after a click on a link to its session */
   focusAt?: number;
+  /** It took the keyboard for `focusAt`: the request is served and must not be handed to a later mount */
+  onFocused?: () => void;
 }) {
   const quit = useRef(onQuit);
   quit.current = onQuit;
-  const sessions = useRef({ isSession, onSession });
-  sessions.current = { isSession, onSession };
+  const sessions = useRef({ isSession, onSession, onFocused });
+  sessions.current = { isSession, onSession, onFocused };
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
@@ -204,7 +206,7 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
   useEffect(() => {
     if (!focusAt) return;
     // After the click that asked for it: that click leaves the keyboard in the terminal it was made in
-    const frame = requestAnimationFrame(() => term.current?.focus());
+    const frame = requestAnimationFrame(() => { term.current?.focus(); sessions.current.onFocused?.(); });
     return () => cancelAnimationFrame(frame);
   }, [focusAt]);
 
