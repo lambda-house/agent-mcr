@@ -37,6 +37,12 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const SIGN_IN_LIMIT: Duration = Duration::from_secs(300);
 const TOOLS_FRESH: Duration = Duration::from_secs(60);
 const QUICK: Duration = Duration::from_secs(15);
+/// How long a session's `initialize` waits for the memory service. An agent
+/// shows a server that starts slowly as failed, so this stays short.
+const AT_START: Duration = Duration::from_secs(4);
+/// A memory service that could not be reached is not asked again for this
+/// long by other sessions that start: they would each wait in turn.
+const AWAY_FOR: Duration = Duration::from_secs(20);
 /// A tool call may run a model on the other side.
 const CALL: Duration = Duration::from_secs(180);
 const MAX_ANSWER: u64 = 4 * 1024 * 1024;
@@ -86,7 +92,9 @@ impl Fail {
 /// the local memory will be another.
 pub trait Backend: Send + Sync {
     /// The backend's `initialize` result: its name and its instructions.
-    fn info(&self) -> Result<Value, Fail>;
+    /// `wait` bounds the answer: a session's start is not held up by a
+    /// memory that is slow or away.
+    fn info(&self, wait: Duration) -> Result<Value, Fail>;
     /// `{"tools": [...]}`, every page.
     fn list_tools(&self) -> Result<Value, Fail>;
     /// The backend's `tools/call` result, as it is.
@@ -414,12 +422,14 @@ struct Session {
 pub struct RemoteMcp {
     link: Arc<Link>,
     session: Mutex<Option<Session>>,
+    /// When the service last could not be reached at a session's start, and why
+    away: Mutex<Option<(Instant, Fail)>>,
     next: AtomicU64,
 }
 
 impl RemoteMcp {
     fn new(link: Arc<Link>) -> Self {
-        Self { link, session: Mutex::new(None), next: AtomicU64::new(1) }
+        Self { link, session: Mutex::new(None), away: Mutex::new(None), next: AtomicU64::new(1) }
     }
 
     /// One POST. The answer is the JSON-RPC message with the request's id,
@@ -500,7 +510,7 @@ impl RemoteMcp {
     }
 
     /// The MCP session with the memory service, started when there is none.
-    fn session(&self) -> Result<Session, Fail> {
+    fn session(&self, wait: Duration) -> Result<Session, Fail> {
         let mut held = lock(&self.session);
         if let Some(session) = held.as_ref() {
             return Ok(session.clone());
@@ -510,10 +520,10 @@ impl RemoteMcp {
             "capabilities": {},
             "clientInfo": {"name": "agent-mcr", "version": env!("CARGO_PKG_VERSION")},
         }});
-        let (answer, id) = self.signed(None, &hello, QUICK)?;
+        let (answer, id) = self.signed(None, &hello, wait)?;
         let info = Self::result(answer)?;
         let session = Session { id, version: info["protocolVersion"].as_str().unwrap_or(PROTOCOL_VERSION).to_string(), info };
-        self.signed(Some(&session), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), QUICK)?;
+        self.signed(Some(&session), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), wait)?;
         *held = Some(session.clone());
         Ok(session)
     }
@@ -521,7 +531,7 @@ impl RemoteMcp {
     fn rpc(&self, method: &str, params: Value, wait: Duration) -> Result<Value, Fail> {
         let mut again = true;
         loop {
-            let session = self.session()?;
+            let session = self.session(QUICK)?;
             let message = json!({"jsonrpc": "2.0", "id": self.id(), "method": method, "params": params});
             match self.signed(Some(&session), &message, wait) {
                 // A memory service that keeps sessions no longer knows this one (404, as the
@@ -541,8 +551,18 @@ impl RemoteMcp {
 }
 
 impl Backend for RemoteMcp {
-    fn info(&self) -> Result<Value, Fail> {
-        self.session().map(|s| s.info)
+    fn info(&self, wait: Duration) -> Result<Value, Fail> {
+        if let Some((at, fail)) = lock(&self.away).as_ref() {
+            if at.elapsed() < AWAY_FOR {
+                return Err(fail.clone());
+            }
+        }
+        let found = self.session(wait).map(|s| s.info);
+        *lock(&self.away) = match &found {
+            Err(fail @ Fail::Unreachable(_)) => Some((Instant::now(), fail.clone())),
+            _ => None,
+        };
+        found
     }
     fn list_tools(&self) -> Result<Value, Fail> {
         let (mut tools, mut cursor) = (Vec::new(), None::<String>);
@@ -562,6 +582,7 @@ impl Backend for RemoteMcp {
     }
     fn reset(&self) {
         *lock(&self.session) = None;
+        *lock(&self.away) = None;
     }
 }
 
@@ -837,7 +858,7 @@ impl Memory {
                     Err(why) => why.clone(),
                     Ok(_) => {
                         let ours = format!("{DATA_NOTE} A call that leaves `memory` out goes to the memory `{DEFAULT_MEMORY}`.");
-                        match self.noted(self.backend.info()) {
+                        match self.noted(self.backend.info(AT_START)) {
                             Ok(info) => match info["instructions"].as_str().filter(|t| !t.trim().is_empty()) {
                                 Some(theirs) => format!("{ours}\n\nFrom the memory service:\n{theirs}"),
                                 None => ours,
@@ -1498,6 +1519,26 @@ mod tests {
         lock(&rig.world).session = Some("two".into());
         assert_eq!(rig.call("clock", json!({}))["result"]["isError"], false);
         assert_eq!(lock(&rig.world).mcp.iter().filter(|m| m["method"] == "initialize").count(), 2);
+    }
+
+    #[test]
+    fn a_memory_service_that_is_away_does_not_hold_a_start_up_twice() {
+        let rig = Rig::signed_in();
+        // Nothing answers at the address any more
+        let gone = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let away = Memory::with(&rig.dir, &format!("http://127.0.0.1:{gone}/mcp"), Box::new(rig.vault.clone()), None);
+        let hello = |m: &Memory| m.handle(&Ok("s1".into()), &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).unwrap();
+        let started = Instant::now();
+        let first = hello(&away);
+        let text = first["result"]["instructions"].as_str().unwrap();
+        assert!(text.starts_with(DATA_NOTE) && text.contains("It did not answer when this session started: The memory service could not be reached"), "{text}");
+        // The next session to start is told the same without another wait
+        assert_eq!(hello(&away), first);
+        assert!(started.elapsed() < AT_START + Duration::from_secs(1));
+        assert_eq!(away.status()["problem"]["kind"], "unreachable");
+        // A call still tries, and says what happened
+        let told = away.handle(&Ok("s1".into()), &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+        assert_eq!(told["error"]["code"], -32000);
     }
 
     #[test]
