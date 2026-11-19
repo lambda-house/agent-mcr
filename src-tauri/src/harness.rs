@@ -4022,7 +4022,7 @@ impl Harness {
             return Err("Refused: terminal_write is unavailable through the CLI; ask the operator to use the terminal or an MCP client that asks for approval.".into());
         }
         match who {
-            Caller::Session { id, .. } if lock(&self.store).sessions.get(id).is_some_and(|t| adapter(&t.profile).asks_before_terminal_write()) => Ok(()),
+            Caller::Session { id, supervisor: true } if lock(&self.store).sessions.get(id).is_some_and(|t| adapter(&t.profile).asks_before_terminal_write()) => Ok(()),
             _ => Err("Refused: terminal_write is only available to a hosted Claude supervisor (which asks the operator for permission). Use task_assign or ask the operator to type into the terminal.".into()),
         }
     }
@@ -6053,6 +6053,8 @@ mod tests {
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-codex".into(), supervisor: true }, false).is_err());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-pi".into(), supervisor: true }, false).is_err());
         assert!(harness.allows_terminal_write(&Caller::Session { id: "unknown".into(), supervisor: true }, false).is_err());
+        // A hosted Claude session that is not the Supervisor: every call is refused it, so the list has no such tool either
+        assert!(harness.allows_terminal_write(&Caller::Session { id: "sup-claude".into(), supervisor: false }, false).is_err());
         assert!(harness.allows_terminal_write(&Caller::Outside, false).is_err());
         assert!(harness.allows_terminal_write(&Caller::Unknown, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
