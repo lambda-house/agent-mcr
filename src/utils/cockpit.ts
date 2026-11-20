@@ -134,7 +134,8 @@ export function harnessChips(a: CockpitAction, now = Date.now()): string[] {
   if (!l || a.derived) return [];
   return [
     l.prompt ? `at a prompt · ${formatAge(l.prompt, now)}` : '',
-    l.held ? `your unsent line there for ${heldFor(l.held, now)}: Enter sends it, Ctrl+C clears it` : '',
+    // Never Ctrl+C: in a working agent it stops the turn (MCR-122)
+    l.held ? `held for a line you have not sent there, ${heldFor(l.held, now)}: if its box is empty, press Enter there` : '',
     l.report ? `reported: needs you · ${formatAge(l.report.since, now)}` : '',
     ...(l.waits ?? []).map(w => `waits for you, late · since ${formatAge(w.since, now)}`),
   ].filter(Boolean);

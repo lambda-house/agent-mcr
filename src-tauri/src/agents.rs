@@ -327,6 +327,16 @@ pub trait Adapter: Sync {
     fn input_box(&self, _screen: &str) -> bool {
         false
     }
+    /// Positive proof that the agent's input box is on screen and empty
+    /// (MCR-122): a hold for an unsent line that is not there ends. False
+    /// when unsure; an agent whose empty box shows suggestions cannot say
+    fn empty_input_box(&self, _screen: &str) -> bool {
+        false
+    }
+    /// Whether `empty_input_box` can ever be true; where not, no screen is read for it
+    fn shows_empty_input_box(&self) -> bool {
+        false
+    }
     /// Whether `at_prompt` knows this program's input box at all. Where it
     /// doesn't, the answer is always no and the screen is not read to ask
     fn sees_prompt(&self) -> bool {
@@ -426,6 +436,13 @@ impl Adapter for Claude {
     }
     fn input_box(&self, screen: &str) -> bool {
         claude_input_box(screen)
+    }
+    /// The prompt mark alone between the rules is an empty box
+    fn empty_input_box(&self, screen: &str) -> bool {
+        claude_input_box(screen)
+    }
+    fn shows_empty_input_box(&self) -> bool {
+        true
     }
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {

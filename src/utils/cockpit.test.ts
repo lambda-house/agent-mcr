@@ -179,9 +179,11 @@ describe('what the harness knows, derived or merged (MCR-118)', () => {
     expect([heldFor(NOW - 45_000, NOW), heldFor(NOW - 12 * 60_000, NOW), heldFor(NOW - 125 * 60_000, NOW), heldFor(NOW - 120 * 60_000, NOW)]).toEqual(['45 s', '12 min', '2 h 5 min', '2 h']);
     expect(harnessChips(action('h', { kind: 'held_line', derived: 'held', since: NOW - 12 * 60_000 }), NOW)).toEqual(['unsent for 12 min']);
     const chips = harnessChips(action('m', { live: { prompt: NOW - 60_000, held: NOW - 3 * 60_000, report: { id: 'r', since: NOW, text: 'Which key?' }, waits: [{ id: 'w', on: 'a go', since: NOW - 3600_000 }] } }), NOW);
-    expect(chips).toEqual(['at a prompt · 1 min ago', 'your unsent line there for 3 min: Enter sends it, Ctrl+C clears it', 'reported: needs you · just now', 'waits for you, late · since 1 h ago']);
+    expect(chips).toEqual(['at a prompt · 1 min ago', 'held for a line you have not sent there, 3 min: if its box is empty, press Enter there', 'reported: needs you · just now', 'waits for you, late · since 1 h ago']);
     // The session's own words are not a chip
     expect(chips.join(' ')).not.toContain('Which key?');
+    // Never Ctrl+C: in a working agent it stops the turn (MCR-122)
+    expect(chips.join(' ')).not.toContain('Ctrl+C');
     expect(harnessChips(action('plain'), NOW)).toEqual([]);
   });
 

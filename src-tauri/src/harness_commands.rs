@@ -113,6 +113,19 @@ impl Draft {
     }
 }
 
+/// The service's word on a line the app told it of (MCR-122). Where the app
+/// said "unsent" and the service keeps no draft, the keys answered a question
+/// the session asked (a digit at a permission menu): the app forgets its
+/// count, or it would tell the same line again at the next key and hold every
+/// message and task until Enter. Keys typed while the call was under way are
+/// forgotten with it; the next key is told anew. A service of an earlier
+/// build answers without `draft`, and nothing changes.
+fn settle(drafts: &mut BTreeMap<String, Draft>, id: &str, told_unsent: bool, answer: &serde_json::Value) {
+    if told_unsent && answer["draft"] == false {
+        drafts.remove(id);
+    }
+}
+
 /// After a word about an unsent line did not reach the service (it restarts
 /// at every rebuild): say it again every `pause` while the line is unsent,
 /// until a call succeeds or `tries` are used up. Without it a first key told
@@ -947,8 +960,14 @@ pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -
             let draft = drafts.lock().is_ok_and(|drafts| drafts.get(id).is_some_and(Draft::unsent));
             // Two ops: a service of the build before takes every `operator_input` for an Enter
             let op = if enter { "operator_input" } else { "operator_draft" };
-            if service(json!({"op": op, "id": id, "draft": draft})).is_err() && draft {
-                retell(drafts.clone(), id.to_string(), std::time::Duration::from_secs(2), 30, |id| service(json!({"op": "operator_draft", "id": id, "draft": true})).is_ok());
+            match service(json!({"op": op, "id": id, "draft": draft})) {
+                Ok(answer) => {
+                    if let Ok(mut drafts) = drafts.lock() {
+                        settle(&mut drafts, id, draft, &answer);
+                    }
+                }
+                Err(_) if draft => retell(drafts.clone(), id.to_string(), std::time::Duration::from_secs(2), 30, |id| service(json!({"op": "operator_draft", "id": id, "draft": true})).is_ok()),
+                Err(_) => {}
             }
         });
     }
@@ -1018,6 +1037,27 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_the_service_takes_for_an_answer_is_forgotten_by_the_app() {
+        // A digit pressed at Claude Code's permission menu: the app counts it as a line
+        let mut drafts: BTreeMap<String, Draft> = BTreeMap::new();
+        drafts.entry("s".into()).or_default().key("2");
+        assert!(drafts["s"].unsent());
+        // An older service answers nothing about the line: the count stays
+        settle(&mut drafts, "s", true, &json!({}));
+        assert!(drafts.contains_key("s"));
+        // The service keeps a draft: so does the app
+        settle(&mut drafts, "s", true, &json!({"draft": true}));
+        assert!(drafts.contains_key("s"));
+        // The service keeps none (the session asks): the app forgets the key, so it is not told again
+        settle(&mut drafts, "s", true, &json!({"draft": false}));
+        assert!(!drafts.contains_key("s"));
+        // A word the app sent about an empty box changes nothing here
+        drafts.entry("t".into()).or_default().key("x");
+        settle(&mut drafts, "t", false, &json!({"draft": false}));
+        assert!(drafts.contains_key("t"));
+    }
 
     #[test]
     fn a_draft_follows_the_keys_and_errs_towards_unsent() {
