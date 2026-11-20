@@ -556,7 +556,7 @@
 .ck-urgency { padding: 0 6px; border-radius: 8px; font-size: 10px; font-weight: 600; text-transform: uppercase; background: var(--layer-1); color: var(--sc-muted); }
 .ck-urgency.now { background: var(--danger-soft); color: var(--danger); }
 .ck-kind { color: var(--sc-muted); font-size: 11px; }
-.session-cockpit .ck-session, .ck-session { padding: 0; border: 0; background: transparent; color: var(--sc-accent); font-size: 12px; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; white-space: nowrap; height: auto; }
+.session-cockpit .ck-session, .ck-session { padding: 0; border: 0; background: transparent; color: var(--sc-accent); font-size: 12px; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; white-space: nowrap; height: auto; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .ck-session.gone, .ck-session.you { color: var(--sc-muted); text-decoration: none; cursor: default; }
 .ck-live { padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; font-size: 10.5px; color: var(--sc-muted); white-space: nowrap; }
 .ck-live::before { content: ''; display: inline-block; width: 5px; height: 5px; margin-right: 4px; border-radius: 50%; background: currentColor; vertical-align: middle; }
@@ -585,13 +585,30 @@
 .ck-line { color: var(--sc-text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ck-waits { color: var(--sc-muted); white-space: nowrap; }
 .ck-track-sub { display: flex; gap: 10px; margin: 1px 0 0 23px; min-width: 0; }
-.ck-track-line { flex-wrap: nowrap; }
-.ck-track-line { align-items: baseline; }
-.ck-track-line strong { min-width: 0; overflow-wrap: anywhere; }
 .ck-track-body { margin: 3px 0 4px 23px; }
 .session-cockpit .ck-lead, .ck-lead { display: flex; align-items: flex-start; gap: 6px; width: 100%; height: auto; padding: 3px 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .ck-lead:hover { background: var(--layer-1); }
 .ck-item { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 2px 0; }
+.ck-item-title { flex: 1 1 12em; min-width: min(10em, 100%); overflow-wrap: break-word; }
+.ck-item .ck-waits { min-width: 0; white-space: normal; overflow-wrap: break-word; }
+.ck-item .ck-line { flex: 1 1 100%; }
+/* A track's row (MCR-105). The title gets the most room and has a floor; it wraps between words only
+   (a word breaks only when it is wider than the whole title). Who leads, who published and when give way:
+   cut with an ellipsis, whole in the tooltip. In a narrow column they go to a smaller second line. */
+.ck-col { container: ck-col / inline-size; }
+.ck-track-line { flex-wrap: nowrap; align-items: baseline; }
+.ck-track-title { flex: 1 1 auto; min-width: min(10em, 100%); overflow-wrap: break-word; }
+.ck-track-meta { flex: 0 4 auto; max-width: 45%; min-width: 0; display: flex; align-items: baseline; gap: 7px; overflow: hidden; white-space: nowrap; }
+.ck-track-meta > * { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ck-track-meta > .ck-role { flex-shrink: 0; }
+.ck-track-meta > .ck-session { min-width: 3em; flex-shrink: 3; }
+.ck-track-meta > .ck-age { margin-left: 0; flex-shrink: 0; max-width: 60%; }
+@container ck-col (max-width: 460px) {
+  .ck-track-line { flex-wrap: wrap; row-gap: 0; }
+  .ck-track-title { flex-basis: 0; }
+  .ck-track-meta { flex: 1 1 100%; max-width: none; padding-left: 23px; font-size: 11px; }
+  .ck-track-meta .ck-session { font-size: 11px; }
+}
 .ck-resizer { flex: 0 0 5px; cursor: row-resize; touch-action: none; }
 .ck-resizer:hover, .ck-resizer:active { background: color-mix(in srgb, var(--sc-accent) 45%, transparent); }
 
