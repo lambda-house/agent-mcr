@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import ConfirmDialog from './ConfirmDialog';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
@@ -32,8 +33,8 @@ const store = (key: string, value: string) => { try { localStorage.setItem(key, 
 /** A session's name as a link to it; plain text when it cannot be opened any more. */
 function SessionLink({ who, onSession }: { who: Named; onSession: (id: string) => void }) {
   // Running by the service's word, not in the list yet: named, and not called ended
-  if (!who.hosted && who.standing === 'running') return <span className="ck-session you" title="Not in the session list yet">{who.name}</span>;
-  if (!who.hosted) return <span className="ck-session gone" title={who.standing === 'gone' ? 'The harness has no such session any more' : 'This session ended'}>{who.name}{who.standing === 'gone' ? ' (gone)' : ' (ended)'}</span>;
+  if (!who.hosted && who.standing === 'running') return <span className="ck-session you" title={`${who.name}: not in the session list yet`}>{who.name}</span>;
+  if (!who.hosted) return <span className="ck-session gone" title={`${who.name}: ${who.standing === 'gone' ? 'the harness has no such session any more' : 'this session ended'}`}>{who.name}{who.standing === 'gone' ? ' (gone)' : ' (ended)'}</span>;
   const h = who.hosted;
   return <button type="button" className="ck-session" title={`Open ${who.name}`} onClick={() => onSession(h.id)}>{who.name}</button>;
 }
@@ -162,7 +163,9 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         {a.live && !a.live.reportOpen && <span className="ck-stale">the report it names is closed</span>}
         {!a.derived && <Stale marks={staleMarks(a, cockpit, hosted, label)}/>}
       </p>
-      {link && (
+      {/* In the page's body, not in the row: a column of the panel is a container (MCR-105), and a
+          container boxes in what is fixed inside it, so the question could land out of sight */}
+      {link && createPortal(
         <ConfirmDialog title="Open this link in your browser?" confirmLabel="Open link" cancelIsDefault
           onCancel={() => setLink(null)} onConfirm={() => { setLink(null); act('open'); }}>
           <dl className="ck-link">
@@ -172,7 +175,8 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
           </dl>
           <p>{from ? `Published ${from}.` : ''} An agent wrote this address. A link can carry data out in its path or query, and it acts with what your browser is signed in to.</p>
           {!link.known && <p className="ck-link-warn" role="alert">Look twice: this host is not on your list of known hosts, or the path is one where you sign in, grant an app access or change an account. Open it only if you know this address and expected it.</p>}
-        </ConfirmDialog>
+        </ConfirmDialog>,
+        document.body,
       )}
     </li>
   );
@@ -187,6 +191,7 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
   const state = trackStateShown(t);
   // Who wrote the text is not always who leads the work: the Supervisor publishes tracks led by others
   const publishedByOther = t.by !== t.lead;
+  const age = `${publishedByOther ? `by ${who(t.by).name} · ` : ''}${t.updated ? formatAge(t.updated) : ''}`;
   return (
     <li className={`ck-track ${t.state}${state.tone === 'stale' ? ' stale' : ''}`} data-track={t.id}>
       <div className="ck-track-line">
@@ -194,14 +199,18 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
           {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}
         </button>
         <span className={`ck-state ${state.tone}`} title={state.tone === 'answered' ? 'From the harness: you pressed Enter in the lead session\'s terminal after this track was published as waiting for you. Its publisher was told to update it' : undefined}>{state.text}</span>
-        <strong>{t.title}</strong>
-        {publishedByOther && <span className="ck-role">lead</span>}
-        <SessionLink who={lead} onSession={onSession}/>
-        <Stale marks={staleMarks(t, cockpit, hosted, label)}/>
-        <span className="ck-age">{publishedByOther ? `by ${who(t.by).name} · ` : ''}{t.updated ? formatAge(t.updated) : ''}</span>
+        <strong className="ck-track-title">{t.title}</strong>
+        {/* Who and when give way to the title: cut with an ellipsis, whole in the tooltip, and on a
+            line of their own under the title when the column is narrow (MCR-105) */}
+        <span className="ck-track-meta">
+          {publishedByOther && <span className="ck-role">lead</span>}
+          <SessionLink who={lead} onSession={onSession}/>
+          <Stale marks={staleMarks(t, cockpit, hosted, label)}/>
+          <span className="ck-age" title={age || undefined}>{age}</span>
+        </span>
       </div>
       {(t.line || waits.length > 0) && <div className="ck-track-sub">
-        {t.line && <span className="ck-line">{t.line}</span>}
+        {t.line && <span className="ck-line" title={t.line}>{t.line}</span>}
         {waits.length > 0 && <span className="ck-waits">waits on {waits.join(', ')}</span>}
       </div>}
       {open && (
@@ -223,7 +232,7 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
                   {w && (w.derived
                     ? <span className={`ck-live${w.overdue ? ' late' : ''}`} title="A wait the session registered with the harness">waits for {w.what}{w.overdue ? ' (late)' : ''}{w.since ? ` · ${formatAge(w.since)}` : ''}</span>
                     : <span className="ck-waits">waits on {w.kind === 'human' ? 'you' : w.kind === 'session' && w.who ? who(w.who).name : w.what || w.kind}{(w.kind === 'human' || w.kind === 'session') && w.what ? `: ${w.what}` : ''}{w.since ? ` · ${formatAge(w.since)}` : ''}</span>)}
-                  {item.next && <span className="ck-line">next: {item.next}</span>}
+                  {item.next && <span className="ck-line" title={`next: ${item.next}`}>next: {item.next}</span>}
                 </li>
               );
             })}

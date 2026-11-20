@@ -4,6 +4,10 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import CockpitPanel from './CockpitPanel';
 import { harnessApi, type Cockpit, type Hosted } from '../utils/harness';
+import { readFileSync } from 'node:fs';
+
+// Vitest hands CSS imports over empty: the stylesheet is read from disk
+const css = readFileSync(`${process.cwd()}/src/styles/harness.css`, 'utf8');
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { cockpit: vi.fn(), cockpitAct: vi.fn() } }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'a while ago' }));
@@ -130,6 +134,9 @@ it('asks before a link is opened, with Cancel as the default, and shows where it
   const pr = host.querySelector('[data-action="pr"]')!;
   await act(async () => ([...pr.querySelectorAll('button.ck-do')].find(b => b.textContent === 'Open link…')! as HTMLButtonElement).click()); await flush();
   const dialog = document.querySelector('.modal')!;
+  // Over the whole window: outside the panel, whose columns are containers that would box it in (MCR-105)
+  expect(dialog.closest('.modal-overlay')!.parentElement).toBe(document.body);
+  expect(host.contains(dialog)).toBe(false);
   expect([...dialog.querySelectorAll('.ck-link dd')].map(d => d.textContent)).toEqual(['example.com', '/a', 'token=abc']);
   expect(dialog.querySelector('.ck-link-warn')!.textContent).toContain('not on your list of known hosts');
   // Cancel has the focus: Enter cancels, and only the link's parts were asked for
@@ -270,6 +277,32 @@ it('names the publisher apart from the lead when the Supervisor published a trac
   const own = host.querySelector('[data-track="own"]')!;
   expect(own.querySelector('.ck-role')).toBeNull();
   expect(own.querySelector('.ck-age')!.textContent).not.toContain('by ');
+});
+
+it('keeps the room of a track row for its title: who and when give way, whole in their tooltips (MCR-105)', async () => {
+  const long = 'Vadim plugin Windows branches merge status';
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, sessions: { ...doc.sessions, b1: { name: long } }, tracks: [{ ...doc.tracks[0], by: 'supervisor' }], actions: [] });
+  await act(async () => root.render(<CockpitPanel active hosted={[session('b1', long), session('r1', 'Reviewer')]} label={label} onSession={() => {}}/>)); await flush();
+  const line = host.querySelector('[data-track="store"] .ck-track-line')!;
+  // The title stands alone; the lead, the publisher and the age are one group after it, which the
+  // stylesheet cuts first and moves under the title in a narrow column
+  expect([...line.children].map(c => c.className.split(' ')[0])).toEqual(['ck-expand', 'ck-state', 'ck-track-title', 'ck-track-meta']);
+  const meta = line.querySelector('.ck-track-meta')!;
+  expect([...meta.children].map(c => c.className.split(' ')[0])).toEqual(['ck-role', 'ck-session', 'ck-age']);
+  expect(meta.querySelector('.ck-session')!.getAttribute('title')).toBe(`Open ${long}`);
+  expect(meta.querySelector('.ck-age')!.getAttribute('title')).toBe('by Supervisor · a while ago');
+  // A cut line of the track says itself whole in its tooltip
+  expect(host.querySelector('[data-track="store"] .ck-line')!.getAttribute('title')).toBe('review done, merge waits');
+});
+
+it('gives the title of a track a floor and never breaks it at any letter (MCR-105)', () => {
+  // The declarations of the first rule whose selector list is exactly this
+  const rule = (selector: string) => { const at = css.indexOf(`\n${selector} {`); return at < 0 ? '' : css.slice(at, css.indexOf('}', at)); };
+  // "anywhere" made the title's smallest width one letter: the row then ran down the page letter by letter
+  expect(css).not.toMatch(/\.ck-track[^{]*\{[^}]*overflow-wrap: anywhere/);
+  expect(rule('.ck-track-title')).toContain('min-width: min(10em, 100%)');
+  expect(rule('.ck-track-meta')).toContain('min-width: 0');
+  expect(css).toMatch(/@container ck-col \(max-width: 460px\) \{[^@]*\.ck-track-meta \{ flex: 1 1 100%/);
 });
 
 it('can be collapsed, and stays so', async () => {
