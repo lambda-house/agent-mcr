@@ -574,6 +574,8 @@ export const canRestart = (h: Hosted) => !h.exit && ['claude', 'codex'].includes
 
 /** How long something has been running, short: 40s, 12m, 3h 5m. */
 export function runningFor(started: number, now: number): string {
+  // A missing start time says nothing, not "NaNh NaNm"
+  if (!Number.isFinite(now - started)) return '';
   const seconds = Math.max(0, Math.round((now - started) / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);

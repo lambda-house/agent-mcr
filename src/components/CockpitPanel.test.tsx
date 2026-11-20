@@ -134,6 +134,9 @@ it('asks before a link is opened, with Cancel as the default, and shows where it
   const pr = host.querySelector('[data-action="pr"]')!;
   await act(async () => ([...pr.querySelectorAll('button.ck-do')].find(b => b.textContent === 'Open link…')! as HTMLButtonElement).click()); await flush();
   const dialog = document.querySelector('.modal')!;
+  // Over the whole window: outside the panel, whose columns are containers that would box it in (MCR-105)
+  expect(dialog.closest('.modal-overlay')!.parentElement).toBe(document.body);
+  expect(host.contains(dialog)).toBe(false);
   expect([...dialog.querySelectorAll('.ck-link dd')].map(d => d.textContent)).toEqual(['example.com', '/a', 'token=abc']);
   expect(dialog.querySelector('.ck-link-warn')!.textContent).toContain('not on your list of known hosts');
   // Cancel has the focus: Enter cancels, and only the link's parts were asked for

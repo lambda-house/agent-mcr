@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeLiveList } from '../store';
-import { DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -300,5 +300,14 @@ describe('the Live list choices as stored (MCR-107)', () => {
     expect(normalizeLiveList({ hiddenFolders: ['/a', 7, null, { x: 1 }], shownFolders: 'not a list', hiddenSessions: [['nested']], hideNoise: 'yes' }))
       .toEqual({ hiddenFolders: ['/a'], shownFolders: [], hiddenSessions: [], hideNoise: true });
     expect(normalizeLiveList({ hideNoise: false }).hideNoise).toBe(false);
+  });
+});
+
+describe('runningFor', () => {
+  it('says how long, and nothing for a missing start time', () => {
+    expect(runningFor(0, 125 * 60_000)).toBe('2h 5m');
+    expect(runningFor(0, 59_000)).toBe('59s');
+    expect(runningFor(Number.NaN, 1)).toBe('');
+    expect(runningFor(undefined as unknown as number, 1)).toBe('');
   });
 });

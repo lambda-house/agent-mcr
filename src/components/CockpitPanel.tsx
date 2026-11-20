@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import ConfirmDialog from './ConfirmDialog';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
@@ -162,7 +163,9 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         {a.live && !a.live.reportOpen && <span className="ck-stale">the report it names is closed</span>}
         {!a.derived && <Stale marks={staleMarks(a, cockpit, hosted, label)}/>}
       </p>
-      {link && (
+      {/* In the page's body, not in the row: a column of the panel is a container (MCR-105), and a
+          container boxes in what is fixed inside it, so the question could land out of sight */}
+      {link && createPortal(
         <ConfirmDialog title="Open this link in your browser?" confirmLabel="Open link" cancelIsDefault
           onCancel={() => setLink(null)} onConfirm={() => { setLink(null); act('open'); }}>
           <dl className="ck-link">
@@ -172,7 +175,8 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
           </dl>
           <p>{from ? `Published ${from}.` : ''} An agent wrote this address. A link can carry data out in its path or query, and it acts with what your browser is signed in to.</p>
           {!link.known && <p className="ck-link-warn" role="alert">Look twice: this host is not on your list of known hosts, or the path is one where you sign in, grant an app access or change an account. Open it only if you know this address and expected it.</p>}
-        </ConfirmDialog>
+        </ConfirmDialog>,
+        document.body,
       )}
     </li>
   );
