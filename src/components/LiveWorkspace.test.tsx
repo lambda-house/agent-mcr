@@ -7,6 +7,7 @@ import { HARNESS_PREFERENCES_CHANGED, harnessApi, type Hosted } from '../utils/h
 import { pickDirectory } from '../utils/tauri';
 import { useStore } from '../store';
 import { DEFAULT_LIVE_LIST } from '../utils/harness';
+import { liveNav } from '../utils/liveNav';
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), storeNoticeSeen: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
@@ -381,6 +382,62 @@ describe('Live workspace', () => {
     await act(async () => item('Restart').click()); await flush();
     expect(host.querySelector('[data-terminal="r1"]')).toBeNull();
     expect([...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'))).toEqual(['s1', 'r2']);
+  });
+
+  it('goes Back and Forward between the sessions shown, like a browser, and never types (MCR-108)', async () => {
+    const shell: Hosted = { ...running, id: 's1', title: '', meta: { label: 'Shell', profile: 'shell' } };
+    const third: Hosted = { ...running, id: 't1', title: 'Third one', started: 3 };
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, shell, running, third]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const shown = () => [...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'));
+    const back = () => button('Back'); const forward = () => button('Forward');
+    // Nothing shown yet: no buttons
+    expect(back()).toBeNull();
+    // A row click counts; then a link from that terminal to another session
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect([back().disabled, forward().disabled]).toEqual([true, true]);
+    linkTo = 's1';
+    await act(async () => button('link in r1').click()); await flush();
+    expect(shown()).toEqual(['s1']);
+    expect(back().title).toBe('Back to Fixing tests (Alt+Left)');
+    focused.length = 0;
+    await act(async () => back().click()); await flush();
+    expect(shown()).toEqual(['r1']);
+    // Back shows the session; it does not hand it the keyboard, as a link click does
+    expect(focused).toEqual([]);
+    expect(forward().disabled).toBe(false);
+    await act(async () => forward().click()); await flush();
+    expect(shown()).toEqual(['s1']);
+    expect(forward().disabled).toBe(true);
+    // Going somewhere new after Back drops what was ahead
+    await act(async () => back().click()); await flush();
+    await act(async () => row('Third one').click()); await flush();
+    expect(shown()).toEqual(['t1']);
+    expect(forward().disabled).toBe(true);
+    // An ended session is passed over: r1 ends, Back goes past it to nothing left
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, shell, { ...running, exit: { code: 0, signal: null, at: 9 } }, third]);
+    await act(async () => { await new Promise(r => setTimeout(r, 2100)); }); await flush();
+    expect(back().disabled).toBe(true);
+    // Nothing was ever written to a terminal
+    expect(harnessApi.signal).not.toHaveBeenCalled();
+    expect(harnessApi.spawn).not.toHaveBeenCalled();
+  });
+
+  it('takes the app\'s Back and Forward commands while it is shown, and gives them back when it is not', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, running, { ...running, id: 't1', title: 'Third one', started: 3 }]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    await act(async () => row('Fixing tests').click()); await flush();
+    await act(async () => row('Third one').click()); await flush();
+    expect(liveNav.current?.canBack()).toBe(true);
+    expect(liveNav.current?.canForward()).toBe(false);
+    await act(async () => liveNav.current!.back()); await flush();
+    expect([...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'))).toEqual(['r1']);
+    expect(liveNav.current?.canForward()).toBe(true);
+    // Another view or Documents shown: the commands go to the document tabs again
+    await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>));
+    expect(liveNav.current).toBeNull();
   });
 
   it('follows a session pointer clicked in a terminal: that session is shown and its terminal takes the keyboard', async () => {
