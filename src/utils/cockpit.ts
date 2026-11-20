@@ -30,10 +30,61 @@ export function urgencyRank(a: CockpitAction): number {
 /** Since when an action stands: what the service saw for a derived one, else when it was first published. */
 export const actionSince = (a: CockpitAction) => a.since || a.updated || 0;
 
-/** "Needs you": by urgency, then the oldest first. An action without a time comes last in its group. */
+/**
+ * An action that still stands as published. Not one the harness knows to be
+ * behind: the operator typed into its session since it was published, or
+ * that session is no more (MCR-103). Such a row stays in sight, after the
+ * others and without its urgency, until its publisher updates or removes it.
+ */
+export const stillAwaits = (a: CockpitAction) => !a.ownerTyped && !a.sessionEnded;
+
+/**
+ * "Needs you": what the harness itself saw (a prompt, an open report) first,
+ * whatever a session published as urgent; then what still stands, by urgency,
+ * then the oldest first; what is behind last. Urgency is a publisher's claim:
+ * it orders published rows among themselves and never puts one above the
+ * harness's own. An action without a time comes last in its group.
+ */
 export function needsYouRows(cockpit: Cockpit): CockpitAction[] {
   const age = (a: CockpitAction) => actionSince(a) || Number.MAX_SAFE_INTEGER;
-  return [...cockpit.actions].sort((a, b) => urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
+  return [...cockpit.actions].sort((a, b) => Number(!a.derived) - Number(!b.derived) || Number(!stillAwaits(a)) - Number(!stillAwaits(b)) || urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
+}
+
+/** How many published rows of one publisher are shown before the rest folds. */
+export const ROWS_PER_PUBLISHER = 3;
+
+/**
+ * The rows that are shown at once, and per publisher how many are folded
+ * away: one session cannot push the others, or the harness's own rows, out
+ * of sight by publishing many. `open` holds the publishers whose rows were unfolded.
+ */
+export function foldRows(rows: CockpitAction[], open: ReadonlySet<string>): { shown: CockpitAction[]; folded: Map<string, number> } {
+  const seen = new Map<string, number>();
+  const folded = new Map<string, number>();
+  const shown = rows.filter(a => {
+    if (a.derived || !a.by) return true;
+    const n = (seen.get(a.by) ?? 0) + 1;
+    seen.set(a.by, n);
+    if (n <= ROWS_PER_PUBLISHER || open.has(a.by)) return true;
+    folded.set(a.by, (folded.get(a.by) ?? 0) + 1);
+    return false;
+  });
+  return { shown, folded };
+}
+
+/** Whether a click on this part of a published action is offered: it still stands, the panel knows its stamp, and the service has not said that its text would be refused. */
+export function clickable(a: CockpitAction, part: 'say' | 'options' | 'url' | 'command' | 'ask'): boolean {
+  if (a.derived || !a.by || !a.updated) return false;
+  if (part === 'ask') return true;
+  if ((part === 'say' || part === 'options') && !stillAwaits(a)) return false;
+  return !a.unclickable?.includes(part);
+}
+
+/** How a track's state reads: the published word, unless the harness knows that the operator has answered in its lead's terminal since. */
+export function trackStateShown(t: CockpitTrack, now = Date.now()): { text: string; tone: CockpitTrack['state'] | 'answered' | 'stale' } {
+  if (t.state === 'waiting_human' && t.ownerTyped) return { text: `you typed ${formatAge(t.ownerTyped, now)}`, tone: 'answered' };
+  if (t.updated && now - t.updated > STALE_AFTER_MS && t.state !== 'done' && t.state !== 'parked') return { text: `stale: ${TRACK_STATE[t.state]}`, tone: 'stale' };
+  return { text: TRACK_STATE[t.state], tone: t.state };
 }
 
 export const ACTION_KIND: Record<CockpitAction['kind'], string> = {
@@ -105,6 +156,8 @@ export function trackWaits(track: CockpitTrack, name: (id: string) => string): s
   for (const item of track.items ?? []) {
     const w = item.waitsOn;
     if (!w || item.state === 'done') continue;
+    // The operator has typed in the lead's terminal since: "waits on you" is no longer the harness's to repeat
+    if (w.kind === 'human' && track.ownerTyped) continue;
     const on = w.kind === 'human' ? 'you' : w.kind === 'session' && w.who ? name(w.who) : w.what || w.kind;
     if (!out.includes(on)) out.push(on);
   }

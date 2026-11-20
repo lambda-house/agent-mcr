@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import CockpitPanel from './CockpitPanel';
 import { harnessApi, type Cockpit, type Hosted } from '../utils/harness';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { cockpit: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { cockpit: vi.fn(), cockpitAct: vi.fn() } }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'a while ago' }));
 
 const session = (id: string, name: string, over: Partial<Hosted> = {}): Hosted => ({ id, pid: 1, argv: ['claude'], cwd: '/work', started: 1, cols: 80, rows: 24, title: '', lastOutput: 1, exit: null, meta: { label: 'Claude Code', profile: 'claude' }, harness: { name, named: true, profile: 'claude', state: 'working' } as Hosted['harness'], ...over });
@@ -62,13 +62,114 @@ it('draws what the harness knows apart from what a session published', async () 
   expect(host.querySelector('[data-action="prompt:r1"] .ck-source')!.textContent).toContain('seen by the harness');
 });
 
-it('offers no click but opening a session: the line to type is text, and no action has a button of its own', async () => {
+it('places the line of a typed word by ids only, says that nothing was sent, and opens that session', async () => {
+  vi.mocked(harnessApi.cockpitAct).mockResolvedValue({ placed: 'b1' });
   await show();
-  const buttons = [...host.querySelectorAll('.ck-action button')];
-  expect(buttons.every(b => b.classList.contains('ck-session'))).toBe(true);
-  expect(host.querySelector('.ck-action a')).toBeNull();
-  await act(async () => (host.querySelector('[data-action="word"] .ck-session') as HTMLButtonElement).click());
+  const word = host.querySelector('[data-action="word"]')!;
+  // The whole line is on the row, and the publisher's name stands next to the button
+  expect(word.querySelector('.ck-say code')!.textContent).toBe('merge MCR-99');
+  const place = [...word.querySelectorAll('button.ck-do')].find(b => b.textContent!.startsWith('Place in Builder'))! as HTMLButtonElement;
+  expect(place.textContent).toBe('Place in Builder, unsent (irreversible)');
+  expect(place.parentElement!.textContent).toContain('from Builder');
+  await act(async () => place.click()); await flush();
+  // Ids and the stamp on screen: no text, no session
+  expect(vi.mocked(harnessApi.cockpitAct).mock.calls).toEqual([['b1', 'word', doc.actions[0].updated, 'place', undefined]]);
+  expect(word.querySelector('.ck-said')!.textContent).toContain('not sent. Press Enter there');
   expect(opened).toEqual(['b1']);
+  // A row the harness made has no button but the session's name
+  expect(host.querySelectorAll('[data-action="prompt:r1"] button.ck-do')).toHaveLength(0);
+});
+
+it('shows the service\'s refusal on the row and opens nothing', async () => {
+  vi.mocked(harnessApi.cockpitAct).mockRejectedValue('Refused: that session asks you something in its terminal.');
+  await show();
+  const word = host.querySelector('[data-action="word"]')!;
+  await act(async () => ([...word.querySelectorAll('button.ck-do')].find(b => b.textContent!.startsWith('Place'))! as HTMLButtonElement).click()); await flush();
+  expect(word.querySelector('.ck-said.bad[role="alert"]')!.textContent).toContain('asks you something');
+  expect(opened).toEqual([]);
+});
+
+it('offers one button per option of a decision, by its place in the list, with no default among them', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ id: 'pick', title: 'Pick one', kind: 'decision', by: 'supervisor', options: ['MCR-102 launchd labels', 'MCR-97 click actions'], recommended: 'MCR-102 launchd labels', risk: 'reversible', urgency: 'today', updated: 77 }] });
+  vi.mocked(harnessApi.cockpitAct).mockResolvedValue({ placed: 'sup1' });
+  const withRoot = [...hosted, session('sup1', 'Root', { meta: { label: 'Claude Code', profile: 'claude', role: 'supervisor' } })];
+  await act(async () => root.render(<CockpitPanel active hosted={withRoot} label={label} onSession={id => opened.push(id)}/>)); await flush();
+  const pick = host.querySelector('[data-action="pick"]')!;
+  const options = [...pick.querySelectorAll('.ck-choices button.ck-do')] as HTMLButtonElement[];
+  expect(options.map(o => o.textContent)).toEqual(['MCR-102 launchd labels (recommended by its publisher)', 'MCR-97 click actions']);
+  // The same look for each: what its publisher recommends, or calls reversible, makes no button the easy one
+  expect(new Set(options.map(o => o.className)).size).toBe(1);
+  expect(pick.textContent).not.toContain('reversible');
+  expect(pick.textContent).toContain('Decision pick: …');
+  expect(pick.textContent).toContain('input box of Supervisor, unsent');
+  await act(async () => options[1].click()); await flush();
+  expect(vi.mocked(harnessApi.cockpitAct).mock.calls).toEqual([['supervisor', 'pick', 77, 'choose', 1]]);
+  expect(opened).toEqual(['sup1']);
+});
+
+it('has no button for what is behind, for a text the service would refuse, or when the session to answer in does not run', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [
+    { ...doc.actions[0], id: 'typed', ownerTyped: Date.now() },
+    { ...doc.actions[0], id: 'old-text', unclickable: ['say'] },
+    { ...doc.actions[0], id: 'no-stamp', updated: undefined },
+    { id: 'pick', title: 'Pick', kind: 'decision', by: 'gone-publisher', options: ['a', 'b'], updated: 5 },
+    { id: 'pr', title: 'Read', kind: 'external', by: 'b1', where: { url: 'http://10.0.0.1/x' }, unclickable: ['url'], updated: 5 },
+  ] });
+  await show();
+  const buttons = (id: string) => [...host.querySelectorAll(`[data-action="${id}"] button.ck-do`)].map(b => b.textContent).filter(t => !t!.startsWith('Ask') && t !== 'Explain');
+  expect([buttons('typed'), buttons('old-text'), buttons('no-stamp'), buttons('pick'), buttons('pr')]).toEqual([[], [], [], [], []]);
+  expect(host.querySelector('[data-action="old-text"]')!.textContent).toContain('No button');
+  expect(host.querySelector('[data-action="pick"] ul.ck-options')).not.toBeNull();
+  expect(host.querySelector('[data-action="pr"]')!.textContent).toContain('not a link a click opens');
+});
+
+it('asks before a link is opened, with Cancel as the default, and shows where it goes as the service read it', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ id: 'pr', title: 'Read the PR', kind: 'external', by: 'b1', where: { url: 'https://example.com/a?token=abc' }, updated: 9 }] });
+  vi.mocked(harnessApi.cockpitAct).mockImplementation(async (_by, _id, _updated, what) => what === 'link' ? { link: { href: 'https://example.com/a?token=abc', host: 'example.com', path: '/a', query: 'token=abc', known: false } } : { opened: 'example.com' });
+  await show();
+  const pr = host.querySelector('[data-action="pr"]')!;
+  await act(async () => ([...pr.querySelectorAll('button.ck-do')].find(b => b.textContent === 'Open link…')! as HTMLButtonElement).click()); await flush();
+  const dialog = document.querySelector('.modal')!;
+  expect([...dialog.querySelectorAll('.ck-link dd')].map(d => d.textContent)).toEqual(['example.com', '/a', 'token=abc']);
+  expect(dialog.querySelector('.ck-link-warn')!.textContent).toContain('not on your list of known hosts');
+  // Cancel has the focus: Enter cancels, and only the link's parts were asked for
+  expect((document.activeElement as HTMLElement).textContent).toBe('Cancel');
+  await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); }); await flush();
+  expect(document.querySelector('.modal')).toBeNull();
+  expect(vi.mocked(harnessApi.cockpitAct).mock.calls.map(c => c[3])).toEqual(['link']);
+  // Asked again and answered with a click on the action: the service is asked to open, by ids
+  await act(async () => ([...pr.querySelectorAll('button.ck-do')].find(b => b.textContent === 'Open link…')! as HTMLButtonElement).click()); await flush();
+  await act(async () => ([...document.querySelectorAll('.modal button')].find(b => b.textContent === 'Open link')! as HTMLButtonElement).click()); await flush();
+  expect(vi.mocked(harnessApi.cockpitAct).mock.calls.map(c => [c[0], c[1], c[2], c[3]])).toEqual([['b1', 'pr', 9, 'link'], ['b1', 'pr', 9, 'link'], ['b1', 'pr', 9, 'open']]);
+  expect(pr.querySelector('.ck-said')!.textContent).toBe('Opened example.com in your browser.');
+});
+
+it('copies a command by ids, explains from the stored text, and asks the publisher more with a click', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ id: 'look', title: 'Look', kind: 'live_check', by: 'b1', detail: '1. restart\n2. look', where: { command: 'cargo test -- --test-threads=1' }, updated: 4 }] });
+  vi.mocked(harnessApi.cockpitAct).mockImplementation(async (_by, _id, _updated, what) => what === 'copy' ? { copied: true } : { placed: 'b1' });
+  await show();
+  const look = host.querySelector('[data-action="look"]')!;
+  const button = (text: string) => [...look.querySelectorAll('button.ck-do')].find(b => b.textContent === text)! as HTMLButtonElement;
+  expect(look.querySelector('.ck-say code')!.textContent).toBe('cargo test -- --test-threads=1');
+  await act(async () => button('Copy').click()); await flush();
+  expect(look.querySelector('.ck-said')!.textContent).toBe('Copied. Nothing was run.');
+  expect(look.querySelector('.ck-detail')).toBeNull();
+  await act(async () => button('Explain').click());
+  expect(look.querySelector('.ck-detail')!.textContent).toBe('1. restart\n2. look');
+  await act(async () => button('Ask Builder more').click()); await flush();
+  expect(vi.mocked(harnessApi.cockpitAct).mock.calls.map(c => [c[0], c[1], c[2], c[3], c[4]])).toEqual([['b1', 'look', 4, 'copy', undefined], ['b1', 'look', 4, 'ask', undefined]]);
+  expect(opened).toEqual(['b1']);
+});
+
+it('folds the rows of a publisher that has many, and keeps the harness\'s own rows on top', async () => {
+  const many = Array.from({ length: 5 }, (_, i) => ({ id: `n${i}`, title: `Noise ${i}`, kind: 'live_check' as const, by: 'b1', urgency: 'now' as const, detail: 'x', updated: i + 1 }));
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [...many, doc.actions[1]] });
+  await show();
+  expect([...host.querySelectorAll('.ck-action')].map(a => a.getAttribute('data-action'))).toEqual(['prompt:r1', 'n0', 'n1', 'n2']);
+  const more = host.querySelector('.ck-more') as HTMLButtonElement;
+  expect(more.textContent).toBe('2 more from Builder');
+  await act(async () => more.click());
+  expect(host.querySelectorAll('.ck-action')).toHaveLength(6);
 });
 
 it('opens a track to its items, with the lead as its row in the list', async () => {
@@ -121,6 +222,54 @@ it('names a session the service says runs, and the list has not shown yet, witho
   const track = host.querySelector('[data-track="l"]')!;
   expect(track.querySelector('.ck-session')!.textContent).toBe('Late one');
   expect(track.querySelector('.ck-stale')).toBeNull();
+});
+
+it('shows that the owner typed in a session instead of repeating that it waits for them (MCR-103)', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({
+    ...doc,
+    tracks: [{ ...doc.tracks[0], ownerTyped: Date.now() - 60000 }],
+    actions: [{ ...doc.actions[0], ownerTyped: Date.now() - 60000 }, { id: 'other', title: 'Another thing', kind: 'live_check', by: 'r1', urgency: 'whenever', updated: Date.now() }],
+  });
+  await show();
+  // The action stays in sight, after what still stands, without its urgency and not counted
+  expect([...host.querySelectorAll('.ck-action')].map(a => a.getAttribute('data-action'))).toEqual(['other', 'word']);
+  const word = host.querySelector('[data-action="word"]')!;
+  expect(word.classList.contains('behind')).toBe(true);
+  expect(word.querySelector('.ck-urgency')).toBeNull();
+  expect(word.querySelector('.ck-live.answered')!.textContent).toContain('you typed there');
+  expect(host.querySelector('.ck-head')!.textContent).toContain('1 needs you');
+  // The track loses the red state and the "waits on you"
+  const track = host.querySelector('[data-track="store"]')!;
+  expect(track.querySelector('.ck-state.answered')!.textContent).toContain('you typed');
+  expect(track.querySelector('.ck-state.waiting_human')).toBeNull();
+  expect(track.textContent).not.toContain('waits on you');
+});
+
+it('says nothing new needs the owner when every action is one they already typed for', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ ...doc.actions[0], ownerTyped: Date.now() }] });
+  await show();
+  expect(host.querySelector('.ck-head .ck-count')!.textContent).toBe('nothing new needs you');
+  expect(host.querySelector('.ck-head .ck-count')!.classList.contains('needs')).toBe(false);
+});
+
+it('says that the session of an action has ended', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ ...doc.actions[0], where: { session: 'old' }, sessionEnded: true }] });
+  await show();
+  const word = host.querySelector('[data-action="word"]')!;
+  expect(word.querySelector('.ck-live.answered')!.textContent).toBe('its session ended');
+  expect(word.querySelector('.ck-urgency')).toBeNull();
+});
+
+it('names the publisher apart from the lead when the Supervisor published a track another session leads', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, tracks: [{ ...doc.tracks[0], by: 'supervisor' }, { ...doc.tracks[0], id: 'own' }], actions: [] });
+  await show();
+  const led = host.querySelector('[data-track="store"]')!;
+  expect(led.querySelector('.ck-role')!.textContent).toBe('lead');
+  expect(led.querySelector('.ck-age')!.textContent).toContain('by Supervisor');
+  // Published by its own lead: one name says both
+  const own = host.querySelector('[data-track="own"]')!;
+  expect(own.querySelector('.ck-role')).toBeNull();
+  expect(own.querySelector('.ck-age')!.textContent).not.toContain('by ');
 });
 
 it('can be collapsed, and stays so', async () => {

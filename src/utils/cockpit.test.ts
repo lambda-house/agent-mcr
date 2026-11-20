@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionSource, liveFacts, named, needsYouRows, STALE_AFTER_MS, staleMarks, trackWaits, urgencyRank } from './cockpit';
+import { actionSource, clickable, foldRows, liveFacts, named, needsYouRows, ROWS_PER_PUBLISHER, STALE_AFTER_MS, staleMarks, stillAwaits, trackStateShown, trackWaits, urgencyRank } from './cockpit';
 import type { Cockpit, CockpitAction, Hosted } from './harness';
 
 const NOW = 100 * 3600_000;
@@ -9,7 +9,7 @@ const action = (id: string, over: Partial<CockpitAction> = {}): CockpitAction =>
 const cockpit = (over: Partial<Cockpit> = {}): Cockpit => ({ schema: 1, version: 1, updated: NOW, tracks: [], actions: [], sessions: {}, ...over });
 
 describe('needs you', () => {
-  it('orders by urgency, then the oldest first, and keeps a prompt with the most urgent', () => {
+  it('puts what the harness saw first, then orders published rows by urgency and the oldest first', () => {
     const rows = needsYouRows(cockpit({ actions: [
       action('later', { urgency: 'whenever', updated: 1 }),
       action('none', { updated: 2 }),
@@ -20,7 +20,8 @@ describe('needs you', () => {
       action('today-old', { urgency: 'today', updated: 10 }),
       action('now-undated', { urgency: 'now' }),
     ] }));
-    expect(rows.map(a => a.id)).toEqual(['prompt', 'now-new', 'now-undated', 'today-old', 'report', 'today-new', 'later', 'none']);
+    // A published "now" is its publisher's claim: it never stands above the harness's own rows
+    expect(rows.map(a => a.id)).toEqual(['prompt', 'report', 'now-new', 'now-undated', 'today-old', 'today-new', 'later', 'none']);
     expect(urgencyRank(action('x'))).toBe(2);
   });
 
@@ -85,4 +86,64 @@ it('says whom a track waits on from its open items, you first, each once', () =>
     { id: '5', title: 'five', owner: 'a', state: 'done', waitsOn: { kind: 'timer', what: 'never shown' } },
   ] }, id => `S-${id}`);
   expect(waits).toEqual(['you', 'CI run 7', 'S-b']);
+});
+
+describe('what the harness knows to be behind (MCR-103)', () => {
+  it('puts an action the owner already typed for, or whose session ended, after what still stands', () => {
+    const rows = needsYouRows(cockpit({ actions: [
+      action('typed-now', { urgency: 'now', updated: 1, ownerTyped: 5 }),
+      action('ended-now', { urgency: 'now', updated: 2, sessionEnded: true }),
+      action('whenever', { urgency: 'whenever', updated: 3 }),
+      action('today', { urgency: 'today', updated: 4 }),
+    ] }));
+    expect(rows.map(a => a.id)).toEqual(['today', 'whenever', 'typed-now', 'ended-now']);
+    expect(rows.map(stillAwaits)).toEqual([true, true, false, false]);
+  });
+
+  it('reads a waiting track as answered once the owner typed in its lead, and an old one as stale', () => {
+    const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'waiting_human' as const, updated: NOW - 40 * 60000 };
+    expect(trackStateShown(track, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human' });
+    expect(trackStateShown({ ...track, ownerTyped: NOW - 36 * 60000 }, NOW)).toEqual({ text: 'you typed 36 min ago', tone: 'answered' });
+    // Only a track that says it waits for the owner is answered by their typing
+    expect(trackStateShown({ ...track, state: 'moving', ownerTyped: NOW }, NOW).tone).toBe('moving');
+    expect(trackStateShown({ ...track, state: 'moving', updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'stale: moving', tone: 'stale' });
+    expect(trackStateShown({ ...track, updated: NOW - STALE_AFTER_MS - 1 }, NOW).tone).toBe('stale');
+    // What rests is not stale for resting
+    expect(trackStateShown({ ...track, state: 'parked', updated: 1 }, NOW).tone).toBe('parked');
+    expect(trackStateShown({ ...track, state: 'done', updated: 1 }, NOW).tone).toBe('done');
+  });
+
+  it('no longer says that a track waits on the owner once they typed there', () => {
+    const items = [{ id: '1', title: 'one', owner: 'human', state: 'waiting' as const, waitsOn: { kind: 'human' as const, what: 'a word' } }, { id: '2', title: 'two', owner: 'a', state: 'waiting' as const, waitsOn: { kind: 'ci' as const, what: 'CI' } }];
+    const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'waiting_human' as const, items };
+    expect(trackWaits(track, id => id)).toEqual(['you', 'CI']);
+    expect(trackWaits({ ...track, ownerTyped: 5 }, id => id)).toEqual(['CI']);
+  });
+});
+
+describe('clicks (MCR-97)', () => {
+  it('folds the rows of one publisher beyond the first few, and never the harness\'s own', () => {
+    const many = Array.from({ length: 6 }, (_, i) => action(`a${i}`, { by: 'noisy', urgency: 'now', updated: i + 1 }));
+    const rows = needsYouRows(cockpit({ actions: [...many, action('other', { by: 'calm', updated: 9 }), action('p1', { derived: 'prompt', kind: 'answer_prompt', since: 1, by: undefined }), action('p2', { derived: 'prompt', kind: 'answer_prompt', since: 2, by: undefined })] }));
+    const { shown, folded } = foldRows(rows, new Set());
+    expect(shown.map(a => a.id)).toEqual(['p1', 'p2', 'a0', 'a1', 'a2', 'other']);
+    expect([...folded]).toEqual([['noisy', 6 - ROWS_PER_PUBLISHER]]);
+    const open = foldRows(rows, new Set(['noisy']));
+    expect(open.shown).toHaveLength(9);
+    expect(open.folded.size).toBe(0);
+  });
+
+  it('offers a click only on a published action that stands, whose stamp is known and whose text the service lets through', () => {
+    const a = action('a', { updated: 5 });
+    expect(['say', 'options', 'url', 'command', 'ask'].map(p => clickable(a, p as 'say'))).toEqual([true, true, true, true, true]);
+    expect(clickable(action('a'), 'say')).toBe(false);
+    expect(clickable(action('a', { updated: 5, by: undefined }), 'say')).toBe(false);
+    expect(clickable(action('a', { updated: 5, derived: 'prompt' }), 'ask')).toBe(false);
+    // Behind what happened since: nothing is placed, a link or a command may still be looked at
+    const behind = action('a', { updated: 5, ownerTyped: 9 });
+    expect([clickable(behind, 'say'), clickable(behind, 'options'), clickable(behind, 'url'), clickable(behind, 'command')]).toEqual([false, false, true, true]);
+    expect(clickable(action('a', { updated: 5, sessionEnded: true }), 'say')).toBe(false);
+    const old = action('a', { updated: 5, unclickable: ['say', 'url'] });
+    expect([clickable(old, 'say'), clickable(old, 'options'), clickable(old, 'url'), clickable(old, 'command')]).toEqual([false, true, false, true]);
+  });
 });

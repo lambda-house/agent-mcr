@@ -32,7 +32,7 @@ const RISKS: [&str; 3] = ["reversible", "irreversible", "spend"];
 const URGENCIES: [&str; 3] = ["now", "today", "whenever"];
 /// Fields the service writes. They are taken out of what a session sends, so
 /// a document that was read can be published back.
-const STAMPS: [&str; 5] = ["updated", "since", "by", "live", "trackMissing"];
+const STAMPS: [&str; 8] = ["updated", "since", "by", "live", "trackMissing", "ownerTyped", "sessionEnded", "unclickable"];
 
 const MAX_TRACKS: usize = 12;
 const MAX_ITEMS: usize = 30;
@@ -226,6 +226,8 @@ pub struct Fact {
     /// Its open `done` report
     pub done: Option<String>,
     pub waits: Vec<FactWait>,
+    /// When the operator last pressed Enter in its terminal, by the app's word
+    pub typed: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -233,6 +235,28 @@ pub struct Facts {
     pub sessions: BTreeMap<String, Fact>,
     /// Every report the store still has, and the session that made it
     pub reports: BTreeMap<String, String>,
+    /// The hosted Supervisor session, when the caller knows it. The store
+    /// alone does not: who is the Supervisor is the runner's word
+    pub root: Option<String>,
+}
+
+/// A published entry whose text the harness knows to be behind (MCR-103): it
+/// says the operator is awaited in a session, and the operator has typed
+/// there since it was last published, or that session is no more. Made at
+/// every read from the facts, never stored and never taken from a publisher.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Outdated {
+    /// The part it is in: a session id, or `ROOT`
+    pub by: String,
+    /// A track; otherwise an action
+    pub track: bool,
+    pub id: String,
+    /// The entry's stamp this is said about: a publish after it makes it a new entry
+    pub updated: u64,
+    /// The session the entry points the operator at
+    pub session: String,
+    /// When the operator typed there; `None`: the session ended or is gone
+    pub typed: Option<u64>,
 }
 
 /// The document as the store file holds it. Read leniently: a field this
@@ -292,22 +316,157 @@ fn text(path: &str, s: &str, max: usize, lines: bool) -> Result<(), String> {
     }
 }
 
-/// A string that may later be placed in an input box, copied as a command
-/// or opened: the operator must see every character of it. Refuses format
-/// and zero-width characters and private-use code points, which `text`
-/// leaves to shown text because other scripts and joined emoji need some of
-/// them. Not a full table of Unicode: unassigned code points are not known here.
-fn seen(path: &str, s: &str) -> Result<(), String> {
-    let hidden = |c: &char| {
-        matches!(*c,
-            '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff0}'..='\u{ffff}' | '\u{e000}'..='\u{f8ff}' | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0000}'..='\u{e0fff}' | '\u{f0000}'..='\u{10ffff}')
-    };
-    match s.chars().find(hidden) {
-        Some(c) => refuse(path, format!("holds a character that cannot be seen (U+{:04X}); this text may be placed in an input box or copied", c as u32)),
-        None => Ok(()),
+/// How long a line may be that a click places in an input box (`say`, an
+/// option), and a command a click copies. Short on purpose: the operator's
+/// check is their eyes, and the whole of it is on the row (MCR-97).
+pub const MAX_PLACED: usize = 120;
+pub const MAX_COPIED: usize = 200;
+
+/// Typographic marks let through next to letters, digits, the space and
+/// ASCII punctuation.
+const MARKS: [char; 9] = ['\u{2013}', '\u{2014}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2026}', '\u{20ac}', '\u{a3}'];
+
+/// Letters by `char::is_alphanumeric` that draw nothing (the Hangul fillers).
+const BLANK_LETTERS: [char; 4] = ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'];
+
+/// Text that may leave the panel through a click: one line of characters
+/// that can all be seen. An allow-list, not a list of what is known to be
+/// bad: a letter or digit, the space U+0020, ASCII punctuation, or one of
+/// `MARKS`. So no control or format character, no other space, no
+/// combining mark, no private-use or unassigned code point. No two spaces
+/// in a row (padding pushes text out of sight) and no backslash at the end
+/// (before Enter it makes a new line in Claude Code and sends nothing).
+/// `Err` says why, without a place.
+fn visible_line(s: &str, max: usize) -> Result<(), String> {
+    if s.is_empty() || s != s.trim() {
+        return Err("must be a line without spaces at its ends".into());
     }
+    if s.chars().count() > max {
+        return Err(format!("is longer than {max} characters"));
+    }
+    let allowed = |c: char| (c.is_alphanumeric() && !BLANK_LETTERS.contains(&c)) || c == ' ' || c.is_ascii_punctuation() || MARKS.contains(&c);
+    if let Some(c) = s.chars().find(|c| !allowed(*c)) {
+        return Err(format!("holds a character that is not let through (U+{:04X}): letters, digits, single spaces and common punctuation only", c as u32));
+    }
+    if s.contains("  ") {
+        return Err("holds two spaces in a row".into());
+    }
+    if s.ends_with('\\') {
+        return Err("ends with a backslash".into());
+    }
+    Ok(())
+}
+
+/// A line a click may place, unsent, in an agent's input box: `visible_line`,
+/// short, and not one that the input box would run as a command. The one
+/// function for the publish and for the click.
+pub fn placeable(s: &str) -> Result<(), String> {
+    visible_line(s, MAX_PLACED)?;
+    match s.chars().next() {
+        Some(c @ ('!' | '#' | '/')) => Err(format!("can't start with {c:?}: in an agent's input box that runs a command")),
+        _ => Ok(()),
+    }
+}
+
+/// A command a click may copy for the operator. Never run or typed by the harness.
+pub fn copyable(s: &str) -> Result<(), String> {
+    visible_line(s, MAX_COPIED)
+}
+
+/// Hosts whose links open after the plain question. Every other host gets
+/// the stronger warning. The owner's list (MCR-97): change it here only.
+pub const PLAIN_HOSTS: [&str; 2] = ["teob.atlassian.net", "github.com"];
+
+/// Paths on those hosts that still get the stronger warning: where one signs
+/// in, grants an app access or changes an account. The owner's list too.
+pub const GUARDED_PATHS: [&str; 4] = ["/login", "/oauth", "/apps", "/settings"];
+
+/// A link as the parser reads it: what is shown and what is opened are these
+/// parts, never the stored string.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Link {
+    /// The parser's own serialisation: the address that is opened
+    pub href: String,
+    pub host: String,
+    pub path: String,
+    pub query: String,
+    /// The host is one of `PLAIN_HOSTS`
+    pub known: bool,
+}
+
+/// A link a click may open in the operator's browser: `https`, a host with a
+/// public-looking name, the default port, no user or password. Not an address
+/// on this machine or in the operator's network: a click there would act with
+/// their browser's own sessions.
+pub fn web_link(s: &str) -> Result<Link, String> {
+    if s.chars().count() > MAX_LINK || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!("must be one link without spaces, at most {MAX_LINK} characters"));
+    }
+    let url = tauri::Url::parse(s).map_err(|_| "is not a link".to_string())?;
+    if url.scheme() != "https" {
+        return Err("must be an https link".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not hold a user or password part".into());
+    }
+    if url.port().is_some() {
+        return Err("must not name a port".into());
+    }
+    // The question shows host, path and query. A fragment would be opened and not shown
+    if url.fragment().is_some() {
+        return Err("must not hold a fragment (the part after #)".into());
+    }
+    // `domain` is the host only when it is a name: a number address has none
+    let host = match (url.domain(), url.host_str()) {
+        (Some(name), _) => name.trim_end_matches('.').to_ascii_lowercase(),
+        (None, Some(_)) => return Err("must name a host, not a number address".into()),
+        (None, None) => return Err("has no host".into()),
+    };
+    let local = host == "localhost" || !host.contains('.') || [".local", ".localhost", ".internal", ".lan", ".home", ".test"].iter().any(|end| host.ends_with(end));
+    // A name of digits and dots only is a number address the parser did not take for one
+    if local || host.split('.').all(|label| label.bytes().all(|b| b.is_ascii_digit())) {
+        return Err("names a host on this machine or in a local network".into());
+    }
+    let path = url.path().to_string();
+    let guarded = GUARDED_PATHS.iter().any(|p| path.to_ascii_lowercase().starts_with(p));
+    Ok(Link { href: url.as_str().to_string(), known: PLAIN_HOSTS.contains(&host.as_str()) && !guarded, host, path, query: url.query().unwrap_or("").to_string() })
+}
+
+/// What a click in the panel asks for (MCR-97). It names an action by ids;
+/// nothing of it is text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Act {
+    /// Put a `typed_word`'s line in its session's input box
+    Place,
+    /// Put the choice of a `decision` in the input box, by the option's place in the list
+    Choose(usize),
+    /// Put a fixed question about the action in its publisher's input box
+    Ask,
+    /// The parts of its link, to be shown and then opened
+    Link,
+    /// Its command, for the clipboard
+    Copy,
+}
+
+/// What the service is to do for a click, from the stored document alone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Deed {
+    /// Type this line, unsent, into this session's input box
+    Type { session: String, text: String },
+    Link(Link),
+    Copy(String),
+}
+
+/// The line for a chosen option. Made by the service: the action's id says
+/// which decision, so that a bare "Yes" is not taken for an answer to
+/// whatever the session asked last. The owner's choice of form (MCR-97): change it here only.
+fn decision_line(action: &str, option: &str) -> String {
+    format!("Decision {action}: {option}")
+}
+
+/// The question "Ask more" places. No text of the action is in it, only its id.
+fn ask_line(action: &str) -> String {
+    format!("Explain cockpit action {action}: what happens if I do it, and what if I do not?")
 }
 
 fn required(path: &str, s: &str, max: usize) -> Result<(), String> {
@@ -331,29 +490,6 @@ fn list(path: &str, all: &[String], most: usize, max: usize) -> Result<(), Strin
         return refuse(path, format!("has more than {most} entries"));
     }
     all.iter().enumerate().try_for_each(|(i, s)| required(&format!("{path}[{i}]"), s, max))
-}
-
-/// A line that may later be placed into an agent's input box: there a first
-/// `!`, `#` or `/` runs a command instead of asking the agent.
-fn plain(path: &str, s: &str) -> Result<(), String> {
-    match s.trim_start().chars().next() {
-        Some(c @ ('!' | '#' | '/')) => refuse(path, format!("can't start with {c:?}: in an agent's input box that runs a command")),
-        _ => Ok(()),
-    }
-}
-
-/// A web link and nothing else: `http` or `https`, a host, no user or password.
-fn link(path: &str, s: &str) -> Result<(), String> {
-    text(path, s, MAX_LINK, false)?;
-    seen(path, s)?;
-    let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) else {
-        return refuse(path, "must be an http or https link");
-    };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() || host.contains('@') || s.chars().any(char::is_whitespace) {
-        return refuse(path, "must be a plain link: a host, no user or password part, no spaces");
-    }
-    Ok(())
 }
 
 /// A session id that names a tracked session that has not ended.
@@ -471,7 +607,11 @@ fn check_action(path: &str, a: &Action, part: &Part, old: Option<&Part>, who: &W
         return refuse(&format!("{path}.blocks[{i}]"), format!("names {missing:?}, which is not an item of that track"));
     }
     // Like a lead: checked when given or changed. The click checks it again (MCR-97)
-    let as_stored = old.is_some_and(|o| o.actions.iter().any(|b| b.id == a.id && b.place.session == a.place.session));
+    // An unchanged target is passed without it only when that session has
+    // ended or is gone, so that the rest of the part can still be changed. A
+    // target that still runs is checked at every publish: it may have been
+    // bound to another supervisor since (MCR-97)
+    let as_stored = old.is_some_and(|o| o.actions.iter().any(|b| b.id == a.id && b.place.session == a.place.session)) && !facts.sessions.get(&a.place.session).is_some_and(|f| !f.ended);
     if !a.place.session.is_empty() && !as_stored {
         let at = format!("{path}.where.session");
         reach(&at, &a.place.session, who, facts)?;
@@ -479,16 +619,19 @@ fn check_action(path: &str, a: &Action, part: &Part, old: Option<&Part>, who: &W
             return refuse(&at, "names a session that is not an agent with a state (a shell, or a terminal without one)");
         }
     }
-    text(&format!("{path}.say"), &a.say, MAX_LINE, false)?;
-    seen(&format!("{path}.say"), &a.say)?;
-    text(&format!("{path}.where.command"), &a.place.command, MAX_LINK, false)?;
-    seen(&format!("{path}.where.command"), &a.place.command)?;
+    // What a click may place or copy passes the allow-list here, and again at the click
+    if !a.say.is_empty() {
+        placeable(&a.say).or_else(|why| refuse(&format!("{path}.say"), why))?;
+    }
+    if !a.place.command.is_empty() {
+        copyable(&a.place.command).or_else(|why| refuse(&format!("{path}.where.command"), why))?;
+    }
     text(&format!("{path}.recommended"), &a.recommended, MAX_SHORT, false)?;
     text(&format!("{path}.why"), &a.why, MAX_WHY, false)?;
     text(&format!("{path}.detail"), &a.detail, MAX_DETAIL, true)?;
     list(&format!("{path}.source"), &a.source, MAX_LIST, MAX_REF)?;
     if !a.place.url.is_empty() {
-        link(&format!("{path}.where.url"), &a.place.url)?;
+        web_link(&a.place.url).map(|_| ()).or_else(|why| refuse(&format!("{path}.where.url"), why))?;
     }
     // What each kind may carry follows what a click on it will do (MCR-94).
     // The click itself is another slice (MCR-97), and must check again
@@ -511,17 +654,21 @@ fn check_action(path: &str, a: &Action, part: &Part, old: Option<&Part>, who: &W
             if a.place.session.is_empty() {
                 return refuse(&format!("{path}.where.session"), "is required for typed_word: the session whose input box gets the line");
             }
-            required(&format!("{path}.say"), &a.say, MAX_LINE)?;
-            plain(&format!("{path}.say"), &a.say)?;
+            if a.say.is_empty() {
+                return refuse(&format!("{path}.say"), "is required");
+            }
         }
         "decision" => {
             if a.options.len() < 2 || a.options.len() > MAX_OPTIONS {
                 return refuse(&format!("{path}.options"), format!("must hold 2 to {MAX_OPTIONS} choices"));
             }
             for (i, option) in a.options.iter().enumerate() {
-                required(&format!("{path}.options[{i}]"), option, MAX_SHORT)?;
-                seen(&format!("{path}.options[{i}]"), option)?;
-                plain(&format!("{path}.options[{i}]"), option)?;
+                placeable(option).or_else(|why| refuse(&format!("{path}.options[{i}]"), why))?;
+                // What a click places is the whole line with the service's frame: it must fit too,
+                // or the option would get a button that always refuses
+                if decision_line(&a.id, option).chars().count() > MAX_PLACED {
+                    return refuse(&format!("{path}.options[{i}]"), format!("is too long: with \"Decision {}: \" before it the line may hold {MAX_PLACED} characters", a.id));
+                }
             }
             if !a.recommended.is_empty() && !a.options.contains(&a.recommended) {
                 return refuse(&format!("{path}.recommended"), "is not one of the options");
@@ -906,6 +1053,96 @@ impl Cockpit {
         true
     }
 
+    /// What a click on an action is to do (MCR-97), from the stored document
+    /// and the facts at this moment. `updated` is the stamp the panel showed:
+    /// an action published again since is another action. Everything a
+    /// publish checked is checked again, because the world moved since: the
+    /// text against the allow-list, the target against who may point at it
+    /// now. Whether that session can take a line at this moment (idle, an
+    /// empty input box, nothing being typed) is the service's to check: it
+    /// needs the terminal.
+    pub fn act(&self, by: &str, id: &str, updated: u64, act: Act, facts: &Facts) -> Result<Deed, String> {
+        let Some(a) = self.parts.get(by).and_then(|p| p.actions.iter().find(|a| a.id == id)) else {
+            return Err("Refused: that action is no longer published. Look at the cockpit again.".into());
+        };
+        if a.updated != updated {
+            return Err("Refused: that action was published again since the panel showed it. Look at it again.".into());
+        }
+        // The publisher's own box: the Supervisor session's for the Supervisor's part
+        let publisher = || if by == ROOT { facts.root.clone().ok_or("Refused: the Supervisor session does not run".to_string()) } else { Ok(by.to_string()) };
+        let into = |session: String, text: String| -> Result<Deed, String> {
+            let Some(fact) = facts.sessions.get(&session).filter(|f| !f.ended) else {
+                return Err("Refused: the session this would be typed into has ended or is gone.".into());
+            };
+            if !fact.agent {
+                return Err("Refused: that session is not an agent with an input box.".into());
+            }
+            // Who may point the operator there, now: the Supervisor anywhere, a session at itself and below
+            if by != ROOT && session != by && !fact.above.iter().any(|s| s == by) {
+                return Err("Refused: that session no longer works for the session that published this action.".into());
+            }
+            placeable(&text).map_err(|why| format!("Refused: the line {why}."))?;
+            Ok(Deed::Type { session, text })
+        };
+        match act {
+            Act::Place | Act::Choose(_) if self.outdated(facts).iter().any(|o| !o.track && o.by == by && o.id == id) => {
+                Err("Refused: you typed into that session after this was published, or it has ended. Its publisher has to update the action first.".into())
+            }
+            Act::Place if a.kind == "typed_word" && !a.place.session.is_empty() => into(a.place.session.clone(), a.say.clone()),
+            Act::Choose(n) if a.kind == "decision" => {
+                let Some(option) = a.options.get(n) else { return Err("Refused: that action has no such option.".into()) };
+                // The option alone must pass: the frame around it is the service's
+                placeable(option).map_err(|why| format!("Refused: the option {why}."))?;
+                let session = if a.place.session.is_empty() { publisher()? } else { a.place.session.clone() };
+                into(session, decision_line(&a.id, option))
+            }
+            Act::Ask => into(publisher()?, ask_line(&a.id)),
+            Act::Link if !a.place.url.is_empty() => web_link(&a.place.url).map(Deed::Link).map_err(|why| format!("Refused: the link {why}.")),
+            Act::Copy if !a.place.command.is_empty() => copyable(&a.place.command).map(|()| Deed::Copy(a.place.command.clone())).map_err(|why| format!("Refused: the command {why}.")),
+            _ => Err("Refused: that action has nothing of this kind to click.".into()),
+        }
+    }
+
+    /// The entries the harness knows to be behind their text, see `Outdated`:
+    /// an action with a session to act in, and a track that says it waits
+    /// for the operator, by its lead. An ended lead is not one: the track
+    /// may wait for the operator elsewhere.
+    pub fn outdated(&self, facts: &Facts) -> Vec<Outdated> {
+        let typed_after = |session: &str, updated: u64| facts.sessions.get(session).filter(|f| !f.ended).and_then(|f| f.typed).filter(|at| *at > updated);
+        let mut out = Vec::new();
+        for (key, part) in &self.parts {
+            // The operator talks to the Supervisor in its terminal all day: a
+            // line typed there says nothing about an entry of the Supervisor's
+            // own that points at the Supervisor itself. Such an entry is never
+            // marked as typed for; the Supervisor has read every such line
+            let own = |session: &str| key == ROOT && facts.root.as_deref() == Some(session);
+            for t in part.tracks.iter().filter(|t| t.state == "waiting_human" && !own(&t.lead)) {
+                if let Some(at) = typed_after(&t.lead, t.updated) {
+                    out.push(Outdated { by: key.clone(), track: true, id: t.id.clone(), updated: t.updated, session: t.lead.clone(), typed: Some(at) });
+                }
+            }
+            for a in part.actions.iter().filter(|a| !a.place.session.is_empty()) {
+                let session = &a.place.session;
+                let typed = match facts.sessions.get(session) {
+                    Some(f) if !f.ended => match typed_after(session, a.updated).filter(|_| !own(session)) {
+                        Some(at) => Some(at),
+                        None => continue,
+                    },
+                    _ => None,
+                };
+                out.push(Outdated { by: key.clone(), track: false, id: a.id.clone(), updated: a.updated, session: session.clone(), typed });
+            }
+        }
+        out
+    }
+
+    /// Whether the document points the operator at a session: an action to
+    /// do there, or a track it leads that says it waits for them. The
+    /// service keeps the time of an Enter there exactly for such a session.
+    pub fn points_at(&self, session: &str) -> bool {
+        self.parts.values().any(|p| p.actions.iter().any(|a| a.place.session == session) || p.tracks.iter().any(|t| t.lead == session && t.state == "waiting_human"))
+    }
+
     /// The document as it is shown: the published parts flattened, in order,
     /// joined with what the harness knows. `reader` is a hosted session that
     /// is not the Supervisor: it gets its own part and those of the sessions
@@ -928,6 +1165,20 @@ impl Cockpit {
             .filter(|(k, _)| shown(k))
             .flat_map(|(key, p)| p.actions.iter().flat_map(|a| a.source.iter()).filter(|s| stands(key, s)).map(String::as_str))
             .collect();
+        // What the harness knows better than the text, on the entry itself (MCR-103)
+        let outdated = self.outdated(facts);
+        let mark = |out: &mut Value, key: &str, track: bool, id: &str| {
+            // When the operator typed in a session is that session's own to tell:
+            // only for the reader's sessions. That a session an entry of the
+            // reader's part points at is no more is the reader's to know, also
+            // when the harness has forgotten it and can say nothing else of it
+            if let Some(o) = outdated.iter().find(|o| o.by == key && o.track == track && o.id == id && (o.typed.is_none() || below(&o.session))) {
+                match o.typed {
+                    Some(at) => out["ownerTyped"] = json!(at),
+                    None => out["sessionEnded"] = json!(true),
+                }
+            }
+        };
         for (key, part) in self.parts.iter().filter(|(k, _)| shown(k)) {
             if key != ROOT {
                 named.insert(key.as_str());
@@ -936,6 +1187,7 @@ impl Cockpit {
                 named.insert(track.lead.as_str());
                 let mut out = json!(track);
                 out["by"] = json!(key);
+                mark(&mut out, key, true, &track.id);
                 for (i, item) in track.items.iter().enumerate() {
                     if item.owner != "human" {
                         named.insert(item.owner.as_str());
@@ -961,6 +1213,25 @@ impl Cockpit {
             for action in &part.actions {
                 let mut out = json!(action);
                 out["by"] = json!(key);
+                mark(&mut out, key, false, &action.id);
+                // What of it a click would refuse by its text alone: stored before
+                // the allow-list, or under an earlier one. Shown as text, without a button
+                let mut unclickable: Vec<&str> = Vec::new();
+                if !action.say.is_empty() && placeable(&action.say).is_err() {
+                    unclickable.push("say");
+                }
+                if action.options.iter().any(|o| placeable(o).is_err()) {
+                    unclickable.push("options");
+                }
+                if !action.place.url.is_empty() && web_link(&action.place.url).is_err() {
+                    unclickable.push("url");
+                }
+                if !action.place.command.is_empty() && copyable(&action.place.command).is_err() {
+                    unclickable.push("command");
+                }
+                if !unclickable.is_empty() {
+                    out["unclickable"] = json!(unclickable);
+                }
                 if !action.place.session.is_empty() {
                     named.insert(action.place.session.as_str());
                 }
@@ -1192,9 +1463,11 @@ mod tests {
         refused(action("typed_word", json!({ "say": "go" })), "where.session");
         refused(action("typed_word", json!({ "where": { "session": "ex" } })), "actions[0].say");
         refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "/clear" })), "runs a command");
-        refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "  !rm -rf ~" })), "runs a command");
-        refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "go\nand more" })), "line break");
-        refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "x".repeat(MAX_LINE + 1) })), "longer than");
+        refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "!rm -rf ~" })), "runs a command");
+        refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "  !rm -rf ~" })), "spaces at its ends");
+        refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "go\nand more" })), "U+000A");
+        refused(action("typed_word", json!({ "where": { "session": "ex" }, "say": "x".repeat(MAX_PLACED + 1) })), "longer than");
+        with_action(action("typed_word", json!({ "where": { "session": "ex" }, "say": "x".repeat(MAX_PLACED) }))).unwrap();
         refused(action("typed_word", json!({ "where": { "session": "ex", "command": "make" }, "say": "go" })), "where.command");
         refused(action("typed_word", json!({ "where": { "session": "ex", "url": "https://example.com" }, "say": "go" })), "where.url");
         refused(action("typed_word", json!({ "where": { "session": "sh" }, "say": "go" })), "not an agent");
@@ -1202,6 +1475,9 @@ mod tests {
         refused(action("typed_word", json!({ "where": { "session": "nobody" }, "say": "go" })), "not a session the harness tracks");
         // decision: choices, each a plain line
         with_action(action("decision", json!({ "options": ["Keep", "Drop"], "recommended": "Keep" }))).unwrap();
+        // An option is as long as the line a click builds from it lets it be: "Decision a1: " is 13 characters
+        with_action(action("decision", json!({ "options": ["Keep", "x".repeat(MAX_PLACED - 13)] }))).unwrap();
+        refused(action("decision", json!({ "options": ["Keep", "x".repeat(MAX_PLACED - 12)] })), "options[1] is too long");
         refused(action("decision", json!({ "options": ["Keep"] })), "2 to 6");
         refused(action("decision", json!({ "options": ["Keep", "Drop"], "recommended": "Wait" })), "recommended");
         refused(action("decision", json!({ "options": ["Keep", "#drop"] })), "options[1]");
@@ -1315,6 +1591,241 @@ mod tests {
         assert!(c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW + 100).unwrap_err().contains("ten minutes"));
         // Refused calls do not count, and the window moves on
         assert!(c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW + WRITE_WINDOW_MS + 100).is_ok());
+    }
+
+    #[test]
+    fn what_the_owner_did_in_a_session_is_marked_on_the_entries_that_await_them_there() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        c.publish(&SUP, &f, &json!({
+            "tracks": [{ "id": "t1", "title": "Waits", "lead": "ex", "state": "waiting_human" }, { "id": "t2", "title": "Moves", "lead": "ex", "state": "moving" }],
+            "actions": [
+                action("typed_word", json!({ "where": { "session": "ex" }, "say": "merge" })),
+                action("decision", json!({ "id": "a2", "options": ["a", "b"] })),
+            ],
+        }), NOW).unwrap();
+        // Nothing typed, or typed before the publish: the text stands
+        assert!(c.outdated(&f).is_empty());
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW);
+        assert!(c.outdated(&f).is_empty());
+        let plain = c.read(&f, None);
+        assert!(plain["tracks"][0].get("ownerTyped").is_none() && plain["actions"][0].get("ownerTyped").is_none());
+        // Typed after it: the waiting track and the action that points there, not the moving track or the action without a session
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 5);
+        let marks = c.outdated(&f);
+        assert_eq!(marks.iter().map(|o| (o.track, o.id.as_str(), o.session.as_str(), o.typed)).collect::<Vec<_>>(), [(true, "t1", "ex", Some(NOW + 5)), (false, "a1", "ex", Some(NOW + 5))]);
+        assert!(c.points_at("ex") && !c.points_at("sup") && !c.points_at("peer"));
+        let read = c.read(&f, None);
+        assert_eq!((&read["tracks"][0]["ownerTyped"], &read["actions"][0]["ownerTyped"]), (&json!(NOW + 5), &json!(NOW + 5)));
+        assert!(read["tracks"][1].get("ownerTyped").is_none() && read["actions"][1].get("ownerTyped").is_none());
+        // The published text is not rewritten, and the mark does not come back in through a publish
+        assert_eq!(read["tracks"][0]["state"], "waiting_human");
+        let mut back = json!({ "tracks": read["tracks"], "actions": read["actions"] });
+        back["tracks"][0]["line"] = json!("still waits");
+        c.publish(&SUP, &f, &back, NOW + 10).unwrap();
+        assert!(!serde_json::to_string(&c).unwrap().contains("ownerTyped"));
+        // The publisher changed the track: its mark is gone. The action it did not change keeps its own
+        let read = c.read(&f, None);
+        assert!(read["tracks"][0].get("ownerTyped").is_none());
+        assert_eq!(read["actions"][0]["ownerTyped"], json!(NOW + 5));
+        // A publisher cannot set the mark itself
+        assert!(c.patch(&SUP, &f, &json!({ "action": { "id": "a2", "ownerTyped": 1, "sessionEnded": true } }), NOW + 11).is_ok());
+        assert!(!serde_json::to_string(&c).unwrap().contains("sessionEnded"));
+    }
+
+    #[test]
+    fn an_action_whose_session_ended_or_is_gone_says_so() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        c.publish(&SUP, &f, &json!({ "tracks": [track()], "actions": [action("typed_word", json!({ "where": { "session": "ex" }, "say": "merge" }))] }), NOW).unwrap();
+        assert!(c.read(&f, None)["actions"][0].get("sessionEnded").is_none());
+        f.sessions.get_mut("ex").unwrap().ended = true;
+        // Also when the owner had typed there before it ended: ended is what counts
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 5);
+        assert_eq!(c.outdated(&f), [Outdated { by: "sup".into(), track: false, id: "a1".into(), updated: NOW, session: "ex".into(), typed: None }]);
+        let read = c.read(&f, None);
+        assert_eq!(read["actions"][0]["sessionEnded"], true);
+        assert!(read["actions"][0].get("ownerTyped").is_none());
+        f.sessions.remove("ex");
+        assert_eq!(c.read(&f, None)["actions"][0]["sessionEnded"], true);
+        // Also in the publisher's own read, which knows nothing else of a session the harness forgot
+        assert_eq!(c.read(&f, Some("sup"))["actions"][0]["sessionEnded"], true);
+    }
+
+    #[test]
+    fn what_the_owner_types_to_the_supervisor_marks_none_of_its_own_entries_that_point_at_itself() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        f.root = Some("root".into());
+        c.publish(&ROOT_WHO, &f, &json!({
+            "tracks": [{ "id": "mine", "title": "Mine", "lead": "root", "state": "waiting_human" }, { "id": "theirs", "title": "Theirs", "lead": "ex", "state": "waiting_human" }],
+            "actions": [
+                { "id": "here", "title": "Tell me", "kind": "typed_word", "where": { "session": "root" }, "say": "go", "risk": "reversible" },
+                { "id": "there", "title": "Tell it", "kind": "typed_word", "where": { "session": "ex" }, "say": "go", "risk": "reversible" },
+            ],
+        }), NOW).unwrap();
+        f.sessions.get_mut("root").unwrap().typed = Some(NOW + 5);
+        assert!(c.outdated(&f).is_empty(), "a line typed to the Supervisor is about anything");
+        // Its entries that point at another session are marked as any other
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 6);
+        assert_eq!(c.outdated(&f).iter().map(|o| (o.by.as_str(), o.id.as_str())).collect::<Vec<_>>(), [(ROOT, "theirs"), (ROOT, "there")]);
+        // And the Supervisor's session ending is still said of an action that points at it
+        f.sessions.get_mut("root").unwrap().ended = true;
+        assert!(c.outdated(&f).iter().any(|o| o.id == "here" && o.typed.is_none()));
+    }
+
+    #[test]
+    fn a_line_a_click_may_place_is_one_line_of_characters_that_are_all_seen() {
+        for good in ["merge MCR-95", "übernimm main, s'il te plaît", "選択する", "yes (the 2nd one) – “quoted” … £5", "a".repeat(MAX_PLACED).as_str()] {
+            assert_eq!(placeable(good), Ok(()), "{good}");
+        }
+        // The ranges the deny-list missed, letters that draw nothing, and what is not assigned
+        for bad in ['\u{1bca0}', '\u{1bca3}', '\u{13430}', '\u{1343f}', '\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}', '\u{e01ef}', '\u{378}', '\u{10ffff}', '\u{200b}', '\u{202e}', '\u{2066}', '\u{301}', '\u{a0}', '\u{3000}', '\t', '\n', '\r', '\u{1b}', '\u{7f}', '\u{0}'] {
+            let why = placeable(&format!("go{bad}on")).unwrap_err();
+            assert!(why.contains(&format!("U+{:04X}", bad as u32)), "{:x}: {why}", bad as u32);
+        }
+        assert!(placeable("go  on").unwrap_err().contains("two spaces"));
+        assert!(placeable("go on\\").unwrap_err().contains("backslash"));
+        assert!(placeable(" go").is_err() && placeable("go ").is_err() && placeable("").is_err());
+        assert!(placeable(&"a".repeat(MAX_PLACED + 1)).unwrap_err().contains("longer"));
+        for lead in ["!ls", "#note", "/clear"] {
+            assert!(placeable(lead).unwrap_err().contains("runs a command"), "{lead}");
+        }
+        // A command to copy may start with a path, and is a little longer; otherwise the same rule
+        assert_eq!(copyable("/usr/bin/true --flag=1 | cat"), Ok(()));
+        assert!(copyable("ls\u{200b}").is_err() && copyable("a  b").is_err() && copyable(&"a".repeat(MAX_COPIED + 1)).is_err());
+    }
+
+    #[test]
+    fn a_link_a_click_may_open_is_https_to_a_named_public_host() {
+        let link = web_link("https://GitHub.com/lambda-house/agent-mcr/pull/1?diff=split").unwrap();
+        assert_eq!((link.href.as_str(), link.host.as_str(), link.path.as_str(), link.query.as_str(), link.known), ("https://github.com/lambda-house/agent-mcr/pull/1?diff=split", "github.com", "/lambda-house/agent-mcr/pull/1", "diff=split", true));
+        // What is opened is what is shown: host, path and query make up the whole address
+        assert_eq!(link.href, format!("https://{}{}?{}", link.host, link.path, link.query));
+        assert!(web_link("https://github.com/x/y#files").unwrap_err().contains("fragment"));
+        assert!(web_link("https://github.com/x/y#").is_err());
+        // Where one signs in, grants access or changes an account, also a known host gets the stronger warning
+        for guarded in ["https://github.com/login/oauth/authorize?client_id=x", "https://github.com/settings/tokens", "https://github.com/apps/some-app/installations/new", "https://github.com/LOGIN", "https://teob.atlassian.net/login?dest=x", "https://github.com/oauth"] {
+            assert!(!web_link(guarded).unwrap().known, "{guarded}");
+        }
+        assert!(web_link("https://github.com/lambda-house/settings-tool").unwrap().known);
+        assert!(web_link("https://teob.atlassian.net/browse/MCR-97").unwrap().known);
+        // Any other host is not known, also one that only looks like a known one
+        for other in ["https://example.com/", "https://github.com.evil.example/", "https://gíthub.com/"] {
+            let link = web_link(other).unwrap();
+            assert!(!link.known && link.host.is_ascii(), "{other}: {link:?}");
+        }
+        // A look-alike name shows as what it is
+        assert!(web_link("https://gíthub.com/").unwrap().host.starts_with("xn--"));
+        // The explicit default port is the default port
+        assert_eq!(web_link("https://example.com:443/x").unwrap().href, "https://example.com/x");
+        for bad in [
+            "http://example.com/", "ftp://example.com/", "file:///etc/passwd", "javascript:alert(1)", "data:text/html,x", "https://", "example.com",
+            "https://user@example.com/", "https://user:pw@example.com/", "https://example.com:8443/", "https://example.com:80/",
+            "https://127.0.0.1/", "https://2130706433/", "https://0x7f.1/", "https://[::1]/", "https://192.168.1.10/admin", "https://10.0.0.1/",
+            "https://localhost/", "https://LOCALHOST./", "https://router/", "https://printer.local/", "https://nas.lan/", "https://dev.internal/", "https://a.localhost/",
+            "https://exa mple.com/", "https://example.com/a\nb",
+        ] {
+            assert!(web_link(bad).is_err(), "{bad} was accepted: {:?}", web_link(bad));
+        }
+        assert!(web_link(&format!("https://example.com/{}", "a".repeat(MAX_LINK))).is_err());
+    }
+
+    #[test]
+    fn a_click_is_resolved_from_the_stored_action_and_checked_again() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        f.root = Some("root".into());
+        c.publish(&SUP, &f, &json!({ "tracks": [track()], "actions": [
+            action("typed_word", json!({ "where": { "session": "ex" }, "say": "merge MCR-95" })),
+            action("decision", json!({ "id": "pick", "options": ["Keep it", "Drop it"], "recommended": "Keep it" })),
+            action("decision", json!({ "id": "there", "options": ["Yes", "No"], "where": { "session": "ex" } })),
+            action("external", json!({ "id": "pr", "where": { "url": "https://github.com/x/y/pull/1" } })),
+            action("live_check", json!({ "id": "look", "detail": "steps", "where": { "command": "cargo test" } })),
+        ] }), NOW).unwrap();
+        c.publish(&ROOT_WHO, &f, &json!({ "actions": [{ "id": "next", "title": "Which next", "kind": "decision", "options": ["A", "B"], "risk": "reversible" }] }), NOW).unwrap();
+        let act = |c: &Cockpit, f: &Facts, by: &str, id: &str, act: Act| c.act(by, id, NOW, act, f);
+        // The stored line into the stored session
+        assert_eq!(act(&c, &f, "sup", "a1", Act::Place), Ok(Deed::Type { session: "ex".into(), text: "merge MCR-95".into() }));
+        // A choice: the service's frame with the action's id, into the publisher's own box, or the session it names
+        assert_eq!(act(&c, &f, "sup", "pick", Act::Choose(1)), Ok(Deed::Type { session: "sup".into(), text: "Decision pick: Drop it".into() }));
+        assert_eq!(act(&c, &f, "sup", "there", Act::Choose(0)), Ok(Deed::Type { session: "ex".into(), text: "Decision there: Yes".into() }));
+        assert_eq!(act(&c, &f, ROOT, "next", Act::Choose(0)), Ok(Deed::Type { session: "root".into(), text: "Decision next: A".into() }));
+        // Whatever passed the publish is placed: the longest id with the longest option that goes with it
+        let long_id = "d".repeat(40);
+        let long_option = "x".repeat(MAX_PLACED - 51);
+        c.patch(&SUP, &f, &json!({ "action": { "id": long_id, "track": "t1", "title": "Long", "kind": "decision", "options": ["a", long_option], "risk": "reversible" } }), NOW).unwrap();
+        assert!(matches!(act(&c, &f, "sup", &long_id, Act::Choose(1)), Ok(Deed::Type { text, .. }) if text.chars().count() == MAX_PLACED));
+        assert!(matches!(act(&c, &f, "sup", &long_id, Act::Ask), Ok(Deed::Type { .. })));
+        // "Ask more": a fixed sentence with the id, to the publisher
+        assert_eq!(act(&c, &f, "sup", "a1", Act::Ask), Ok(Deed::Type { session: "sup".into(), text: "Explain cockpit action a1: what happens if I do it, and what if I do not?".into() }));
+        assert!(matches!(act(&c, &f, "sup", "pr", Act::Link), Ok(Deed::Link(l)) if l.host == "github.com" && l.known));
+        assert_eq!(act(&c, &f, "sup", "look", Act::Copy), Ok(Deed::Copy("cargo test".into())));
+        let refused = |r: Result<Deed, String>, why: &str| {
+            let err = r.unwrap_err();
+            assert!(err.starts_with("Refused: ") && err.contains(why), "{why}: {err}");
+        };
+        // Not the action the panel showed
+        refused(c.act("sup", "a1", NOW - 1, Act::Place, &f), "published again");
+        refused(act(&c, &f, "sup", "nothing", Act::Place), "no longer published");
+        refused(act(&c, &f, "peer", "a1", Act::Place), "no longer published");
+        // Not what its kind has
+        refused(act(&c, &f, "sup", "a1", Act::Choose(0)), "nothing of this kind");
+        refused(act(&c, &f, "sup", "pick", Act::Place), "nothing of this kind");
+        refused(act(&c, &f, "sup", "pick", Act::Choose(2)), "no such option");
+        refused(act(&c, &f, "sup", "a1", Act::Link), "nothing of this kind");
+        refused(act(&c, &f, "sup", "a1", Act::Copy), "nothing of this kind");
+        // The target was bound to another supervisor since the publish
+        let mut moved = f.clone();
+        moved.sessions.get_mut("ex").unwrap().above = vec!["peer".into()];
+        refused(act(&c, &moved, "sup", "a1", Act::Place), "no longer works for");
+        refused(act(&c, &moved, "sup", "there", Act::Choose(0)), "no longer works for");
+        // The Supervisor may point anywhere, as it may publish there
+        c.patch(&ROOT_WHO, &f, &json!({ "action": { "id": "far", "title": "Say it", "kind": "typed_word", "where": { "session": "peer" }, "say": "go", "risk": "reversible" } }), NOW).unwrap();
+        assert_eq!(act(&c, &f, ROOT, "far", Act::Place), Ok(Deed::Type { session: "peer".into(), text: "go".into() }));
+        // Ended, gone, or no agent
+        let mut ended = f.clone();
+        ended.sessions.get_mut("ex").unwrap().ended = true;
+        refused(act(&c, &ended, "sup", "a1", Act::Place), "has ended");
+        let mut shell = f.clone();
+        shell.sessions.get_mut("ex").unwrap().agent = false;
+        refused(act(&c, &shell, "sup", "a1", Act::Place), "not an agent");
+        // The owner typed there since: the action is behind, its publisher updates it first
+        let mut typed = f.clone();
+        typed.sessions.get_mut("ex").unwrap().typed = Some(NOW + 1);
+        refused(act(&c, &typed, "sup", "a1", Act::Place), "after this was published");
+        // No Supervisor runs: its own box is nowhere
+        let mut alone = f.clone();
+        alone.root = None;
+        refused(act(&c, &alone, ROOT, "next", Act::Choose(0)), "does not run");
+        // A stored text from before the allow-list is not placed, opened or copied
+        let part = c.parts.get_mut("sup").unwrap();
+        part.actions[0].say = "merge\u{200b} MCR-95".into();
+        part.actions[1].options[0] = "Keep\u{3164}it".into();
+        part.actions[3].place.url = "http://github.com/x".into();
+        part.actions[4].place.command = "cargo  test".into();
+        refused(act(&c, &f, "sup", "a1", Act::Place), "U+200B");
+        refused(act(&c, &f, "sup", "pick", Act::Choose(0)), "U+3164");
+        assert!(act(&c, &f, "sup", "pick", Act::Choose(1)).is_ok());
+        refused(act(&c, &f, "sup", "pr", Act::Link), "https");
+        refused(act(&c, &f, "sup", "look", Act::Copy), "two spaces");
+        // The read says which of them have no button, so the panel offers none
+        let read = c.read(&f, None);
+        let unclickable = |id: &str| read["actions"].as_array().unwrap().iter().find(|a| a["id"] == id).unwrap()["unclickable"].clone();
+        assert_eq!((unclickable("a1"), unclickable("pick"), unclickable("pr"), unclickable("look"), unclickable("there")), (json!(["say"]), json!(["options"]), json!(["url"]), json!(["command"]), Value::Null));
+    }
+
+    #[test]
+    fn an_unchanged_target_is_checked_again_at_a_publish_while_it_runs() {
+        let mut c = published();
+        let mut f = facts();
+        // Bound to another supervisor since: a publish that keeps the target is refused now
+        f.sessions.get_mut("ex").unwrap().above = vec!["peer".into()];
+        let again = json!({ "tracks": [{ "id": "t1", "title": "Cockpit", "lead": "sup", "state": "moving" }], "actions": [action("typed_word", json!({ "where": { "session": "ex" }, "say": "something else" }))] });
+        assert!(c.publish(&SUP, &f, &again, NOW + 1).unwrap_err().contains("not you or one of your executors"));
+        // Ended: the entry may stay as it is, so that the rest of the part can change
+        f.sessions.get_mut("ex").unwrap().ended = true;
+        c.publish(&SUP, &f, &again, NOW + 2).unwrap();
     }
 
     #[test]
@@ -1484,10 +1995,14 @@ mod tests {
                 (action("typed_word", json!({ "where": { "session": "ex" }, "say": line })), "actions[0].say"),
                 (action("decision", json!({ "options": ["Keep", line] })), "actions[0].options[1]"),
                 (action("live_check", json!({ "detail": "x", "where": { "command": line } })), "where.command"),
-                (action("external", json!({ "where": { "url": format!("https://example.com/{hidden}") } })), "where.url"),
             ] {
                 let err = with_action(a).unwrap_err();
-                assert!(err.contains(place) && err.contains("cannot be seen"), "{:x} {place}: {err}", hidden as u32);
+                assert!(err.contains(place) && err.contains(&format!("U+{:04X}", hidden as u32)), "{:x} {place}: {err}", hidden as u32);
+            }
+            // In a link such a character is refused, or it is in the address only as its visible %-code
+            match web_link(&format!("https://example.com/a{hidden}b")) {
+                Ok(link) => assert!(!link.href.contains(hidden) && link.href.is_ascii(), "{}", link.href),
+                Err(why) => assert!(!why.is_empty()),
             }
         }
         // Text that is only shown: no separators that break a line unseen and no tag characters
