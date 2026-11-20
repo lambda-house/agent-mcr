@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import CockpitPanel from './CockpitPanel';
+import CockpitPanel, { READ_TIMEOUT_MS } from './CockpitPanel';
 import { harnessApi, type Cockpit, type Hosted } from '../utils/harness';
 import { readFileSync } from 'node:fs';
 
@@ -364,7 +364,32 @@ it('merges what the harness knows into the published action for the same session
   expect(row.querySelector('.ck-urgency')!.textContent).toBe('now');
   expect([...row.querySelectorAll('.ck-live.harness')].map(c => c.textContent)).toEqual(['at a prompt · a while ago', 'reported: needs you · a while ago']);
   expect(row.textContent).toContain('Builder reported: Which branch?');
-  // The published row keeps its own click, and does not say its report is closed
-  expect(row.textContent).toContain('Place in Builder, unsent');
+  // No Place while the session asks at a prompt (the service would refuse it): the reason instead
+  expect(row.textContent).not.toContain('Place in Builder, unsent');
+  expect(row.textContent).toContain('No button while Builder asks at a prompt: answer it there first.');
   expect(row.textContent).not.toContain('the report it names is closed');
+  // Once the prompt is answered, the published row has its click again
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ ...doc.actions[0], live: { report: { id: 'r9', since: Date.now(), text: 'Which branch?' } } }] });
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 2100)); });
+  expect(host.querySelector('[data-action="word"]')!.textContent).toContain('Place in Builder, unsent');
+});
+
+it('says that the cockpit could not be read when a read hangs, instead of showing the last one as now (MCR-118)', async () => {
+  vi.useFakeTimers();
+  try {
+    await act(async () => root.render(<CockpitPanel active hosted={hosted} label={label} onSession={id => opened.push(id)}/>));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(host.querySelector('.ck-head')!.textContent).toContain('2 need you');
+    // The service stops answering
+    vi.mocked(harnessApi.cockpit).mockReturnValue(new Promise(() => {}));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000 + READ_TIMEOUT_MS + 10); });
+    expect(host.querySelector('.ck-head')!.textContent).toContain('could not be read');
+    expect(host.querySelector('p.ck-empty[role="alert"]')!.textContent).toContain('no answer from the harness service in 5 s');
+    // It answers again: the error goes
+    vi.mocked(harnessApi.cockpit).mockResolvedValue(doc);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2010); });
+    expect(host.querySelector('.ck-head')!.textContent).toContain('2 need you');
+  } finally {
+    vi.useRealTimers();
+  }
 });

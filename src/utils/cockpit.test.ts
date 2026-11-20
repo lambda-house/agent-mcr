@@ -184,4 +184,14 @@ describe('what the harness knows, derived or merged (MCR-118)', () => {
     expect(chips.join(' ')).not.toContain('Which key?');
     expect(harnessChips(action('plain'), NOW)).toEqual([]);
   });
+
+  it('offers no line to place while the session asks at a prompt', () => {
+    const word = action('w', { kind: 'typed_word', say: 'go', updated: NOW, where: { session: 'x' } });
+    expect(clickable(word, 'say')).toBe(true);
+    expect(clickable({ ...word, live: { prompt: NOW } }, 'say')).toBe(false);
+    expect(clickable({ ...word, options: ['a'], live: { prompt: NOW } }, 'options')).toBe(false);
+    // Asking its publisher more stays possible
+    expect(clickable({ ...word, live: { prompt: NOW } }, 'ask')).toBe(true);
+    expect(clickable({ ...word, live: { held: NOW } }, 'say')).toBe(true);
+  });
 });

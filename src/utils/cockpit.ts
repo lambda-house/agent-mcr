@@ -98,6 +98,8 @@ export function clickable(a: CockpitAction, part: 'say' | 'options' | 'url' | 'c
   if (a.derived || !a.by || !a.updated) return false;
   if (part === 'ask') return true;
   if ((part === 'say' || part === 'options') && !stillAwaits(a)) return false;
+  // The session asks at a prompt: the service refuses to place a line there, so no button offers it
+  if ((part === 'say' || part === 'options') && a.live?.prompt) return false;
   return !a.unclickable?.includes(part);
 }
 

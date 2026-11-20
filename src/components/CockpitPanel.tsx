@@ -116,6 +116,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
             </p>
           )}
           {a.unclickable?.includes('say') && <p className="ck-source">No button: this line holds characters that are not placed by a click. Type it yourself if it is right.</p>}
+          {!a.unclickable?.includes('say') && a.live?.prompt && stillAwaits(a) && <p className="ck-source">No button while {at ? at.name : 'that session'} asks at a prompt: answer it there first.</p>}
         </div>
       )}
       {a.options && (
@@ -130,7 +131,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
           ) : (
             <>
               <ul className="ck-options" aria-label="Options">{a.options.map(o => <li key={o}>{o}{o === a.recommended ? ' (recommended by its publisher)' : ''}</li>)}</ul>
-              <p className="ck-source">{a.unclickable?.includes('options') ? 'No buttons: an option holds characters that are not placed by a click.' : !awaits ? 'No buttons: this is behind what happened since.' : 'No buttons: the session to answer in does not run.'} Answer in {choiceBox ? choiceBox.name : 'the publishing session'} yourself.</p>
+              <p className="ck-source">{a.unclickable?.includes('options') ? 'No buttons: an option holds characters that are not placed by a click.' : !awaits ? 'No buttons: this is behind what happened since.' : a.live?.prompt ? `No buttons while ${at ? at.name : 'that session'} asks at a prompt: answer it there first.` : 'No buttons: the session to answer in does not run.'} Answer in {choiceBox ? choiceBox.name : 'the publishing session'} yourself.</p>
             </>
           )}
         </div>
@@ -253,6 +254,9 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
  * does; `onSession` opens one. The cockpit document is asked for while
  * `active`, as often as the list.
  */
+/** How long a read of the cockpit may take before the panel says it could not be read (MCR-118). */
+export const READ_TIMEOUT_MS = 5000;
+
 export default function CockpitPanel({ active, hosted, label, onSession }: { active: boolean; hosted: Hosted[]; label: (h: Hosted) => string; onSession: (id: string) => void }) {
   const [cockpit, setCockpit] = useState<Cockpit | null>(null);
   const [error, setError] = useState('');
@@ -263,10 +267,17 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
   useEffect(() => {
     if (!active) return;
     let live = true;
+    // Only the newest read may change what is shown: one that hung and answers late is older than what came since
+    let started = 0; let shown = 0;
     const load = () => {
-      Promise.resolve().then(() => harnessApi.cockpit())
-        .then(c => { if (live) { setCockpit(c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null); setError(''); } })
-        .catch(e => { if (live) setError(String(e)); });
+      const n = ++started;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      // A read that hangs is said, never covered by the last good one: "nothing needs you" is a claim
+      const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer from the harness service in ${READ_TIMEOUT_MS / 1000} s`)), READ_TIMEOUT_MS); });
+      Promise.race([Promise.resolve().then(() => harnessApi.cockpit()), late])
+        .then(c => { if (live && n > shown) { shown = n; setCockpit(c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null); setError(''); } })
+        .catch(e => { if (live && n > shown) { shown = n; setError(String(e instanceof Error ? e.message : e)); } })
+        .finally(() => clearTimeout(timer));
     };
     load();
     const timer = setInterval(() => { if (!document.hidden) load(); }, 2000);

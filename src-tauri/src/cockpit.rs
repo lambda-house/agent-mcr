@@ -243,7 +243,14 @@ pub struct Facts {
     /// The hosted Supervisor session, when the caller knows it. The store
     /// alone does not: who is the Supervisor is the runner's word
     pub root: Option<String>,
+    /// When the facts were taken (0: unknown, nothing counts as old)
+    pub now: u64,
 }
+
+/// A published entry not touched for this long may be out of date; the
+/// panel marks it so (`STALE_AFTER_MS` in `utils/cockpit.ts`), and the harness
+/// merges none of its facts into it (MCR-118).
+pub const STALE_AFTER_MS: u64 = 6 * 3_600_000;
 
 /// A published entry whose text the harness knows to be behind (MCR-103): it
 /// says the operator is awaited in a session, and the operator has typed
@@ -1298,12 +1305,17 @@ impl Cockpit {
                 continue;
             }
             named.insert(id.as_str());
+            // Not into an action that may be out of date, or whose publisher ended:
+            // today's prompt would read under an old title
+            let fresh = |a: &Value| facts.now == 0 || a["updated"].as_u64().is_some_and(|at| facts.now.saturating_sub(at) <= STALE_AFTER_MS);
+            let publisher_runs = |key: &str| key == ROOT || facts.sessions.get(key).is_some_and(|f| !f.ended);
             let standing_for = |a: &Value| {
                 a.get("derived").is_none()
                     && a.get("ownerTyped").is_none()
                     && a.get("sessionEnded").is_none()
+                    && fresh(a)
                     && a["where"]["session"] == id.as_str()
-                    && a["by"].as_str().is_some_and(|key| key == ROOT || key == id || fact.above.iter().any(|s| s == key))
+                    && a["by"].as_str().is_some_and(|key| publisher_runs(key) && (key == ROOT || key == id || fact.above.iter().any(|s| s == key)))
             };
             match actions.iter_mut().find(|a| standing_for(a)) {
                 Some(host) => {
@@ -2175,6 +2187,22 @@ mod tests {
         let actions = read["actions"].as_array().unwrap();
         assert!(actions[0].get("live").is_none());
         assert_eq!(actions.iter().filter(|a| a.get("derived").is_some()).count(), 3);
+        // Not into an action that may be out of date, nor one whose publisher ended: today's
+        // prompt would read under an old title (review of MCR-118)
+        let c = published();
+        let mut f = facts();
+        f.sessions.get_mut("ex").unwrap().prompt = Some(NOW + STALE_AFTER_MS + 2);
+        f.now = NOW + STALE_AFTER_MS;
+        assert_eq!(c.read(&f, None)["actions"][0]["live"]["prompt"], NOW + STALE_AFTER_MS + 2, "still fresh");
+        f.now = NOW + STALE_AFTER_MS + 1;
+        let read = c.read(&f, None);
+        assert!(read["actions"][0].get("live").is_none());
+        assert!(read["actions"].as_array().unwrap().iter().any(|a| a["derived"] == "prompt" && a["where"]["session"] == "ex"));
+        f.now = NOW;
+        f.sessions.get_mut("sup").unwrap().ended = true;
+        let read = c.read(&f, None);
+        assert!(read["actions"][0].get("live").is_none());
+        assert!(read["actions"].as_array().unwrap().iter().any(|a| a["derived"] == "prompt" && a["where"]["session"] == "ex"));
         // None of the new kinds can be published
         for kind in ["held_line", "human_wait"] {
             assert!(with_action(action(kind, json!({ "where": { "session": "ex" } }))).unwrap_err().contains("cannot be published"), "{kind}");

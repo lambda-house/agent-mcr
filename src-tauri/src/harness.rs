@@ -1250,15 +1250,18 @@ impl Store {
             .map(|(id, t)| {
                 let ended = t.state == ENDED;
                 let open = self.open_report(id);
+                let agent = adapter(&t.profile).is_agent();
                 let fact = cockpit::Fact {
                     name: label(t),
                     state: t.state.clone(),
                     ended,
-                    agent: adapter(&t.profile).is_agent(),
+                    agent,
                     above: self.chain(id),
                     prompt: t.attention.as_ref().filter(|a| a.kind == "permission" && !ended).map(|a| a.since),
-                    // A line that has stood a while, not one the operator is typing now
-                    held: Some(t.typed).filter(|since| t.draft && !ended && now.saturating_sub(*since) >= HELD_SHOW_MS),
+                    // A line that has stood a while, not one the operator is typing now. Only in an
+                    // agent's input box: in a shell the keys go to whatever runs there (q in less,
+                    // vim, htop), and `Draft` cannot tell those from a line
+                    held: Some(t.typed).filter(|since| agent && t.draft && !ended && now.saturating_sub(*since) >= HELD_SHOW_MS),
                     needs_human: open.filter(|r| r.kind == "needs_human").map(|r| (r.id.clone(), r.text.clone(), r.created)),
                     done: open.filter(|r| r.kind == "done").map(|r| r.id.clone()),
                     typed: Some(t.operator_sent).filter(|at| *at > 0),
@@ -1267,7 +1270,7 @@ impl Store {
                 (id.clone(), fact)
             })
             .collect();
-        cockpit::Facts { sessions, reports: self.reports.iter().map(|r| (r.id.clone(), r.session.clone())).collect(), root: None }
+        cockpit::Facts { sessions, reports: self.reports.iter().map(|r| (r.id.clone(), r.session.clone())).collect(), root: None, now }
     }
 
     /// `target` is an executor of `me`, directly or further down.
@@ -7308,9 +7311,11 @@ mod tests {
         s.sessions.insert("typing".into(), t(true, now - HELD_SHOW_MS + 1, "idle"));
         s.sessions.insert("sent".into(), t(false, now - 10 * HELD_SHOW_MS, "idle"));
         s.sessions.insert("ended".into(), t(true, now - 10 * HELD_SHOW_MS, ENDED));
+        // In a shell the keys go to whatever runs there (q in less, vim): no line to speak of
+        s.sessions.insert("shell".into(), Tracked { profile: "shell".into(), ..t(true, now - 10 * HELD_SHOW_MS, "unknown") });
         let facts = s.cockpit_facts(now);
         let held = |id: &str| facts.sessions[id].held;
-        assert_eq!((held("old"), held("typing"), held("sent"), held("ended")), (Some(now - HELD_SHOW_MS), None, None, None));
+        assert_eq!((held("old"), held("typing"), held("sent"), held("ended"), held("shell")), (Some(now - HELD_SHOW_MS), None, None, None, None));
         // In the read: a row of its own, with its age, at the next poll (MCR-118)
         let read = s.cockpit.read(&facts, None);
         assert_eq!(read["actions"].as_array().unwrap().iter().map(|a| (a["kind"].as_str().unwrap(), a["where"]["session"].as_str().unwrap(), a["since"].as_u64().unwrap())).collect::<Vec<_>>(), [("held_line", "old", now - HELD_SHOW_MS)]);
