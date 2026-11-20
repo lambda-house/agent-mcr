@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionSource, clickable, foldRows, liveFacts, named, needsYouRows, ROWS_PER_PUBLISHER, STALE_AFTER_MS, staleMarks, stillAwaits, trackStateShown, trackWaits, urgencyRank } from './cockpit';
+import { actionSource, clickable, foldRows, harnessChips, harnessSaw, heldFor, liveFacts, named, needsYouRows, ROWS_PER_PUBLISHER, STALE_AFTER_MS, staleMarks, stillAwaits, shownUrgency, trackStateShown, trackWaits, urgencyRank } from './cockpit';
 import type { Cockpit, CockpitAction, Hosted } from './harness';
 
 const NOW = 100 * 3600_000;
@@ -145,5 +145,43 @@ describe('clicks (MCR-97)', () => {
     expect(clickable(action('a', { updated: 5, sessionEnded: true }), 'say')).toBe(false);
     const old = action('a', { updated: 5, unclickable: ['say', 'url'] });
     expect([clickable(old, 'say'), clickable(old, 'options'), clickable(old, 'url'), clickable(old, 'command')]).toEqual([false, true, false, true]);
+  });
+});
+
+describe('what the harness knows, derived or merged (MCR-118)', () => {
+  it('ranks a published row that carries a harness fact with the harness rows, at the harness urgency', () => {
+    const rows = needsYouRows(cockpit({ actions: [
+      action('claims-now', { urgency: 'now', updated: 1 }),
+      action('held', { kind: 'held_line', derived: 'held', since: 5 }),
+      action('merged-prompt', { urgency: 'whenever', updated: 9, where: { session: 'x' }, live: { prompt: 8 } }),
+      action('wait', { kind: 'human_wait', derived: 'wait', since: 2 }),
+      action('report-only', { updated: 3, live: { reportOpen: true } }),
+    ] }));
+    expect(rows.map(a => a.id)).toEqual(['merged-prompt', 'wait', 'held', 'claims-now', 'report-only']);
+    // A publisher's "whenever" does not hide the harness's "now"; a merged held line is "today"
+    expect(shownUrgency(action('m', { urgency: 'whenever', live: { prompt: 1 } }))).toBe('now');
+    expect(shownUrgency(action('m', { urgency: 'now', live: { held: 1 } }))).toBe('today');
+    // "reportOpen" alone is the publisher's own citation, not a fact the harness adds
+    expect(harnessSaw(action('r', { live: { reportOpen: true } }))).toBe(false);
+    // Behind: no urgency at all
+    expect(shownUrgency(action('b', { live: { prompt: 1 }, ownerTyped: 2 }))).toBe('');
+  });
+
+  it('never folds a row the harness knows about, also when one publisher has many', () => {
+    const many = Array.from({ length: ROWS_PER_PUBLISHER + 2 }, (_, i) => action(`p${i}`, { by: 'busy', updated: i + 1 }));
+    many.push(action('merged', { by: 'busy', updated: 99, live: { held: 1 } }));
+    const { shown, folded } = foldRows(needsYouRows(cockpit({ actions: many })), new Set());
+    expect(shown.map(a => a.id)).toContain('merged');
+    expect(folded.get('busy')).toBe(2);
+  });
+
+  it('says how long a line has stood, and what was merged, as chips', () => {
+    expect([heldFor(NOW - 45_000, NOW), heldFor(NOW - 12 * 60_000, NOW), heldFor(NOW - 125 * 60_000, NOW), heldFor(NOW - 120 * 60_000, NOW)]).toEqual(['45 s', '12 min', '2 h 5 min', '2 h']);
+    expect(harnessChips(action('h', { kind: 'held_line', derived: 'held', since: NOW - 12 * 60_000 }), NOW)).toEqual(['unsent for 12 min']);
+    const chips = harnessChips(action('m', { live: { prompt: NOW - 60_000, held: NOW - 3 * 60_000, report: { id: 'r', since: NOW, text: 'Which key?' }, waits: [{ id: 'w', on: 'a go', since: NOW - 3600_000 }] } }), NOW);
+    expect(chips).toEqual(['at a prompt · 1 min ago', 'your unsent line there for 3 min: Enter sends it, Ctrl+C clears it', 'reported: needs you · just now', 'waits for you, late · since 1 h ago']);
+    // The session's own words are not a chip
+    expect(chips.join(' ')).not.toContain('Which key?');
+    expect(harnessChips(action('plain'), NOW)).toEqual([]);
   });
 });

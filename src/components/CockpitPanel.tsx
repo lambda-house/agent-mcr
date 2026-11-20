@@ -4,7 +4,7 @@ import ConfirmDialog from './ConfirmDialog';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
-import { ACTION_KIND, actionSource, clickable, foldRows, liveFacts, named, needsYouRows, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
+import { ACTION_KIND, actionSource, clickable, foldRows, harnessChips, harnessSaw, liveFacts, named, needsYouRows, shownUrgency, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
 import { harnessApi, type Cockpit, type CockpitAct, type CockpitAction, type CockpitLink, type CockpitTrack, type Hosted } from '../utils/harness';
 
 /**
@@ -55,7 +55,9 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   const track = a.track ? cockpit.tracks.find(t => t.id === a.track && (!a.trackBy || t.by === a.trackBy)) : undefined;
   // An action the harness knows to be behind keeps its text and loses its urgency
   const awaits = stillAwaits(a);
-  const urgency = !awaits ? '' : a.derived === 'prompt' ? 'now' : a.urgency ?? (a.derived === 'report' ? 'today' : '');
+  const urgency = shownUrgency(a);
+  // What the harness knows of the session, on this row: merged into a published one, or how long a line stood (MCR-118)
+  const chips = harnessChips(a);
   // What a click did, or why the service refused it: said on the row, in the service's words
   const [said, setSaid] = useState<{ text: string; bad: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -87,7 +89,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   const choiceBox = at ?? publisher;
   const from = publisher ? `from ${publisher.name}` : '';
   return (
-    <li className={`ck-action${a.derived ? ' derived' : ''}${awaits ? '' : ' behind'}`} data-action={a.id}>
+    <li className={`ck-action${a.derived ? ' derived' : ''}${!a.derived && harnessSaw(a) ? ' merged' : ''}${awaits ? '' : ' behind'}`} data-action={a.id}>
       <div className="ck-action-head">
         {urgency && <span className={`ck-urgency ${urgency}`}>{urgency}</span>}
         {a.ownerTyped && !a.sessionEnded && <span className="ck-live answered" title="From the harness: you pressed Enter in that session's terminal after this was published. Its publisher was told to update it">you typed there {formatAge(a.ownerTyped)}</span>}
@@ -96,9 +98,12 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         <span className="ck-kind">{ACTION_KIND[a.kind]}</span>
         {at && <SessionLink who={at} onSession={onSession}/>}
         {at?.hosted && <Live h={at.hosted}/>}
+        {chips.map(c => <span key={c} className="ck-live harness" title="From the harness, now">{c}</span>)}
         {caution && <span className="ck-risk caution">{caution}</span>}
       </div>
-      {a.derived && a.detail && <p className="ck-fact">{a.detail}</p>}
+      {a.derived && a.detail && <p className="ck-fact">{a.derived === 'wait' ? 'It registered: ' : ''}{a.detail}</p>}
+      {!a.derived && a.live?.report && <p className="ck-fact">{at ? at.name : 'The session'} reported: {a.live.report.text}</p>}
+      {!a.derived && a.live?.waits?.map(w => <p key={w.id} className="ck-fact">{at ? at.name : 'The session'} waits for you, past its time. It registered: {w.on}</p>)}
       {a.why && <p>{a.why}</p>}
       {/* The whole line, never cut: what is read here is what a click places */}
       {a.say && (
@@ -160,7 +165,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         {a.trackMissing && <span className="ck-stale">its track was removed</span>}
         {a.blocks?.length ? <span>blocks: {a.blocks.join(', ')}</span> : null}
         {a.source?.length ? <span>source: {a.source.join(', ')}</span> : null}
-        {a.live && !a.live.reportOpen && <span className="ck-stale">the report it names is closed</span>}
+        {a.live?.reportOpen === false && <span className="ck-stale">the report it names is closed</span>}
         {!a.derived && <Stale marks={staleMarks(a, cockpit, hosted, label)}/>}
       </p>
       {/* In the page's body, not in the row: a column of the panel is a container (MCR-105), and a
