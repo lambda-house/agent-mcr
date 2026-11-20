@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { SettingRow } from '@/ui';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type HarnessStatus, type HarnessPreferences } from '../utils/harness';
 import { BackgroundPanel } from './Background';
+import { useStore } from '../store';
 
 /** What the switch does and where the person stands with Codex's own trust step. */
 export function codexHooksDescription(status: HarnessStatus): string {
@@ -18,6 +19,8 @@ export default function HarnessSettingsSection() {
   const [backgroundOpen, setBackgroundOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const hideNoise = useStore(s => s.liveList.hideNoise);
+  const setLiveList = useStore(s => s.setLiveList);
   useEffect(() => {
     let active = true;
     harnessApi.status().then(s => { if (active) setStatus(s); }).catch(e => { if (active) setError(String(e)); });
@@ -63,6 +66,12 @@ export default function HarnessSettingsSection() {
           <option value="">None</option>
           {prefs.profiles.filter(p => p.canSupervise && prefs.enabledProfiles.includes(p.id)).map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
         </select>
+      }/>
+      <SettingRow label="Leave out temporary and removed folders" description="In the Live list, folders that are no longer on disk (a removed worktree) and agents' temporary folders (scratchpads in the system's temp folder, .claude/live-check test homes) go to Hidden folders by themselves. A folder with a running session always shows. Nothing is deleted." control={
+        <label className="settings-toggle">
+          <input type="checkbox" aria-label="Leave out temporary and removed folders" checked={hideNoise} onChange={e => { const on = e.target.checked; setLiveList(p => ({ ...p, hideNoise: on })); }}/>
+          <span className="settings-toggle-slider"/>
+        </label>
       }/>
       <SettingRow label="Background processes" description="Runner and harness service keep sessions alive when the app closes." control={
         <button type="button" aria-expanded={backgroundOpen} onClick={() => setBackgroundOpen(open => !open)}>{backgroundOpen ? 'Hide' : 'Manage…'}</button>

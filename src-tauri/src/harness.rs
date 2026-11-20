@@ -318,6 +318,19 @@ pub struct Resumable {
     pub tags: Vec<String>,
 }
 
+/// Whether a session's folder is still a folder on disk. An empty path, or
+/// one that cannot be asked about, counts as there: only a folder known to be
+/// gone is left out of the app's list.
+fn folder_there(cwd: &str) -> bool {
+    if cwd.is_empty() {
+        return true;
+    }
+    match std::fs::metadata(cwd) {
+        Ok(meta) => meta.is_dir(),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -2656,6 +2669,10 @@ impl Harness {
                 }
                 let open = store.tasks.values().filter(|t| t.session == id && t.open()).count();
                 let mut out = info.clone();
+                // An ended session whose folder is gone (a removed worktree): the app leaves it out (MCR-107)
+                if !info["exit"].is_null() && !folder_there(info["cwd"].as_str().unwrap_or("")) {
+                    out["cwdGone"] = json!(true);
+                }
                 out["harness"] = json!(tracked);
                 out["openTasks"] = json!(open);
                 out["unread"] = json!(store.unread(id));
@@ -4519,7 +4536,21 @@ impl Harness {
                         r
                     })
                     .collect();
-                Ok(json!({ "sessions": list }))
+                // Whether each folder is still there, asked once per folder: the
+                // app leaves out folders that are gone (MCR-107). Asked here, of
+                // folders the transcripts name, and not by the page of any path it likes
+                let mut there: BTreeMap<String, bool> = BTreeMap::new();
+                let sessions: Vec<Value> = list
+                    .iter()
+                    .map(|r| {
+                        let mut out = json!(r);
+                        if !*there.entry(r.cwd.clone()).or_insert_with(|| folder_there(&r.cwd)) {
+                            out["gone"] = json!(true);
+                        }
+                        out
+                    })
+                    .collect();
+                Ok(json!({ "sessions": sessions }))
             }
             // The memory server's connection, as the app sees and steers it. Only the app
             // gets here (see `handle`), and it has asked the person before the last two
@@ -5740,6 +5771,21 @@ mod tests {
             assert_eq!(h.control(&json!({"op": "settings", "storeNoticeSeen": true})).unwrap()["storeNotice"]["frozen"], true);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn a_folder_counts_as_gone_only_when_it_is_known_to_be() {
+        let dir = std::env::temp_dir().join(format!("mcr-folder-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(folder_there(dir.to_str().unwrap()));
+        assert!(folder_there(""));
+        // A file is not a folder to work in
+        let file = dir.join("f");
+        std::fs::write(&file, "x").unwrap();
+        assert!(!folder_there(file.to_str().unwrap()));
+        assert!(!folder_there(dir.join("removed-worktree").to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!folder_there(dir.to_str().unwrap()));
     }
 
     #[test]

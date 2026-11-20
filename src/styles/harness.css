@@ -337,6 +337,18 @@
 .hs-resume > small { flex: 0 0 auto; color: var(--sc-muted); font-size: 10.5px; }
 .hs-list li.hs-earlier-more { display: block; padding: 2px 6px; color: var(--sc-muted); font-size: 11px; }
 .session-cockpit .hs-more-folders { margin: 2px 8px 8px; padding: 3px 8px; border: 0; background: transparent; color: var(--sc-muted); font-size: 11px; justify-content: flex-start; }
+/* Hiding and cleaning up (MCR-107) */
+.hs-list li.hs-earlier-row { display: flex; align-items: center; gap: 2px; }
+.hs-earlier-row .hs-resume { flex: 1; min-width: 0; }
+.session-cockpit .hs-earlier-hide { opacity: 0; }
+.hs-earlier-row:hover .hs-earlier-hide, .hs-earlier-hide:focus-visible { opacity: .8; }
+.session-cockpit .hs-earlier-unhide { height: auto; padding: 0; border: 0; background: transparent; color: var(--sc-muted); font-size: 11px; text-decoration: underline; text-underline-offset: 2px; }
+.session-cockpit .hs-cleanup { display: flex; align-items: center; gap: 5px; }
+.hs-hidden { margin: 0 8px 8px; border-top: 1px solid var(--sc-border); padding-top: 4px; }
+.hs-list .hs-hidden ul { padding: 2px 0 2px 14px; }
+.hs-list li.hs-hidden-row { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 1px 6px; flex-wrap: nowrap; }
+.hs-hidden-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--sc-text); font-size: 11.5px; }
+.hs-hidden-why { flex: 0 0 auto; color: var(--sc-muted); font-size: 10.5px; }
 /* Background processes: the question before they start, and what runs with its off switch */
 .hs-gate { display: flex; flex-direction: column; gap: 8px; margin: 10px; padding: 12px; border: 1px solid var(--sc-border); border-radius: 6px; background: var(--sc-card); font-size: 12px; line-height: 1.45; }
 .hs-gate strong { font-size: 13px; }

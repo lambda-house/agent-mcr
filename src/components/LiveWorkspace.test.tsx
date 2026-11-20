@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LiveWorkspace from './LiveWorkspace';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type Hosted } from '../utils/harness';
 import { pickDirectory } from '../utils/tauri';
+import { useStore } from '../store';
+import { DEFAULT_LIVE_LIST } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), storeNoticeSeen: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
@@ -40,12 +42,120 @@ beforeEach(() => {
   vi.mocked(harnessApi.list).mockResolvedValue([ended, running]);
   vi.mocked(harnessApi.resumable).mockResolvedValue([]);
   vi.mocked(harnessApi.ack).mockResolvedValue();
+  // The list's choices live in the app's settings, shared by every test here
+  useStore.setState({ liveList: DEFAULT_LIVE_LIST });
   vi.spyOn(document, 'hasFocus').mockReturnValue(true);
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 
 const rows = () => [...host.querySelectorAll('.hs-dir > ul > li')];
 const folders = () => [...host.querySelectorAll('.hs-dir')];
+
+describe('hiding folders and cleaning up (MCR-107)', () => {
+  const label = (path: string) => `[aria-label="Folder ${path}"]`;
+  const hiddenRows = () => [...host.querySelectorAll('.hs-hidden-row')].map(r => [r.querySelector('.hs-hidden-path')!.getAttribute('title'), r.querySelector('.hs-hidden-why')!.textContent]);
+  const openHidden = async () => { const toggle = host.querySelector('.hs-hidden .hs-earlier-toggle') as HTMLButtonElement; if (toggle.getAttribute('aria-expanded') !== 'true') await act(async () => toggle.click()); };
+
+  it('hides a folder without a running session, keeps it in Hidden folders, and shows it again', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([running]);
+    vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'old-1', cwd: '/Users/me/legacy', modified: 5 }]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    // A folder with a running session has no Hide; one with history only has
+    expect(host.querySelector('button[aria-label="Hide folder /work/repo"]')).toBeNull();
+    await act(async () => (host.querySelector('button[aria-label="Hide folder /Users/me/legacy"]') as HTMLButtonElement).click());
+    expect(host.querySelector(label('/Users/me/legacy'))).toBeNull();
+    expect(host.querySelector('.hs-hidden .hs-earlier-toggle')!.textContent).toContain('Hidden folders · 1');
+    await openHidden();
+    expect(hiddenRows()).toEqual([['/Users/me/legacy', 'hidden by you']]);
+    // Kept in the app's settings, not in the harness
+    expect(useStore.getState().liveList.hiddenFolders).toEqual(['/Users/me/legacy']);
+    await act(async () => (host.querySelector('button[aria-label="Show folder /Users/me/legacy"]') as HTMLButtonElement).click());
+    expect(host.querySelector(label('/Users/me/legacy'))).not.toBeNull();
+    expect(host.querySelector('.hs-hidden')).toBeNull();
+  });
+
+  it('shows a hidden folder again as soon as a session runs there, and hides it again when it has ended', async () => {
+    useStore.setState({ liveList: { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/work/repo'] } });
+    vi.mocked(harnessApi.list).mockResolvedValue([ended]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(host.querySelector(label('/work/repo'))).toBeNull();
+    // A new session there, waiting for the person: it must be in sight
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...running, harness: { name: 'Asks', named: true, profile: 'claude', state: 'waiting', since: 1, precise: true, attention: { kind: 'permission', text: 'Bash?', since: 1 }, lastMessage: null } as Hosted['harness'] }]);
+    await act(async () => { await new Promise(r => setTimeout(r, 2100)); }); await flush();
+    expect(host.querySelector(label('/work/repo'))).not.toBeNull();
+    expect(host.querySelector('.hs-hidden')).toBeNull();
+    vi.mocked(harnessApi.list).mockResolvedValue([ended]);
+    await act(async () => { await new Promise(r => setTimeout(r, 2100)); }); await flush();
+    expect(host.querySelector(label('/work/repo'))).toBeNull();
+  });
+
+  it('leaves out folders that are gone and agents\' temporary folders, says why, and the switch turns it off', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([running, { ...ended, cwd: '/Users/me/work/agent-mcr/.claude/worktrees/mcr-49-memory', cwdGone: true }]);
+    vi.mocked(harnessApi.resumable).mockResolvedValue([
+      { agent: 'claude', id: 'p1', cwd: '/private/tmp/claude-501/x/scratchpad', modified: 9 },
+      { agent: 'claude', id: 'p2', cwd: '/Users/me/work/agent-mcr/.claude/live-check/hooks', modified: 8 },
+      { agent: 'codex', id: 'p3', cwd: '/Users/me/api', modified: 7 },
+      { agent: 'claude', id: 'p4', cwd: '/Users/me/old', modified: 6, gone: true },
+    ]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(folders().map(f => f.getAttribute('aria-label'))).toEqual(['Folder /work/repo', 'Folder /Users/me/api']);
+    await openHidden();
+    expect(hiddenRows().sort()).toEqual([
+      ['/Users/me/old', 'folder gone'],
+      ['/Users/me/work/agent-mcr/.claude/live-check/hooks', 'temporary'],
+      ['/Users/me/work/agent-mcr/.claude/worktrees/mcr-49-memory', 'folder gone'],
+      ['/private/tmp/claude-501/x/scratchpad', 'temporary'],
+    ]);
+    // Shown again by the person: the rule does not take it back
+    await act(async () => (host.querySelector('button[aria-label="Show folder /private/tmp/claude-501/x/scratchpad"]') as HTMLButtonElement).click());
+    expect(host.querySelector(label('/private/tmp/claude-501/x/scratchpad'))).not.toBeNull();
+    // The switch off: everything is in the list
+    await act(async () => useStore.getState().setLiveList(p => ({ ...p, hideNoise: false })));
+    expect(host.querySelector('.hs-hidden')).toBeNull();
+    expect(folders()).toHaveLength(6);
+  });
+
+  it('hides a past session, and shows the folder\'s hidden ones again', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([running]);
+    vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'claude', id: 'old-1', cwd: '/work/repo', modified: 5, title: 'First try' }, { agent: 'claude', id: 'old-2', cwd: '/work/repo', modified: 4, title: 'Second try' }, { agent: 'codex', id: 'x-1', cwd: '/Users/me/api', modified: 3, title: 'Elsewhere' }]);
+    useStore.setState({ liveList: { ...DEFAULT_LIVE_LIST, hiddenSessions: ['x-1'] } });
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const earlier = () => host.querySelector('[aria-label="Folder /work/repo"] .hs-earlier')!;
+    expect(earlier().querySelector('.hs-earlier-toggle')!.textContent).toContain('Earlier · 2');
+    await act(async () => (earlier().querySelector('.hs-earlier-toggle') as HTMLButtonElement).click());
+    await act(async () => (host.querySelector('button[aria-label="Hide session First try"]') as HTMLButtonElement).click());
+    expect(earlier().querySelector('.hs-earlier-toggle')!.textContent).toContain('Earlier · 1');
+    expect(earlier().textContent).not.toContain('First try');
+    // The other folder's only past session is hidden: the folder goes to Hidden folders with that reason
+    await openHidden();
+    expect(hiddenRows()).toEqual([['/Users/me/api', 'its sessions hidden']]);
+    // "show them" brings back this folder's, not the other folder's
+    await act(async () => (earlier().querySelector('.hs-earlier-unhide') as HTMLButtonElement).click());
+    expect(useStore.getState().liveList.hiddenSessions).toEqual(['x-1']);
+    expect(earlier().textContent).toContain('First try');
+  });
+
+  it('removes all ended sessions after saying how many, and only those', async () => {
+    const ended2: Hosted = { ...ended, id: 'e2', cwd: '/Users/me/api' };
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, ended2, running]);
+    vi.mocked(harnessApi.forget).mockResolvedValue();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const cleanup = host.querySelector('.hs-cleanup') as HTMLButtonElement;
+    expect(cleanup.textContent).toContain('Remove ended sessions · 2');
+    await act(async () => cleanup.click());
+    const dialog = document.querySelector('.modal')!;
+    expect(dialog.textContent).toContain('Remove 2 ended sessions from the list?');
+    expect(dialog.textContent).toContain('conversations stay on disk');
+    expect(harnessApi.forget).not.toHaveBeenCalled();
+    // Cancel: nothing goes
+    await act(async () => ([...dialog.querySelectorAll('button')].find(b => b.textContent === 'Cancel') as HTMLButtonElement).click());
+    expect(harnessApi.forget).not.toHaveBeenCalled();
+    await act(async () => cleanup.click());
+    await act(async () => ([...document.querySelectorAll('.modal button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
+    expect(vi.mocked(harnessApi.forget).mock.calls.map(c => c[0]).sort()).toEqual(['e1', 'e2']);
+    expect(harnessApi.signal).not.toHaveBeenCalled();
+  });
+});
 
 describe('Live workspace', () => {
   it('uses indexed names consistently in the sidebar and terminal header', async () => {

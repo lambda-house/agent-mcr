@@ -46,6 +46,8 @@ export interface Hosted {
   id: string; pid: number | null; argv: string[]; cwd: string; started: number;
   cols: number; rows: number; title: string; lastOutput: number;
   exit: HostedExit | null; meta: Record<string, string>;
+  /** From the service: the session ended and its folder is no longer on disk (MCR-107) */
+  cwdGone?: boolean;
   harness?: Tracked; openTasks?: number;
   /** Messages from other sessions it hasn't read yet */
   unread?: number;
@@ -74,6 +76,8 @@ export interface Resumable {
   title?: string;
   role?: string;
   tags?: string[];
+  /** From the service: its folder is no longer on disk (MCR-107) */
+  gone?: boolean;
 }
 export interface HarnessStatus {
   runner: { protocol: number; pid: number; version: string; exe: string }; profiles: Profile[]; home: string;
@@ -655,6 +659,70 @@ export function directorySections(sessions: Hosted[], resumable: Resumable[], pi
   const active = (d: DirSection) => d.sessions.some(h => !h.exit);
   return [...by.values()].map(d => ({ ...d, earlier: [...d.earlier].sort((a, b) => b.modified - a.modified) }))
     .sort((a, b) => Number(active(b)) - Number(active(a)) || a.path.localeCompare(b.path, undefined, { sensitivity: 'base' }));
+}
+
+/** What the person chose to see of the Live list (MCR-107). Kept in the app's settings, not in the harness. */
+export interface LiveListPrefs {
+  /** Folders the person hid, by exact path */
+  hiddenFolders: string[];
+  /** Folders the automatic rule would leave out and the person showed again */
+  shownFolders: string[];
+  /** Earlier (past) sessions the person hid, by conversation id */
+  hiddenSessions: string[];
+  /** Leave out folders that are gone and agents' temporary folders */
+  hideNoise: boolean;
+}
+export const DEFAULT_LIVE_LIST: LiveListPrefs = { hiddenFolders: [], shownFolders: [], hiddenSessions: [], hideNoise: true };
+
+/**
+ * An agent's temporary folder: under the system's temp folder (scratchpads,
+ * test homes made there) or a `.claude/live-check` test home. Told from the
+ * path alone, on macOS, Linux and Windows.
+ */
+export function temporaryFolder(path: string): boolean {
+  const p = path.replace(/\\/g, '/').toLowerCase();
+  if (/(^|\/)\.claude\/live-check(\/|$)/.test(p)) return true;
+  return ['/tmp/', '/private/tmp/', '/var/tmp/', '/var/folders/', '/private/var/folders/'].some(root => `${p}/`.startsWith(root))
+    || /^[a-z]:\/users\/[^/]+\/appdata\/local\/temp(\/|$)/.test(p)
+    || /^[a-z]:\/windows\/temp(\/|$)/.test(p);
+}
+
+/** Why a folder is in the hidden entry. */
+export type HiddenReason = 'hidden' | 'gone' | 'temporary' | 'sessions hidden';
+export const HIDDEN_REASON: Record<HiddenReason, string> = { hidden: 'hidden by you', gone: 'folder gone', temporary: 'temporary', 'sessions hidden': 'its sessions hidden' };
+
+/** A folder as the list shows it: its earlier sessions without the hidden ones, and how many those are. */
+export interface ShownSection extends DirSection { hiddenEarlier: number }
+
+/**
+ * Which folders the Live list shows and which go into "Hidden folders", with
+ * the reason. A folder with a running session always shows, whatever was
+ * chosen: a session that waits for the person, or has a report open for
+ * them, is a running one, and nothing that needs them may be out of sight.
+ * Hiding changes what is shown only: no session ends and no transcript is touched.
+ */
+export function folderVisibility(sections: DirSection[], prefs: LiveListPrefs): { shown: ShownSection[]; hidden: { section: ShownSection; reason: HiddenReason }[] } {
+  const hiddenSessions = new Set(prefs.hiddenSessions);
+  const shown: ShownSection[] = [];
+  const hidden: { section: ShownSection; reason: HiddenReason }[] = [];
+  for (const d of sections) {
+    const earlier = d.earlier.filter(r => !hiddenSessions.has(r.id));
+    const section: ShownSection = { ...d, earlier, hiddenEarlier: d.earlier.length - earlier.length };
+    const reason = ((): HiddenReason | null => {
+      if (d.sessions.some(h => !h.exit)) return null;
+      if (prefs.hiddenFolders.includes(d.path)) return 'hidden';
+      // Added by the person, or shown again by them: the automatic rule is theirs to overrule
+      if (prefs.hideNoise && !d.pinned && !prefs.shownFolders.includes(d.path)) {
+        if (d.sessions.some(h => h.cwdGone) || d.earlier.some(r => r.gone)) return 'gone';
+        if (temporaryFolder(d.path)) return 'temporary';
+      }
+      if (!d.pinned && !d.sessions.length && !earlier.length && section.hiddenEarlier) return 'sessions hidden';
+      return null;
+    })();
+    if (reason) hidden.push({ section, reason }); else shown.push(section);
+  }
+  hidden.sort((a, b) => b.section.latest - a.section.latest);
+  return { shown, hidden };
 }
 
 /** A path for a section heading: the last two folders, since the start is the same everywhere. */
