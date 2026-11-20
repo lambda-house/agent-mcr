@@ -13,13 +13,15 @@ type Decoration = { marker: Marker; x: number; width: number; options: Record<st
 const screen = vi.hoisted(() => ({
   lines: [] as string[][], wrapped: new Set<number>(), provider: null as unknown, focused: 0, providers: 0,
   decorations: [] as Decoration[], render: (() => {}) as (start: number, end: number) => void, switchBuffer: () => {},
+  resized: [] as ((size: { cols: number; rows: number }) => void)[], cellReads: 0, alternate: false,
 }));
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
     cols = 80; rows = 24; unicode = { activeVersion: '' };
-    buffer = { active: { viewportY: 0, baseY: 0, cursorY: 0, getLine: (y: number) => {
+    buffer = { active: { viewportY: 0, baseY: 0, cursorY: 0, get type() { return screen.alternate ? 'alternate' : 'normal'; }, getLine: (y: number) => {
       const cells = screen.lines[y];
-      return cells && { length: cells.length, isWrapped: screen.wrapped.has(y), getCell: (x: number) => ({ getChars: () => cells[x], getWidth: () => (cells[x] === '' && x > 0 && cells[x - 1].charCodeAt(0) > 0x2e80 ? 0 : 1) }) };
+      return cells && { length: cells.length, isWrapped: screen.wrapped.has(y), translateToString: () => cells.map(c => c || ' ').join(''),
+        getCell: (x: number) => { screen.cellReads++; return { getChars: () => cells[x], getWidth: () => (cells[x] === '' && x > 0 && cells[x - 1].charCodeAt(0) > 0x2e80 ? 0 : 1) }; } };
     } }, onBufferChange: (f: () => void) => { screen.switchBuffer = f; return { dispose() {} }; } };
     onRender(f: (e: { start: number; end: number }) => void) { screen.render = (start, end) => f({ start, end }); return { dispose() {} }; }
     refresh() {}
@@ -38,7 +40,7 @@ vi.mock('@xterm/xterm', () => ({
     loadAddon() {} open() {} write() {} paste() {} dispose() {}
     attachCustomKeyEventHandler() {}
     focus() { screen.focused++; }
-    onKey() { return { dispose() {} }; } onData() { return { dispose() {} }; } onResize() { return { dispose() {} }; }
+    onKey() { return { dispose() {} }; } onData() { return { dispose() {} }; } onResize(f: (size: { cols: number; rows: number }) => void) { screen.resized.push(f); return { dispose() {} }; }
     registerLinkProvider(provider: unknown) { screen.provider = provider; screen.providers++; return { dispose() { screen.providers--; } }; }
   },
 }));
@@ -56,7 +58,7 @@ let root: Root; let host: HTMLDivElement;
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   if (!('ResizeObserver' in globalThis)) Object.assign(globalThis, { ResizeObserver: class { observe() {} disconnect() {} } });
-  screen.lines = []; screen.wrapped = new Set(); screen.provider = null; screen.focused = 0; screen.providers = 0; screen.decorations = [];
+  screen.lines = []; screen.wrapped = new Set(); screen.provider = null; screen.focused = 0; screen.providers = 0; screen.decorations = []; screen.resized = []; screen.cellReads = 0; screen.alternate = false;
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); });
@@ -143,6 +145,41 @@ describe('session pointers in a terminal', () => {
     expect(followed).toEqual(['a27f56d8749b']);
     screen.render(1, 1);
     expect(underlined()).toEqual([[0, 10, 10], [1, 0, 6]]);
+  });
+
+  it('reads no line cell by cell that holds no pointer, also across a wrap', async () => {
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live}/>));
+    screen.lines = [cells('plain output with nothing in it'), cells('more plain text, a hex a27f56d8749b'), cells('see: mc'), cells('r:a27f56d8749b')];
+    screen.wrapped = new Set([3]);
+    screen.render(0, 1);
+    expect(linksAt(1)).toBeUndefined();
+    expect(screen.cellReads).toBe(0);
+    // A pointer cut by the wrap: "mcr:" is only in the joined text, and that line is read
+    screen.render(2, 3);
+    expect(screen.cellReads).toBeGreaterThan(0);
+    expect(underlined()).toEqual([[2, 5, 2], [3, 0, 14]]);
+  });
+
+  it('makes no marks on the other screen buffer, where xterm shows none, and still links there', async () => {
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live}/>));
+    screen.alternate = true;
+    screen.lines = [cells('full screen: mcr:a27f56d8749b')];
+    screen.render(0, 0);
+    expect(underlined()).toEqual([]);
+    expect(linksAt(1)!.map(l => l.text)).toEqual(['mcr:a27f56d8749b']);
+  });
+
+  it('drops every mark after a resize and marks the rows in view again', async () => {
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live}/>));
+    screen.lines = [cells('see mcr:a27f56d8749b')];
+    screen.render(0, 0);
+    const before = screen.decorations.filter(d => !d.disposed);
+    expect(before).toHaveLength(1);
+    // The new width moved the pointer to another column
+    screen.lines = [cells('  see mcr:a27f56d8749b')];
+    screen.resized.forEach(f => f({ cols: 80, rows: 24 }));
+    expect(before[0].disposed).toBe(true);
+    expect(underlined()).toEqual([[0, 6, 16]]);
   });
 
   it('takes the keyboard when asked to, once per request, and gives its provider back', async () => {

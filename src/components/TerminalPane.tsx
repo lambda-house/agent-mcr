@@ -102,8 +102,12 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
       while (first > 0 && buffer().getLine(first)?.isWrapped) first--;
       let last = y;
       while (buffer().getLine(last + 1)?.isWrapped) last++;
+      // Most lines hold no pointer: their text, asked of xterm as one string,
+      // says so without reading them cell by cell (a cell is an object each time)
+      let text = '';
+      for (let row = first; row <= last; row++) text += buffer().getLine(row)?.translateToString(false) ?? '';
       const rows: TerminalCell[][] = [];
-      for (let row = first; row <= last; row++) rows.push(cellsOf(row));
+      if (text.includes('mcr:')) for (let row = first; row <= last; row++) rows.push(cellsOf(row));
       return { first, last, rows };
     };
     const links = t.registerLinkProvider({
@@ -146,6 +150,10 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
       marker.onDispose(() => { if (marks.includes(m)) unmark(m); });
     };
     const remark = (start: number, end: number) => {
+      // xterm draws no decoration while the other screen buffer is active (a
+      // full-screen program): marks made there would not be seen. The link and
+      // its underline under the mouse work there all the same
+      if (buffer().type === 'alternate') return;
       const known = sessions.current.isSession;
       const looked = new Set<number>();
       for (let row = start; row <= end; row++) {
@@ -163,6 +171,10 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
     const rendered = t.onRender(({ start, end }) => remark(start, end));
     // Marks belong to the buffer they were made in: the other one starts clean
     const switched = t.buffer.onBufferChange(() => { [...marks].forEach(unmark); remark(0, t.rows - 1); });
+    // A new width rewraps the lines and moves their cells, also in the
+    // scrollback: every mark is dropped, the rows in view are marked again at
+    // once, and the others when they are drawn
+    const reflowed = t.onResize(() => { [...marks].forEach(unmark); remark(0, t.rows - 1); });
     // The marks are drawn over the cells, so looking again needs no repaint
     pointers.current = () => remark(0, t.rows - 1);
     try { f.fit(); } catch { /* not laid out yet */ }
@@ -248,7 +260,7 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
       element.removeEventListener('paste', onPaste, true);
       element.removeEventListener('dragover', onDragOver, true);
       element.removeEventListener('drop', onDrop, true);
-      typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose(); rendered.dispose(); switched.dispose();
+      typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose(); rendered.dispose(); switched.dispose(); reflowed.dispose();
       pointers.current = () => {};
       if (view !== null) void harnessApi.detach(view);
       t.dispose();

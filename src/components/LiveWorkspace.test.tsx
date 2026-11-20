@@ -13,12 +13,15 @@ vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // The link button stands for a click on `mcr:<linkTo>` in that terminal's text
 // and the stand-in takes the keyboard as the pane does: once per request, then says so. `mounts` counts its mounts.
 let linkTo = '';
+// Every isSession a terminal was given: it stays the same function while the same sessions run (MCR-106)
+const givenIsSession: unknown[] = [];
 const focused: string[] = [];
 const mounts: string[] = [];
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
   return { default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
     useEffect(() => { mounts.push(id); }, [id]);
+    useEffect(() => { givenIsSession.push(isSession); }, [isSession]);
     useEffect(() => { if (focusAt) { focused.push(id); onFocused?.(); } }, [focusAt]); // eslint-disable-line react-hooks/exhaustive-deps
     return <div data-terminal={id} data-focus-at={focusAt ?? ''} data-links={['r1', 'e1', 's1', 'nobody'].filter(x => isSession?.(x)).join(' ')}><button aria-label={`quit ${id}`} onClick={onQuit}/><button aria-label={`link in ${id}`} onClick={() => onSession?.(linkTo)}/></div>;
   } };
@@ -48,6 +51,20 @@ const rows = () => [...host.querySelectorAll('.hs-dir > ul > li')];
 const folders = () => [...host.querySelectorAll('.hs-dir')];
 
 describe('Live workspace', () => {
+  it('gives its terminals the same session check while the same sessions run, and a new one when that changes', async () => {
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => (host.querySelector('.hs-item') as HTMLButtonElement).click()); await flush();
+    givenIsSession.length = 0;
+    // Two refreshes of an unchanged list
+    await act(async () => { await new Promise(r => setTimeout(r, 4200)); }); await flush();
+    expect(givenIsSession).toHaveLength(0);
+    // A session ends: the check changes, and says so
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...running, exit: { code: 0, signal: null, at: 9 } }]);
+    await act(async () => { await new Promise(r => setTimeout(r, 2100)); }); await flush();
+    expect(givenIsSession).toHaveLength(1);
+    expect((givenIsSession[0] as (id: string) => boolean)('r1')).toBe(false);
+  }, 10000);
+
   it('uses indexed names consistently in the sidebar and terminal header', async () => {
     const session: Hosted = { ...running, title: 'Codex', meta: { profile: 'codex', label: 'Codex' }, harness: { name: 'Codex', named: false, profile: 'codex', state: 'idle', since: 1, precise: true, agentSession: 'conversation', attention: null, lastMessage: null } };
     vi.mocked(harnessApi.list).mockResolvedValue([session]);
