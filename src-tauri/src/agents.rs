@@ -504,11 +504,14 @@ impl Adapter for Codex {
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
         let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
-        // The harness tools, for this launch only (values are TOML; a JSON string is one)
+        // The harness tools and the memory server, for this launch only (values are TOML; a JSON string is one)
+        let memory = crate::memory::SERVER;
         let tools = format!(
-            "-c {} -c {}",
+            "-c {} -c {} -c {} -c {}",
             sh(&format!("mcp_servers.{AGENT_SERVER}.command={}", json!(l.exe))),
-            sh(&format!("mcp_servers.{AGENT_SERVER}.args=[\"--harness-mcp\"]"))
+            sh(&format!("mcp_servers.{AGENT_SERVER}.args=[\"--harness-mcp\"]")),
+            sh(&format!("mcp_servers.{memory}.command={}", json!(l.exe))),
+            sh(&format!("mcp_servers.{memory}.args=[\"--memory-mcp\"]"))
         );
         let mut cmd = format!("exec {head}");
         if l.resume.is_some() {
@@ -751,6 +754,10 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
             args.extend(["-c".into(), "tui.notifications=true".into()]);
             args.extend(["-c".into(), format!("mcp_servers.{AGENT_SERVER}.command={exe_lit}")]);
             args.extend(["-c".into(), format!("mcp_servers.{AGENT_SERVER}.args=['--harness-mcp']")]);
+            // The memory server, as on the other systems: a program and one flag, no credential
+            let memory = crate::memory::SERVER;
+            args.extend(["-c".into(), format!("mcp_servers.{memory}.command={exe_lit}")]);
+            args.extend(["-c".into(), format!("mcp_servers.{memory}.args=['--memory-mcp']")]);
             if l.supervisor {
                 args.extend(["-c".into(), format!("mcp_servers.supervisor.command={exe_lit}")]);
                 args.extend(["-c".into(), "mcp_servers.supervisor.args=['--supervise']".into()]);
@@ -1025,6 +1032,9 @@ mod tests {
         assert!(codex.contains(&"notify=['C:\\Program Files\\Agent MCR\\agent-mcr.exe','--harness-hook','codex-notify']".to_string()));
         assert!(codex.contains(&"mcp_servers.supervisor.command='C:\\Program Files\\Agent MCR\\agent-mcr.exe'".to_string()));
         assert!(codex.contains(&"mcp_servers.supervisor.args=['--supervise']".to_string()));
+        // The memory server comes with a Windows launch too
+        assert!(codex.contains(&"mcp_servers.mcr-memory.command='C:\\Program Files\\Agent MCR\\agent-mcr.exe'".to_string()));
+        assert!(codex.contains(&"mcp_servers.mcr-memory.args=['--memory-mcp']".to_string()));
         assert!(codex.iter().any(|a| a.starts_with("developer_instructions='You run in a terminal hosted by Agent MCR")));
         assert!(!codex.iter().any(|a| a.contains("never in argv")));
         assert!(cmd_line(&codex).is_ok());

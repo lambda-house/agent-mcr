@@ -15,6 +15,7 @@ import { pluginRegistry, usePluginVersion } from '../plugins';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import SessionAgentAccess from './SessionAgentAccess';
 import HarnessSettingsSection from './HarnessSettingsSection';
+import MemoryConnection from './MemoryConnection';
 import '../styles/settings-modal.css';
 
 type SettingsCategory =
@@ -247,6 +248,7 @@ const SettingsModal: React.FC = () => {
             {activeCategory === 'plugins' && <PluginsSettingsSection />}
             {activeCategory === 'harnesses' && <HarnessSettingsSection />}
 
+            {activeCategory === 'memories' && <MemoryConnection />}
             {activeCategory === 'memories' && (
               <div className="settings-section">
                 <div className="settings-section-head">

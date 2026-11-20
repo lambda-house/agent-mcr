@@ -14,6 +14,7 @@ pub use crate::agents::Launch;
 use crate::cockpit::{self, Cockpit};
 use crate::ipc::{self, Listener, Stream};
 use crate::peer;
+use crate::memory::{self, Memory};
 use crate::slack::{self, Slack};
 use crate::agents::{adapter, is_uuid, modified_ms, sh, Interrupt, adapters, profiles};
 use crate::runner::{self, lock, now_ms, Client, Unit};
@@ -275,8 +276,11 @@ pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
     for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop"] {
         hooks.insert(event.into(), hook(event));
     }
-    // The harness tools need no approval: they only reach other sessions' inboxes
-    let mut allow = vec![format!("mcp__{AGENT_SERVER}")];
+    // The harness tools need no approval: they only reach other sessions' inboxes.
+    // The memory tools need none either (owner's decision of 2026-11-19, MCR-49):
+    // they read and write the connected memory and run nothing here. The rule names
+    // our server only: `mcr-memory` is not a name a person's own server has (MCR-80)
+    let mut allow = vec![format!("mcp__{AGENT_SERVER}"), format!("mcp__{}", memory::SERVER)];
     if supervisor {
         // D5: the supervisor has the harness without a question per tool, except
         // typing into a terminal: that can run any command, so the operator is asked
@@ -287,9 +291,11 @@ pub fn claude_settings(exe: &str, supervisor: bool) -> Value {
     json!({ "hooks": hooks, "permissions": { "allow": allow } })
 }
 
-/// Claude Code MCP config for one launch (`--mcp-config`): the harness tools.
+/// Claude Code MCP config for one launch (`--mcp-config`): the harness tools
+/// and the memory server. Both are bridges to this service; neither entry
+/// carries a credential.
 pub fn claude_mcp(exe: &str, supervisor: bool) -> Value {
-    let mut servers = json!({ AGENT_SERVER: { "command": exe, "args": ["--harness-mcp"] } });
+    let mut servers = json!({ AGENT_SERVER: { "command": exe, "args": ["--harness-mcp"] }, memory::SERVER: { "command": exe, "args": ["--memory-mcp"] } });
     if supervisor {
         servers[SUPERVISOR_SERVER] = json!({ "command": exe, "args": ["--supervise"] });
     }
@@ -2321,6 +2327,8 @@ pub struct Harness {
     subagents: Mutex<BTreeMap<String, (Instant, Vec<Subagent>)>>,
     /// The Slack connector (D14)
     slack: Arc<Slack>,
+    /// The memory server (D16): the sign-in and the router of the `mcr-memory` MCP server
+    memory: Arc<Memory>,
     /// Per session that has not reported yet: the output time at which its
     /// screen was last read for a prompt, and the question found (MCR-71)
     screens: Mutex<BTreeMap<String, Screen>>,
@@ -2480,7 +2488,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) };
+        let harness = Self { writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -4039,6 +4047,22 @@ impl Harness {
         result
     }
 
+    /// The `mcr-memory` MCP server for one bridge (`--memory-mcp`). Memory is for
+    /// hosted sessions: who calls is taken from the caller's process, as for
+    /// `mcr`, and anybody else gets a server that lists nothing and says why.
+    fn memory_mcp(&self, mut reader: BufReader<Stream>, mut writer: Stream, peer: &peer::Peer) -> std::io::Result<()> {
+        let me = self.caller(peer);
+        loop {
+            let frame = match read_frame(&mut reader) {
+                Ok(Some(frame)) => frame,
+                Ok(None) | Err(_) => return Ok(()),
+            };
+            if let Some(reply) = self.memory.handle(&me, &frame) {
+                writeln!(writer, "{reply}")?;
+            }
+        }
+    }
+
     /// A task from a supervisor: for an agent, in words, and never while the
     /// session waits on the operator (D6). `by` is the hosted session that
     /// assigns it, known from its process, or empty.
@@ -4497,6 +4521,11 @@ impl Harness {
                     .collect();
                 Ok(json!({ "sessions": list }))
             }
+            // The memory server's connection, as the app sees and steers it. Only the app
+            // gets here (see `handle`), and it has asked the person before the last two
+            "memory_status" => Ok(self.memory.status()),
+            "memory_connect" => self.memory.connect(),
+            "memory_disconnect" => Ok(self.memory.disconnect()),
             // The Slack connector, as the app sees and steers it. Only the app gets here (see `handle`)
             "slack" => Ok(self.slack.status_live(self)),
             "slack_probe" | "slack_connect" => {
@@ -4814,6 +4843,9 @@ impl Harness {
             }
             if req["op"] == "agent" {
                 return self.agent(reader, writer, req["cli"] != true, &peer);
+            }
+            if req["op"] == "memory" {
+                return self.memory_mcp(reader, writer, &peer);
             }
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
@@ -5367,6 +5399,13 @@ pub fn supervise_bridge(dir: &Path) -> Result<(), String> {
 pub fn agent_bridge(dir: &Path) -> Result<(), String> {
     let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
     bridge(std::io::stdin(), std::io::stdout(), BRIDGE_RETRY, bridge_to(path, "agent"))
+}
+
+/// `--memory-mcp`: a hosted agent's stdio ⇄ the memory server in the service,
+/// which holds the sign-in. The bridge carries no credential and starts nothing.
+pub fn memory_bridge(dir: &Path) -> Result<(), String> {
+    let path = std::env::var("AGENT_MCR_HARNESS").map(PathBuf::from).unwrap_or_else(|_| socket(dir));
+    bridge(std::io::stdin(), std::io::stdout(), BRIDGE_RETRY, bridge_to(path, "memory"))
 }
 
 /// `--harness-tool <name> [json]`: one harness tool call from a shell, for a
@@ -6240,8 +6279,14 @@ mod tests {
         assert_eq!(claude, "exec claude --permission-mode acceptEdits --mcp-config '/cfg dir/claude-mcp.json' --settings '/cfg dir/claude-hooks.json'");
         let codex = command_line(&launch("codex")).unwrap();
         assert!(codex.contains(" -c 'mcp_servers.mcr.command=\"/Apps/Agent MCR.app/agent-mcr\"' -c 'mcp_servers.mcr.args=[\"--harness-mcp\"]'"), "{codex}");
-        assert_eq!(claude_settings("/x", false)["permissions"]["allow"], json!(["mcp__mcr"]));
+        assert_eq!(claude_settings("/x", false)["permissions"]["allow"], json!(["mcp__mcr", "mcp__mcr-memory"]));
         assert_eq!(claude_mcp("/x", false)["mcpServers"]["mcr"]["args"][0], "--harness-mcp");
+        // The memory server comes with every launch, the Supervisor's too, as a bridge: a program and one flag
+        assert!(codex.contains("' -c 'mcp_servers.mcr-memory.command=\"/Apps/Agent MCR.app/agent-mcr\"' -c 'mcp_servers.mcr-memory.args=[\"--memory-mcp\"]'"), "{codex}");
+        for supervisor in [false, true] {
+            assert_eq!(claude_mcp("/x", supervisor)["mcpServers"]["mcr-memory"], json!({"command": "/x", "args": ["--memory-mcp"]}));
+            assert!(claude_settings("/x", supervisor)["permissions"]["allow"].as_array().unwrap().contains(&json!("mcp__mcr-memory")));
+        }
         // Every agent kind is told about its peers, and Claude gets the skill
         let told = command_line(&Launch { plugin: "/cfg dir/claude-plugin", note: true, ..launch("claude") }).unwrap();
         assert!(told.contains(" --plugin-dir '/cfg dir/claude-plugin' --append-system-prompt 'You run in a terminal hosted by Agent MCR"), "{told}");
@@ -6873,6 +6918,63 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn memory_is_served_on_the_socket_and_refuses_a_caller_that_is_no_session() {
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Arc::new(Harness::open(&dir));
+        // Not connected until the person connects it, and the app can ask
+        assert_eq!(harness.control(&json!({"op": "memory_status"})).unwrap()["state"], "disconnected");
+        let (mut bridge, service) = Stream::pair().unwrap();
+        let serving = harness.clone();
+        std::thread::spawn(move || serving.handle(service, now_ms()));
+        let mut answers = BufReader::new(bridge.try_clone().unwrap());
+        // This test is no hosted session: the server answers, lists nothing and says why
+        writeln!(bridge, "{}", json!({"op": "memory"})).unwrap();
+        let mut ask = |frame: Value| {
+            writeln!(bridge, "{frame}").unwrap();
+            let mut line = String::new();
+            answers.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let hello = ask(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}}));
+        assert_eq!(hello["result"]["serverInfo"]["name"], "agent-mcr-memory");
+        let why = hello["result"]["instructions"].as_str().unwrap().to_string();
+        assert!(why.contains("Cannot tell which process is calling") || why.contains("hosted by Agent MCR"), "{why}");
+        assert_eq!(ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))["result"]["tools"], json!([]));
+        let told = ask(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_list", "arguments": {}}}));
+        assert_eq!((told["result"]["isError"].clone(), told["result"]["content"][0]["text"].clone()), (json!(true), json!(why)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_bridge_replays_the_handshake_to_a_restarted_service() {
+        let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let listener = Listener::bind(&path).unwrap();
+        let (mut agent, input) = Stream::pair().unwrap();
+        let (output, from_bridge) = Stream::pair().unwrap();
+        let mut from_bridge = BufReader::new(from_bridge);
+        std::thread::spawn(move || bridge(input, output, Duration::from_secs(10), bridge_to(path, "memory")));
+        let line = |r: &mut BufReader<Stream>| { let mut l = String::new(); r.read_line(&mut l).unwrap(); serde_json::from_str::<Value>(&l).unwrap() };
+        let (first, _) = listener.accept().unwrap();
+        let mut service = BufReader::new(first.try_clone().unwrap());
+        writeln!(agent, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).unwrap();
+        assert_eq!(line(&mut service)["op"], "memory");
+        assert_eq!(line(&mut service)["method"], "initialize");
+        writeln!(&first, "{}", json!({"jsonrpc": "2.0", "id": 1, "result": {}})).unwrap();
+        assert_eq!(line(&mut from_bridge)["id"], 1);
+        // The service restarts: the bridge finds the new one and says who it is and what was agreed
+        drop(service);
+        drop(first);
+        let (second, _) = listener.accept().unwrap();
+        let mut service = BufReader::new(second.try_clone().unwrap());
+        assert_eq!(line(&mut service)["op"], "memory");
+        assert_eq!(line(&mut service)["method"], "initialize");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn bridge_survives_a_service_restart() {
         let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));

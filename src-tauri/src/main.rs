@@ -29,7 +29,9 @@ mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;
 mod session_mcp;
+mod memory;
 mod slack;
+mod vault;
 mod session_commands;
 mod session_db;
 mod session_memory;
@@ -1181,10 +1183,11 @@ fn main() {
     }
     // The harness service, the supervisor's MCP bridge and the agents' hook reporter
     match std::env::args().nth(1).as_deref() {
-        Some(flag @ ("--harness" | "--supervise" | "--harness-mcp")) => {
+        Some(flag @ ("--harness" | "--supervise" | "--harness-mcp" | "--memory-mcp")) => {
             let result = get_config_dir().map_err(|e| e.message).and_then(|dir| match flag {
                 "--harness" => harness::serve(&dir),
                 "--supervise" => harness::supervise_bridge(&dir),
+                "--memory-mcp" => harness::memory_bridge(&dir),
                 _ => harness::agent_bridge(&dir),
             });
             if let Err(e) = result {
@@ -1283,6 +1286,9 @@ fn main() {
             harness_commands::harness_outside_supervisors,
             harness_commands::harness_store_notice_seen,
             harness_commands::harness_codex_hooks,
+            harness_commands::memory_status,
+            harness_commands::memory_connect,
+            harness_commands::memory_disconnect,
             harness_commands::slack_status,
             harness_commands::slack_connect,
             harness_commands::slack_disconnect,
