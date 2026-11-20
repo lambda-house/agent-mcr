@@ -1,4 +1,5 @@
 import { useStore, canNavigateBack, canNavigateForward, type AppState } from '../store';
+import { liveNav } from './liveNav';
 import { PLATFORM } from './platform';
 import { saveActiveDocument, requestSaveAll } from './save';
 import { exportActiveDocument } from './export';
@@ -252,19 +253,23 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
           enabled: hasSeveralTabs,
           run: () => state().activatePrevTab(),
         },
+        // Through the Live view's history while it is shown, the document tabs' otherwise (MCR-108).
+        // One command per key: the first command that matches a key is the one that runs
         {
           id: 'tabs.back',
           label: 'Back',
           shortcut: { alt: true, key: 'ArrowLeft' },
-          enabled: canNavigateBack,
-          run: () => state().navigateBack(),
+          aliases: PLATFORM === 'macos' ? [{ mod: true, key: '[' }] : [],
+          enabled: (s) => liveNav.current ? liveNav.current.canBack() : canNavigateBack(s),
+          run: () => { if (liveNav.current) liveNav.current.back(); else state().navigateBack(); },
         },
         {
           id: 'tabs.forward',
           label: 'Forward',
           shortcut: { alt: true, key: 'ArrowRight' },
-          enabled: canNavigateForward,
-          run: () => state().navigateForward(),
+          aliases: PLATFORM === 'macos' ? [{ mod: true, key: ']' }] : [],
+          enabled: (s) => liveNav.current ? liveNav.current.canForward() : canNavigateForward(s),
+          run: () => { if (liveNav.current) liveNav.current.forward(); else state().navigateForward(); },
         },
         'separator',
         {

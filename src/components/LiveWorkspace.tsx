@@ -1,7 +1,7 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
@@ -11,6 +11,9 @@ import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou } from './SessionRow';
 import { canRestart, directorySections, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
+import { liveNav } from '../utils/liveNav';
+import { PLATFORM } from '../utils/platform';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -22,6 +25,8 @@ const PINNED_KEY = 'hs-dirs';
 const START: [string, string][] = [['claude', 'Claude Code'], ['codex', 'Codex']];
 /** Folders with only history shown before "more" is asked for. */
 const HISTORY_FOLDERS = 6;
+const BACK_KEYS = PLATFORM === 'macos' ? '⌘[' : 'Alt+Left';
+const FORWARD_KEYS = PLATFORM === 'macos' ? '⌘]' : 'Alt+Right';
 
 const LIST_WIDTH_KEY = 'hs-list-width';
 /** The session list is never narrower than this, and leaves the terminal at least as much. */
@@ -227,6 +232,37 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const select = (id: string) => {
     openItem({ kind: 'session', id });
   };
+  // Back and Forward (MCR-108): every change of the shown session is a place in the history, whatever made it
+  const [history, setHistory] = useState(EMPTY_HISTORY);
+  // The session Back or Forward is going to: that change is a step, not a new place
+  const stepping = useRef('');
+  useEffect(() => {
+    if (!selected) return;
+    if (stepping.current === selected) { stepping.current = ''; return; }
+    setHistory(h => visit(h, selected));
+  }, [selected]);
+  const running = (id: string) => hosted.some(h => h.id === id && !h.exit);
+  const backTo = step(history, -1, running);
+  const forwardTo = step(history, 1, running);
+  /** Show the session at that place: as a row click does. Nothing is typed, and its terminal does not take the keyboard */
+  const goTo = (index: number | null) => {
+    if (index === null) return;
+    const id = history.entries[index];
+    setHistory(h => ({ ...h, index }));
+    stepping.current = id;
+    select(id);
+  };
+  const goBack = () => goTo(step(history, -1, running));
+  const goForward = () => goTo(step(history, 1, running));
+  // The app's Back and Forward commands come here while the Live view is shown
+  const nav = useRef({ goBack, goForward, backTo, forwardTo });
+  nav.current = { goBack, goForward, backTo, forwardTo };
+  useEffect(() => {
+    if (!active) return;
+    const mine = { canBack: () => nav.current.backTo !== null, canForward: () => nav.current.forwardTo !== null, back: () => nav.current.goBack(), forward: () => nav.current.goForward() };
+    liveNav.current = mine;
+    return () => { if (liveNav.current === mine) liveNav.current = null; };
+  }, [active]);
   // A click on `mcr:<id>` in a terminal: that session is selected like its row, and its terminal takes the keyboard.
   // The request is dropped once its pane served it, or a pane mounted again later would take the keyboard with no click
   const [linked, setLinked] = useState<{ id: string; at: number } | null>(null);
@@ -387,6 +423,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       // The new id takes the old one's place among the opened too: a pane that shows it without being the selected one needs its terminal
       setOpened(o => o.map(x => x === h.id ? fresh.id : x));
       setLayout(l => replaceSessionInLayout(l, h.id, fresh.id));
+      setHistory(hist => renamed(hist, h.id, fresh.id));
       if (selected === h.id) select(fresh.id);
       if (!fresh.resumed) setError(`${sessionLabel(h)} had no saved conversation to continue: it started fresh in the same folder.`);
     }).catch(e => { setError(err(e)); void refresh(); });
@@ -887,7 +924,20 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
 
         return (
           <>
-            {layoutBarOverride?.({ leavesCount: leaves.length, controller, defaultRender: () => null })}
+            {(() => {
+              const layoutBar = layoutBarOverride?.({ leavesCount: leaves.length, controller, defaultRender: () => null });
+              if (!opened.length && !layoutBar) return null;
+              const nameAt = (index: number | null) => index === null ? '' : names.get(history.entries[index]) ?? '';
+              return (
+                <div className="hs-pane-toolbar">
+                  {opened.length > 0 && <div className="hs-history" role="toolbar" aria-label="Session history">
+                    <button type="button" className="hs-layout-btn" aria-label="Back" disabled={backTo === null} title={backTo === null ? 'Back' : `Back to ${nameAt(backTo)} (${BACK_KEYS})`} onClick={goBack}><ArrowLeft size={13}/></button>
+                    <button type="button" className="hs-layout-btn" aria-label="Forward" disabled={forwardTo === null} title={forwardTo === null ? 'Forward' : `Forward to ${nameAt(forwardTo)} (${FORWARD_KEYS})`} onClick={goForward}><ArrowRight size={13}/></button>
+                  </div>}
+                  {layoutBar}
+                </div>
+              );
+            })()}
             {leaves.length === 1 && !leaves[0].item
               ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
               : <div className="hs-layout-root">{renderNode(layout)}</div>}
