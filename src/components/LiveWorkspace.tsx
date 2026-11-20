@@ -1,7 +1,7 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
+import { BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
@@ -10,7 +10,9 @@ import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou } from './SessionRow';
-import { canRestart, directorySections, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { useStore } from '../store';
+import ConfirmDialog from './ConfirmDialog';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
@@ -118,6 +120,12 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const pin = (next: string[]) => { setPinned(next); try { localStorage.setItem(PINNED_KEY, JSON.stringify(next)); } catch { /* not kept */ } };
   const [allHistory, setAllHistory] = useState(false);
   const [earlierOpen, setEarlierOpen] = useState(() => new Set<string>());
+  // What the person chose to see of the list (MCR-107): kept in the app's settings
+  const liveList = useStore(s => s.liveList);
+  const setLiveList = useStore(s => s.setLiveList);
+  const [hiddenOpen, setHiddenOpen] = useState(false);
+  // "Remove ended sessions": the ones counted when the question was asked
+  const [removing, setRemoving] = useState<string[] | null>(null);
   // The session being connected to a supervisor: its row shows the chooser
   const [binding, setBinding] = useState('');
   // The usage pane beside the terminal: open or closed is this viewer's preference
@@ -420,9 +428,40 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     setCwd('');
   };
   const home = status?.home ?? '';
-  const sections = useMemo(() => directorySections(sorted, resumable.filter(r => !/[\\/]agent-mcr[\\/]supervisor$/.test(r.cwd)), pinned), [sorted, resumable, pinned]);
+  const allSections = useMemo(() => directorySections(sorted, resumable.filter(r => !/[\\/]agent-mcr[\\/]supervisor$/.test(r.cwd)), pinned), [sorted, resumable, pinned]);
+  // Hidden folders and past sessions leave the list before anything is counted (MCR-107)
+  const { shown: sections, hidden: hiddenFolders } = useMemo(() => folderVisibility(allSections, liveList), [allSections, liveList]);
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
+  const hideFolder = (path: string) => setLiveList(p => ({ ...p, hiddenFolders: [...p.hiddenFolders.filter(x => x !== path), path], shownFolders: p.shownFolders.filter(x => x !== path) }));
+  // Shown again by the person: also over the automatic rule, or a folder that is gone or temporary would stay out with that reason
+  const showFolder = (path: string, reason: HiddenReason, earlier: string[]) => setLiveList(p => reason === 'hidden' ? { ...p, hiddenFolders: p.hiddenFolders.filter(x => x !== path), shownFolders: [...p.shownFolders.filter(x => x !== path), path] }
+    : reason === 'sessions hidden' ? { ...p, hiddenSessions: p.hiddenSessions.filter(id => !earlier.includes(id)) }
+    : { ...p, shownFolders: [...p.shownFolders.filter(x => x !== path), path] });
+  /** All past sessions of a folder, hidden ones too: what "show them" brings back */
+  const sessionsOf = (path: string) => allSections.find(x => x.path === path)?.earlier.map(r => r.id) ?? [];
+  const hideSession = (id: string) => setLiveList(p => ({ ...p, hiddenSessions: [...p.hiddenSessions.filter(x => x !== id), id] }));
+  // A hidden past session that left the history (resumed, or older than it reaches) needs no place in the
+  // settings. Folders are never dropped: whether a folder is still in the list depends on more than the
+  // history (the status, a profile turned off), and a lost choice costs more than a few kept bytes
+  useEffect(() => {
+    if (!pastSessions.length || !liveList.hiddenSessions.length) return;
+    const known = new Set(pastSessions.map(r => r.id));
+    if (liveList.hiddenSessions.some(id => !known.has(id))) setLiveList(p => ({ ...p, hiddenSessions: p.hiddenSessions.filter(id => known.has(id)) }));
+  }, [pastSessions, liveList.hiddenSessions, setLiveList]);
+  const ended = hosted.filter(h => h.exit);
+  /** Every ended session the question counted leaves the list; a session's conversation stays on disk. */
+  const removeEnded = (ids: string[]) => act(async () => {
+    // Each on its own: one that fails leaves the others removed, and is said
+    const results = await Promise.allSettled(ids.map(id => harnessApi.forget(id)));
+    const done = ids.filter((_, i) => results[i].status === 'fulfilled');
+    setOpened(o => o.filter(x => !done.includes(x)));
+    setLayout(l => done.reduce((layout, id) => removeSessionFromLayout(layout, id), l));
+    setSelected(s => done.includes(s) ? '' : s);
+    done.forEach(id => pluginRegistry.emitEvent('session:closed', { id }));
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) throw new Error(`${ids.length - done.length} of ${ids.length} ended sessions could not be removed: ${err(failed.reason)}`);
+  });
 
   const projectResumables = useMemo(() => resumable.filter(r => r.cwd === cwd), [resumable, cwd]);
   const selectedResume = useMemo(() => projectResumables.find(r => r.id === resume) ?? null, [projectResumables, resume]);
@@ -659,6 +698,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                 actions={(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) }))}/>
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
+              {!d.sessions.some(h => !h.exit) && <button type="button" className="hs-dir-start" title={`Hide ${name}: it goes to Hidden folders at the end of the list. Nothing is deleted`} aria-label={`Hide folder ${d.path}`} onClick={() => hideFolder(d.path)}><EyeOff size={12}/></button>}
             </header>
             {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(row)}</ul>}
             {d.earlier.length > 0 && <div className="hs-earlier">
@@ -666,18 +706,41 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                 {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<History size={11}/> Earlier · {d.earlier.length} · last {formatAge(d.earlier[0].modified)}
               </button>
               {open && <ul aria-label={`Earlier sessions in ${d.path}`}>
-                {d.earlier.slice(0, 12).map(r => <li key={r.id}>
+                {d.earlier.slice(0, 12).map(r => <li key={r.id} className="hs-earlier-row">
                   <button type="button" className="hs-item hs-resume" disabled={!status || starting} title={`Continue this ${r.agent === 'claude' ? 'Claude' : 'Codex'} session here${maybeOpenElsewhere(r, Date.now()) ? '. It changed minutes ago: close it in its other terminal first' : ''}\n${r.id}`} onClick={() => void start(undefined, r.cwd, r.id)}>
                     <EarlierRow agent={r.agent} title={titles[r.id] || r.title || `${r.agent === 'claude' ? 'Claude' : 'Codex'} session`} modified={r.modified} note={maybeOpenElsewhere(r, Date.now()) ? ' · open elsewhere?' : ''}/>
                   </button>
+                  <button type="button" className="hs-dir-start hs-earlier-hide" title="Hide this session from the list. Its conversation stays on disk and can still be found by search" aria-label={`Hide session ${titles[r.id] || r.title || r.id}`} onClick={() => hideSession(r.id)}><EyeOff size={11}/></button>
                 </li>)}
                 {d.earlier.length > 12 && <li className="hs-earlier-more">{d.earlier.length - 12} older: use search</li>}
+                {d.hiddenEarlier > 0 && <li className="hs-earlier-more"><button type="button" className="hs-earlier-unhide" onClick={() => showFolder(d.path, 'sessions hidden', sessionsOf(d.path))}>{d.hiddenEarlier} hidden · show them</button></li>}
               </ul>}
             </div>}
           </li>;
         })}
       </ul>
       {sections.length > shown.length && <button type="button" className="hs-more-folders" onClick={() => setAllHistory(true)}>{sections.length - shown.length} more folders with history</button>}
+      {ended.length > 0 && <button type="button" className="hs-more-folders hs-cleanup" onClick={() => setRemoving(ended.map(h => h.id))}><Trash2 size={11}/> Remove ended sessions · {ended.length}</button>}
+      {hiddenFolders.length > 0 && <div className="hs-hidden">
+        <button type="button" className="hs-earlier-toggle" aria-expanded={hiddenOpen} onClick={() => setHiddenOpen(o => !o)}>
+          {hiddenOpen ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<EyeOff size={11}/> Hidden folders · {hiddenFolders.length}
+        </button>
+        {hiddenOpen && <ul aria-label="Hidden folders">
+          {hiddenFolders.map(({ section: d, reason }) => {
+            const name = tildePath(d.path, home);
+            return <li key={d.path} className="hs-hidden-row">
+              <span className="hs-hidden-path" title={d.path}>{shortPath(name)}</span>
+              <small className={`hs-hidden-why ${reason.replace(' ', '-')}`}>{HIDDEN_REASON[reason]}</small>
+              <button type="button" className="hs-dir-start" title={`Show ${name} in the list again`} aria-label={`Show folder ${d.path}`} onClick={() => showFolder(d.path, reason, sessionsOf(d.path))}><Eye size={12}/></button>
+            </li>;
+          })}
+          {liveList.hideNoise && <li className="hs-earlier-more">Folders that are gone and agents' temporary folders are left out by themselves; turn that off in Settings → Harnesses.</li>}
+        </ul>}
+      </div>}
+      {removing && <ConfirmDialog title={`Remove ${removing.length} ended session${removing.length === 1 ? '' : 's'} from the list?`} confirmLabel={`Remove ${removing.length}`}
+        onCancel={() => setRemoving(null)} onConfirm={() => { const ids = removing; setRemoving(null); removeEnded(ids); }}>
+        <p>Their terminal output in Agent MCR goes with them. Their conversations stay on disk with Claude Code and Codex: you find them under their folder's Earlier sessions and in Journal, and can resume them.</p>
+      </ConfirmDialog>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
     </aside>
   );

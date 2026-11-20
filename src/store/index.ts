@@ -4,6 +4,7 @@ import { DEFAULT_SEARCH_OPTIONS, type SearchOptions } from '../utils/search';
 import type { ColorTheme } from '../utils/markdown';
 import type { AgentEntry } from '../utils/tauri';
 import { sameScrollPosition, type ScrollPosition } from '../utils/scrollAnchor';
+import { DEFAULT_LIVE_LIST, type LiveListPrefs } from '../utils/harness';
 import { documentWindowPath, documentWindowStorage } from '../utils/documentWindow';
 
 // ============================================================
@@ -129,6 +130,8 @@ export interface AppState {
   smoothScroll: boolean;
   /** Show web images in documents without asking first. */
   loadRemoteImages: boolean;
+  /** What the Live list shows of folders and past sessions (MCR-107) */
+  liveList: LiveListPrefs;
 
   // Appearance
   /** Rendered markdown text color in the dark theme. */
@@ -213,6 +216,7 @@ export interface AppState {
   setSettingsOpen: (open: boolean) => void;
   setSaveAllPromptOpen: (open: boolean) => void;
   setSmoothScroll: (enabled: boolean) => void;
+  setLiveList: (change: (prefs: LiveListPrefs) => LiveListPrefs) => void;
   setLoadRemoteImages: (enabled: boolean) => void;
 
   // Appearance
@@ -297,6 +301,16 @@ function normalizeTabs(tabs: unknown): Tab[] {
   }
 
   return normalized;
+}
+
+/** The Live list's choices as they were stored, with anything that is not a list of strings or a switch dropped. */
+export function normalizeLiveList(stored: unknown): LiveListPrefs {
+  const v = (stored ?? {}) as Partial<Record<keyof LiveListPrefs, unknown>>;
+  const strings = (x: unknown) => Array.isArray(x) ? x.filter((s): s is string => typeof s === 'string') : [];
+  return {
+    hiddenFolders: strings(v.hiddenFolders), shownFolders: strings(v.shownFolders), hiddenSessions: strings(v.hiddenSessions),
+    hideNoise: typeof v.hideNoise === 'boolean' ? v.hideNoise : DEFAULT_LIVE_LIST.hideNoise,
+  };
 }
 
 /**
@@ -414,6 +428,7 @@ export const useStore = create<AppState>()(
       statusBarPinned: false,
       activeHeadingId: null,
       smoothScroll: true,
+      liveList: DEFAULT_LIVE_LIST,
       loadRemoteImages: false,
 
       // Appearance
@@ -781,6 +796,7 @@ export const useStore = create<AppState>()(
       setSaveAllPromptOpen: (open) => set({ saveAllPromptOpen: open }),
 
       setSmoothScroll: (enabled) => set({ smoothScroll: enabled }),
+      setLiveList: (change) => set((state) => ({ liveList: change(state.liveList) })),
 
       setLoadRemoteImages: (enabled) => set({ loadRemoteImages: enabled }),
 
@@ -855,6 +871,7 @@ export const useStore = create<AppState>()(
         panelZoom: state.panelZoom,
         statusBarPinned: state.statusBarPinned,
         smoothScroll: state.smoothScroll,
+        liveList: state.liveList,
         loadRemoteImages: state.loadRemoteImages,
         markdownTextColor: state.markdownTextColor,
         markdownTextColorLight: state.markdownTextColorLight,
@@ -904,6 +921,7 @@ export const useStore = create<AppState>()(
           scrollPositions: persisted.scrollPositions ?? {},
           panelZoom: { ...DEFAULT_PANEL_ZOOM, ...persisted.panelZoom },
           searchOptions: { ...DEFAULT_SEARCH_OPTIONS, ...persisted.searchOptions },
+          liveList: normalizeLiveList(persisted.liveList),
           // Documents are not persisted - they are re-read from disk on start
           documents: {},
           sessionRestored: false,

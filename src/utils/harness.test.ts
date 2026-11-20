@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { normalizeLiveList } from '../store';
+import { DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -234,5 +235,70 @@ describe('pointerSpans (MCR-106)', () => {
     const gap = row('mcr:a27f56d8749b');
     gap[6] = { chars: '', width: 1 };
     expect(pointerSpans([gap], live)).toEqual([]);
+  });
+});
+
+describe('folders the Live list leaves out (MCR-107)', () => {
+  it('tells an agent\'s temporary folder from its path, on every system', () => {
+    for (const path of ['/private/tmp/claude-501/-Users-me/abc/scratchpad', '/tmp/x', '/private/tmp/claude-501/x/scratchpad/trust-claude-1', '/var/folders/rh/T/mcr-store-1', '/private/var/folders/rh/T/x',
+      '/Users/me/work/agent-mcr/.claude/live-check', '/Users/me/work/agent-mcr/.claude/live-check/hooks', '/Users/me/work/agent-mcr/.claude/live-check/inner',
+      'C:\\Users\\Me\\AppData\\Local\\Temp\\scratch', 'c:/users/me/appdata/local/temp', 'C:\\Windows\\Temp\\x', 'C:\\Users\\Me\\work\\.claude\\live-check\\inner']) {
+      expect(temporaryFolder(path), path).toBe(true);
+    }
+    for (const path of ['/Users/me/work/agent-mcr', '/Users/me/tmp', '/Users/me/tmpfoo', '/tmpx/y', '/Users/me/work/agent-mcr/.claude/worktrees/mcr-49', '/Users/me/.claude/live-checks', 'C:\\Users\\Me\\work', 'D:\\Temp\\project']) {
+      expect(temporaryFolder(path), path).toBe(false);
+    }
+  });
+
+  const live = { ...hosted(), cwd: '/tmp/x', exit: null };
+  const over = { ...hosted(), cwd: '/tmp/x', exit: { code: 0, signal: null, at: 1 } };
+  const section = (path: string, more: Partial<DirSection> = {}): DirSection => ({ path, sessions: [], earlier: [], pinned: false, latest: 0, ...more });
+  const view = (sections: DirSection[], prefs = DEFAULT_LIVE_LIST) => {
+    const v = folderVisibility(sections, prefs);
+    return { shown: v.shown.map(d => d.path), hidden: v.hidden.map(h => [h.section.path, h.reason]) };
+  };
+
+  it('always shows a folder with a running session, whatever was chosen', () => {
+    const prefs = { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/tmp/x'] };
+    expect(view([section('/tmp/x', { sessions: [live], earlier: [{ agent: 'claude', id: 'a', cwd: '/tmp/x', modified: 1, gone: true }] })], prefs)).toEqual({ shown: ['/tmp/x'], hidden: [] });
+    expect(view([section('/tmp/x', { sessions: [over] })], prefs)).toEqual({ shown: [], hidden: [['/tmp/x', 'hidden']] });
+  });
+
+  it('says why a folder is out: hidden by the person first, then gone, then temporary', () => {
+    const r = (cwd: string, more = {}) => ({ agent: 'claude' as const, id: cwd, cwd, modified: 1, ...more });
+    const all = [
+      section('/Users/me/a', { earlier: [r('/Users/me/a')] }),
+      section('/Users/me/gone', { earlier: [r('/Users/me/gone', { gone: true })] }),
+      section('/Users/me/removed', { sessions: [{ ...over, cwd: '/Users/me/removed', cwdGone: true }] }),
+      section('/private/tmp/s/scratchpad', { earlier: [r('/private/tmp/s/scratchpad')] }),
+      section('/private/tmp/mine', { earlier: [r('/private/tmp/mine', { gone: true })] }),
+    ];
+    expect(view(all, { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/private/tmp/mine'] }).hidden.sort()).toEqual([
+      ['/Users/me/gone', 'gone'], ['/Users/me/removed', 'gone'], ['/private/tmp/mine', 'hidden'], ['/private/tmp/s/scratchpad', 'temporary'],
+    ]);
+    // The switch off: only what the person hid
+    expect(view(all, { ...DEFAULT_LIVE_LIST, hideNoise: false, hiddenFolders: ['/private/tmp/mine'] }).hidden).toEqual([['/private/tmp/mine', 'hidden']]);
+    // Shown again by the person, or added by them: the rule does not take it back
+    expect(view(all, { ...DEFAULT_LIVE_LIST, shownFolders: ['/Users/me/gone'] }).shown).toContain('/Users/me/gone');
+    expect(view([section('/tmp/added', { pinned: true })]).shown).toEqual(['/tmp/added']);
+  });
+
+  it('hides past sessions by id, counts them, and puts a folder that has nothing else into the hidden entry', () => {
+    const earlier = [{ agent: 'claude' as const, id: 's1', cwd: '/Users/me/a', modified: 2 }, { agent: 'claude' as const, id: 's2', cwd: '/Users/me/a', modified: 1 }];
+    const v = folderVisibility([section('/Users/me/a', { earlier })], { ...DEFAULT_LIVE_LIST, hiddenSessions: ['s1'] });
+    expect([v.shown[0].earlier.map(r => r.id), v.shown[0].hiddenEarlier]).toEqual([['s2'], 1]);
+    expect(view([section('/Users/me/a', { earlier })], { ...DEFAULT_LIVE_LIST, hiddenSessions: ['s1', 's2'] }).hidden).toEqual([['/Users/me/a', 'sessions hidden']]);
+    // A parent folder hides nothing below it: by exact path only
+    expect(view([section('/Users/me'), section('/Users/me/a', { earlier })], { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me'] }).shown).toEqual(['/Users/me/a']);
+  });
+});
+
+describe('the Live list choices as stored (MCR-107)', () => {
+  it('keeps lists of strings and a switch, and drops anything else', () => {
+    expect(normalizeLiveList(undefined)).toEqual(DEFAULT_LIVE_LIST);
+    expect(normalizeLiveList('rubbish')).toEqual(DEFAULT_LIVE_LIST);
+    expect(normalizeLiveList({ hiddenFolders: ['/a', 7, null, { x: 1 }], shownFolders: 'not a list', hiddenSessions: [['nested']], hideNoise: 'yes' }))
+      .toEqual({ hiddenFolders: ['/a'], shownFolders: [], hiddenSessions: [], hideNoise: true });
+    expect(normalizeLiveList({ hideNoise: false }).hideNoise).toBe(false);
   });
 });
