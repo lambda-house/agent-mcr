@@ -9,7 +9,7 @@ import SessionStats from './SessionStats';
 import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
-import { EarlierRow, HostedRow, hostedDetail, needsYou } from './SessionRow';
+import { EarlierRow, HostedRow, hostedDetail, needsYou, ProgramLine } from './SessionRow';
 import { canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { useStore } from '../store';
 import ConfirmDialog from './ConfirmDialog';
@@ -952,6 +952,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                     <AgentMark profile={h.harness?.profile || h.meta.profile || ''}/>
                     <strong>{sessionLabel(h)}</strong>
                     <span title={h.cwd}>{h.cwd}</span>
+                    <ProgramLine hosted={h} compact/>
                     <div className="hs-pane-tools">
                       <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>
                       {paneTools?.({ leafId: node.id, multiPane, controller })}

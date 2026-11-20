@@ -289,6 +289,13 @@ pub trait Adapter: Sync {
     fn is_agent(&self) -> bool {
         self.profile().task_tracking
     }
+    /// A plain terminal: the program that reads its input is whatever the
+    /// person runs in it, not an agent's screen. Not the same as `!is_agent`:
+    /// an agent without state tracking (Antigravity, OpenCode, Pi) is a screen
+    /// with an input box all the same (MCR-115)
+    fn is_plain_terminal(&self) -> bool {
+        false
+    }
     /// The harness chooses the conversation id at launch; otherwise the agent reports it
     fn names_conversation(&self) -> bool {
         false
@@ -620,6 +627,9 @@ impl Adapter for Shell {
     fn profile(&self) -> Profile {
         Profile { id: "shell", label: "Terminal", command: "", optional: false, can_supervise: false, task_tracking: false }
     }
+    fn is_plain_terminal(&self) -> bool {
+        true
+    }
     #[cfg(any(unix, test))]
     fn command_line(&self, _base: &str, l: &Launch) -> Result<String, String> {
         if l.resume.is_some() || l.task.is_some() {
@@ -637,6 +647,13 @@ pub fn adapters() -> impl Iterator<Item = &'static dyn Adapter> {
 
 pub fn profiles() -> Vec<Profile> {
     adapters().map(|a| a.profile()).collect()
+}
+
+/// Whether a session of this profile is a plain terminal (`is_plain_terminal`).
+/// Only for a profile this build knows: an unknown one is a shell elsewhere,
+/// but it may be an agent a later build added, so here it is not.
+pub fn plain_terminal(profile: &str) -> bool {
+    adapters().find(|a| a.id() == profile).is_some_and(|a| a.is_plain_terminal())
 }
 
 /// The adapter of a profile; anything unknown is treated as a plain shell.
@@ -939,6 +956,10 @@ mod tests {
             assert_eq!(serialized["taskTracking"], p.task_tracking);
         }
         assert!(command_line(&Launch { profile: "shell", supervisor: true, ..Default::default() }).is_err());
+        // Only the shell is a plain terminal: every agent, with state tracking or without, is a screen
+        // with an input box, and a profile this build does not know may be one (MCR-115)
+        assert_eq!(profiles().iter().filter(|p| plain_terminal(p.id)).map(|p| p.id).collect::<Vec<_>>(), ["shell"]);
+        assert!(!plain_terminal("an-agent-of-a-later-build") && !plain_terminal(""));
     }
 
     #[test]

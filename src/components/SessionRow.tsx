@@ -3,7 +3,7 @@ import { Hourglass } from 'lucide-react';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
 import { formatAge } from '../utils/agent';
-import { formatUntil, harnessApi, heldNote, hostedState, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
+import { formatUntil, harnessApi, heldNote, hostedState, programHint, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { Session } from '../utils/sessions';
 
 /**
@@ -23,6 +23,24 @@ export function hostedDetail(h: Hosted, extra = ''): string {
   return h.exit
     ? `exited ${h.exit.signal ? `by ${h.exit.signal}` : `with ${h.exit.code}`} · ${formatAge(h.exit.at)}`
     : [h.openTasks ? `${h.openTasks} task${h.openTasks > 1 ? 's' : ''}` : '', h.unread ? `${h.unread} unread` : '', heldNote(h), extra].filter(Boolean).join(' · ');
+}
+
+/**
+ * What the program in the terminal said of itself (MCR-115), drawn as its
+ * word and never as a state: no dot, the program's name first, "reports",
+ * and the tooltip saying that nothing checked it. `compact` is for the
+ * terminal pane's title.
+ */
+export function ProgramLine({ hosted, compact = false }: { hosted: Hosted; compact?: boolean }) {
+  const hint = programHint(hosted);
+  if (!hint) return null;
+  const Tag = compact ? 'span' : 'small';
+  return <Tag className={`hs-program${compact ? ' compact' : ''}${hint.disagrees ? ' disagrees' : ''}`} title={hint.full}>
+    <span className="hs-program-lead">{hint.lead}</span>
+    <span className="hs-program-says">reports</span>
+    {hint.progress !== undefined && <span className="hs-program-bar" role="progressbar" aria-label={`${hint.lead} reports ${hint.progress}%`} aria-valuenow={hint.progress} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${hint.progress}%` }}/></span>}
+    <span className="hs-program-text">{hint.text}</span>
+  </Tag>;
 }
 
 /**
@@ -55,6 +73,7 @@ export function HostedRow({ hosted: h, label, tooltip = label, session, detail =
         title={`Registered by the session ${formatAge(w.since)}: ${w.kind}${w.ref ? ` · ${w.ref}` : ''}\n${w.overdue ? `Expected to be over ${formatAge(w.expectBy)}${w.escalated ? `; ${w.escalated === 'operator' ? 'you were' : 'its supervisor was'} told` : ''}` : `Expected to be over ${formatUntil(w.expectBy)}`}`}>
         <Hourglass size={10}/> waits for {w.on}{w.overdue ? ' · late' : ''}</small>)}
       {summary && <small className="hs-status" title={summary.full || undefined}>{summary.lead && <span className="hs-lead">{summary.lead}</span>}{summary.text && <span>{summary.text}</span>}</small>}
+      <ProgramLine hosted={h}/>
     </span>
   </>;
 }

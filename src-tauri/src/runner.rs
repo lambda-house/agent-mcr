@@ -19,6 +19,7 @@
 //! the runner does no authorization of its own.
 
 use crate::ipc::{self, Listener, Stream};
+use crate::program::{self, Program, Said};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -67,6 +68,10 @@ pub struct Info {
     /// Opaque labels from the caller (profile, group); the runner doesn't interpret them.
     #[serde(default)]
     pub meta: BTreeMap<String, String>,
+    /// What the program said of itself in its output (OSC 7501, 133, 9;4;
+    /// MCR-115). Untrusted: any output can print it.
+    #[serde(default, skip_serializing_if = "Program::is_empty")]
+    pub program: Program,
 }
 
 #[derive(Deserialize)]
@@ -86,11 +91,14 @@ pub struct SpawnRequest {
 
 /// Finds terminal notifications in the output stream: BEL, and OSC 0/2
 /// (title), OSC 9 and OSC 777 (desktop notifications). Agent-independent
-/// signals for the attention queue.
+/// signals for the attention queue. Also what a program says of itself
+/// (OSC 7501, 133 and 9;4, read by `program`), and a full reset.
 #[derive(Default)]
 struct Scanner {
     state: ScanState,
     osc: Vec<u8>,
+    /// The OSC ran past `MAX_OSC`: what is kept of it is only its start
+    overrun: bool,
 }
 #[derive(Default, PartialEq)]
 enum ScanState {
@@ -105,6 +113,8 @@ enum Signal {
     Bell,
     Title(String),
     Notify(String, String),
+    Program(Said),
+    Reset,
 }
 
 impl Scanner {
@@ -119,27 +129,32 @@ impl Scanner {
                 ScanState::Esc => {
                     if b == b']' {
                         self.osc.clear();
+                        self.overrun = false;
                         self.state = ScanState::Osc;
+                    } else if b == b'c' {
+                        out.push(Signal::Reset);
+                        self.state = ScanState::Ground;
                     } else {
                         self.state = if b == 0x1b { ScanState::Esc } else { ScanState::Ground };
                     }
                 }
                 ScanState::Osc => match b {
                     0x07 => {
-                        self.finish(out);
+                        self.finish(1, out);
                         self.state = ScanState::Ground;
                     }
                     0x1b => self.state = ScanState::OscEsc,
                     _ if self.osc.len() < MAX_OSC => self.osc.push(b),
-                    _ => {}
+                    _ => self.overrun = true,
                 },
                 ScanState::OscEsc => {
                     if b == b'\\' {
-                        self.finish(out);
+                        self.finish(2, out);
                         self.state = ScanState::Ground;
                     } else if b == b']' {
                         // An aborted OSC followed by a new one
                         self.osc.clear();
+                        self.overrun = false;
                         self.state = ScanState::Osc;
                     } else {
                         self.state = if b == 0x1b { ScanState::Esc } else { ScanState::Ground };
@@ -149,7 +164,15 @@ impl Scanner {
         }
     }
 
-    fn finish(&mut self, out: &mut Vec<Signal>) {
+    /// `terminator` is the length of the ST: 1 for BEL, 2 for ESC \\.
+    fn finish(&mut self, terminator: usize, out: &mut Vec<Signal>) {
+        // A sequence too long for its whole length to be known is over every limit
+        let sequence = if self.overrun { usize::MAX } else { 2 + self.osc.len() + terminator };
+        if let Some(said) = program::read(&self.osc, sequence) {
+            out.push(Signal::Program(said));
+            self.osc.clear();
+            return;
+        }
         let text = String::from_utf8_lossy(&self.osc).into_owned();
         let (code, rest) = text.split_once(';').unwrap_or((text.as_str(), ""));
         match code {
@@ -216,6 +239,8 @@ struct Output {
     views: Vec<SyncSender<Arc<[u8]>>>,
     scanner: Scanner,
     last_bell: u64,
+    /// A program status query is passed on at most once a second
+    last_query: u64,
     closed: bool,
 }
 
@@ -403,6 +428,7 @@ impl Runner {
             last_output: 0,
             exit: None,
             meta: req.meta,
+            program: Program::default(),
         };
         let session = Arc::new(Session {
             info: Mutex::new(info.clone()),
@@ -417,6 +443,7 @@ impl Runner {
                 views: Vec::new(),
                 scanner: Scanner::default(),
                 last_bell: 0,
+                last_query: 0,
                 closed: false,
             }),
         });
@@ -434,7 +461,11 @@ impl Runner {
                 Ok(s) => Exit { code: s.exit_code(), signal: s.signal().map(str::to_owned), at: now_ms() },
                 Err(_) => Exit { code: u32::MAX, signal: None, at: now_ms() },
             };
-            lock(&session.info).exit = Some(exit.clone());
+            {
+                let mut info = lock(&session.info);
+                info.exit = Some(exit.clone());
+                info.program.exited();
+            }
             runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
         });
         Ok(info)
@@ -465,12 +496,14 @@ impl Runner {
                 let now = now_ms();
                 // Agents ring often; one bell event per second per session is enough
                 signals.retain(|s| {
-                    if *s != Signal::Bell {
-                        return true;
-                    }
-                    let keep = now.saturating_sub(out.last_bell) >= 1000;
+                    let last = match s {
+                        Signal::Bell => &mut out.last_bell,
+                        Signal::Program(Said::Query) => &mut out.last_query,
+                        _ => return true,
+                    };
+                    let keep = now.saturating_sub(*last) >= 1000;
                     if keep {
-                        out.last_bell = now;
+                        *last = now;
                     }
                     keep
                 });
@@ -490,12 +523,22 @@ impl Runner {
                     Signal::Notify(title, body) => {
                         self.broadcast(json!({"event": "notify", "id": id, "title": title, "body": body}))
                     }
+                    // Whether to answer is the service's to decide (off unless the operator turned it on)
+                    Signal::Program(Said::Query) => self.broadcast(json!({"event": "program_query", "id": id})),
+                    // Kept for the session list only: a program can report as fast as it writes
+                    Signal::Program(said) => lock(&session.info).program.take(said, now_ms()),
+                    Signal::Reset => lock(&session.info).program.reset(),
                 }
             }
         }
-        let mut out = lock(&session.output);
-        out.closed = true;
-        out.views.clear();
+        {
+            let mut out = lock(&session.output);
+            out.closed = true;
+            out.views.clear();
+        }
+        // The terminal closed: a working record read from the last chunk after the
+        // exit was seen goes too (the wait thread and this one race)
+        lock(&session.info).program.exited();
     }
 
     #[cfg(unix)]
@@ -1318,9 +1361,109 @@ mod tests {
                 Signal::Bell,
                 Signal::Title("my title".into()),
                 Signal::Notify(String::new(), "Claude needs your permission".into()),
+                // OSC 9;4 is progress, not a notification
+                Signal::Program(Said::Progress(Some(program::Progress { state: "normal".into(), value: Some(50), at: 0 }))),
                 Signal::Notify("Codex".into(), "Approve?".into()),
             ]
         );
+    }
+
+    #[test]
+    fn scanner_reads_program_status_split_anywhere_with_either_terminator() {
+        let whole = b"\x1b]7501;state=working:progress=40:app=cargo\x1b\\\x1b]7501;state=blocked:id=deploy:kind=permission\x07\x1b]7501;?\x1b\\\x1b]133;D;1\x07\x1b]9;4;1;30\x1b\\\x1bc";
+        let mut expected = Vec::new();
+        Scanner::default().feed(whole, &mut expected);
+        assert_eq!(expected.len(), 6, "{expected:?}");
+        assert!(matches!(&expected[0], Signal::Program(Said::Report(r)) if r.state == "working" && r.progress == Some(40) && r.app == "cargo"));
+        assert!(matches!(&expected[1], Signal::Program(Said::Report(r)) if r.id == "deploy" && r.kind == "permission"));
+        assert_eq!(expected[2], Signal::Program(Said::Query));
+        assert_eq!(expected[3], Signal::Program(Said::Prompt("D".into(), Some(1))));
+        assert!(matches!(&expected[4], Signal::Program(Said::Progress(Some(p))) if p.value == Some(30)));
+        assert_eq!(expected[5], Signal::Reset);
+        // Cut at every byte, the stream says the same
+        for cut in 1..whole.len() {
+            let (mut scanner, mut out) = (Scanner::default(), Vec::new());
+            scanner.feed(&whole[..cut], &mut out);
+            scanner.feed(&whole[cut..], &mut out);
+            assert_eq!(out, expected, "cut at {cut}");
+        }
+        // And one byte at a time
+        let (mut scanner, mut out) = (Scanner::default(), Vec::new());
+        whole.iter().for_each(|b| scanner.feed(&[*b], &mut out));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn scanner_discards_a_program_report_longer_than_a_sequence_may_be() {
+        let fits = |len: usize| {
+            // ESC ] "7501;state=done:x=" filler ESC \ is `len` bytes in all
+            let head = "7501;state=done:x=";
+            let body = format!("{head}{}", "a".repeat(len - 2 - head.len() - 2));
+            let mut out = Vec::new();
+            Scanner::default().feed(format!("\x1b]{body}\x1b\\").as_bytes(), &mut out);
+            !out.is_empty()
+        };
+        assert!(fits(program::MAX_SEQUENCE));
+        assert!(!fits(program::MAX_SEQUENCE + 1));
+        assert!(!fits(3 * program::MAX_SEQUENCE));
+        // A long title is still cut and kept, as before
+        let mut out = Vec::new();
+        Scanner::default().feed(format!("\x1b]0;{}\x07", "t".repeat(5000)).as_bytes(), &mut out);
+        assert!(matches!(&out[..], [Signal::Title(t)] if t.len() == MAX_OSC - 2));
+        // The scanner is back on its feet after the long one
+        let mut scanner = Scanner::default();
+        let mut out = Vec::new();
+        scanner.feed(format!("\x1b]7501;state=done:x={}\x07\x1b]7501;state=idle\x07", "a".repeat(5000)).as_bytes(), &mut out);
+        assert!(matches!(&out[..], [Signal::Program(Said::Report(r))] if r.state == "idle"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_program_says_of_itself_is_in_the_list_and_a_query_is_an_event() {
+        let socket = temp_socket("program");
+        serve_in_background(&socket);
+        let mut control = Client::connect(&socket).unwrap();
+        let (mut events, _keep) = open_stream(&socket, json!({"op": "watch"})).unwrap();
+        // "cargo build" as title, base64; a query; then the program waits for a line and exits
+        // The query three times in a row: passed on once
+        let script = "printf '\\033]7501;state=working:progress=40:app=cargo:title=Y2FyZ28gYnVpbGQ\\033\\\\'; printf '\\033]7501;state=done:id=lint\\007'; printf '\\033]7501;?\\033\\\\\\033]7501;?\\007\\033]7501;?\\033\\\\'; read line; exit 0";
+        control.call(json!({"op": "spawn", "id": "p1", "argv": ["/bin/sh", "-c", script], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = String::new();
+        while !seen.contains("\"program_query\"") {
+            assert!(Instant::now() < deadline, "events: {seen}");
+            let mut line = String::new();
+            events.read_line(&mut line).unwrap();
+            seen.push_str(&line);
+        }
+        let program = &control.call(json!({"op": "list"})).unwrap()["sessions"][0]["program"];
+        let records = program["records"].as_array().unwrap();
+        assert_eq!((records[0]["state"].as_str(), records[0]["progress"].as_u64(), records[0]["app"].as_str(), records[0]["title"].as_str()), (Some("working"), Some(40), Some("cargo"), Some("cargo build")));
+        assert_eq!((records[1]["id"].as_str(), records[1]["state"].as_str()), (Some("lint"), Some("done")));
+        // The runner itself answers nothing: that is the service's to decide
+        let (mut out, mut input) = open_stream(&socket, json!({"op": "attach", "id": "p1"})).unwrap();
+        input.write_all(b"\n").unwrap();
+        let _ = read_until(&mut out, "");
+        // At the exit the working record goes and the done one stays
+        while !seen.contains("\"exited\"") {
+            assert!(Instant::now() < deadline, "events: {seen}");
+            let mut line = String::new();
+            events.read_line(&mut line).unwrap();
+            seen.push_str(&line);
+        }
+        assert_eq!(seen.matches("\"program_query\"").count(), 1, "one query a second is passed on: {seen}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let list = control.call(json!({"op": "list"})).unwrap();
+            if !list["sessions"][0]["exit"].is_null() {
+                let records = list["sessions"][0]["program"]["records"].as_array().cloned().unwrap_or_default();
+                assert_eq!(records.iter().map(|r| r["id"].as_str().unwrap_or("")).collect::<Vec<_>>(), ["lint"]);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        control.call(json!({"op": "forget", "id": "p1"})).unwrap();
     }
 
     #[cfg(unix)]

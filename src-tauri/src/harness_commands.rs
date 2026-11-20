@@ -222,7 +222,7 @@ pub async fn harness_status() -> Result<Value, String> {
         let settings = service(json!({"op": "settings"}))?;
         // The service can outlive an app update and return an older settings shape.
         let preferences = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
-        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"], "storeNotice": settings["storeNotice"] }))
+        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"], "programQuery": settings["programQuery"], "storeNotice": settings["storeNotice"] }))
     })
     .await
 }
@@ -390,6 +390,33 @@ pub async fn harness_codex_hooks(app: tauri::AppHandle, on: bool) -> Result<bool
             }
         }
         service(json!({"op": "settings", "codexHooks": on})).map(|s| s["codexHooks"] == true)
+    })
+    .await
+}
+
+/// Answer a program's OSC 7501 feature query, or stop that (MCR-115).
+/// Turning it on is confirmed in a native dialog, never by the page alone:
+/// the answer is written to the session's input, and any output can ask.
+#[tauri::command]
+pub async fn harness_program_query(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    blocking(move || {
+        if on {
+            let mut dialog = app
+                .dialog()
+                .message("A program can ask its terminal whether it reads program status reports (OSC 7501). With this on, Agent MCR answers with a fixed line that lists the states it knows, written to the session's input like a terminal's own answer. It holds nothing from any report and is never written into a line you have not sent.\n\nAny output can ask, a file shown in the terminal too: a program that did not ask then finds that line in its input. Leave this off unless a program you run needs the answer.\n\nReports are shown either way, and never change a session's state.")
+                .title("Answer program status queries?")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom("Answer".to_string(), "Cancel".to_string()));
+            if let Some(window) = app.get_webview_window("main") {
+                dialog = dialog.parent(&window);
+            }
+            if !dialog.blocking_show() {
+                return Ok(false);
+            }
+        }
+        service(json!({"op": "settings", "programQuery": on})).map(|s| s["programQuery"] == true)
     })
     .await
 }

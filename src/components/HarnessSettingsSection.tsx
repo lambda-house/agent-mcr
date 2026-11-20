@@ -12,6 +12,14 @@ export function codexHooksDescription(status: HarnessStatus): string {
   return `${what} On. Codex asks once to review them: start a Codex session and choose "Trust all and continue". Until then new Codex sessions stop at that question.`;
 }
 
+/** The query answer (MCR-115): what it writes, where, and why it is off unless needed. */
+export function programQueryDescription(on: boolean): string {
+  const what = 'Programs can report their state in their output (OSC 7501); the Live list shows it as their word, below what the hooks say. A program may first ask whether the terminal reads such reports.';
+  return on
+    ? `${what} On: Agent MCR answers with a fixed line written to the session's input, never into a line you have not sent. Any output can ask, a file shown in the terminal too.`
+    : `${what} Off: nothing is answered; reports are shown all the same.`;
+}
+
 export default function HarnessSettingsSection() {
   const [prefs, setPrefs] = useState<HarnessPreferences | null>(null);
   const [status, setStatus] = useState<HarnessStatus | null>(null);
@@ -57,6 +65,12 @@ export default function HarnessSettingsSection() {
       {status && <SettingRow label="Use Codex hooks" description={codexHooksDescription(status)} control={
         <label className="settings-toggle">
           <input type="checkbox" aria-label="Use Codex hooks" checked={!!status.codexHooks} onChange={e => { void harnessApi.codexHooks(e.target.checked).then(on => setStatus({ ...status, codexHooks: on })).catch(e => setError(String(e))); }}/>
+          <span className="settings-toggle-slider"/>
+        </label>
+      }/>}
+      {status && <SettingRow label="Answer program status queries" description={programQueryDescription(!!status.programQuery)} control={
+        <label className="settings-toggle">
+          <input type="checkbox" aria-label="Answer program status queries" checked={!!status.programQuery} onChange={e => { void harnessApi.programQuery(e.target.checked).then(on => setStatus({ ...status, programQuery: on })).catch(e => setError(String(e))); }}/>
           <span className="settings-toggle-slider"/>
         </label>
       }/>}
