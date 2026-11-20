@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { normalizeLiveList } from '../store';
 import { DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
@@ -273,5 +274,15 @@ describe('folders the Live list leaves out (MCR-107)', () => {
     expect(view([section('/Users/me/a', { earlier })], { ...DEFAULT_LIVE_LIST, hiddenSessions: ['s1', 's2'] }).hidden).toEqual([['/Users/me/a', 'sessions hidden']]);
     // A parent folder hides nothing below it: by exact path only
     expect(view([section('/Users/me'), section('/Users/me/a', { earlier })], { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me'] }).shown).toEqual(['/Users/me/a']);
+  });
+});
+
+describe('the Live list choices as stored (MCR-107)', () => {
+  it('keeps lists of strings and a switch, and drops anything else', () => {
+    expect(normalizeLiveList(undefined)).toEqual(DEFAULT_LIVE_LIST);
+    expect(normalizeLiveList('rubbish')).toEqual(DEFAULT_LIVE_LIST);
+    expect(normalizeLiveList({ hiddenFolders: ['/a', 7, null, { x: 1 }], shownFolders: 'not a list', hiddenSessions: [['nested']], hideNoise: 'yes' }))
+      .toEqual({ hiddenFolders: ['/a'], shownFolders: [], hiddenSessions: [], hideNoise: true });
+    expect(normalizeLiveList({ hideNoise: false }).hideNoise).toBe(false);
   });
 });

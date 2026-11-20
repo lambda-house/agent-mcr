@@ -304,7 +304,7 @@ function normalizeTabs(tabs: unknown): Tab[] {
 }
 
 /** The Live list's choices as they were stored, with anything that is not a list of strings or a switch dropped. */
-function normalizeLiveList(stored: unknown): LiveListPrefs {
+export function normalizeLiveList(stored: unknown): LiveListPrefs {
   const v = (stored ?? {}) as Partial<Record<keyof LiveListPrefs, unknown>>;
   const strings = (x: unknown) => Array.isArray(x) ? x.filter((s): s is string => typeof s === 'string') : [];
   return {

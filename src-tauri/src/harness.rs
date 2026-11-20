@@ -318,6 +318,9 @@ pub struct Resumable {
     pub tags: Vec<String>,
 }
 
+/// How long the answer to "is this session's folder still there" is kept.
+const FOLDER_CHECK_MS: u64 = 60_000;
+
 /// Whether a session's folder is still a folder on disk. An empty path, or
 /// one that cannot be asked about, counts as there: only a folder known to be
 /// gone is left out of the app's list.
@@ -2313,6 +2316,8 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
 type ToldOutdated = (String, bool, String, u64, bool);
 
 pub struct Harness {
+    /// Whether session folders are still there, and when that was asked (`Harness::folder_there`)
+    folders: Mutex<BTreeMap<String, (Instant, bool)>>,
     /// One writer at a time per session (MCR-97): held by `submit` from the
     /// text to its Enter, and by a line placed for the operator. Without it
     /// a placed line could land between a task's text and the harness's own
@@ -2501,7 +2506,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -2645,6 +2650,16 @@ impl Harness {
         let processes = self.processes();
         lock(&self.activity).retain(|pid, _| processes.iter().any(|p| p.pid == *pid));
         lock(&self.subagents).retain(|id, _| ids.contains(id.as_str()));
+        // Whether the folders of ended sessions are still there (MCR-107), asked
+        // before the store is locked: a folder on a share that went away can
+        // make the question hang, and nothing else may wait for it
+        let gone: BTreeSet<String> = infos
+            .iter()
+            .filter(|i| !i["exit"].is_null())
+            .filter_map(|i| i["cwd"].as_str())
+            .filter(|cwd| !self.folder_there(cwd))
+            .map(str::to_owned)
+            .collect();
         let store = lock(&self.store);
         let home = dirs::home_dir();
         let recent = now_ms().saturating_sub(3_600_000);
@@ -2670,7 +2685,7 @@ impl Harness {
                 let open = store.tasks.values().filter(|t| t.session == id && t.open()).count();
                 let mut out = info.clone();
                 // An ended session whose folder is gone (a removed worktree): the app leaves it out (MCR-107)
-                if !info["exit"].is_null() && !folder_there(info["cwd"].as_str().unwrap_or("")) {
+                if !info["exit"].is_null() && gone.contains(info["cwd"].as_str().unwrap_or("")) {
                     out["cwdGone"] = json!(true);
                 }
                 out["harness"] = json!(tracked);
@@ -3055,6 +3070,23 @@ impl Harness {
             return Err(HELD_LINE.into());
         }
         self.type_into(session, input)
+    }
+
+    /// `folder_there`, remembered per folder for `FOLDER_CHECK_MS`: the list is
+    /// asked every two seconds, and a folder on a share that went away can
+    /// take long to answer. Never called with the store locked.
+    fn folder_there(&self, cwd: &str) -> bool {
+        let now = Instant::now();
+        if let Some((at, there)) = lock(&self.folders).get(cwd) {
+            if now.duration_since(*at) < Duration::from_millis(FOLDER_CHECK_MS) {
+                return *there;
+            }
+        }
+        let there = folder_there(cwd);
+        let mut folders = lock(&self.folders);
+        folders.retain(|_, (at, _)| now.duration_since(*at) < Duration::from_millis(FOLDER_CHECK_MS));
+        folders.insert(cwd.to_string(), (now, there));
+        there
     }
 
     /// The lock of the one who writes to a session's terminal now.
@@ -4544,7 +4576,7 @@ impl Harness {
                     .iter()
                     .map(|r| {
                         let mut out = json!(r);
-                        if !*there.entry(r.cwd.clone()).or_insert_with(|| folder_there(&r.cwd)) {
+                        if !*there.entry(r.cwd.clone()).or_insert_with(|| self.folder_there(&r.cwd)) {
                             out["gone"] = json!(true);
                         }
                         out
@@ -5771,6 +5803,23 @@ mod tests {
             assert_eq!(h.control(&json!({"op": "settings", "storeNoticeSeen": true})).unwrap()["storeNotice"]["frozen"], true);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn the_answer_whether_a_folder_is_there_is_kept_for_a_minute() {
+        let dir = std::env::temp_dir().join(format!("mcr-folders-{}", runner::random_id()));
+        let state = std::env::temp_dir().join(format!("mcr-folders-state-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = Harness::open(&state);
+        let path = dir.to_str().unwrap();
+        assert!(h.folder_there(path));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Asked again within the minute: the kept answer, no new look at the disk
+        assert!(h.folder_there(path));
+        // Once the answer is old, the disk is asked again
+        lock(&h.folders).get_mut(path).unwrap().0 -= Duration::from_millis(FOLDER_CHECK_MS + 1);
+        assert!(!h.folder_there(path));
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -8316,7 +8365,9 @@ mod tests {
                     "list" => json!({"sessions": [
                         {"id": "up", "cwd": "/tmp", "meta": {"profile": "claude"}},
                         {"id": "live", "cwd": "/tmp", "meta": {"profile": "claude"}},
-                        {"id": "gone", "cwd": "/tmp", "exit": {"code": 0}, "meta": {"profile": "codex"}}
+                        {"id": "gone", "cwd": "/tmp", "exit": {"code": 0}, "meta": {"profile": "codex"}},
+                        {"id": "worktree", "cwd": "/tmp/mcr-removed-worktree-of-this-test", "exit": {"code": 0}, "meta": {"profile": "claude"}},
+                        {"id": "running-in-gone", "cwd": "/tmp/mcr-removed-worktree-of-this-test", "meta": {"profile": "claude"}}
                     ]}),
                     // Nothing is typed anywhere in this test
                     _ => json!({"error": "not in this test"}),
@@ -8349,12 +8400,17 @@ mod tests {
         assert_eq!((on_disk.sessions["gone"].state.as_str(), on_disk.sessions["gone"].attention.is_none()), (ENDED, true));
         // And nothing in the attention list
         assert!(h.attention().unwrap().is_empty());
+        // An ended session whose folder is no longer on disk says so in the list (MCR-107);
+        // one whose folder is there, and a running one, do not
+        let listed = h.sessions().unwrap();
+        let gone_folder = |id: &str| listed.iter().find(|s| s["id"] == id).unwrap()["cwdGone"].clone();
+        assert_eq!((gone_folder("worktree"), gone_folder("gone"), gone_folder("running-in-gone"), gone_folder("up")), (json!(true), Value::Null, Value::Null, Value::Null));
         // The Slack connector is told only of running sessions, so a channel routed to the
         // ended one is held as "The routed session is not running", and its inbox takes nothing
         use crate::slack::Host;
         let mut peers: Vec<String> = h.peers().into_iter().map(|p| p.id).collect();
         peers.sort();
-        assert_eq!(peers, ["live", "up"]);
+        assert_eq!(peers, ["live", "running-in-gone", "up"]);
         assert!(h.inbox("gone", "Slack #bots · Tim", "hello", json!({"ref": "C1:1.0"})).is_none());
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();

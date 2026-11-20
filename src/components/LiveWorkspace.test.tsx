@@ -135,6 +135,50 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
     expect(earlier().textContent).toContain('First try');
   });
 
+  it('shows a folder the person hid again also when it is gone or temporary', async () => {
+    useStore.setState({ liveList: { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/private/tmp/x/scratchpad'] } });
+    vi.mocked(harnessApi.list).mockResolvedValue([running]);
+    vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'claude', id: 'p1', cwd: '/private/tmp/x/scratchpad', modified: 9 }]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await openHidden();
+    expect(hiddenRows()).toEqual([['/private/tmp/x/scratchpad', 'hidden by you']]);
+    await act(async () => (host.querySelector('button[aria-label="Show folder /private/tmp/x/scratchpad"]') as HTMLButtonElement).click());
+    // Not hidden again with the next reason: it is in the list
+    expect(host.querySelector(label('/private/tmp/x/scratchpad'))).not.toBeNull();
+    expect(host.querySelector('.hs-hidden')).toBeNull();
+  });
+
+  it('drops from the settings what left the list altogether, once both lists were read', async () => {
+    useStore.setState({ liveList: { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/old', '/Users/me/api'], shownFolders: ['/Users/me/gone-for-good'], hiddenSessions: ['left-history', 'p3'] } });
+    vi.mocked(harnessApi.list).mockResolvedValue([running]);
+    vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'p3', cwd: '/Users/me/api', modified: 7 }]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(useStore.getState().liveList).toEqual({ ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/api'], shownFolders: [], hiddenSessions: ['p3'] });
+  });
+
+  it('keeps every choice while the session list has not been read', async () => {
+    const kept = { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/old'], hiddenSessions: ['x'] };
+    useStore.setState({ liveList: kept });
+    vi.mocked(harnessApi.list).mockReturnValue(new Promise(() => {}));
+    vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'p3', cwd: '/Users/me/api', modified: 7 }]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(useStore.getState().liveList).toEqual(kept);
+  });
+
+  it('removes the ended sessions it could, and says which part failed', async () => {
+    const ended2: Hosted = { ...ended, id: 'e2', cwd: '/Users/me/api' };
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, ended2, running]);
+    vi.mocked(harnessApi.forget).mockImplementation(async id => { if (id === 'e2') throw new Error('runner unreachable'); });
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    // e1 is open in a pane: it must leave it, although e2 failed
+    await act(async () => ([...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes('Shell')) as HTMLButtonElement).click()); await flush();
+    expect(host.querySelector('[data-terminal="e1"]')).not.toBeNull();
+    await act(async () => (host.querySelector('.hs-cleanup') as HTMLButtonElement).click());
+    await act(async () => ([...document.querySelectorAll('.modal button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
+    expect(host.querySelector('[data-terminal="e1"]')).toBeNull();
+    expect(host.querySelector('[role="alert"]')!.textContent).toContain('1 of 2 ended sessions could not be removed: runner unreachable');
+  });
+
   it('removes all ended sessions after saying how many, and only those', async () => {
     const ended2: Hosted = { ...ended, id: 'e2', cwd: '/Users/me/api' };
     vi.mocked(harnessApi.list).mockResolvedValue([ended, ended2, running]);

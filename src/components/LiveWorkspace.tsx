@@ -124,6 +124,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const liveList = useStore(s => s.liveList);
   const setLiveList = useStore(s => s.setLiveList);
   const [hiddenOpen, setHiddenOpen] = useState(false);
+  // The session list has been read once: until then a folder known only from it would look gone
+  const [listed, setListed] = useState(false);
   // "Remove ended sessions": the ones counted when the question was asked
   const [removing, setRemoving] = useState<string[] | null>(null);
   // The session being connected to a supervisor: its row shows the chooser
@@ -153,7 +155,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     }).catch(e => { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); });
   }, [closed]);
   const refresh = useCallback(async () => {
-    try { const list = await harnessApi.list(); if (mounted.current) { setHosted(list); setError(''); } }
+    try { const list = await harnessApi.list(); if (mounted.current) { setHosted(list); setListed(true); setError(''); } }
     catch (e) { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); }
   }, [closed]);
 
@@ -432,26 +434,35 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const recentHistory = sections.filter(d => !d.sessions.length && !d.pinned).sort((a, b) => b.latest - a.latest).slice(0, HISTORY_FOLDERS);
   const shown = allHistory ? sections : sections.filter(d => d.sessions.length || d.pinned || recentHistory.includes(d));
   const hideFolder = (path: string) => setLiveList(p => ({ ...p, hiddenFolders: [...p.hiddenFolders.filter(x => x !== path), path], shownFolders: p.shownFolders.filter(x => x !== path) }));
-  const showFolder = (path: string, reason: HiddenReason, earlier: string[]) => setLiveList(p => reason === 'hidden' ? { ...p, hiddenFolders: p.hiddenFolders.filter(x => x !== path) }
+  // Shown again by the person: also over the automatic rule, or a folder that is gone or temporary would stay out with that reason
+  const showFolder = (path: string, reason: HiddenReason, earlier: string[]) => setLiveList(p => reason === 'hidden' ? { ...p, hiddenFolders: p.hiddenFolders.filter(x => x !== path), shownFolders: [...p.shownFolders.filter(x => x !== path), path] }
     : reason === 'sessions hidden' ? { ...p, hiddenSessions: p.hiddenSessions.filter(id => !earlier.includes(id)) }
     : { ...p, shownFolders: [...p.shownFolders.filter(x => x !== path), path] });
   /** All past sessions of a folder, hidden ones too: what "show them" brings back */
   const sessionsOf = (path: string) => allSections.find(x => x.path === path)?.earlier.map(r => r.id) ?? [];
   const hideSession = (id: string) => setLiveList(p => ({ ...p, hiddenSessions: [...p.hiddenSessions.filter(x => x !== id), id] }));
-  // A hidden past session that left the history (resumed, or older than it reaches) needs no place in the settings
+  // What left the list altogether needs no place in the settings: a hidden past session that left the
+  // history (resumed, or older than it reaches), a folder that has neither sessions nor history any more.
+  // Only once the history has been read, so that nothing is dropped while the lists are still empty
   useEffect(() => {
-    if (!pastSessions.length || !liveList.hiddenSessions.length) return;
+    if (!pastSessions.length || !listed) return;
     const known = new Set(pastSessions.map(r => r.id));
-    if (liveList.hiddenSessions.some(id => !known.has(id))) setLiveList(p => ({ ...p, hiddenSessions: p.hiddenSessions.filter(id => known.has(id)) }));
-  }, [pastSessions, liveList.hiddenSessions, setLiveList]);
+    const paths = new Set(allSections.map(d => d.path));
+    const stale = liveList.hiddenSessions.some(id => !known.has(id)) || [...liveList.hiddenFolders, ...liveList.shownFolders].some(path => !paths.has(path));
+    if (stale) setLiveList(p => ({ ...p, hiddenSessions: p.hiddenSessions.filter(id => known.has(id)), hiddenFolders: p.hiddenFolders.filter(x => paths.has(x)), shownFolders: p.shownFolders.filter(x => paths.has(x)) }));
+  }, [pastSessions, listed, allSections, liveList, setLiveList]);
   const ended = hosted.filter(h => h.exit);
   /** Every ended session the question counted leaves the list; a session's conversation stays on disk. */
   const removeEnded = (ids: string[]) => act(async () => {
-    await Promise.all(ids.map(id => harnessApi.forget(id)));
-    setOpened(o => o.filter(x => !ids.includes(x)));
-    setLayout(l => ids.reduce((layout, id) => removeSessionFromLayout(layout, id), l));
-    setSelected(s => ids.includes(s) ? '' : s);
-    ids.forEach(id => pluginRegistry.emitEvent('session:closed', { id }));
+    // Each on its own: one that fails leaves the others removed, and is said
+    const results = await Promise.allSettled(ids.map(id => harnessApi.forget(id)));
+    const done = ids.filter((_, i) => results[i].status === 'fulfilled');
+    setOpened(o => o.filter(x => !done.includes(x)));
+    setLayout(l => done.reduce((layout, id) => removeSessionFromLayout(layout, id), l));
+    setSelected(s => done.includes(s) ? '' : s);
+    done.forEach(id => pluginRegistry.emitEvent('session:closed', { id }));
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) throw new Error(`${ids.length - done.length} of ${ids.length} ended sessions could not be removed: ${err(failed.reason)}`);
   });
 
   const projectResumables = useMemo(() => resumable.filter(r => r.cwd === cwd), [resumable, cwd]);
