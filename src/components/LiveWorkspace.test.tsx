@@ -148,20 +148,23 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
     expect(host.querySelector('.hs-hidden')).toBeNull();
   });
 
-  it('drops from the settings what left the list altogether, once both lists were read', async () => {
+  it('drops only hidden past sessions that left the history, and keeps every folder choice', async () => {
     useStore.setState({ liveList: { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/old', '/Users/me/api'], shownFolders: ['/Users/me/gone-for-good'], hiddenSessions: ['left-history', 'p3'] } });
     vi.mocked(harnessApi.list).mockResolvedValue([running]);
     vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'p3', cwd: '/Users/me/api', modified: 7 }]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    expect(useStore.getState().liveList).toEqual({ ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/api'], shownFolders: [], hiddenSessions: ['p3'] });
+    expect(useStore.getState().liveList).toEqual({ ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/old', '/Users/me/api'], shownFolders: ['/Users/me/gone-for-good'], hiddenSessions: ['p3'] });
   });
 
-  it('keeps every choice while the session list has not been read', async () => {
-    const kept = { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/old'], hiddenSessions: ['x'] };
+  it('keeps every folder choice when the status arrives last, or without the profile of a folder\'s history', async () => {
+    const kept = { ...DEFAULT_LIVE_LIST, hiddenFolders: ['/Users/me/api'], shownFolders: ['/private/tmp/x'] };
     useStore.setState({ liveList: kept });
-    vi.mocked(harnessApi.list).mockReturnValue(new Promise(() => {}));
     vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'codex', id: 'p3', cwd: '/Users/me/api', modified: 7 }]);
+    const status = await vi.mocked(harnessApi.status)();
+    let arrive: (s: typeof status) => void = () => {};
+    vi.mocked(harnessApi.status).mockReturnValue(new Promise(r => { arrive = r; }));
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => arrive({ ...status, profiles: status.profiles.filter(p => p.id !== 'codex') })); await flush();
     expect(useStore.getState().liveList).toEqual(kept);
   });
 

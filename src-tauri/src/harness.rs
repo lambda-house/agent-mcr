@@ -3082,6 +3082,9 @@ impl Harness {
                 return *there;
             }
         }
+        // Until the disk has answered, the folder counts as there for everyone
+        // else who asks: a share that went away hangs this caller, not all of them
+        lock(&self.folders).insert(cwd.to_string(), (now, true));
         let there = folder_there(cwd);
         let mut folders = lock(&self.folders);
         folders.retain(|_, (at, _)| now.duration_since(*at) < Duration::from_millis(FOLDER_CHECK_MS));
@@ -5819,6 +5822,10 @@ mod tests {
         // Once the answer is old, the disk is asked again
         lock(&h.folders).get_mut(path).unwrap().0 -= Duration::from_millis(FOLDER_CHECK_MS + 1);
         assert!(!h.folder_there(path));
+        // While a first question is under way, others are told "there"
+        let other = dir.join("being-asked");
+        lock(&h.folders).insert(other.to_str().unwrap().into(), (Instant::now(), true));
+        assert!(h.folder_there(other.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&state);
     }
 
