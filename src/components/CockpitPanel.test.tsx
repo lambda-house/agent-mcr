@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import CockpitPanel from './CockpitPanel';
+import CockpitPanel, { READ_TIMEOUT_MS } from './CockpitPanel';
 import { harnessApi, type Cockpit, type Hosted } from '../utils/harness';
 import { readFileSync } from 'node:fs';
 
@@ -314,4 +314,82 @@ it('can be collapsed, and stays so', async () => {
   act(() => root.unmount()); root = createRoot(host);
   await show();
   expect(host.querySelector('.ck-body')).toBeNull();
+});
+
+it('shows a session at a prompt with nothing published, at the first read, and drops it when the prompt is answered (MCR-118)', async () => {
+  const empty: Cockpit = { schema: 1, version: 0, updated: 0, sessions: { r1: { name: 'Reviewer' } }, tracks: [], actions: [] };
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...empty, actions: [{ id: 'prompt:r1', title: 'Reviewer asks for your answer in its terminal', kind: 'answer_prompt', derived: 'prompt', where: { session: 'r1' }, since: Date.now() }] });
+  await show();
+  const row = host.querySelector('[data-action="prompt:r1"]')!;
+  expect(row.textContent).toContain('Reviewer asks for your answer in its terminal');
+  expect(row.querySelector('.ck-urgency')!.textContent).toBe('now');
+  expect(row.classList.contains('derived')).toBe(true);
+  expect(host.querySelector('.ck-head')!.textContent).toContain('1 needs you');
+  // The row opens its session
+  await act(async () => (row.querySelector('.ck-session') as HTMLElement).click());
+  expect(opened).toEqual(['r1']);
+  // Answered: the next read has no row, and the panel says so
+  vi.mocked(harnessApi.cockpit).mockResolvedValue(empty);
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 2100)); });
+  expect(host.querySelector('[data-action="prompt:r1"]')).toBeNull();
+  expect(host.querySelector('.ck-head')!.textContent).toContain('nothing needs you');
+});
+
+it('shows how long an unsent line has stood, and an overdue human wait with what the session registered (MCR-118)', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ schema: 1, version: 0, updated: 0, sessions: { b1: { name: 'Builder' }, r1: { name: 'Reviewer' } }, tracks: [], actions: [
+    { id: 'held:b1', title: 'Your unsent line in Builder: press Enter there to send it, Ctrl+C to clear it', kind: 'held_line', derived: 'held', where: { session: 'b1' }, since: Date.now() - 12 * 60_000, detail: 'Messages and tasks for it wait until the line is sent or cleared.' },
+    { id: 'wait:w1', title: 'Reviewer waits for you, past the time it expected', kind: 'human_wait', derived: 'wait', where: { session: 'r1' }, since: Date.now() - 3600_000, detail: 'a go for the fault run' },
+  ] });
+  await show();
+  const held = host.querySelector('[data-action="held:b1"]')!;
+  expect(held.textContent).toContain('unsent for 12 min');
+  expect(held.textContent).toContain('press Enter there to send it, Ctrl+C to clear it');
+  expect(held.querySelector('.ck-urgency')!.textContent).toBe('today');
+  const wait = host.querySelector('[data-action="wait:w1"]')!;
+  expect(wait.textContent).toContain('It registered: a go for the fault run');
+  expect(wait.querySelector('.ck-kind')!.textContent).toBe('waits for you');
+  // Nothing on a derived row is a button: it only opens its session
+  expect([...host.querySelectorAll('.ck-action button')].filter(b => !b.classList.contains('ck-session'))).toEqual([]);
+});
+
+it('merges what the harness knows into the published action for the same session: one row, its chips, the harness urgency (MCR-118)', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [
+    { ...doc.actions[0], urgency: 'whenever', live: { prompt: Date.now() - 60_000, report: { id: 'r9', since: Date.now(), text: 'Which branch?' } } },
+  ] });
+  await show();
+  const rows = [...host.querySelectorAll('.ck-action')];
+  expect(rows.map(r => r.getAttribute('data-action'))).toEqual(['word']);
+  const row = rows[0];
+  expect(row.classList.contains('merged')).toBe(true);
+  expect(row.querySelector('.ck-urgency')!.textContent).toBe('now');
+  expect([...row.querySelectorAll('.ck-live.harness')].map(c => c.textContent)).toEqual(['at a prompt · a while ago', 'reported: needs you · a while ago']);
+  expect(row.textContent).toContain('Builder reported: Which branch?');
+  // No Place while the session asks at a prompt (the service would refuse it): the reason instead
+  expect(row.textContent).not.toContain('Place in Builder, unsent');
+  expect(row.textContent).toContain('No button while Builder asks at a prompt: answer it there first.');
+  expect(row.textContent).not.toContain('the report it names is closed');
+  // Once the prompt is answered, the published row has its click again
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [{ ...doc.actions[0], live: { report: { id: 'r9', since: Date.now(), text: 'Which branch?' } } }] });
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 2100)); });
+  expect(host.querySelector('[data-action="word"]')!.textContent).toContain('Place in Builder, unsent');
+});
+
+it('says that the cockpit could not be read when a read hangs, instead of showing the last one as now (MCR-118)', async () => {
+  vi.useFakeTimers();
+  try {
+    await act(async () => root.render(<CockpitPanel active hosted={hosted} label={label} onSession={id => opened.push(id)}/>));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(host.querySelector('.ck-head')!.textContent).toContain('2 need you');
+    // The service stops answering
+    vi.mocked(harnessApi.cockpit).mockReturnValue(new Promise(() => {}));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000 + READ_TIMEOUT_MS + 10); });
+    expect(host.querySelector('.ck-head')!.textContent).toContain('could not be read');
+    expect(host.querySelector('p.ck-empty[role="alert"]')!.textContent).toContain('no answer from the harness service in 5 s');
+    // It answers again: the error goes
+    vi.mocked(harnessApi.cockpit).mockResolvedValue(doc);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2010); });
+    expect(host.querySelector('.ck-head')!.textContent).toContain('2 need you');
+  } finally {
+    vi.useRealTimers();
+  }
 });

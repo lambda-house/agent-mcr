@@ -17,15 +17,35 @@ export const ROOT_PART = 'supervisor';
 const URGENCY = { now: 0, today: 1, whenever: 2 } as const;
 
 /**
- * How soon an action wants the person, lowest first. A prompt holds an agent
- * in the middle of its turn, so it goes with `now`; an open report without a
- * published action goes with `today`; an action without urgency comes last.
+ * Whether the harness itself knows that this row needs the person: a row it
+ * derived, or a published action into which it merged what it knows of that
+ * session (MCR-118). Such a row is ranked and kept in sight as the harness's own.
+ */
+export const harnessSaw = (a: CockpitAction) => !!a.derived || !!(a.live && (a.live.prompt || a.live.held || a.live.report || a.live.waits?.length));
+
+/**
+ * The harness's urgency for a row, if it has one: a prompt holds an agent in
+ * the middle of its turn (`now`); an unsent line, an open report and a late
+ * wait for the person are `today`.
+ */
+export function harnessUrgency(a: CockpitAction): 'now' | 'today' | null {
+  if (a.derived === 'prompt' || a.live?.prompt) return 'now';
+  return harnessSaw(a) ? 'today' : null;
+}
+
+/**
+ * How soon an action wants the person, lowest first. What the harness knows
+ * comes before what a publisher claims: a publisher's urgency never ranks a
+ * row above the harness's own. An action without urgency comes last.
  */
 export function urgencyRank(a: CockpitAction): number {
-  if (a.derived === 'prompt') return URGENCY.now;
-  if (a.urgency) return URGENCY[a.urgency];
-  return a.derived === 'report' ? URGENCY.today : URGENCY.whenever;
+  const harness = harnessUrgency(a);
+  if (harness) return URGENCY[harness];
+  return a.urgency ? URGENCY[a.urgency] : URGENCY.whenever;
 }
+
+/** The urgency a row shows: the harness's where it knows one, else the publisher's; none on a row that is behind. */
+export const shownUrgency = (a: CockpitAction) => (stillAwaits(a) ? harnessUrgency(a) ?? a.urgency ?? '' : '');
 
 /** Since when an action stands: what the service saw for a derived one, else when it was first published. */
 export const actionSince = (a: CockpitAction) => a.since || a.updated || 0;
@@ -47,7 +67,7 @@ export const stillAwaits = (a: CockpitAction) => !a.ownerTyped && !a.sessionEnde
  */
 export function needsYouRows(cockpit: Cockpit): CockpitAction[] {
   const age = (a: CockpitAction) => actionSince(a) || Number.MAX_SAFE_INTEGER;
-  return [...cockpit.actions].sort((a, b) => Number(!a.derived) - Number(!b.derived) || Number(!stillAwaits(a)) - Number(!stillAwaits(b)) || urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
+  return [...cockpit.actions].sort((a, b) => Number(!harnessSaw(a)) - Number(!harnessSaw(b)) || Number(!stillAwaits(a)) - Number(!stillAwaits(b)) || urgencyRank(a) - urgencyRank(b) || age(a) - age(b) || a.id.localeCompare(b.id));
 }
 
 /** How many published rows of one publisher are shown before the rest folds. */
@@ -62,7 +82,8 @@ export function foldRows(rows: CockpitAction[], open: ReadonlySet<string>): { sh
   const seen = new Map<string, number>();
   const folded = new Map<string, number>();
   const shown = rows.filter(a => {
-    if (a.derived || !a.by) return true;
+    // What the harness knows never folds away, also when it rides on a published row
+    if (harnessSaw(a) || !a.by) return true;
     const n = (seen.get(a.by) ?? 0) + 1;
     seen.set(a.by, n);
     if (n <= ROWS_PER_PUBLISHER || open.has(a.by)) return true;
@@ -77,6 +98,8 @@ export function clickable(a: CockpitAction, part: 'say' | 'options' | 'url' | 'c
   if (a.derived || !a.by || !a.updated) return false;
   if (part === 'ask') return true;
   if ((part === 'say' || part === 'options') && !stillAwaits(a)) return false;
+  // The session asks at a prompt: the service refuses to place a line there, so no button offers it
+  if ((part === 'say' || part === 'options') && a.live?.prompt) return false;
   return !a.unclickable?.includes(part);
 }
 
@@ -89,8 +112,33 @@ export function trackStateShown(t: CockpitTrack, now = Date.now()): { text: stri
 
 export const ACTION_KIND: Record<CockpitAction['kind'], string> = {
   typed_word: 'your word', decision: 'decision', secret_step: 'step only you can do', live_check: 'live check',
-  external: 'outside', answer_prompt: 'prompt', report: 'report',
+  external: 'outside', answer_prompt: 'prompt', report: 'report', held_line: 'unsent line', human_wait: 'waits for you',
 };
+
+/** How long a line has stood, in plain words: "45 s", "12 min", "2 h 5 min". */
+export function heldFor(since: number, now = Date.now()): string {
+  const s = Math.max(0, Math.floor((now - since) / 1000));
+  if (s < 60) return `${s} s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ''}`;
+}
+
+/**
+ * What the harness knows of a row's session, as chips: on a merged row each
+ * fact it took in, on a derived unsent line how long it has stood. The
+ * session's own text (what a wait is for, a report) is not a chip.
+ */
+export function harnessChips(a: CockpitAction, now = Date.now()): string[] {
+  if (a.derived === 'held' && a.since) return [`unsent for ${heldFor(a.since, now)}`];
+  const l = a.live;
+  if (!l || a.derived) return [];
+  return [
+    l.prompt ? `at a prompt · ${formatAge(l.prompt, now)}` : '',
+    l.held ? `your unsent line there for ${heldFor(l.held, now)}: Enter sends it, Ctrl+C clears it` : '',
+    l.report ? `reported: needs you · ${formatAge(l.report.since, now)}` : '',
+    ...(l.waits ?? []).map(w => `waits for you, late · since ${formatAge(w.since, now)}`),
+  ].filter(Boolean);
+}
 
 export const TRACK_STATE: Record<CockpitTrack['state'], string> = {
   moving: 'moving', waiting_human: 'waits for you', blocked: 'blocked', parked: 'parked', done: 'done',

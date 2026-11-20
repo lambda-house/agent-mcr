@@ -172,7 +172,7 @@ export interface CockpitTrack {
   ownerTyped?: number;
 }
 /** `answer_prompt` and `report` come from the service only (`derived`); sessions publish the others. */
-export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'answer_prompt' | 'report';
+export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'answer_prompt' | 'report' | 'held_line' | 'human_wait';
 export interface CockpitAction {
   id: string; title: string; kind: CockpitActionKind;
   track?: string; trackBy?: string; item?: string;
@@ -184,8 +184,8 @@ export interface CockpitAction {
   urgency?: 'now' | 'today' | 'whenever';
   source?: string[]; detail?: string; since?: number; updated?: number;
   by?: string;
-  /** Built by the service from a session's prompt or its open needs_human report */
-  derived?: 'prompt' | 'report';
+  /** Built by the service: a session's prompt, its open needs_human report, the operator's unsent line there, a human wait past its time (MCR-118) */
+  derived?: 'prompt' | 'report' | 'held' | 'wait';
   /** Its track was removed since */
   trackMissing?: boolean;
   /** From the service, never published: the operator pressed Enter in `where.session` at this time, after the action was last published (MCR-103) */
@@ -194,8 +194,25 @@ export interface CockpitAction {
   sessionEnded?: boolean;
   /** From the service: which of its texts a click would refuse (stored under an earlier rule). Shown as text, no button */
   unclickable?: ('say' | 'options' | 'url' | 'command')[];
-  /** It names a report in `source`: whether that report is still open */
-  live?: { reportOpen: boolean };
+  /**
+   * From the service, never published. `reportOpen`: it names a report in
+   * `source`, and whether that report is still open. The rest is what the
+   * harness knows of the session it points at, merged into it instead of a
+   * derived row of its own (MCR-118)
+   */
+  live?: CockpitLive;
+}
+/** What the harness knows of the session a published action points at (`Cockpit::read`). */
+export interface CockpitLive {
+  reportOpen?: boolean;
+  /** At a prompt since */
+  prompt?: number;
+  /** The operator's unsent line there, since */
+  held?: number;
+  /** Its open needs_human report */
+  report?: { id: string; since: number; text: string };
+  /** Its human waits past their time */
+  waits?: { id: string; on: string; ref?: string; since: number }[];
 }
 /** A link as the service's parser reads it: what the question shows and what is opened (MCR-97). */
 export interface CockpitLink { href: string; host: string; path: string; query: string; known: boolean }

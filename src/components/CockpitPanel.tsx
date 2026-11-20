@@ -4,7 +4,7 @@ import ConfirmDialog from './ConfirmDialog';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
-import { ACTION_KIND, actionSource, clickable, foldRows, liveFacts, named, needsYouRows, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
+import { ACTION_KIND, actionSource, clickable, foldRows, harnessChips, harnessSaw, liveFacts, named, needsYouRows, shownUrgency, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
 import { harnessApi, type Cockpit, type CockpitAct, type CockpitAction, type CockpitLink, type CockpitTrack, type Hosted } from '../utils/harness';
 
 /**
@@ -55,7 +55,9 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   const track = a.track ? cockpit.tracks.find(t => t.id === a.track && (!a.trackBy || t.by === a.trackBy)) : undefined;
   // An action the harness knows to be behind keeps its text and loses its urgency
   const awaits = stillAwaits(a);
-  const urgency = !awaits ? '' : a.derived === 'prompt' ? 'now' : a.urgency ?? (a.derived === 'report' ? 'today' : '');
+  const urgency = shownUrgency(a);
+  // What the harness knows of the session, on this row: merged into a published one, or how long a line stood (MCR-118)
+  const chips = harnessChips(a);
   // What a click did, or why the service refused it: said on the row, in the service's words
   const [said, setSaid] = useState<{ text: string; bad: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -87,7 +89,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   const choiceBox = at ?? publisher;
   const from = publisher ? `from ${publisher.name}` : '';
   return (
-    <li className={`ck-action${a.derived ? ' derived' : ''}${awaits ? '' : ' behind'}`} data-action={a.id}>
+    <li className={`ck-action${a.derived ? ' derived' : ''}${!a.derived && harnessSaw(a) ? ' merged' : ''}${awaits ? '' : ' behind'}`} data-action={a.id}>
       <div className="ck-action-head">
         {urgency && <span className={`ck-urgency ${urgency}`}>{urgency}</span>}
         {a.ownerTyped && !a.sessionEnded && <span className="ck-live answered" title="From the harness: you pressed Enter in that session's terminal after this was published. Its publisher was told to update it">you typed there {formatAge(a.ownerTyped)}</span>}
@@ -96,9 +98,12 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         <span className="ck-kind">{ACTION_KIND[a.kind]}</span>
         {at && <SessionLink who={at} onSession={onSession}/>}
         {at?.hosted && <Live h={at.hosted}/>}
+        {chips.map(c => <span key={c} className="ck-live harness" title="From the harness, now">{c}</span>)}
         {caution && <span className="ck-risk caution">{caution}</span>}
       </div>
-      {a.derived && a.detail && <p className="ck-fact">{a.detail}</p>}
+      {a.derived && a.detail && <p className="ck-fact">{a.derived === 'wait' ? 'It registered: ' : ''}{a.detail}</p>}
+      {!a.derived && a.live?.report && <p className="ck-fact">{at ? at.name : 'The session'} reported: {a.live.report.text}</p>}
+      {!a.derived && a.live?.waits?.map(w => <p key={w.id} className="ck-fact">{at ? at.name : 'The session'} waits for you, past its time. It registered: {w.on}</p>)}
       {a.why && <p>{a.why}</p>}
       {/* The whole line, never cut: what is read here is what a click places */}
       {a.say && (
@@ -111,6 +116,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
             </p>
           )}
           {a.unclickable?.includes('say') && <p className="ck-source">No button: this line holds characters that are not placed by a click. Type it yourself if it is right.</p>}
+          {!a.unclickable?.includes('say') && a.live?.prompt && stillAwaits(a) && <p className="ck-source">No button while {at ? at.name : 'that session'} asks at a prompt: answer it there first.</p>}
         </div>
       )}
       {a.options && (
@@ -125,7 +131,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
           ) : (
             <>
               <ul className="ck-options" aria-label="Options">{a.options.map(o => <li key={o}>{o}{o === a.recommended ? ' (recommended by its publisher)' : ''}</li>)}</ul>
-              <p className="ck-source">{a.unclickable?.includes('options') ? 'No buttons: an option holds characters that are not placed by a click.' : !awaits ? 'No buttons: this is behind what happened since.' : 'No buttons: the session to answer in does not run.'} Answer in {choiceBox ? choiceBox.name : 'the publishing session'} yourself.</p>
+              <p className="ck-source">{a.unclickable?.includes('options') ? 'No buttons: an option holds characters that are not placed by a click.' : !awaits ? 'No buttons: this is behind what happened since.' : a.live?.prompt ? `No buttons while ${at ? at.name : 'that session'} asks at a prompt: answer it there first.` : 'No buttons: the session to answer in does not run.'} Answer in {choiceBox ? choiceBox.name : 'the publishing session'} yourself.</p>
             </>
           )}
         </div>
@@ -160,7 +166,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         {a.trackMissing && <span className="ck-stale">its track was removed</span>}
         {a.blocks?.length ? <span>blocks: {a.blocks.join(', ')}</span> : null}
         {a.source?.length ? <span>source: {a.source.join(', ')}</span> : null}
-        {a.live && !a.live.reportOpen && <span className="ck-stale">the report it names is closed</span>}
+        {a.live?.reportOpen === false && <span className="ck-stale">the report it names is closed</span>}
         {!a.derived && <Stale marks={staleMarks(a, cockpit, hosted, label)}/>}
       </p>
       {/* In the page's body, not in the row: a column of the panel is a container (MCR-105), and a
@@ -248,6 +254,9 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
  * does; `onSession` opens one. The cockpit document is asked for while
  * `active`, as often as the list.
  */
+/** How long a read of the cockpit may take before the panel says it could not be read (MCR-118). */
+export const READ_TIMEOUT_MS = 5000;
+
 export default function CockpitPanel({ active, hosted, label, onSession }: { active: boolean; hosted: Hosted[]; label: (h: Hosted) => string; onSession: (id: string) => void }) {
   const [cockpit, setCockpit] = useState<Cockpit | null>(null);
   const [error, setError] = useState('');
@@ -258,10 +267,17 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
   useEffect(() => {
     if (!active) return;
     let live = true;
+    // Only the newest read may change what is shown: one that hung and answers late is older than what came since
+    let started = 0; let shown = 0;
     const load = () => {
-      Promise.resolve().then(() => harnessApi.cockpit())
-        .then(c => { if (live) { setCockpit(c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null); setError(''); } })
-        .catch(e => { if (live) setError(String(e)); });
+      const n = ++started;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      // A read that hangs is said, never covered by the last good one: "nothing needs you" is a claim
+      const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer from the harness service in ${READ_TIMEOUT_MS / 1000} s`)), READ_TIMEOUT_MS); });
+      Promise.race([Promise.resolve().then(() => harnessApi.cockpit()), late])
+        .then(c => { if (live && n > shown) { shown = n; setCockpit(c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null); setError(''); } })
+        .catch(e => { if (live && n > shown) { shown = n; setError(String(e instanceof Error ? e.message : e)); } })
+        .finally(() => clearTimeout(timer));
     };
     load();
     const timer = setInterval(() => { if (!document.hidden) load(); }, 2000);

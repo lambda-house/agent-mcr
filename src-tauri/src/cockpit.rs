@@ -24,10 +24,12 @@ pub const ROOT: &str = "supervisor";
 const TRACK_STATES: [&str; 5] = ["moving", "waiting_human", "blocked", "parked", "done"];
 const ITEM_STATES: [&str; 5] = ["doing", "review", "ready", "waiting", "done"];
 const WAIT_KINDS: [&str; 5] = ["human", "session", "ci", "timer", "external"];
-/// The kinds a session may publish. `answer_prompt` and `report` are built by
-/// the service from a session's prompt and its open report, and by nobody else.
+/// The kinds a session may publish. `answer_prompt`, `report`, `held_line`
+/// and `human_wait` are built by the service from a session's prompt, its
+/// open report, the operator's unsent line there and a human wait past its
+/// time (MCR-118), and by nobody else.
 const ACTION_KINDS: [&str; 5] = ["typed_word", "decision", "secret_step", "live_check", "external"];
-const DERIVED_KINDS: [&str; 2] = ["answer_prompt", "report"];
+const DERIVED_KINDS: [&str; 4] = ["answer_prompt", "report", "held_line", "human_wait"];
 const RISKS: [&str; 3] = ["reversible", "irreversible", "spend"];
 const URGENCIES: [&str; 3] = ["now", "today", "whenever"];
 /// Fields the service writes. They are taken out of what a session sends, so
@@ -221,6 +223,9 @@ pub struct Fact {
     pub above: Vec<String>,
     /// It asks the operator at a prompt (`permission` attention): since when
     pub prompt: Option<u64>,
+    /// The operator has an unsent line in its input box that has stood a
+    /// while (MCR-85, MCR-118): since when. The line's text is not known here
+    pub held: Option<u64>,
     /// Its open `needs_human` report: id, text, when
     pub needs_human: Option<(String, String, u64)>,
     /// Its open `done` report
@@ -238,7 +243,14 @@ pub struct Facts {
     /// The hosted Supervisor session, when the caller knows it. The store
     /// alone does not: who is the Supervisor is the runner's word
     pub root: Option<String>,
+    /// When the facts were taken (0: unknown, nothing counts as old)
+    pub now: u64,
 }
+
+/// A published entry not touched for this long may be out of date; the
+/// panel marks it so (`STALE_AFTER_MS` in `utils/cockpit.ts`), and the harness
+/// merges none of its facts into it (MCR-118).
+pub const STALE_AFTER_MS: u64 = 6 * 3_600_000;
 
 /// A published entry whose text the harness knows to be behind (MCR-103): it
 /// says the operator is awaited in a session, and the operator has typed
@@ -1249,20 +1261,72 @@ impl Cockpit {
             }
         }
         // What needs the operator by the harness's own knowledge, whoever published what
+        // (MCR-118): a prompt, the operator's unsent line, an open needs_human report and a
+        // human wait past its time. All of a session's facts go into a published action that
+        // points the operator at that session, when the action still stands and its publisher
+        // stands for the session (the session itself, one above it, the Supervisor: as `stands`
+        // for reports, so no session can hide another tree's row); otherwise each is a row of its own
         for (id, fact) in facts.sessions.iter().filter(|(id, f)| !f.ended && below(id)) {
+            let who = if fact.name.is_empty() { "A session" } else { fact.name.as_str() };
+            let mut live = serde_json::Map::new();
+            let mut rows = Vec::new();
             if let Some(since) = fact.prompt {
-                named.insert(id.as_str());
-                actions.push(json!({
+                live.insert("prompt".into(), json!(since));
+                rows.push(json!({
                     "id": format!("prompt:{id}"), "kind": "answer_prompt", "derived": "prompt", "where": { "session": id }, "since": since,
-                    "title": format!("{} asks for your answer in its terminal", if fact.name.is_empty() { "A session" } else { &fact.name }),
+                    "title": format!("{who} asks for your answer in its terminal"),
+                }));
+            }
+            // Not the Supervisor's own: its input box is right under the panel, and the owner types there all day
+            if let Some(since) = fact.held.filter(|_| facts.root.as_deref() != Some(id.as_str())) {
+                live.insert("held".into(), json!(since));
+                rows.push(json!({
+                    "id": format!("held:{id}"), "kind": "held_line", "derived": "held", "where": { "session": id }, "since": since,
+                    "title": format!("Your unsent line in {who}: press Enter there to send it, Ctrl+C to clear it"),
+                    "detail": "Messages and tasks for it wait until the line is sent or cleared.",
                 }));
             }
             if let Some((report, said, since)) = fact.needs_human.as_ref().filter(|(report, ..)| !cited.contains(report.as_str())) {
-                named.insert(id.as_str());
-                actions.push(json!({
+                live.insert("report".into(), json!({ "id": report, "since": since, "text": said }));
+                rows.push(json!({
                     "id": format!("report:{report}"), "kind": "report", "derived": "report", "where": { "session": id }, "since": since, "source": [report],
-                    "title": format!("{} needs you", if fact.name.is_empty() { "A session" } else { &fact.name }), "detail": said,
+                    "title": format!("{who} needs you"), "detail": said,
                 }));
+            }
+            let late: Vec<&FactWait> = fact.waits.iter().filter(|w| w.overdue && w.kind == "human").collect();
+            if !late.is_empty() {
+                live.insert("waits".into(), json!(late.iter().map(|w| json!({ "id": w.id, "on": w.on, "ref": w.reference, "since": w.since })).collect::<Vec<_>>()));
+                rows.extend(late.iter().map(|w| json!({
+                    "id": format!("wait:{}", w.id), "kind": "human_wait", "derived": "wait", "where": { "session": id }, "since": w.since,
+                    "title": format!("{who} waits for you, past the time it expected"), "detail": w.on,
+                })));
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            named.insert(id.as_str());
+            // Not into an action that may be out of date, or whose publisher ended:
+            // today's prompt would read under an old title
+            let fresh = |a: &Value| facts.now == 0 || a["updated"].as_u64().is_some_and(|at| facts.now.saturating_sub(at) <= STALE_AFTER_MS);
+            let publisher_runs = |key: &str| key == ROOT || facts.sessions.get(key).is_some_and(|f| !f.ended);
+            let standing_for = |a: &Value| {
+                a.get("derived").is_none()
+                    && a.get("ownerTyped").is_none()
+                    && a.get("sessionEnded").is_none()
+                    && fresh(a)
+                    && a["where"]["session"] == id.as_str()
+                    && a["by"].as_str().is_some_and(|key| publisher_runs(key) && (key == ROOT || key == id || fact.above.iter().any(|s| s == key)))
+            };
+            match actions.iter_mut().find(|a| standing_for(a)) {
+                Some(host) => {
+                    if !host["live"].is_object() {
+                        host["live"] = json!({});
+                    }
+                    if let Some(merged) = host["live"].as_object_mut() {
+                        merged.extend(live);
+                    }
+                }
+                None => actions.extend(rows),
             }
         }
         tracks.sort_by_key(|(place, _)| *place);
@@ -1852,12 +1916,16 @@ mod tests {
         f.sessions.get_mut("ex").unwrap().waits = vec![FactWait { id: "w1".into(), kind: "pipeline".into(), on: "CI run".into(), reference: "run 7".into(), since: NOW + 2, overdue: true }];
         f.sessions.get_mut("ex").unwrap().done = Some("r0".into());
         f.sessions.get_mut("peer").unwrap().needs_human = Some(("r1".into(), "Which key?".into(), NOW + 3));
+        f.sessions.get_mut("sh").unwrap().prompt = Some(NOW + 4);
         let read = c.read(&f, None);
         let actions = read["actions"].as_array().unwrap();
         // A prompt is an action in the harness's own words: the prompt's text is not copied
         let prompt = actions.iter().find(|a| a["kind"] == "answer_prompt").unwrap();
-        assert_eq!((&prompt["where"]["session"], &prompt["derived"], &prompt["since"]), (&json!("ex"), &json!("prompt"), &json!(NOW + 1)));
-        assert_eq!(prompt["title"], "Worker asks for your answer in its terminal");
+        assert_eq!((&prompt["where"]["session"], &prompt["derived"], &prompt["since"]), (&json!("sh"), &json!("prompt"), &json!(NOW + 4)));
+        assert_eq!(prompt["title"], "Shell asks for your answer in its terminal");
+        // The worker's prompt went into the action that points the operator at it: one row, not two (MCR-118)
+        assert_eq!(actions.iter().filter(|a| a["where"]["session"] == "ex").count(), 1);
+        assert_eq!(actions[0]["live"]["prompt"], NOW + 1);
         // An open needs_human report is an action, also of a session on no track
         let report = actions.iter().find(|a| a["kind"] == "report").unwrap();
         assert_eq!((&report["where"]["session"], &report["detail"], &report["source"][0]), (&json!("peer"), &json!("Which key?"), &json!("r1")));
@@ -1884,10 +1952,12 @@ mod tests {
         assert_eq!(read["actions"][0]["live"]["reportOpen"], true);
         f.sessions.get_mut("sup").unwrap().needs_human = None;
         assert_eq!(c.read(&f, None)["actions"][0]["live"]["reportOpen"], false);
-        // A derived entry that comes back in a publish is dropped, not stored as the agent's
+        // A derived entry, and what was merged into a published one, that come back in a publish are dropped, not stored as the agent's
         let read = c.read(&f, None);
+        assert!(read["actions"][0]["live"]["prompt"].is_u64());
         c.publish(&SUP, &f, &json!({ "tracks": read["tracks"], "actions": read["actions"] }), NOW).unwrap();
         assert_eq!(c.parts["sup"].actions.len(), 1);
+        assert!(!serde_json::to_string(&c).unwrap().contains("\"live\""));
         assert!(c.parts["sup"].tracks[0].items[0].waits_on.is_none());
     }
 
@@ -1904,7 +1974,10 @@ mod tests {
         c.patch(&SUP, &f, &json!({ "track": t }), NOW).unwrap();
         let mine = c.read(&f, Some("sup"));
         assert_eq!(mine["tracks"].as_array().unwrap().len(), 1);
-        assert_eq!(mine["actions"].as_array().unwrap().iter().filter(|a| a["derived"] == "prompt").map(|a| a["where"]["session"].as_str().unwrap()).collect::<Vec<_>>(), ["ex"]);
+        // Its executor's prompt, merged into its own action for that executor; the peer's is not its to see
+        assert!(mine["actions"].as_array().unwrap().iter().all(|a| a["derived"] != "prompt"));
+        assert_eq!(mine["actions"][0]["live"]["prompt"], NOW);
+        assert!(!mine.to_string().contains("\"peer\",\"since\""));
         // A peer it names: its name and state, not what it waits for
         assert_eq!(mine["sessions"]["peer"]["state"], "working");
         assert!(mine["sessions"]["peer"].get("waits").is_none() && mine["sessions"]["peer"].get("needsOperator").is_none());
@@ -2019,9 +2092,12 @@ mod tests {
     fn only_the_reporter_or_a_session_above_it_stands_for_its_report() {
         let mut c = published();
         let mut f = facts();
+        // The supervisor's action points the operator at itself, not at the reporter
+        c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "where": { "session": "sup" } } }), NOW).unwrap();
         f.reports.insert("r1".into(), "ex".into());
         f.sessions.get_mut("ex").unwrap().needs_human = Some(("r1".into(), "Which key?".into(), NOW));
         let derived = |c: &Cockpit, f: &Facts| c.read(f, None)["actions"].as_array().unwrap().iter().filter(|a| a["kind"] == "report").count();
+        let a1 = |c: &Cockpit, f: &Facts| c.read(f, None)["actions"].as_array().unwrap().iter().find(|a| a["id"] == "a1").unwrap().clone();
         // A session of another tree names the report: the service's own entry stays
         c.publish(&Who { id: "peer", root: false }, &f, &json!({ "tracks": [{ "id": "p", "title": "Mine", "state": "moving" }], "actions": [{ "id": "quiet", "track": "p", "title": "Nothing to see", "kind": "decision", "options": ["a", "b"], "risk": "reversible", "source": ["r1"] }] }), NOW).unwrap();
         assert_eq!(derived(&c, &f), 1);
@@ -2030,11 +2106,107 @@ mod tests {
         // Its supervisor does stand for it; so does the reporter itself, and the Supervisor
         c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "source": ["r1"] } }), NOW).unwrap();
         assert_eq!(derived(&c, &f), 0);
-        assert_eq!(c.read(&f, None)["actions"].as_array().unwrap().iter().find(|a| a["id"] == "a1").unwrap()["live"]["reportOpen"], true);
+        assert_eq!(a1(&c, &f)["live"]["reportOpen"], true);
         c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "source": [] } }), NOW).unwrap();
+        assert_eq!(derived(&c, &f), 1);
+        // Without naming it, an action that points the operator at the reporter takes the report in (MCR-118)
+        c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "where": { "session": "ex" } } }), NOW).unwrap();
+        assert_eq!(derived(&c, &f), 0);
+        assert_eq!((&a1(&c, &f)["live"]["report"]["id"], &a1(&c, &f)["live"]["report"]["text"]), (&json!("r1"), &json!("Which key?")));
+        c.patch(&SUP, &f, &json!({ "action": { "id": "a1", "where": { "session": "sup" } } }), NOW).unwrap();
         assert_eq!(derived(&c, &f), 1);
         c.publish(&ROOT_WHO, &f, &json!({ "actions": [{ "id": "x", "title": "Answer", "kind": "decision", "options": ["a", "b"], "risk": "reversible", "source": ["r1"] }] }), NOW).unwrap();
         assert_eq!(derived(&c, &f), 0);
+    }
+
+    #[test]
+    fn needs_you_holds_what_the_harness_knows_without_anyone_publishing() {
+        // Nothing published at all (MCR-118)
+        let c = Cockpit::default();
+        let mut f = facts();
+        f.root = Some("root".into());
+        let rows = |c: &Cockpit, f: &Facts| c.read(f, None)["actions"].as_array().unwrap().iter().map(|a| (a["kind"].as_str().unwrap().to_string(), a["where"]["session"].as_str().unwrap().to_string())).collect::<Vec<_>>();
+        assert!(rows(&c, &f).is_empty());
+        // A prompt: a row at the next read
+        f.sessions.get_mut("ex").unwrap().prompt = Some(NOW);
+        assert_eq!(rows(&c, &f), [("answer_prompt".to_string(), "ex".to_string())]);
+        // The operator's unsent line, with since when; the line's text is never known here
+        f.sessions.get_mut("peer").unwrap().held = Some(NOW - 90_000);
+        let read = c.read(&f, None);
+        let held = read["actions"].as_array().unwrap().iter().find(|a| a["kind"] == "held_line").unwrap();
+        assert_eq!((&held["derived"], &held["since"], &held["where"]["session"]), (&json!("held"), &json!(NOW - 90_000), &json!("peer")));
+        assert!(held["title"].as_str().unwrap().contains("press Enter there to send it, Ctrl+C to clear it"));
+        // Not the Supervisor's own line: its box is under the panel
+        f.sessions.get_mut("root").unwrap().held = Some(NOW - 90_000);
+        assert!(!rows(&c, &f).iter().any(|(_, s)| s == "root"));
+        // A human wait past its time; not one in time, and not a wait on CI
+        f.sessions.get_mut("sh").unwrap().waits = vec![
+            FactWait { id: "w1".into(), kind: "human".into(), on: "a go for the fault run".into(), reference: String::new(), since: NOW - 5, overdue: true },
+            FactWait { id: "w2".into(), kind: "human".into(), on: "later".into(), reference: String::new(), since: NOW, overdue: false },
+            FactWait { id: "w3".into(), kind: "pipeline".into(), on: "CI".into(), reference: String::new(), since: NOW, overdue: true },
+        ];
+        let read = c.read(&f, None);
+        let waits: Vec<&Value> = read["actions"].as_array().unwrap().iter().filter(|a| a["kind"] == "human_wait").collect();
+        assert_eq!(waits.len(), 1);
+        assert_eq!((&waits[0]["id"], &waits[0]["detail"], &waits[0]["derived"]), (&json!("wait:w1"), &json!("a go for the fault run"), &json!("wait")));
+        // Each state that clears takes its row with it
+        f.sessions.get_mut("ex").unwrap().prompt = None;
+        f.sessions.get_mut("peer").unwrap().held = None;
+        f.sessions.get_mut("sh").unwrap().waits.clear();
+        assert!(rows(&c, &f).is_empty());
+        // An ended session asks nothing any more
+        f.sessions.get_mut("gone").unwrap().prompt = Some(NOW);
+        assert!(rows(&c, &f).is_empty());
+    }
+
+    #[test]
+    fn a_fact_goes_into_a_published_action_for_its_session_only_when_that_one_stands_for_it() {
+        let mut c = published();
+        let mut f = facts();
+        f.sessions.get_mut("ex").unwrap().prompt = Some(NOW + 1);
+        f.sessions.get_mut("ex").unwrap().held = Some(NOW + 2);
+        f.sessions.get_mut("ex").unwrap().waits = vec![FactWait { id: "w1".into(), kind: "human".into(), on: "a go".into(), reference: String::new(), since: NOW, overdue: true }];
+        // The supervisor's action points the operator at its executor: one row with the facts on it
+        let read = c.read(&f, None);
+        let actions = read["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!((&actions[0]["id"], &actions[0]["live"]["prompt"], &actions[0]["live"]["held"], &actions[0]["live"]["waits"][0]["on"]), (&json!("a1"), &json!(NOW + 1), &json!(NOW + 2), &json!("a go")));
+        // An action the owner already typed for is behind: the facts are rows of their own again
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 5);
+        let read = c.read(&f, None);
+        assert!(read["actions"].as_array().unwrap().iter().find(|a| a["id"] == "a1").unwrap().get("live").is_none());
+        assert_eq!(read["actions"].as_array().unwrap().iter().filter(|a| a.get("derived").is_some()).count(), 3);
+        f.sessions.get_mut("ex").unwrap().typed = None;
+        // A session of another tree points at the executor: its action takes nothing in
+        c = Cockpit::default();
+        let mut peer_facts = f.clone();
+        // (bound to `peer` when it published, since then to `sup`)
+        peer_facts.sessions.get_mut("ex").unwrap().above = vec!["peer".into()];
+        c.publish(&Who { id: "peer", root: false }, &peer_facts, &json!({ "tracks": [{ "id": "p", "title": "Mine", "state": "moving" }], "actions": [{ "id": "p1", "track": "p", "title": "Say go", "kind": "typed_word", "where": { "session": "ex" }, "say": "go", "risk": "reversible" }] }), NOW).unwrap();
+        let read = c.read(&f, None);
+        let actions = read["actions"].as_array().unwrap();
+        assert!(actions[0].get("live").is_none());
+        assert_eq!(actions.iter().filter(|a| a.get("derived").is_some()).count(), 3);
+        // Not into an action that may be out of date, nor one whose publisher ended: today's
+        // prompt would read under an old title (review of MCR-118)
+        let c = published();
+        let mut f = facts();
+        f.sessions.get_mut("ex").unwrap().prompt = Some(NOW + STALE_AFTER_MS + 2);
+        f.now = NOW + STALE_AFTER_MS;
+        assert_eq!(c.read(&f, None)["actions"][0]["live"]["prompt"], NOW + STALE_AFTER_MS + 2, "still fresh");
+        f.now = NOW + STALE_AFTER_MS + 1;
+        let read = c.read(&f, None);
+        assert!(read["actions"][0].get("live").is_none());
+        assert!(read["actions"].as_array().unwrap().iter().any(|a| a["derived"] == "prompt" && a["where"]["session"] == "ex"));
+        f.now = NOW;
+        f.sessions.get_mut("sup").unwrap().ended = true;
+        let read = c.read(&f, None);
+        assert!(read["actions"][0].get("live").is_none());
+        assert!(read["actions"].as_array().unwrap().iter().any(|a| a["derived"] == "prompt" && a["where"]["session"] == "ex"));
+        // None of the new kinds can be published
+        for kind in ["held_line", "human_wait"] {
+            assert!(with_action(action(kind, json!({ "where": { "session": "ex" } }))).unwrap_err().contains("cannot be published"), "{kind}");
+        }
     }
 
     #[test]

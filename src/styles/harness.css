@@ -550,6 +550,8 @@
 .ck-empty { margin: 8px 0; color: var(--sc-muted); }
 .ck-action { padding: 5px 8px; margin-bottom: 4px; border: 1px solid var(--line); border-left: 3px solid var(--sc-accent); border-radius: 6px; background: var(--sc-bg); }
 .ck-action.derived { border-left-color: var(--danger); }
+/* A published row that carries what the harness knows of its session (MCR-118): marked as the harness's rows are */
+.ck-action.merged { border-left-color: var(--danger); }
 .ck-action-head, .ck-track-line { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
 .ck-action p { margin: 3px 0 0; overflow-wrap: anywhere; }
 .ck-action strong, .ck-track-line strong { font-weight: 600; }
@@ -561,6 +563,8 @@
 .ck-live { padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; font-size: 10.5px; color: var(--sc-muted); white-space: nowrap; }
 .ck-live::before { content: ''; display: inline-block; width: 5px; height: 5px; margin-right: 4px; border-radius: 50%; background: currentColor; vertical-align: middle; }
 .ck-live.late { color: var(--danger); border-color: var(--danger-line); }
+/* A fact the harness merged into a row, or how long a line stood: may be long, so it wraps */
+.ck-live.harness { color: var(--sc-text); border-color: var(--danger-line); white-space: normal; }
 .ck-fact { font-style: italic; }
 .ck-say span { color: var(--sc-muted); }
 .ck-say code { padding: 1px 5px; border-radius: 4px; background: var(--layer-1); font-size: 11.5px; user-select: text; }
