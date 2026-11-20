@@ -322,14 +322,14 @@ describe('programHint (MCR-115)', () => {
       { id: 'deploy', state: 'blocked', kind: 'permission', msg: 'Approve deploy?', at: now },
     ] } });
     const hint = programHint(h)!;
-    expect(hint.lead).toBe('cargo');
+    expect(hint.lead).toBe('program cargo');
     expect(hint.text).toBe('working 40% · cargo build · +2 more');
     expect(hint.progress).toBe(40);
     // The tooltip says where it comes from and that nothing checked it, then every record, newest first
     expect(hint.full).toContain('Not checked: any output can print this');
     expect(hint.full.split('\n').slice(-3).map(l => l.split(':')[0])).toEqual(['deploy', '(root)', 'lint']);
     const noRoot = programHint(hosted({ program: { records: [{ id: 'a', state: 'done', at: now - 9 }, { id: 'b', state: 'error', msg: 'tests failed', app: 'npm', at: now }] } }))!;
-    expect([noRoot.lead, noRoot.text, noRoot.progress]).toEqual(['npm', 'error · tests failed · +1 more', undefined]);
+    expect([noRoot.lead, noRoot.text, noRoot.progress]).toEqual(['program npm', 'error · tests failed · +1 more', undefined]);
   });
 
   it('ranks below the hooks: a forged report never changes the state, and says that the hooks differ', () => {

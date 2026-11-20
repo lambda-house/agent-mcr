@@ -531,9 +531,14 @@ impl Runner {
                 }
             }
         }
-        let mut out = lock(&session.output);
-        out.closed = true;
-        out.views.clear();
+        {
+            let mut out = lock(&session.output);
+            out.closed = true;
+            out.views.clear();
+        }
+        // The terminal closed: a working record read from the last chunk after the
+        // exit was seen goes too (the wait thread and this one race)
+        lock(&session.info).program.exited();
     }
 
     #[cfg(unix)]
@@ -1420,7 +1425,8 @@ mod tests {
         let mut control = Client::connect(&socket).unwrap();
         let (mut events, _keep) = open_stream(&socket, json!({"op": "watch"})).unwrap();
         // "cargo build" as title, base64; a query; then the program waits for a line and exits
-        let script = "printf '\\033]7501;state=working:progress=40:app=cargo:title=Y2FyZ28gYnVpbGQ\\033\\\\'; printf '\\033]7501;state=done:id=lint\\007'; printf '\\033]7501;?\\033\\\\'; read line; exit 0";
+        // The query three times in a row: passed on once
+        let script = "printf '\\033]7501;state=working:progress=40:app=cargo:title=Y2FyZ28gYnVpbGQ\\033\\\\'; printf '\\033]7501;state=done:id=lint\\007'; printf '\\033]7501;?\\033\\\\\\033]7501;?\\007\\033]7501;?\\033\\\\'; read line; exit 0";
         control.call(json!({"op": "spawn", "id": "p1", "argv": ["/bin/sh", "-c", script], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = String::new();
@@ -1439,6 +1445,13 @@ mod tests {
         input.write_all(b"\n").unwrap();
         let _ = read_until(&mut out, "");
         // At the exit the working record goes and the done one stays
+        while !seen.contains("\"exited\"") {
+            assert!(Instant::now() < deadline, "events: {seen}");
+            let mut line = String::new();
+            events.read_line(&mut line).unwrap();
+            seen.push_str(&line);
+        }
+        assert_eq!(seen.matches("\"program_query\"").count(), 1, "one query a second is passed on: {seen}");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let list = control.call(json!({"op": "list"})).unwrap();

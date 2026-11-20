@@ -25,7 +25,7 @@ it('shows what the program reports as its word under the hooks\' state, never as
   // One state dot, and it is the hooks'
   expect([...host.querySelectorAll('.hs-dot')].map(d => d.className)).toEqual(['hs-dot working']);
   const line = host.querySelector('.hs-program')!;
-  expect(line.textContent).toBe('terraformreportsblocked (permission) 60% · Apply 3 to add?');
+  expect(line.textContent).toBe('program terraformreportsblocked (permission) 60% · Apply 3 to add?');
   expect(line.getAttribute('title')).toContain('Not checked: any output can print this');
   expect(line.getAttribute('title')).toContain("The agent's hooks say working, and the hooks rank first.");
   // The hooks say otherwise: struck, not hidden
@@ -44,4 +44,12 @@ it('draws nothing for a program that said nothing, and a short form for the pane
   const compact = host.querySelector('span.hs-program.compact')!;
   expect(compact.textContent).toBe('programreportsprogress 30%');
   expect(compact.classList.contains('disagrees')).toBe(false);
+});
+
+it('labels a program that names itself as one of ours as a program, in plain weight (MCR-115 review)', async () => {
+  await act(async () => root.render(<HostedRow hosted={hosted({ program: { records: [{ state: 'done', app: 'Supervisor', at: now }] } })} label="build"/>));
+  const lead = host.querySelector('.hs-program-lead')!;
+  expect(lead.textContent).toBe('program Supervisor');
+  // Only the session's own name is in the row's bold title
+  expect(host.querySelector('strong')!.textContent).not.toContain('Supervisor');
 });

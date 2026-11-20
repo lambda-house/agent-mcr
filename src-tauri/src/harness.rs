@@ -4243,12 +4243,20 @@ impl Harness {
     /// A program in a session asked whether the terminal reads OSC 7501
     /// (MCR-115). The answer is the fixed `QUERY_REPLY`, which holds nothing
     /// from any report. It is written only while the operator turned it on,
-    /// never into an unsent line of theirs, and under the writer's lock, so
-    /// it never lands between a task's text and its Enter. It is not a key:
-    /// it goes past `operator_input` and says nothing of the owner.
+    /// never into an unsent line of theirs and never into an agent's input
+    /// box, and under the writer's lock, so it never lands between a task's
+    /// text and its Enter. It is not a key: it goes past `operator_input` and
+    /// says nothing of the owner. This runs on the thread that reads the
+    /// runner's events: while someone writes, it is not answered rather than
+    /// holding up every other event (a program that asked gets no answer, as
+    /// with the setting off).
     fn answer_program_query(&self, id: &str) {
         let writer = self.writer(id);
-        let _typing = lock(&writer);
+        let _typing = match writer.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
         if !answers_program_query(&lock(&self.store), id, now_ms()) {
             return;
         }
@@ -5028,10 +5036,13 @@ fn reads_screen(untracked: bool, unsure: bool, sees_prompt: bool) -> bool {
 /// into the operator's line and submitted with it. There is no time limit on
 /// a draft: typing into the line after all is what this is here to prevent.
 /// Whether a program's status query in session `id` is answered: only
-/// while the operator turned it on, in a running session, and not while
-/// the operator has an unsent line there (MCR-115).
+/// while the operator turned it on, in a running session that is no agent,
+/// and not while the operator has an unsent line there (MCR-115). In an
+/// agent's terminal the program is the agent's own screen, which never asks:
+/// a query there is output it drew, and an answer would land in its input
+/// box as a line nobody knows of, sent with the next task's Enter (MCR-85).
 fn answers_program_query(s: &Store, id: &str, now: u64) -> bool {
-    s.program_query && s.sessions.get(id).is_some_and(|t| t.state != ENDED && !held(t, now))
+    s.program_query && s.sessions.get(id).is_some_and(|t| t.state != ENDED && !adapter(&t.profile).is_agent() && !held(t, now))
 }
 
 fn held(tracked: &Tracked, now: u64) -> bool {
@@ -7331,9 +7342,12 @@ mod tests {
         let harness = Harness::open(&dir);
         *lock(&harness.typed) = Some(Vec::new());
         harness.update(|s| {
-            s.sessions.insert("busy".into(), Tracked { profile: "claude".into(), state: "working".into(), hooked: true, precise: true, ..Tracked::default() });
-            s.sessions.insert("typing".into(), Tracked { profile: "claude".into(), state: "idle".into(), draft: true, ..Tracked::default() });
+            s.sessions.insert("busy".into(), Tracked { profile: "shell".into(), state: "unknown".into(), ..Tracked::default() });
+            s.sessions.insert("typing".into(), Tracked { profile: "shell".into(), state: "unknown".into(), draft: true, ..Tracked::default() });
             s.sessions.insert("gone".into(), Tracked { profile: "shell".into(), state: ENDED.into(), ..Tracked::default() });
+            for (id, profile) in [("claude", "claude"), ("codex", "codex")] {
+                s.sessions.insert(id.into(), Tracked { profile: profile.into(), state: "idle".into(), hooked: true, precise: true, ..Tracked::default() });
+            }
         });
         let typed = |h: &Harness| lock(&h.typed).as_ref().unwrap().clone();
         let query = |h: &Harness, id: &str| h.runner_event(&json!({"event": "program_query", "id": id}));
@@ -7345,18 +7359,27 @@ mod tests {
         harness.control(&json!({"op": "settings", "programQuery": true})).unwrap();
         query(&harness, "busy");
         assert_eq!(typed(&harness), [("busy".to_string(), crate::program::QUERY_REPLY.to_string())]);
-        // Never into the operator's unsent line, never into an ended session or one the service does not know
-        for id in ["typing", "gone", "nobody"] {
+        // Never into the operator's unsent line, never into an ended session or one the service does not know,
+        // never into an agent's input box: there a query is only output its screen drew
+        for id in ["typing", "gone", "nobody", "claude", "codex"] {
             query(&harness, id);
         }
         assert_eq!(typed(&harness).len(), 1);
         // The answer is not the owner's key: no Enter time, no draft, no state change
         let busy = lock(&harness.store).sessions["busy"].clone();
-        assert_eq!((busy.operator_sent, busy.draft, busy.state.as_str(), busy.attention.is_none()), (0, false, "working", true));
+        assert_eq!((busy.operator_sent, busy.draft, busy.state.as_str(), busy.attention.is_none()), (0, false, "unknown", true));
+        // While someone writes to the session, the query is not answered: the thread that reads the runner's events never waits
+        let writer = harness.writer("busy");
+        let busy_writing = lock(&writer);
+        query(&harness, "busy");
+        drop(busy_writing);
+        assert_eq!(typed(&harness).len(), 1);
+        query(&harness, "busy");
+        assert_eq!(typed(&harness).len(), 2);
         // And off again
         harness.control(&json!({"op": "settings", "programQuery": false})).unwrap();
         query(&harness, "busy");
-        assert_eq!(typed(&harness).len(), 1);
+        assert_eq!(typed(&harness).len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

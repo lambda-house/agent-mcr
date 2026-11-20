@@ -804,7 +804,7 @@ export function heldNote(h: Hosted): string {
 
 /** A program's word about itself, as the Live row shows it (MCR-115). */
 export interface ProgramHint {
-  /** Who says it: the program's `app`, else "program" */
+  /** Who says it: "program" with the program's own `app` name, which is its claim (a forged `app=Supervisor` must read as a program's word), or "shell" for an OSC 133 mark */
   lead: string;
   text: string;
   /** The tooltip: where it comes from, that it is unchecked, every record */
@@ -841,7 +841,7 @@ export function programHint(h: Hosted): ProgramHint | null {
     const lines = records.slice().reverse().map(r => `${r.id || '(root)'}: ${recordWords(r)} · ${formatAgo(r.at)}`);
     const disagrees = fromHooks && disagreement(main.state, hostedState(h));
     return {
-      lead: main.app || records.find(r => r.app)?.app || 'program',
+      lead: ['program', main.app || records.find(r => r.app)?.app].filter(Boolean).join(' '),
       text: `${recordWords(main)}${more > 0 ? ` · +${more} more` : ''}`,
       full: [PROGRAM_SOURCE, hooks, ...lines].filter(Boolean).join('\n'),
       progress: main.state === 'working' || main.state === 'blocked' ? main.progress : undefined,

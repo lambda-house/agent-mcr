@@ -399,7 +399,8 @@
    state. No dot and no state colour; the program's name, "reports", then what
    it said, in italics like any text the harness did not check */
 .hs-item-text small.hs-program { display: flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; font-style: italic; }
-.hs-program-lead { font-style: normal; font-weight: 600; color: color-mix(in srgb, var(--sc-text) 65%, var(--sc-muted)); flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
+/* Plain, not bold: the bold name in a row is a session's, and a program names itself (app=Supervisor) */
+.hs-program-lead { font-style: normal; font-weight: 400; color: var(--sc-muted); flex: 0 0 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
 .hs-program-says { flex: 0 0 auto; color: var(--sc-muted); }
 .hs-program-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .hs-program-bar { flex: 0 0 auto; display: inline-block; width: 36px; height: 4px; border-radius: 2px; background: var(--sc-border); overflow: hidden; }
