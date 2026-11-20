@@ -8360,6 +8360,9 @@ mod tests {
         let dir = socket_test_dir("mcr-ended-");
         std::fs::create_dir_all(&dir).unwrap();
         let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        // A folder that is there and one that is not, on every system (no "/tmp" on Windows)
+        let there = dir.to_string_lossy().into_owned();
+        let removed = dir.join("removed-worktree-of-this-test").to_string_lossy().into_owned();
         let server = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
@@ -8370,11 +8373,11 @@ mod tests {
                     "stop-test" => break,
                     "hello" => json!({"protocol": runner::PROTOCOL}),
                     "list" => json!({"sessions": [
-                        {"id": "up", "cwd": "/tmp", "meta": {"profile": "claude"}},
-                        {"id": "live", "cwd": "/tmp", "meta": {"profile": "claude"}},
-                        {"id": "gone", "cwd": "/tmp", "exit": {"code": 0}, "meta": {"profile": "codex"}},
-                        {"id": "worktree", "cwd": "/tmp/mcr-removed-worktree-of-this-test", "exit": {"code": 0}, "meta": {"profile": "claude"}},
-                        {"id": "running-in-gone", "cwd": "/tmp/mcr-removed-worktree-of-this-test", "meta": {"profile": "claude"}}
+                        {"id": "up", "cwd": there, "meta": {"profile": "claude"}},
+                        {"id": "live", "cwd": there, "meta": {"profile": "claude"}},
+                        {"id": "gone", "cwd": there, "exit": {"code": 0}, "meta": {"profile": "codex"}},
+                        {"id": "worktree", "cwd": removed, "exit": {"code": 0}, "meta": {"profile": "claude"}},
+                        {"id": "running-in-gone", "cwd": removed, "meta": {"profile": "claude"}}
                     ]}),
                     // Nothing is typed anywhere in this test
                     _ => json!({"error": "not in this test"}),
