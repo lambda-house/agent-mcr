@@ -511,6 +511,44 @@ export function sessionLinks(text: string, known: (id: string) => boolean): { st
   return found;
 }
 
+/** One terminal cell as xterm has it: its characters, and how many columns it takes (0: the second half of a wide character). */
+export interface TerminalCell { chars: string; width: number }
+
+/** Where a session pointer stands on screen: per row of the line it is on, the first column and how many columns it covers. */
+export interface PointerSpan {
+  id: string; text: string;
+  /** Rows counted from the line's first row; columns from 0 */
+  cells: { row: number; x: number; width: number }[];
+}
+
+/**
+ * The session pointers in one line of terminal output, which may run over
+ * several rows when the terminal wrapped it (MCR-106: a pointer cut by the
+ * wrap is still one pointer). `rows` are the line's rows in order, each as
+ * its cells. An empty cell counts as a space.
+ */
+export function pointerSpans(rows: TerminalCell[][], known: (id: string) => boolean): PointerSpan[] {
+  let text = '';
+  // Where each character of `text` stands
+  const at: { row: number; x: number; width: number }[] = [];
+  rows.forEach((cells, row) => cells.forEach((cell, x) => {
+    if (cell.width === 0) return;
+    const chars = cell.chars || ' ';
+    for (let i = 0; i < chars.length; i++) at.push({ row, x, width: cell.width });
+    text += chars;
+  }));
+  return sessionLinks(text, known).map(link => {
+    const cells: PointerSpan['cells'] = [];
+    for (const c of at.slice(link.start, link.end)) {
+      const last = cells[cells.length - 1];
+      if (last && last.row === c.row) {
+        if (c.x >= last.x + last.width) last.width = c.x + c.width - last.x;
+      } else cells.push({ row: c.row, x: c.x, width: c.width });
+    }
+    return { id: link.id, text: text.slice(link.start, link.end), cells };
+  });
+}
+
 /** The drag type of a session row; its text/plain data is the session's reference. */
 export const SESSION_DRAG_TYPE = 'application/x-mcr-session';
 

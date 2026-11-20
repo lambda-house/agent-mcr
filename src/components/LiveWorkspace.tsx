@@ -230,7 +230,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // A click on `mcr:<id>` in a terminal: that session is selected like its row, and its terminal takes the keyboard.
   // The request is dropped once its pane served it, or a pane mounted again later would take the keyboard with no click
   const [linked, setLinked] = useState<{ id: string; at: number } | null>(null);
-  const isSession = (id: string) => hosted.some(h => h.id === id && !h.exit);
+  // The same function while the same sessions run: a terminal looks at its links again when it changes (MCR-106)
+  const liveIds = hosted.filter(h => !h.exit).map(h => h.id).join(' ');
+  const isSession = useCallback((id: string) => liveIds.split(' ').includes(id), [liveIds]);
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
   useEffect(() => {

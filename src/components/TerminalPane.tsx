@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { Terminal } from '@xterm/xterm';
+import { Terminal, type IDecoration, type IMarker } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
-import { harnessApi, pastedImage, SESSION_DRAG_TYPE, sessionLinks, shellQuote } from '../utils/harness';
+import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
 import { isPaletteKey, PLATFORM } from '../utils/platform';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
@@ -55,6 +55,8 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
   quit.current = onQuit;
   const sessions = useRef({ isSession, onSession, onFocused });
   sessions.current = { isSession, onSession, onFocused };
+  // Looks at the pointers on screen again (MCR-106)
+  const pointers = useRef<() => void>(() => {});
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
@@ -82,30 +84,99 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P
     t.attachCustomKeyEventHandler(e => !isPaletteKey(e, PLATFORM));
     term.current = t; fit.current = f;
-    // A session pointer in the output is a link to that session (MCR-82)
+    // A session pointer in the output is a link to that session (MCR-82).
+    // A line the terminal wrapped is read whole, so a pointer cut by the wrap is one link
+    const buffer = () => t.buffer.active;
+    const cellsOf = (y: number): TerminalCell[] => {
+      const line = buffer().getLine(y);
+      const cells: TerminalCell[] = [];
+      for (let x = 0; line && x < line.length; x++) {
+        const cell = line.getCell(x);
+        cells.push({ chars: cell?.getChars() ?? '', width: cell?.getWidth() ?? 1 });
+      }
+      return cells;
+    };
+    // The rows of the line that row `y` (0-based, in the buffer) belongs to
+    const lineAt = (y: number) => {
+      let first = y;
+      while (first > 0 && buffer().getLine(first)?.isWrapped) first--;
+      let last = y;
+      while (buffer().getLine(last + 1)?.isWrapped) last++;
+      // Most lines hold no pointer: their text, asked of xterm as one string,
+      // says so without reading them cell by cell (a cell is an object each time)
+      let text = '';
+      for (let row = first; row <= last; row++) text += buffer().getLine(row)?.translateToString(false) ?? '';
+      const rows: TerminalCell[][] = [];
+      if (text.includes('mcr:')) for (let row = first; row <= last; row++) rows.push(cellsOf(row));
+      return { first, last, rows };
+    };
     const links = t.registerLinkProvider({
       provideLinks(y, done) {
-        const line = t.buffer.active.getLine(y - 1);
         const known = sessions.current.isSession;
-        if (!line || !known) return done(undefined);
-        // The column of every character: a wide one takes two cells, and the second holds nothing
-        let text = '';
-        const columns: number[] = [];
-        for (let x = 0; x < line.length; x++) {
-          const cell = line.getCell(x);
-          if (!cell || cell.getWidth() === 0) continue;
-          const chars = cell.getChars() || ' ';
-          for (let i = 0; i < chars.length; i++) columns.push(x);
-          text += chars;
-        }
-        const found = sessionLinks(text, known).map(link => ({
-          range: { start: { x: columns[link.start] + 1, y }, end: { x: columns[link.end - 1] + 1, y } },
-          text: text.slice(link.start, link.end),
-          activate: () => sessions.current.onSession?.(link.id),
-        }));
+        if (!known || !buffer().getLine(y - 1)) return done(undefined);
+        const { first, rows } = lineAt(y - 1);
+        const found = pointerSpans(rows, known)
+          .filter(p => p.cells.some(c => first + c.row === y - 1))
+          .map(p => {
+            const start = p.cells[0], end = p.cells[p.cells.length - 1];
+            return {
+              // Columns and rows are 1-based; the end is the pointer's last cell
+              range: { start: { x: start.x + 1, y: first + start.row + 1 }, end: { x: end.x + end.width, y: first + end.row + 1 } },
+              text: p.text,
+              activate: () => sessions.current.onSession?.(p.id),
+            };
+          });
         done(found.length ? found : undefined);
       },
     });
+    // xterm underlines a link only under the mouse. So that a pointer is seen
+    // to be one (MCR-106), each is underlined all the time by a decoration:
+    // an element over its cells that takes no pointer events and holds no
+    // text, so the cells, the selection, what is copied and the click are
+    // xterm's as before. The rows that are drawn are looked at again on every
+    // render, so a line rewritten in place or a session that ended loses it.
+    type Mark = { marker: IMarker; decoration: IDecoration; x: number; width: number; id: string };
+    let marks: Mark[] = [];
+    const unmark = (m: Mark) => { marks = marks.filter(other => other !== m); m.decoration.dispose(); m.marker.dispose(); };
+    const mark = (row: number, x: number, width: number, id: string) => {
+      const marker = t.registerMarker(row - (buffer().baseY + buffer().cursorY));
+      if (!marker) return;
+      const decoration = t.registerDecoration({ marker, x, width, layer: 'top' });
+      if (!decoration) { marker.dispose(); return; }
+      decoration.onRender(element => element.classList.add('hs-pointer'));
+      const m = { marker, decoration, x, width, id };
+      marks.push(m);
+      // The row left the scrollback
+      marker.onDispose(() => { if (marks.includes(m)) unmark(m); });
+    };
+    const remark = (start: number, end: number) => {
+      // xterm draws no decoration while the other screen buffer is active (a
+      // full-screen program): marks made there would not be seen. The link and
+      // its underline under the mouse work there all the same
+      if (buffer().type === 'alternate') return;
+      const known = sessions.current.isSession;
+      const looked = new Set<number>();
+      for (let row = start; row <= end; row++) {
+        const y = buffer().viewportY + row;
+        if (looked.has(y) || !buffer().getLine(y)) continue;
+        const { first, last, rows } = lineAt(y);
+        for (let r = first; r <= last; r++) looked.add(r);
+        const want = known ? pointerSpans(rows, known).flatMap(p => p.cells.map(c => ({ row: first + c.row, x: c.x, width: c.width, id: p.id }))) : [];
+        const same = (m: Mark, w: (typeof want)[number]) => m.marker.line === w.row && m.x === w.x && m.width === w.width && m.id === w.id;
+        const have = marks.filter(m => m.marker.line >= first && m.marker.line <= last);
+        have.filter(m => !want.some(w => same(m, w))).forEach(unmark);
+        want.filter(w => !have.some(m => same(m, w))).forEach(w => mark(w.row, w.x, w.width, w.id));
+      }
+    };
+    const rendered = t.onRender(({ start, end }) => remark(start, end));
+    // Marks belong to the buffer they were made in: the other one starts clean
+    const switched = t.buffer.onBufferChange(() => { [...marks].forEach(unmark); remark(0, t.rows - 1); });
+    // A new width rewraps the lines and moves their cells, also in the
+    // scrollback: every mark is dropped, the rows in view are marked again at
+    // once, and the others when they are drawn
+    const reflowed = t.onResize(() => { [...marks].forEach(unmark); remark(0, t.rows - 1); });
+    // The marks are drawn over the cells, so looking again needs no repaint
+    pointers.current = () => remark(0, t.rows - 1);
     try { f.fit(); } catch { /* not laid out yet */ }
 
     let view: number | null = null;
@@ -189,12 +260,16 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
       element.removeEventListener('paste', onPaste, true);
       element.removeEventListener('dragover', onDragOver, true);
       element.removeEventListener('drop', onDrop, true);
-      typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose();
+      typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose(); rendered.dispose(); switched.dispose(); reflowed.dispose();
+      pointers.current = () => {};
       if (view !== null) void harnessApi.detach(view);
       t.dispose();
       term.current = null; fit.current = null; resend.current = () => {};
     };
   }, [id]);
+
+  // A session that started or ended changes which pointers are links
+  useEffect(() => { pointers.current(); }, [isSession]);
 
   useEffect(() => {
     if (!active) return;
