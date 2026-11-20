@@ -5036,13 +5036,14 @@ fn reads_screen(untracked: bool, unsure: bool, sees_prompt: bool) -> bool {
 /// into the operator's line and submitted with it. There is no time limit on
 /// a draft: typing into the line after all is what this is here to prevent.
 /// Whether a program's status query in session `id` is answered: only
-/// while the operator turned it on, in a running session that is no agent,
-/// and not while the operator has an unsent line there (MCR-115). In an
-/// agent's terminal the program is the agent's own screen, which never asks:
-/// a query there is output it drew, and an answer would land in its input
-/// box as a line nobody knows of, sent with the next task's Enter (MCR-85).
+/// while the operator turned it on, in a running plain terminal of a profile
+/// this build knows (`agents::plain_terminal`), and not while the operator
+/// has an unsent line there (MCR-115). In any agent's terminal, with state
+/// tracking or without, the program is the agent's own screen, which never
+/// asks: a query there is output it drew, and an answer would land in its
+/// input box as a line nobody knows of, sent with the next Enter (MCR-85).
 fn answers_program_query(s: &Store, id: &str, now: u64) -> bool {
-    s.program_query && s.sessions.get(id).is_some_and(|t| t.state != ENDED && !adapter(&t.profile).is_agent() && !held(t, now))
+    s.program_query && s.sessions.get(id).is_some_and(|t| t.state != ENDED && crate::agents::plain_terminal(&t.profile) && !held(t, now))
 }
 
 fn held(tracked: &Tracked, now: u64) -> bool {
@@ -7345,7 +7346,7 @@ mod tests {
             s.sessions.insert("busy".into(), Tracked { profile: "shell".into(), state: "unknown".into(), ..Tracked::default() });
             s.sessions.insert("typing".into(), Tracked { profile: "shell".into(), state: "unknown".into(), draft: true, ..Tracked::default() });
             s.sessions.insert("gone".into(), Tracked { profile: "shell".into(), state: ENDED.into(), ..Tracked::default() });
-            for (id, profile) in [("claude", "claude"), ("codex", "codex")] {
+            for (id, profile) in [("claude", "claude"), ("codex", "codex"), ("antigravity", "antigravity"), ("opencode", "opencode"), ("pi", "pi"), ("unknown", "an-agent-of-a-later-build")] {
                 s.sessions.insert(id.into(), Tracked { profile: profile.into(), state: "idle".into(), hooked: true, precise: true, ..Tracked::default() });
             }
         });
@@ -7361,7 +7362,7 @@ mod tests {
         assert_eq!(typed(&harness), [("busy".to_string(), crate::program::QUERY_REPLY.to_string())]);
         // Never into the operator's unsent line, never into an ended session or one the service does not know,
         // never into an agent's input box: there a query is only output its screen drew
-        for id in ["typing", "gone", "nobody", "claude", "codex"] {
+        for id in ["typing", "gone", "nobody", "claude", "codex", "antigravity", "opencode", "pi", "unknown"] {
             query(&harness, id);
         }
         assert_eq!(typed(&harness).len(), 1);
