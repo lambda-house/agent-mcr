@@ -21,6 +21,7 @@ mod agent;
 mod ipc;
 mod peer;
 mod runner;
+mod program;
 mod agents;
 mod cockpit;
 mod harness;
@@ -1286,6 +1287,7 @@ fn main() {
             harness_commands::harness_outside_supervisors,
             harness_commands::harness_store_notice_seen,
             harness_commands::harness_codex_hooks,
+            harness_commands::harness_program_query,
             harness_commands::memory_status,
             harness_commands::memory_connect,
             harness_commands::memory_disconnect,

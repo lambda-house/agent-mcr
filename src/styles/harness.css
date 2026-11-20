@@ -395,6 +395,20 @@
 .hs-lead { margin-right: 5px; font-weight: 600; color: color-mix(in srgb, var(--sc-text) 75%, var(--sc-muted)); }
 .hs-lead:not(:only-child)::after { content: ' ·'; font-weight: 400; }
 
+/* What the program in the terminal says of itself (MCR-115): its word, not a
+   state. No dot and no state colour; the program's name, "reports", then what
+   it said, in italics like any text the harness did not check */
+.hs-item-text small.hs-program { display: flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; font-style: italic; }
+.hs-program-lead { font-style: normal; font-weight: 600; color: color-mix(in srgb, var(--sc-text) 65%, var(--sc-muted)); flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
+.hs-program-says { flex: 0 0 auto; color: var(--sc-muted); }
+.hs-program-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.hs-program-bar { flex: 0 0 auto; display: inline-block; width: 36px; height: 4px; border-radius: 2px; background: var(--sc-border); overflow: hidden; }
+.hs-program-bar > span { display: block; height: 100%; background: color-mix(in srgb, var(--sc-muted) 70%, var(--sc-text)); }
+/* The hooks say otherwise: theirs is the state; the program's word is struck through, not hidden */
+.hs-program.disagrees .hs-program-text { text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--sc-muted) 60%, transparent); }
+.hs-pane-title > .hs-program.compact { display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; max-width: 45%; font-style: italic; }
+.hs-pane-title > .hs-program.compact > .hs-program-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* Prompt cache. Warm: the next message is cheap, the row glows like an ember
    (fainter when the cache is about to expire). Cold: waking it up re-reads the
    whole context, the row is burnt to ashes. */

@@ -15,7 +15,9 @@ export interface Attention { kind: 'permission' | 'assessment' | 'notification';
 /** What the harness service knows about a session (`harness::Tracked`). */
 export interface Tracked {
   name: string; profile: string; state: 'starting' | 'working' | 'idle' | 'waiting' | 'unknown' | 'exited';
-  since: number; precise: boolean; agentSession: string | null; attention: Attention | null; lastMessage: string | null;
+  since: number; precise: boolean; agentSession: string | null;
+  /** The agent has reported through a hook: with `precise`, the state is the hooks' word */
+  hooked?: boolean; attention: Attention | null; lastMessage: string | null;
   /** When its last turn ended with `lastMessage` */
   lastMessageAt?: number;
   /** False when `name` is the title the agent gave the session, not a name someone chose */
@@ -41,11 +43,29 @@ export interface RunningShell {
   /** Since when its processor time has not moved, as the service saw it */
   quietSince?: number;
 }
+/** One OSC 7501 record a program keeps in its terminal (`program::Record`): exactly its last report with that id. */
+export interface ProgramRecord {
+  /** Absent for the root record */
+  id?: string;
+  state: 'idle' | 'working' | 'done' | 'blocked' | 'error';
+  kind?: 'permission' | 'question' | 'auth'; progress?: number; app?: string; title?: string; msg?: string; at: number;
+}
+/** What the program in a terminal said of itself (`program::Program`, MCR-115). Untrusted: any output can print it. */
+export interface ProgramStatus {
+  /** Least recently updated first */
+  records?: ProgramRecord[];
+  /** The last OSC 133 mark: A a prompt starts, B input, C a command runs, D it finished */
+  prompt?: { mark: 'A' | 'B' | 'C' | 'D'; exit?: number; at: number };
+  /** The last OSC 9;4 progress */
+  progress?: { state: 'normal' | 'error' | 'indeterminate' | 'paused'; value?: number; at: number };
+}
 /** A terminal the runner hosts (`runner::Info`), with the service's view of it. */
 export interface Hosted {
   id: string; pid: number | null; argv: string[]; cwd: string; started: number;
   cols: number; rows: number; title: string; lastOutput: number;
   exit: HostedExit | null; meta: Record<string, string>;
+  /** What the program said of itself in its output (absent from a runner older than MCR-115) */
+  program?: ProgramStatus;
   /** From the service: the session ended and its folder is no longer on disk (MCR-107) */
   cwdGone?: boolean;
   harness?: Tracked; openTasks?: number;
@@ -90,6 +110,8 @@ export interface HarnessStatus {
   codexHooks?: boolean;
   /** A Codex hook has reported under this program's path: Codex runs them, so the person trusted them. Remembered after the sessions are gone */
   codexHooksReporting?: boolean;
+  /** The service answers a program's OSC 7501 feature query (MCR-115; off by default) */
+  programQuery?: boolean;
   /** What the service could not read of its state file at its last start, until the person has seen it */
   storeNotice?: StoreNotice | null;
 }
@@ -411,6 +433,8 @@ export const harnessApi = {
   outsideSupervisors: (on: boolean) => invoke<boolean>('harness_outside_supervisors', { on }),
   /** Asks in a native dialog before turning it on; resolves to the setting as it is afterwards */
   codexHooks: (on: boolean) => invoke<boolean>('harness_codex_hooks', { on }),
+  /** Asks in a native dialog before turning it on; resolves to the setting as it is afterwards */
+  programQuery: (on: boolean) => invoke<boolean>('harness_program_query', { on }),
   supervisor: (cols: number, rows: number) => invoke<Hosted>('harness_supervisor', { cols, rows }),
   /** End the agent and continue its conversation in a new process; the session id changes */
   restart: (id: string) => invoke<Hosted & { replaced: string; resumed: boolean }>('harness_restart', { id }),
@@ -777,3 +801,75 @@ export function shortPath(path: string): string {
 export function heldNote(h: Hosted): string {
   return h.harness?.draft && !h.exit && (h.unread || h.openTasks) ? 'held: you have an unsent line here' : '';
 }
+
+/** A program's word about itself, as the Live row shows it (MCR-115). */
+export interface ProgramHint {
+  /** Who says it: the program's `app`, else "program" */
+  lead: string;
+  text: string;
+  /** The tooltip: where it comes from, that it is unchecked, every record */
+  full: string;
+  /** 0 to 100 while a percent was reported */
+  progress?: number;
+  /** The hooks say otherwise; theirs is the state the row shows */
+  disagrees: boolean;
+}
+
+const PROGRAM_SOURCE = 'Reported by the program in this terminal (OSC 7501, 133 or 9;4). Not checked: any output can print this, a file shown in the terminal too. It never answers a prompt and never changes the session\'s state.';
+
+const recordWords = (r: ProgramRecord) => {
+  const state = r.state === 'blocked' ? `blocked${r.kind ? ` (${r.kind})` : ''}` : r.state;
+  return [`${state}${r.progress !== undefined ? ` ${r.progress}%` : ''}`, r.title, r.msg].filter(Boolean).join(' · ');
+};
+
+/**
+ * What the program in a running session said of itself, ranked below what
+ * the harness knows: the root record, else the record updated last; else
+ * OSC 9;4 progress; else the last OSC 133 mark. The row's state dot and
+ * state stay the hooks'; when they disagree the hint says so. Null when the
+ * program said nothing or the session ended.
+ */
+export function programHint(h: Hosted): ProgramHint | null {
+  const p = h.program;
+  if (!p || h.exit) return null;
+  const records = p.records ?? [];
+  const fromHooks = !!(h.harness?.precise && h.harness?.hooked);
+  const hooks = fromHooks ? `The agent's hooks say ${STATE_LABEL[hostedState(h)].toLowerCase()}, and the hooks rank first.` : '';
+  const main = records.find(r => !r.id) ?? records[records.length - 1];
+  if (main) {
+    const more = records.length - 1;
+    const lines = records.slice().reverse().map(r => `${r.id || '(root)'}: ${recordWords(r)} · ${formatAgo(r.at)}`);
+    const disagrees = fromHooks && disagreement(main.state, hostedState(h));
+    return {
+      lead: main.app || records.find(r => r.app)?.app || 'program',
+      text: `${recordWords(main)}${more > 0 ? ` · +${more} more` : ''}`,
+      full: [PROGRAM_SOURCE, hooks, ...lines].filter(Boolean).join('\n'),
+      progress: main.state === 'working' || main.state === 'blocked' ? main.progress : undefined,
+      disagrees,
+    };
+  }
+  if (p.progress) {
+    const g = p.progress;
+    const text = g.state === 'indeterminate' ? 'busy' : `${g.state === 'normal' ? 'progress' : g.state}${g.value !== undefined ? ` ${g.value}%` : ''}`;
+    return { lead: 'program', text, full: [PROGRAM_SOURCE, hooks, `OSC 9;4 · ${formatAgo(g.at)}`].filter(Boolean).join('\n'), progress: g.state === 'indeterminate' ? undefined : g.value, disagrees: false };
+  }
+  if (p.prompt) {
+    const m = p.prompt;
+    const text = m.mark === 'C' ? 'a command runs' : m.mark === 'D' ? `command finished${m.exit !== undefined ? ` with ${m.exit}` : ''}` : 'at a prompt';
+    return { lead: 'shell', text, full: [PROGRAM_SOURCE, hooks, `OSC 133 ${m.mark} · ${formatAgo(m.at)}`].filter(Boolean).join('\n'), disagrees: false };
+  }
+  return null;
+}
+
+/** A program's state that contradicts the hooks' (asks while they say it works, works while they say it waits). */
+function disagreement(program: ProgramRecord['state'], hooks: string): boolean {
+  if (program === 'blocked') return hooks !== 'waiting';
+  if (program === 'working') return hooks === 'idle' || hooks === 'waiting';
+  if (program === 'idle') return hooks === 'working' || hooks === 'waiting';
+  return false;
+}
+
+const formatAgo = (at: number) => {
+  const s = Math.max(0, Math.round((Date.now() - at) / 1000));
+  return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
+};

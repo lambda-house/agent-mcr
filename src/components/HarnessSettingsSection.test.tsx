@@ -7,7 +7,7 @@ import { harnessApi, type HarnessPreferences } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({
   ...await importOriginal<object>(),
-  harnessApi: { status: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn(), codexHooks: vi.fn(), background: vi.fn(), stopBackground: vi.fn() },
+  harnessApi: { status: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn(), codexHooks: vi.fn(), programQuery: vi.fn(), background: vi.fn(), stopBackground: vi.fn() },
 }));
 const prefs: HarnessPreferences = {
   profiles: ['claude', 'codex', 'antigravity', 'pi', 'opencode', 'shell'].map(id => ({ id, label: id === 'shell' ? 'Terminal' : id, command: id === 'shell' ? '' : id, optional: ['antigravity', 'pi', 'opencode'].includes(id), canSupervise: id !== 'shell', taskTracking: ['claude', 'codex'].includes(id) })),
@@ -69,6 +69,26 @@ it('turns Codex hooks on only when the native question was answered yes, and say
   vi.mocked(harnessApi.codexHooks).mockResolvedValue(false);
   await act(async () => box().click()); await flush();
   expect(harnessApi.codexHooks).toHaveBeenLastCalledWith(false);
+  expect(box().checked).toBe(false);
+});
+
+it('answers program status queries only after the native question, and is off by default (MCR-115)', async () => {
+  await act(async () => root.render(<HarnessSettingsSection/>)); await flush();
+  const box = () => host.querySelector('input[aria-label="Answer program status queries"]') as HTMLInputElement;
+  expect(box().checked).toBe(false);
+  expect(host.textContent).toContain('Off: nothing is answered; reports are shown all the same.');
+  // Cancelled in the native dialog: still off
+  vi.mocked(harnessApi.programQuery).mockResolvedValue(false);
+  await act(async () => box().click()); await flush();
+  expect(harnessApi.programQuery).toHaveBeenLastCalledWith(true);
+  expect(box().checked).toBe(false);
+  vi.mocked(harnessApi.programQuery).mockResolvedValue(true);
+  await act(async () => box().click()); await flush();
+  expect(box().checked).toBe(true);
+  expect(host.textContent).toContain('never into a line you have not sent');
+  vi.mocked(harnessApi.programQuery).mockResolvedValue(false);
+  await act(async () => box().click()); await flush();
+  expect(harnessApi.programQuery).toHaveBeenLastCalledWith(false);
   expect(box().checked).toBe(false);
 });
 

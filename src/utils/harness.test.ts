@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeLiveList } from '../store';
-import { DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -309,5 +309,57 @@ describe('runningFor', () => {
     expect(runningFor(0, 59_000)).toBe('59s');
     expect(runningFor(Number.NaN, 1)).toBe('');
     expect(runningFor(undefined as unknown as number, 1)).toBe('');
+  });
+});
+
+describe('programHint (MCR-115)', () => {
+  const now = Date.now();
+  const hooks = (state: 'working' | 'idle' | 'waiting') => ({ name: '', profile: 'claude', state, precise: true, hooked: true } as Hosted['harness']);
+  it('shows the root record, else the one updated last, as the program\'s word', () => {
+    const h = hosted({ program: { records: [
+      { id: 'lint', state: 'done', at: now - 5000 },
+      { state: 'working', progress: 40, app: 'cargo', title: 'cargo build', at: now - 1000 },
+      { id: 'deploy', state: 'blocked', kind: 'permission', msg: 'Approve deploy?', at: now },
+    ] } });
+    const hint = programHint(h)!;
+    expect(hint.lead).toBe('cargo');
+    expect(hint.text).toBe('working 40% · cargo build · +2 more');
+    expect(hint.progress).toBe(40);
+    // The tooltip says where it comes from and that nothing checked it, then every record, newest first
+    expect(hint.full).toContain('Not checked: any output can print this');
+    expect(hint.full.split('\n').slice(-3).map(l => l.split(':')[0])).toEqual(['deploy', '(root)', 'lint']);
+    const noRoot = programHint(hosted({ program: { records: [{ id: 'a', state: 'done', at: now - 9 }, { id: 'b', state: 'error', msg: 'tests failed', app: 'npm', at: now }] } }))!;
+    expect([noRoot.lead, noRoot.text, noRoot.progress]).toEqual(['npm', 'error · tests failed · +1 more', undefined]);
+  });
+
+  it('ranks below the hooks: a forged report never changes the state, and says that the hooks differ', () => {
+    // Output printed "blocked on a permission" while the hooks say the agent works
+    const h = hosted({ harness: hooks('working'), program: { records: [{ state: 'blocked', kind: 'permission', msg: 'Approve rm -rf?', at: now }] } });
+    expect(hostedState(h)).toBe('working');
+    const hint = programHint(h)!;
+    expect(hint.disagrees).toBe(true);
+    expect(hint.full).toContain("The agent's hooks say working, and the hooks rank first.");
+    expect(hint.text).toBe('blocked (permission) · Approve rm -rf?');
+    // Where they agree, nothing is struck
+    expect(programHint(hosted({ harness: hooks('waiting'), program: h.program }))!.disagrees).toBe(false);
+    expect(programHint(hosted({ harness: hooks('working'), program: { records: [{ state: 'working', at: now }] } }))!.disagrees).toBe(false);
+    // Without hooks there is nothing to disagree with
+    expect(programHint(hosted({ program: h.program }))!.disagrees).toBe(false);
+  });
+
+  it('falls back to OSC 9;4 progress, then to the OSC 133 mark', () => {
+    expect(programHint(hosted({ program: { progress: { state: 'normal', value: 30, at: now } } }))).toMatchObject({ lead: 'program', text: 'progress 30%', progress: 30 });
+    expect(programHint(hosted({ program: { progress: { state: 'indeterminate', at: now } } }))).toMatchObject({ text: 'busy', progress: undefined });
+    expect(programHint(hosted({ program: { progress: { state: 'error', value: 80, at: now } } }))!.text).toBe('error 80%');
+    expect(programHint(hosted({ program: { prompt: { mark: 'D', exit: 2, at: now } } }))).toMatchObject({ lead: 'shell', text: 'command finished with 2' });
+    expect(programHint(hosted({ program: { prompt: { mark: 'A', at: now } } }))!.text).toBe('at a prompt');
+    // A 7501 record outranks both
+    expect(programHint(hosted({ program: { records: [{ state: 'idle', at: now }], progress: { state: 'normal', value: 3, at: now } } }))!.text).toBe('idle');
+  });
+
+  it('says nothing when the program said nothing, or the session ended', () => {
+    expect(programHint(hosted())).toBeNull();
+    expect(programHint(hosted({ program: {} }))).toBeNull();
+    expect(programHint(hosted({ program: { records: [{ state: 'done', at: now }] }, exit: { code: 0, signal: null, at: now } }))).toBeNull();
   });
 });
