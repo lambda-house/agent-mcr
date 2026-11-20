@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { gist, heldNote, hostedLabel, hostedState, pastedImage, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -218,5 +218,21 @@ describe('heldNote', () => {
     expect(heldNote(session(false, { unread: 1 }))).toBe('');
     expect(heldNote(session(true, { unread: 1, exit: { code: 0, signal: null, at: 1 } }))).toBe('');
     expect(heldNote(hosted({ unread: 1 }))).toBe('');
+  });
+});
+
+describe('pointerSpans (MCR-106)', () => {
+  const row = (text: string) => [...text].flatMap(c => c.charCodeAt(0) > 0x2e80 ? [{ chars: c, width: 2 }, { chars: '', width: 0 }] : [{ chars: c, width: 1 }]);
+  const live = (id: string) => id === 'a27f56d8749b';
+  it('gives a pointer its cells, also after wide characters and across a wrapped row', () => {
+    expect(pointerSpans([row('go mcr:a27f56d8749b')], live)).toEqual([{ id: 'a27f56d8749b', text: 'mcr:a27f56d8749b', cells: [{ row: 0, x: 3, width: 16 }] }]);
+    expect(pointerSpans([row('日本 mcr:a27f56d8749b')], live)[0].cells).toEqual([{ row: 0, x: 5, width: 16 }]);
+    expect(pointerSpans([row('see: mcr:a27f'), row('56d8749b ok')], live)[0].cells).toEqual([{ row: 0, x: 5, width: 8 }, { row: 1, x: 0, width: 8 }]);
+  });
+  it('finds nothing for an unknown id, a bare id, or an empty cell inside a pointer', () => {
+    expect(pointerSpans([row('mcr:000000000000 a27f56d8749b')], live)).toEqual([]);
+    const gap = row('mcr:a27f56d8749b');
+    gap[6] = { chars: '', width: 1 };
+    expect(pointerSpans([gap], live)).toEqual([]);
   });
 });

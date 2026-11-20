@@ -8,14 +8,33 @@ type Link = { range: { start: { x: number; y: number }; end: { x: number; y: num
 type Provider = { provideLinks: (y: number, done: (links: Link[] | undefined) => void) => void };
 
 // A stand-in for xterm: the screen is the lines the test sets, one cell per column
-const screen = vi.hoisted(() => ({ lines: [] as string[][], provider: null as unknown, focused: 0, providers: 0 }));
+type Marker = { line: number; disposed: boolean; dispose: () => void; onDispose: (f: () => void) => void };
+type Decoration = { marker: Marker; x: number; width: number; options: Record<string, unknown>; element: HTMLElement; disposed: boolean };
+const screen = vi.hoisted(() => ({
+  lines: [] as string[][], wrapped: new Set<number>(), provider: null as unknown, focused: 0, providers: 0,
+  decorations: [] as Decoration[], render: (() => {}) as (start: number, end: number) => void, switchBuffer: () => {},
+}));
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
     cols = 80; rows = 24; unicode = { activeVersion: '' };
-    buffer = { active: { getLine: (y: number) => {
+    buffer = { active: { viewportY: 0, baseY: 0, cursorY: 0, getLine: (y: number) => {
       const cells = screen.lines[y];
-      return cells && { length: cells.length, getCell: (x: number) => ({ getChars: () => cells[x], getWidth: () => (cells[x] === '' && x > 0 && cells[x - 1].charCodeAt(0) > 0x2e80 ? 0 : 1) }) };
-    } } };
+      return cells && { length: cells.length, isWrapped: screen.wrapped.has(y), getCell: (x: number) => ({ getChars: () => cells[x], getWidth: () => (cells[x] === '' && x > 0 && cells[x - 1].charCodeAt(0) > 0x2e80 ? 0 : 1) }) };
+    } }, onBufferChange: (f: () => void) => { screen.switchBuffer = f; return { dispose() {} }; } };
+    onRender(f: (e: { start: number; end: number }) => void) { screen.render = (start, end) => f({ start, end }); return { dispose() {} }; }
+    refresh() {}
+    registerMarker(offset: number) {
+      const done: (() => void)[] = [];
+      const marker: Marker = { line: offset, disposed: false, dispose() { if (!marker.disposed) { marker.disposed = true; done.forEach(f => f()); } }, onDispose(f) { done.push(f); } };
+      return marker;
+    }
+    registerDecoration(options: { marker: Marker; x: number; width: number }) {
+      const element = document.createElement('div');
+      element.className = 'xterm-decoration';
+      const d: Decoration = { marker: options.marker, x: options.x, width: options.width, options, element, disposed: false };
+      screen.decorations.push(d);
+      return { onRender(f: (e: HTMLElement) => void) { f(element); }, dispose() { d.disposed = true; } };
+    }
     loadAddon() {} open() {} write() {} paste() {} dispose() {}
     attachCustomKeyEventHandler() {}
     focus() { screen.focused++; }
@@ -37,7 +56,7 @@ let root: Root; let host: HTMLDivElement;
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   if (!('ResizeObserver' in globalThis)) Object.assign(globalThis, { ResizeObserver: class { observe() {} disconnect() {} } });
-  screen.lines = []; screen.provider = null; screen.focused = 0; screen.providers = 0;
+  screen.lines = []; screen.wrapped = new Set(); screen.provider = null; screen.focused = 0; screen.providers = 0; screen.decorations = [];
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); });
@@ -68,6 +87,62 @@ describe('session pointers in a terminal', () => {
     linksAt(2)![0].activate(new MouseEvent('click'), '');
     await act(async () => root.render(<TerminalPane id="t1" active={false}/>));
     expect(linksAt(2)).toBeUndefined();
+  });
+
+  // The underlines standing now: row, first column, columns
+  const underlined = () => screen.decorations.filter(d => !d.disposed).map(d => [d.marker.line, d.x, d.width]);
+
+  it('underlines a pointer of a known session all the time, not only under the mouse (MCR-106)', async () => {
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live}/>));
+    screen.lines = [cells('type this in mcr:a27f56d8749b now'), cells('日本 mcr:a27f56d8749b'), cells('mcr:000000000000 and a27f56d8749b'), cells('plain text')];
+    screen.render(0, 3);
+    expect(underlined()).toEqual([[0, 13, 16], [1, 5, 16]]);
+    // A line over its cells and nothing else: no colour of its own, no text, and the mouse goes through it (the style sheet)
+    for (const d of screen.decorations) {
+      expect(d.element.classList.contains('hs-pointer')).toBe(true);
+      expect(d.element.textContent).toBe('');
+      expect(Object.keys(d.options).sort()).toEqual(['layer', 'marker', 'width', 'x']);
+    }
+    // Drawn again: nothing is added twice
+    screen.render(0, 3);
+    expect(underlined()).toHaveLength(2);
+  });
+
+  it('takes the underline away when the line is rewritten, the session ends, or the screen switches', async () => {
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live}/>));
+    screen.lines = [cells('mcr:a27f56d8749b'), cells('see mcr:a27f56d8749b')];
+    screen.render(0, 1);
+    expect(underlined()).toEqual([[0, 0, 16], [1, 4, 16]]);
+    // The agent redrew the first row with other text
+    screen.lines[0] = cells('something else');
+    screen.render(0, 0);
+    expect(underlined()).toEqual([[1, 4, 16]]);
+    // The session is no longer one the app knows: looked at again without waiting for a repaint
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={() => false}/>));
+    expect(underlined()).toEqual([]);
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live}/>));
+    expect(underlined()).toEqual([[1, 4, 16]]);
+    // The other screen buffer starts clean, and is looked at in its turn
+    screen.lines = [cells('plain')];
+    screen.switchBuffer();
+    expect(underlined()).toEqual([]);
+  });
+
+  it('treats a pointer cut by the line wrap as one: one link over both rows, underlined on each', async () => {
+    const followed: string[] = [];
+    await act(async () => root.render(<TerminalPane id="t1" active={false} isSession={live} onSession={id => followed.push(id)}/>));
+    // A row of 20 columns full to its end, and the rest of the line on the next row
+    screen.lines = [cells('see this: mcr:a27f56'), cells('d8749b and more'), cells('next line')];
+    screen.wrapped = new Set([1]);
+    for (const y of [1, 2]) {
+      const links = linksAt(y)!;
+      expect(links.map(l => [l.text, l.range.start, l.range.end])).toEqual([['mcr:a27f56d8749b', { x: 11, y: 1 }, { x: 6, y: 2 }]]);
+    }
+    expect(linksAt(3)).toBeUndefined();
+    linksAt(2)![0].activate(new MouseEvent('click'), '');
+    expect(followed).toEqual(['a27f56d8749b']);
+    screen.render(1, 1);
+    expect(underlined()).toEqual([[0, 10, 10], [1, 0, 6]]);
   });
 
   it('takes the keyboard when asked to, once per request, and gives its provider back', async () => {
