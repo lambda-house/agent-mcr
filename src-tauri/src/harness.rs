@@ -2097,8 +2097,10 @@ const HELD_TELL_MS: u64 = 60_000;
 /// not to come and go while a line is typed
 const HELD_SHOW_MS: u64 = 30_000;
 /// A draft that began this long before a prompt was marked, or later, is
-/// taken for the keys that answered it once the prompt is answered (MCR-122)
-const ANSWER_LEAD_MS: u64 = 30_000;
+/// taken for the keys that answered it once the prompt is answered, where
+/// the screen cannot tell (MCR-122). Short: a line typed ahead just before a
+/// prompt is a line, and would otherwise lose its hold at the answer
+const ANSWER_LEAD_MS: u64 = 3_000;
 /// A draft unchanged this long is looked for on screen, at most this often
 /// per session: an empty input box there ends it (MCR-122)
 const DRAFT_CHECK_MS: u64 = 15_000;
@@ -2129,12 +2131,17 @@ fn drop_prompt(tracked: &mut Tracked) {
 /// A prompt of the session was answered: it moved on (MCR-122). The keys
 /// that answered it (a digit, which Claude Code takes without Enter, an
 /// arrow) reached the app as typing and may have left a "draft" there, which
-/// only Enter or Ctrl+C would end and which held every message and task. A
-/// draft that began after the prompt was marked, or at most `ANSWER_LEAD_MS`
-/// before (the key can come before the hook that marks the prompt), was
-/// that answer and goes. A line started long before the prompt was a line.
-/// Call it before the mark is taken.
+/// only Enter or Ctrl+C would end and which held every message and task.
+/// Where the screen can prove an empty input box (Claude Code), the answer
+/// changes nothing here: `check_drafts` ends such a hold from the screen, and
+/// a line the operator typed ahead just before the prompt keeps its hold. For
+/// the others, a draft that began after the prompt was marked, or at most
+/// `ANSWER_LEAD_MS` before (the key can come just before the hook that marks
+/// the prompt), was that answer and goes. Call it before the mark is taken.
 fn answered(tracked: &mut Tracked, now: u64) {
+    if adapter(&tracked.profile).shows_empty_input_box() {
+        return;
+    }
     let Some(since) = tracked.attention.as_ref().filter(|a| a.kind == "permission").map(|a| a.since) else { return };
     if tracked.draft && tracked.typed.saturating_add(ANSWER_LEAD_MS) >= since {
         clear_draft(tracked, now);
@@ -2409,6 +2416,10 @@ pub struct Harness {
     shown: Mutex<BTreeMap<String, String>>,
     /// When a held session's screen was last read for an empty input box (`check_drafts`)
     drafts_checked: Mutex<BTreeMap<String, u64>>,
+    /// When the app last said a session has an unsent line, by any word
+    /// (`operator_draft` says so again while the person types): kept here,
+    /// not in the store, which is written only when the draft changes
+    draft_words: Mutex<BTreeMap<String, u64>>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -2559,7 +2570,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_words: Mutex::new(BTreeMap::new()) };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -3456,24 +3467,30 @@ impl Harness {
     /// at the next tick, after `DRAFT_QUIET_MS`.
     fn check_drafts(&self) {
         let now = now_ms();
+        // Quiet: no word about the line for the check time either, so a person typing on is never read for
+        let word = |id: &str| lock(&self.draft_words).get(id).copied().unwrap_or(0);
         let held: Vec<(String, String)> = lock(&self.store)
             .sessions
             .iter()
-            .filter(|(_, t)| t.draft && t.state != ENDED && now.saturating_sub(t.typed) >= DRAFT_CHECK_MS && adapter(&t.profile).shows_empty_input_box())
+            .filter(|(id, t)| t.draft && t.state != ENDED && now.saturating_sub(t.typed.max(word(id))) >= DRAFT_CHECK_MS && adapter(&t.profile).shows_empty_input_box())
             .map(|(id, t)| (id.clone(), t.profile.clone()))
             .collect();
         lock(&self.drafts_checked).retain(|id, _| held.iter().any(|(h, _)| h == id));
+        // (the store's lock is never taken inside this one: the order is store, then words)
+        let drafted: BTreeSet<String> = lock(&self.store).sessions.iter().filter(|(_, t)| t.draft).map(|(id, _)| id.clone()).collect();
+        lock(&self.draft_words).retain(|id, _| drafted.contains(id));
         for (id, profile) in held {
             if lock(&self.drafts_checked).get(&id).is_some_and(|at| now.saturating_sub(*at) < DRAFT_CHECK_MS) {
                 continue;
             }
             lock(&self.drafts_checked).insert(id.clone(), now);
+            let before = word(&id);
             if !self.screen(&id).is_some_and(|screen| adapter(&profile).empty_input_box(&screen)) {
                 continue;
             }
-            // Asked again: a key told while the screen was read starts a new line
+            // Asked again: a word told while the screen was read is a line begun since
             self.update(|s| {
-                if let Some(t) = s.sessions.get_mut(&id).filter(|t| t.draft && now_ms().saturating_sub(t.typed) >= DRAFT_CHECK_MS) {
+                if let Some(t) = s.sessions.get_mut(&id).filter(|t| t.draft && word(&id) == before && now_ms().saturating_sub(t.typed.max(before)) >= DRAFT_CHECK_MS) {
                     clear_draft(t, now_ms());
                 }
             });
@@ -4579,6 +4596,9 @@ impl Harness {
                 // cannot know that; it says so again when the person types on
                 let asks = |t: &Tracked| t.attention.as_ref().is_some_and(|a| a.kind == "permission");
                 let draft = req["draft"].as_bool().unwrap_or(false) && !lock(&self.store).sessions.get(id).is_some_and(|t| !t.draft && asks(t));
+                if draft {
+                    lock(&self.draft_words).insert(id.to_string(), now_ms());
+                }
                 // Sent at every Enter in a terminal, and most change nothing: the store is written only for one that does
                 // The time of an Enter is kept for the cockpit (MCR-103): at once
                 // for a session it points the operator at, so that "you typed
@@ -7517,44 +7537,55 @@ mod tests {
 
     #[test]
     fn a_key_that_answered_a_prompt_holds_nothing_once_the_prompt_is_answered() {
-        // MCR-122: a digit pressed at Claude Code's permission menu, told before the hook marked the prompt
+        // MCR-122: a digit pressed at a permission question, told before the mark of the question
         let dir = std::env::temp_dir().join(format!("agent-mcr-answered-{}", runner::random_id()));
         let harness = Harness::open(&dir);
         harness.update(|s| {
-            for id in ["digit", "line", "guessed"] {
-                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "working".into(), hooked: true, precise: true, ..Tracked::default() });
+            for (id, profile) in [("codex", "codex"), ("codex-line", "codex"), ("claude", "claude"), ("claude-line", "claude"), ("guessed", "codex")] {
+                s.sessions.insert(id.into(), Tracked { profile: profile.into(), state: "working".into(), hooked: true, precise: true, ..Tracked::default() });
             }
         });
         let tracked = |id: &str| lock(&harness.store).sessions[id].clone();
         let word = |id: &str, draft: bool| harness.control(&json!({"op": "operator_draft", "id": id, "draft": draft})).unwrap();
-        // The digit arrives first: a draft, and the service says so
-        assert_eq!(word("digit", true)["draft"], true);
-        // Then the hook marks the prompt, and the agent moves on with the answer
-        harness.update(|s| { apply_hook(s, "digit", "Notification", &json!({"notification_type": "permission_prompt", "message": "Allow?"})); });
-        assert!(tracked("digit").draft, "still held while it asks");
-        harness.update(|s| { apply_hook(s, "digit", "PostToolUse", &json!({})); });
-        assert!(!tracked("digit").draft, "the key was the answer");
-        assert!(held(&tracked("digit"), now_ms()), "for the quiet time, so a key told just now lands first");
-        // A key at a prompt the service knows of: no draft, and the app is told so
-        harness.update(|s| { apply_hook(s, "digit", "Notification", &json!({"notification_type": "permission_prompt", "message": "Allow?"})); });
-        assert_eq!(word("digit", true)["draft"], false);
-
-        // A line typed long before the prompt is a line: it outlives the answer
-        harness.update(|s| {
-            let t = s.sessions.get_mut("line").unwrap();
-            (t.draft, t.typed) = (true, now_ms() - ANSWER_LEAD_MS - 60_000);
-            apply_hook(s, "line", "Notification", &json!({"notification_type": "permission_prompt", "message": "Allow?"}));
-            apply_hook(s, "line", "PostToolUse", &json!({}));
-        });
-        assert!(tracked("line").draft);
-
-        // A prompt the harness read from the screen and then saw go (Codex, a menu without a hook)
+        let ask = |s: &mut Store, id: &str, since: u64| s.sessions.get_mut(id).unwrap().attention = Some(Attention { kind: "permission".into(), text: "Allow?".into(), since, ..Attention::default() });
+        let begun = |s: &mut Store, id: &str, at: u64| {
+            let t = s.sessions.get_mut(id).unwrap();
+            (t.draft, t.typed) = (true, at);
+        };
         let now = now_ms();
+        // Where the screen cannot tell (Codex): a draft begun just before the mark was the answer
+        assert_eq!(word("codex", true)["draft"], true);
         harness.update(|s| {
-            s.sessions.get_mut("guessed").unwrap().profile = "codex".into();
+            ask(s, "codex", now_ms() + 1_000);
+            apply_hook(s, "codex", "PostToolUse", &json!({}));
+        });
+        assert!(!tracked("codex").draft, "the key was the answer");
+        assert!(held(&tracked("codex"), now_ms()), "for the quiet time, so a key told just now lands first");
+        // A line typed ahead 10 s before the question is a line: it keeps its hold through the answer
+        harness.update(|s| {
+            begun(s, "codex-line", now - 10_000);
+            ask(s, "codex-line", now);
+            apply_hook(s, "codex-line", "PostToolUse", &json!({}));
+        });
+        assert!(tracked("codex-line").draft);
+        // Where the screen can (Claude Code), the answer changes nothing: the screen ends a digit's hold
+        // (`an_empty_input_box_on_screen_ends_a_hold`), and a line typed ahead stays held
+        harness.update(|s| {
+            begun(s, "claude", now);
+            ask(s, "claude", now + 500);
+            apply_hook(s, "claude", "PostToolUse", &json!({}));
+            begun(s, "claude-line", now - 10_000);
+            ask(s, "claude-line", now);
+            apply_hook(s, "claude-line", "PostToolUse", &json!({}));
+        });
+        assert!(tracked("claude").draft && tracked("claude-line").draft);
+        // A key at a question the service knows of: no draft, and the app is told so
+        harness.update(|s| ask(s, "codex", now_ms()));
+        assert_eq!(word("codex", true)["draft"], false);
+        // A prompt the harness read from the screen and then saw go
+        harness.update(|s| {
             apply_look(s, "guessed", Seen::Asking("Run this?".into()), now);
-            let t = s.sessions.get_mut("guessed").unwrap();
-            (t.draft, t.typed) = (true, now + 5);
+            begun(s, "guessed", now + 5);
             apply_look(s, "guessed", Seen::Answered { announced: false }, now + 10);
         });
         assert!(!tracked("guessed").draft);
@@ -7589,6 +7620,13 @@ mod tests {
         lock(&harness.drafts_checked).insert("text".into(), now_ms() - DRAFT_CHECK_MS);
         harness.check_drafts();
         assert!(!draft("text"));
+        // A person who types on says so again every second: such a line is not read for, and a word
+        // told while the screen was read keeps the hold
+        harness.update(|s| { s.sessions.insert("typing".into(), Tracked { profile: "claude".into(), state: "working".into(), draft: true, typed: old, ..Tracked::default() }); });
+        lock(&harness.shown).insert("typing".into(), claude_idle_screen());
+        harness.control(&json!({"op": "operator_draft", "id": "typing", "draft": true})).unwrap();
+        harness.check_drafts();
+        assert!(draft("typing") && !lock(&harness.drafts_checked).contains_key("typing"));
         // What waited for the line is no longer held once the quiet time is over
         let empty = lock(&harness.store).sessions["empty"].clone();
         assert!(held(&empty, now_ms()) && !held(&empty, now_ms() + DRAFT_QUIET_MS));
