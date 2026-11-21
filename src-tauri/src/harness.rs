@@ -950,7 +950,10 @@ pub struct Tracked {
     /// The agent profile it was launched with (MCR-126), set by the harness
     /// at launch and never from what the agent says. None: a bare profile
     /// (its adapter, as every session before P2)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Read leniently: a record this build cannot read is none, never a lost
+    /// session (MCR-126 review 16715 M2; `read_store` drops a `Tracked` it
+    /// cannot read, with its name, supervisor and executors)
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "crate::profiles::lenient_ref")]
     pub agent_profile: Option<crate::profiles::ProfileRef>,
     /// The operator or the supervisor named it (output only)
     #[serde(skip_deserializing)]
@@ -1923,17 +1926,33 @@ impl Store {
             "attention": if attention.is_null() { Value::Null } else { json!({"kind": attention["kind"], "text": short_text(attention["text"].as_str().unwrap_or(""), 240), "ageSeconds": age_seconds(now, attention["since"].as_u64().unwrap_or(0))}) },
             "needsOperator": !attention.is_null() && attention["kind"] != "notification", "held": held_info(h, now), "executors": children,
         });
-        with_profile(out, h)
+        with_profile(out, s)
     }
 }
 
 /// A session's entry with what it shows of its profile (MCR-126): the agent
 /// profile it was launched with, the role kind, the part and the level.
-fn with_profile(mut out: Value, h: &Value) -> Value {
+/// `session` is a session as `sessions` lists it: its `harness` record and the
+/// runner's `meta`, which says which one is the root Supervisor.
+fn with_profile(mut out: Value, session: &Value) -> Value {
     if let Some(m) = out.as_object_mut() {
-        m.extend(crate::profiles::session_facts(h));
+        m.extend(crate::profiles::session_facts(&session["harness"], session["meta"]["role"] == "supervisor"));
     }
     out
+}
+
+/// One entry of `list_peers`, as the caller in `mine` sees the session `s`.
+fn peer_entry(s: &Value, mine: &str, relation: Value, now: u64) -> Value {
+    let h = &s["harness"];
+    with_profile(json!({
+        "id": s["id"], "name": h["name"], "profile": h["profile"], "cwd": s["cwd"], "state": h["state"], "status": h["status"],
+        "role": if s["meta"]["role"] == "supervisor" { json!("supervisor") } else { h["role"].clone() },
+        "folder": folder_relation(mine, s["cwd"].as_str().unwrap_or("")),
+        "needsOperator": !h["attention"].is_null() && h["attention"]["kind"] != "notification",
+        "held": held_info(h, now),
+        "supervisor": h["supervisor"],
+        "relation": relation,
+    }), s)
 }
 
 /// Reports the app lists, newest last.
@@ -3926,18 +3945,7 @@ impl Harness {
                 let mut peers: Vec<Value> = sessions
                     .iter()
                     .filter(|s| s["exit"].is_null() && s["id"] != me)
-                    .map(|s| {
-                        let h = &s["harness"];
-                        with_profile(json!({
-                            "id": s["id"], "name": h["name"], "profile": h["profile"], "cwd": s["cwd"], "state": h["state"], "status": h["status"],
-                            "role": if s["meta"]["role"] == "supervisor" { json!("supervisor") } else { h["role"].clone() },
-                            "folder": folder_relation(&mine, s["cwd"].as_str().unwrap_or("")),
-                            "needsOperator": !h["attention"].is_null() && h["attention"]["kind"] != "notification",
-                            "held": held_info(h, now_ms()),
-                            "supervisor": h["supervisor"],
-                            "relation": relation(s["id"].as_str().unwrap_or("")),
-                        }), h)
-                    })
+                    .map(|s| peer_entry(s, &mine, relation(s["id"].as_str().unwrap_or("")), now_ms()))
                     .filter(|p| !args["same_folder"].as_bool().unwrap_or(false) || !p["folder"].is_null())
                     .collect();
                 // Those who work where the caller works come first
@@ -4938,7 +4946,7 @@ impl Harness {
             "pid": session["pid"], "exit": session["exit"], "title": session["title"], "lastOutput": session["lastOutput"],
             "status": h["status"], "role": h["role"], "unread": session["unread"], "subagents": session["subagents"],
         });
-        with_profile(out, h)
+        with_profile(out, session)
     }
 
     /// A supervisor tool call (root, D5). The one thing it can't do is answer
@@ -6412,7 +6420,7 @@ mod tests {
         // A session launched with a profile (P2 sets it) shows it
         let launched = Tracked {
             profile: "claude".into(),
-            agent_profile: Some(crate::profiles::ProfileRef { id: "implementer@claude-opus".into(), version: 1, role: crate::profiles::Role::Implementer, digest: "d".into() }),
+            agent_profile: Some(crate::profiles::ProfileRef { id: "implementer@claude-opus".into(), version: 1, role: "implementer".into(), digest: "d".into() }),
             ..Tracked::default()
         };
         let h = serde_json::to_value(&launched).unwrap();
@@ -6429,6 +6437,30 @@ mod tests {
         let tree = store.overview(&sessions, None, 0);
         assert_eq!(tree["sessions"][0]["roleKind"], "implementer");
         assert_eq!(tree["sessions"][0]["level"], "C3");
+        // list_peers (review 16715 L5), and the bare root Supervisor (L2)
+        let peer = peer_entry(&sessions[0], "/w", json!("your executor"), 0);
+        assert_eq!((peer["roleKind"].as_str(), peer["level"].as_str(), peer["folder"].as_str()), (Some("implementer"), Some("C3"), Some("same")));
+        assert_eq!(peer["agentProfile"]["version"], 1);
+        assert_eq!(peer["relation"], "your executor");
+        let root = json!({"id": "s", "cwd": "/c", "exit": null, "meta": {"role": "supervisor"}, "harness": {"profile": "claude", "role": ""}});
+        let peer = peer_entry(&root, "/w", Value::Null, 0);
+        assert_eq!((peer["role"].as_str(), peer["roleKind"].as_str(), peer["part"].as_str()), (Some("supervisor"), Some("supervisor"), Some("")));
+        assert_eq!(Harness::brief(&root)["roleKind"], "supervisor");
+    }
+
+    #[test]
+    fn a_session_whose_profile_record_this_build_cannot_read_is_kept() {
+        // M2 (review 16715): read_store drops a Tracked it cannot read, with its
+        // name, supervisor and executors; a later build's profile record must not do that
+        for profile in [json!({"id": "auditor@x", "version": 3, "role": "auditor", "digest": "d", "later": true}), json!("auditor@x"), json!([1, 2])] {
+            let t: Tracked = serde_json::from_value(json!({"name": "kept", "profile": "claude", "supervisor": "up", "agentProfile": profile})).unwrap();
+            assert_eq!((t.name.as_str(), t.supervisor.as_deref()), ("kept", Some("up")));
+            if profile.is_object() {
+                assert_eq!(t.agent_profile.unwrap().role, "auditor");
+            } else {
+                assert!(t.agent_profile.is_none());
+            }
+        }
     }
 
     fn launch<'a>(profile: &'a str) -> Launch<'a> {

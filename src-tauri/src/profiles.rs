@@ -175,11 +175,13 @@ pub struct Inference {
     pub effort: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Permissions {
-    /// A Claude permission mode or a Codex sandbox, from the adapter's list
-    pub mode: String,
+    /// A Claude permission mode or a Codex sandbox, from the adapter's list:
+    /// required where the adapter has modes, refused where it has none
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     #[serde(default)]
     pub push: Push,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +256,7 @@ pub struct AgentProfile {
     pub summary: String,
     #[serde(default)]
     pub inference: Inference,
+    #[serde(default)]
     pub permissions: Permissions,
     #[serde(default)]
     pub tools: Tools,
@@ -279,13 +282,23 @@ impl AgentProfile {
 }
 
 /// What a session records of the profile it was launched with (P2 sets it).
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
+/// Stored in the harness's state, so it takes what a later build wrote: the
+/// role is text, not `Role` (a later build may know more roles), and missing
+/// fields are empty (review 16715 M2)
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ProfileRef {
     pub id: String,
     pub version: u32,
-    pub role: Role,
+    pub role: String,
     pub digest: String,
+}
+
+/// `Tracked.agent_profile` as stored: anything this build cannot read as a
+/// `ProfileRef` is none, so the session itself is never lost (M2)
+pub fn lenient_ref<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ProfileRef>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -365,6 +378,9 @@ pub fn approve(config_dir: &Path, file: &str, now: u64) -> Result<Approval, Stri
     let text = std::str::from_utf8(&bytes).map_err(|_| "Not UTF-8 text")?;
     let profile = parse(text, Origin::Operator)?;
     let mut all = approvals(config_dir).unwrap_or_default();
+    // The newest approval of a file or an id is the only one (review 16715 M1):
+    // bringing back the bytes of an earlier version must not make it count again
+    all.retain(|_, a| a.file != file && a.id != profile.id);
     let approval = Approval { file: file.to_string(), id: profile.id, at: now };
     all.insert(digest(&bytes), approval.clone());
     let json = serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?;
@@ -489,7 +505,8 @@ pub fn load(config_dir: &Path) -> Loaded {
             continue;
         }
         let hash = digest(&bytes);
-        if !approved.contains_key(&hash) {
+        // Approved for this file: the same bytes under another name are not
+        if !approved.get(&hash).is_some_and(|a| a.file == name && a.id == profile.id) {
             loaded.not_approved.push(NotApproved { file: name.clone(), id: profile.id, digest: hash });
             continue;
         }
@@ -595,14 +612,20 @@ pub fn check(p: &AgentProfile, origin: Origin) -> Result<(), String> {
     }
 
     // Permissions: the allow-list ceiling (M1, M8, decision 3)
-    if !can.modes.contains(&p.permissions.mode.as_str()) {
-        return Err(if can.modes.is_empty() {
-            format!("permissions.mode: {} is started as its adapter says; a profile cannot set its mode", p.adapter)
-        } else {
-            format!("permissions.mode: {} takes {}; bypass and danger modes are never allowed", p.adapter, choices(can.modes))
-        });
+    let mode = p.permissions.mode.as_deref();
+    match mode {
+        Some(_) if can.modes.is_empty() => {
+            return Err(format!("permissions.mode: {} is started as its adapter says; a profile cannot set its mode", p.adapter));
+        }
+        None if !can.modes.is_empty() => {
+            return Err(format!("permissions.mode: {} needs one of {}", p.adapter, choices(can.modes)));
+        }
+        Some(m) if !can.modes.contains(&m) => {
+            return Err(format!("permissions.mode: {} takes {}; bypass and danger modes are never allowed", p.adapter, choices(can.modes)));
+        }
+        _ => {}
     }
-    if p.permissions.mode == "auto" {
+    if mode == Some("auto") {
         return Err(match p.role {
             Role::Supervisor | Role::Validator => format!("permissions.mode: never auto for the {} (MCR-126 M8)", p.role.as_str()),
             // Allowed for other roles only through the operator's native dialog, which comes with the app's profile editor
@@ -766,12 +789,22 @@ pub fn list_tool(config_dir: &Path, args: &Value) -> Result<Value, String> {
 /// `profile` stays the adapter id it always was; `agentProfile` is the
 /// profile it was launched with (none before P2: bare); `part` is the free
 /// text that was the role.
-pub fn session_facts(h: &Value) -> Map<String, Value> {
+/// `root`: the runner says this is the root Supervisor (`meta.role`). Without a
+/// profile it is a bare Supervisor: role kind `supervisor`, and `reduced` when
+/// its adapter does not leave `terminal_write` to the operator (16647 M5).
+pub fn session_facts(h: &Value, root: bool) -> Map<String, Value> {
     let profile = h["profile"].as_str().unwrap_or("");
     let level = session_level(profile, h["ownHooks"] == true);
-    let agent_profile = h.get("agentProfile").filter(|v| !v.is_null()).cloned().unwrap_or(Value::Null);
-    let role_kind = agent_profile["role"].as_str().unwrap_or("custom").to_string();
+    let agent_profile = h.get("agentProfile").filter(|v| v.is_object()).cloned().unwrap_or(Value::Null);
+    let role_kind = match agent_profile["role"].as_str().filter(|r| !r.is_empty()) {
+        Some(r) => r.to_string(),
+        None if root => "supervisor".to_string(),
+        None => "custom".to_string(),
+    };
     let mut m = Map::new();
+    if root && agent_profile.is_null() && !supervisor_safe(crate::agents::adapter(profile)) {
+        m.insert("reduced".into(), json!(true));
+    }
     m.insert("agentProfile".into(), agent_profile);
     m.insert("roleKind".into(), json!(role_kind));
     m.insert("part".into(), h["role"].clone());
@@ -802,7 +835,8 @@ mod tests {
         for e in &loaded.profiles {
             assert_eq!(e.origin, Origin::Builtin);
             assert_eq!(e.digest.len(), 64);
-            assert!(e.profile.permissions.mode != "auto" && e.profile.permissions.mode != "plan", "{}: no built-in uses auto, nor plan until it is verified (M3)", e.profile.id);
+            let mode = e.profile.permissions.mode.as_deref();
+            assert!(mode.is_some() && mode != Some("auto") && mode != Some("plan"), "{}: no built-in uses auto, nor plan until it is verified (M3)", e.profile.id);
             assert_eq!(e.profile.permissions.push, Push::None);
         }
         // The validator for Claude-made work is another kind (decision 5, 11)
@@ -973,26 +1007,47 @@ mod tests {
         std::fs::write(p.join("notes.txt"), "not a profile").unwrap();
         std::fs::write(p.join(".hidden.toml"), "garbage").unwrap();
         std::fs::write(p.join("new.toml"), base("codex", "lead", "workspace-write")).unwrap();
-        // Only approved content is used (16697 A); zcopy has mine's bytes, so the same approval
+        // Only approved content is used (16697 A), and only under the file it
+        // was approved for: zcopy has mine's bytes and is not approved
         approve(&dir, "mine.toml", 1).unwrap();
         let loaded = load(&dir);
         let mine = loaded.get("implementer@x").expect("loaded");
         assert_eq!((mine.origin, mine.file.as_deref()), (Origin::Operator, Some("mine.toml")));
         let errors: BTreeMap<&str, &str> = loaded.invalid.iter().map(|i| (i.file.as_str(), i.error.as_str())).collect();
         assert!(errors["bad.toml"].contains("permissions.mode"));
-        assert!(errors["zcopy.toml"].contains("already defined by the file mine.toml"));
         assert!(errors["shadow.toml"].contains("built-in"));
-        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert_eq!(errors.len(), 2, "{errors:?}");
         assert_eq!(loaded.profiles.len(), BUILT_INS.len() + 1);
-        assert_eq!(loaded.not_approved.iter().map(|n| (n.file.as_str(), n.id.as_str())).collect::<Vec<_>>(), [("new.toml", "lead@x")]);
+        let waiting = |l: &Loaded| l.not_approved.iter().map(|n| n.file.clone()).collect::<Vec<_>>();
+        assert_eq!(waiting(&loaded), ["new.toml", "zcopy.toml"]);
         // A changed file is not approved any more, until it is approved again
+        let v1 = std::fs::read(p.join("mine.toml")).unwrap();
         std::fs::write(p.join("mine.toml"), base("claude", "implementer", "acceptEdits").replace("version = 1", "version = 2")).unwrap();
         let loaded = load(&dir);
-        assert!(loaded.get("implementer@x").is_some(), "zcopy still has the approved bytes");
-        assert_eq!(loaded.get("implementer@x").unwrap().file.as_deref(), Some("zcopy.toml"));
-        assert!(loaded.not_approved.iter().any(|n| n.file == "mine.toml"));
+        assert!(loaded.get("implementer@x").is_none());
+        assert!(waiting(&loaded).contains(&"mine.toml".to_string()));
         approve(&dir, "mine.toml", 2).unwrap();
-        assert!(load(&dir).not_approved.iter().all(|n| n.file != "mine.toml"));
+        assert_eq!(load(&dir).get("implementer@x").unwrap().profile.version, 2);
+        // M1 (review 16715): the newest approval of a file and of an id is the
+        // only one, so v1's bytes brought back are not approved any more
+        std::fs::write(p.join("mine.toml"), &v1).unwrap();
+        let loaded = load(&dir);
+        assert!(loaded.get("implementer@x").is_none(), "an earlier approved version counts again");
+        assert!(waiting(&loaded).contains(&"mine.toml".to_string()));
+        // ... also when the old bytes come back under another file name
+        std::fs::write(p.join("mine.toml"), base("claude", "implementer", "acceptEdits").replace("version = 1", "version = 2")).unwrap();
+        std::fs::write(p.join("old.toml"), &v1).unwrap();
+        let loaded = load(&dir);
+        assert_eq!(loaded.get("implementer@x").unwrap().profile.version, 2);
+        assert!(waiting(&loaded).contains(&"old.toml".to_string()));
+        // Approving the same id in another file takes the approval from the first
+        approve(&dir, "old.toml", 3).unwrap();
+        let loaded = load(&dir);
+        assert_eq!(loaded.get("implementer@x").unwrap().file.as_deref(), Some("old.toml"));
+        assert!(waiting(&loaded).contains(&"mine.toml".to_string()));
+        let kept = approvals(&dir).unwrap();
+        assert_eq!(kept.len(), 1, "one approval per id: {kept:?}");
+        std::fs::remove_file(p.join("old.toml")).unwrap();
         // Nothing but a valid profile file in the folder is approved
         assert!(approve(&dir, "bad.toml", 3).unwrap_err().contains("permissions.mode"));
         assert!(approve(&dir, "../x.toml", 3).is_err());
@@ -1041,16 +1096,59 @@ mod tests {
 
     #[test]
     fn a_session_shows_its_profile_from_the_harness_record() {
-        let bare = session_facts(&json!({ "profile": "codex", "ownHooks": true, "role": "reviewer of MCR-1" }));
+        let bare = session_facts(&json!({ "profile": "codex", "ownHooks": true, "role": "reviewer of MCR-1" }), false);
         assert_eq!(bare["agentProfile"], Value::Null);
         assert_eq!(bare["roleKind"], "custom");
         assert_eq!(bare["part"], "reviewer of MCR-1");
         assert_eq!(bare["level"], "C3");
-        let launched = session_facts(&json!({ "profile": "claude", "role": "", "agentProfile": { "id": "implementer@claude-opus", "version": 1, "role": "implementer", "digest": "d" } }));
+        let launched = session_facts(&json!({ "profile": "claude", "role": "", "agentProfile": { "id": "implementer@claude-opus", "version": 1, "role": "implementer", "digest": "d" } }), false);
         assert_eq!(launched["roleKind"], "implementer");
         assert_eq!(launched["agentProfile"]["id"], "implementer@claude-opus");
         // What a stored record says round-trips
         let r: ProfileRef = serde_json::from_value(launched["agentProfile"].clone()).unwrap();
-        assert_eq!(r.role, Role::Implementer);
+        assert_eq!(r.role, "implementer");
+        // L2 (review 16715): the bare root Supervisor is a supervisor, reduced
+        // where its adapter does not leave terminal_write to the operator
+        let root = session_facts(&json!({ "profile": "claude", "role": "" }), true);
+        assert_eq!(root["roleKind"], "supervisor");
+        assert!(root.get("reduced").is_none());
+        let root = session_facts(&json!({ "profile": "codex", "role": "" }), true);
+        assert_eq!(root["roleKind"], "supervisor");
+        assert_eq!(root["reduced"], true);
+    }
+
+    #[test]
+    fn a_stored_profile_ref_from_a_later_build_is_read_or_left_out_never_fatal() {
+        // M2 (review 16715): a role this build does not know, extra and missing fields
+        let r: ProfileRef = serde_json::from_value(json!({ "id": "auditor@x", "role": "auditor", "later": 1 })).unwrap();
+        assert_eq!((r.role.as_str(), r.version), ("auditor", 0));
+        assert_eq!(session_facts(&json!({ "profile": "claude", "agentProfile": { "id": "auditor@x", "role": "auditor" } }), false)["roleKind"], "auditor");
+        // A shape this build cannot read is no profile
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(default, deserialize_with = "lenient_ref")]
+            p: Option<ProfileRef>,
+        }
+        for shape in [json!("implementer@claude-opus"), json!(42), json!({ "id": 7 }), json!(null)] {
+            let h: Holder = serde_json::from_value(json!({ "p": shape })).unwrap();
+            assert!(h.p.is_none(), "{shape}");
+        }
+        assert_eq!(session_facts(&json!({ "profile": "claude", "agentProfile": "weird" }), false)["roleKind"], "custom");
+    }
+
+    #[test]
+    fn custom_profiles_fit_agents_below_c2() {
+        // L1 (review 16715): an adapter without modes takes a profile without permissions
+        let pi = "id = \"custom@pi\"\nversion = 1\nrole = \"custom\"\nadapter = \"pi\"\nsummary = \"Pi as a terminal agent\"\n";
+        assert!(parse(pi, Origin::Operator).is_ok());
+        let agy = pi.replace("custom@pi", "custom@agy").replace("adapter = \"pi\"", "adapter = \"antigravity\"");
+        assert!(parse(&agy, Origin::Operator).is_ok());
+        // ... and nothing it cannot pass
+        assert!(refused(&format!("{pi}[permissions]\nmode = \"manual\"\n")).contains("cannot set its mode"));
+        assert!(refused(&format!("{pi}[inference]\nmodel = \"m\"\n")).contains("takes no model"));
+        assert!(refused(&format!("{pi}[limits]\nmax_executors = 1\n")).contains("max_executors"));
+        // An adapter with modes still needs one
+        let claude = "id = \"implementer@m\"\nversion = 1\nrole = \"implementer\"\nadapter = \"claude\"\n";
+        assert!(refused(claude).contains("claude needs one of"));
     }
 }
