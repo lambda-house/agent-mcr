@@ -10,16 +10,24 @@ export interface TerminalTask { hasSelection: () => boolean; open: () => void }
 
 export const terminalTask: { current: TerminalTask | null } = { current: null };
 
-/** The key: Cmd+Shift+C on macOS, Ctrl+Shift+C elsewhere (`commands.ts` has the same as the command's shortcut). */
+/**
+ * The key, on macOS only: Cmd+Shift+C. On Windows and Linux Ctrl+Shift+C is
+ * the terminal's copy, as in Windows Terminal and GNOME Terminal (MCR-125
+ * review L2), so there the task is in the menus only.
+ */
 export const TASK_SHORTCUT = { mod: true, shift: true, key: 'c' } as const;
 
-/**
- * Whether a key press is Copy as task's. The terminal leaves it to the app:
- * Ctrl+Shift+C would otherwise reach the agent as Ctrl+C and stop its turn.
- * `code` too, so a layout without Latin letters has the same key.
- */
+const isC = (e: KeyboardEvent) => e.key.toLowerCase() === 'c' || e.code === 'KeyC';
+
+/** Copy as task's key (macOS). The terminal leaves it to the app. `code` too, for a layout without Latin letters. */
 export function isTaskKey(e: KeyboardEvent, platform: Platform = PLATFORM): boolean {
-  if (e.altKey || !e.shiftKey) return false;
-  const mod = platform === 'macos' ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
-  return mod && (e.key.toLowerCase() === 'c' || e.code === 'KeyC');
+  return platform === 'macos' && !e.altKey && e.shiftKey && e.metaKey && !e.ctrlKey && isC(e);
+}
+
+/**
+ * Ctrl+Shift+C on Windows and Linux: copy the selection. Never handed to the
+ * agent, which would take it for Ctrl+C and stop its turn.
+ */
+export function isCopyKey(e: KeyboardEvent, platform: Platform = PLATFORM): boolean {
+  return platform !== 'macos' && !e.altKey && e.shiftKey && e.ctrlKey && !e.metaKey && isC(e);
 }

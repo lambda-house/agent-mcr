@@ -471,6 +471,8 @@ export const harnessApi = {
   cockpitAct: (by: string, id: string, updated: number, act: CockpitAct, option?: number) => invoke<CockpitActed>('harness_cockpit_act', { by, id, updated, act, option: option ?? null }),
   /** Copy as task (MCR-125 v0): the instruction and the excerpt as one task text on the clipboard. Starts and stores nothing */
   copyAsTask: (source: string, instruction: string, excerpt: string) => invoke<void>('harness_copy_as_task', { source, instruction, excerpt }),
+  /** The operator's copy of a terminal selection, through the platform's clipboard tool */
+  copyText: (text: string) => invoke<void>('harness_copy_text', { text }),
   /** A note from the person; without a folder it is for every session */
   postNote: (text: string, hours: number, folder?: string) => invoke<void>('harness_note_post', { text, hours, folder: folder || null }),
   removeNote: (note: string) => invoke<void>('harness_note_remove', { note }),

@@ -9,6 +9,9 @@
  * which builds the text that is copied.
  */
 
+/** Characters, as Rust counts them (code points), not UTF-16 units. */
+export const chars = (s: string) => [...s].length;
+
 /** The most of a terminal that goes into one task, in characters (`task_copy::MAX_EXCERPT`). */
 export const MAX_EXCERPT = 4000;
 /** The most the instruction may hold (`task_copy::MAX_INSTRUCTION`). */

@@ -228,7 +228,8 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
         {
           id: 'edit.copyAsTask',
           label: 'Copy Terminal Selection as Task…',
-          shortcut: { ...TASK_SHORTCUT },
+          // macOS only: elsewhere Ctrl+Shift+C is the terminal's copy
+          shortcut: PLATFORM === 'macos' ? { ...TASK_SHORTCUT } : undefined,
           enabled: () => terminalTask.current?.hasSelection() ?? false,
           run: () => terminalTask.current?.open(),
         },

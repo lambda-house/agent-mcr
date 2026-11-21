@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import TaskCopyDialog from './TaskCopyDialog';
 import { harnessApi } from '../utils/harness';
 import { MAX_EXCERPT } from '../utils/taskCopy';
-import { isTaskKey, terminalTask } from '../utils/terminalTask';
+import { isCopyKey, isTaskKey, terminalTask } from '../utils/terminalTask';
 import { buildMenu, type Command, type MenuItem } from '../utils/commands';
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { copyAsTask: vi.fn() } }));
@@ -61,6 +61,13 @@ it('says why the service refused, and stays open', async () => {
   expect(on.done).not.toHaveBeenCalled();
 });
 
+it('counts characters as the Rust side does, not UTF-16 units', () => {
+  render('🙂'.repeat(MAX_EXCERPT));
+  type('Look at it');
+  expect(copyButton().disabled).toBe(false);
+  expect(document.querySelector('.tc-count')?.textContent).toContain(`${MAX_EXCERPT} of at most`);
+});
+
 it('refuses a passage over the bound, and cancels with Escape; Cmd or Ctrl+Enter copies', async () => {
   render('x'.repeat(MAX_EXCERPT + 1));
   type('Do it');
@@ -82,14 +89,17 @@ it('refuses a passage over the bound, and cancels with Escape; Cmd or Ctrl+Enter
   window.removeEventListener('keydown', app);
 });
 
-it('has one key, kept from the agent, and a menu command for the terminal that last had the keyboard', () => {
+it('has its key on macOS only, leaves Ctrl+Shift+C to copy elsewhere, and a menu command for the shown terminal', () => {
   const key = (init: KeyboardEventInit) => new KeyboardEvent('keydown', init);
   expect(isTaskKey(key({ key: 'C', metaKey: true, shiftKey: true }), 'macos')).toBe(true);
-  expect(isTaskKey(key({ key: 'C', ctrlKey: true, shiftKey: true }), 'windows')).toBe(true);
-  expect(isTaskKey(key({ key: 'С', code: 'KeyC', ctrlKey: true, shiftKey: true }), 'linux')).toBe(true);
-  expect(isTaskKey(key({ key: 'c', ctrlKey: true }), 'windows')).toBe(false);
+  expect(isTaskKey(key({ key: 'C', ctrlKey: true, shiftKey: true }), 'windows')).toBe(false);
   expect(isTaskKey(key({ key: 'C', ctrlKey: true, shiftKey: true }), 'macos')).toBe(false);
-  expect(isTaskKey(key({ key: 'C', ctrlKey: true, shiftKey: true, altKey: true }), 'linux')).toBe(false);
+  // Windows and Linux: Ctrl+Shift+C copies, as in other terminals (review L2), on any layout
+  expect(isCopyKey(key({ key: 'C', ctrlKey: true, shiftKey: true }), 'windows')).toBe(true);
+  expect(isCopyKey(key({ key: 'С', code: 'KeyC', ctrlKey: true, shiftKey: true }), 'linux')).toBe(true);
+  expect(isCopyKey(key({ key: 'c', ctrlKey: true }), 'linux')).toBe(false);
+  expect(isCopyKey(key({ key: 'C', ctrlKey: true, shiftKey: true, altKey: true }), 'linux')).toBe(false);
+  expect(isCopyKey(key({ key: 'C', metaKey: true, shiftKey: true }), 'macos')).toBe(false);
   const find = (items: MenuItem[]): Command | undefined => {
     for (const item of items) {
       if (item === 'separator') continue;
