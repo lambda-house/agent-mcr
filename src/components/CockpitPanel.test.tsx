@@ -395,3 +395,31 @@ it('says that the cockpit could not be read when a read hangs, instead of showin
     vi.useRealTimers();
   }
 });
+
+// MCR-124 S1 (M5): needs asked with `report` reach today's panel in their older form. A need
+// that is guarded (an owner word, or a choice that cannot simply be undone) comes as
+// `unclickable` and gets no button; a plain one gets the buttons of a decision, by ids
+it('shows the action form of needs: buttons for a plain one, none for a guarded one, a question as text', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, tracks: [], actions: [
+    { id: 'branch', title: 'Which branch?', kind: 'decision', by: 'b1', where: { session: 'b1' }, options: ['Use main', 'Use a branch'], recommended: 'Use a branch', risk: 'reversible', need: true, source: ['r7'], updated: 11 },
+    { id: 'go-on', title: 'Go on?', kind: 'decision', by: 'b1', where: { session: 'b1' }, options: ['go on'], risk: 'reversible', need: true, updated: 12 },
+    { id: 'paid', title: 'Run the paid step?', kind: 'decision', by: 'b1', where: { session: 'b1' }, options: ['Run it', 'Wait'], risk: 'spend', amount: '40 EUR', need: true, unclickable: ['options'], updated: 13 },
+    { id: 'why', title: 'Why did the build break?', kind: 'question', by: 'r1', where: {}, risk: 'reversible', need: true, updated: 14 },
+  ] });
+  vi.mocked(harnessApi.cockpitAct).mockResolvedValue({ placed: 'b1' });
+  await show();
+  const buttons = (id: string) => [...host.querySelectorAll(`[data-action="${id}"] .ck-choices button.ck-do`)].map(b => b.textContent);
+  expect(buttons('branch')).toEqual(['Use main', 'Use a branch (recommended by its publisher)']);
+  expect(buttons('go-on')).toEqual(['go on']);
+  // Guarded: the choices as text, no button, and why
+  expect(buttons('paid')).toEqual([]);
+  const paid = host.querySelector('[data-action="paid"]')!;
+  expect([...paid.querySelectorAll('.ck-options li')].map(li => li.textContent)).toEqual(['Run it', 'Wait']);
+  expect(paid.textContent).toContain('No buttons');
+  // A question has nothing to place: its title is shown, and the row renders
+  expect(host.querySelector('[data-action="why"]')!.textContent).toContain('Why did the build break?');
+  expect(host.querySelectorAll('[data-action="why"] .ck-choices button.ck-do')).toHaveLength(0);
+  // A click names the need by its ids and stamp, as for an action
+  await act(async () => ([...host.querySelectorAll('[data-action="branch"] .ck-choices button.ck-do')][1] as HTMLButtonElement).click()); await flush();
+  expect(vi.mocked(harnessApi.cockpitAct).mock.calls).toEqual([['b1', 'branch', 11, 'choose', 1]]);
+});

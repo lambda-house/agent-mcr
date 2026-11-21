@@ -194,7 +194,8 @@ export interface CockpitTrack {
   ownerTyped?: number;
 }
 /** `answer_prompt` and `report` come from the service only (`derived`); sessions publish the others. */
-export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'answer_prompt' | 'report' | 'held_line' | 'human_wait';
+/** `question`: a need asked with `report` that has no choices (MCR-124), in its older action form */
+export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'question' | 'answer_prompt' | 'report' | 'held_line' | 'human_wait';
 export interface CockpitAction {
   id: string; title: string; kind: CockpitActionKind;
   track?: string; trackBy?: string; item?: string;
@@ -216,6 +217,8 @@ export interface CockpitAction {
   sessionEnded?: boolean;
   /** From the service: which of its texts a click would refuse (stored under an earlier rule). Shown as text, no button */
   unclickable?: ('say' | 'options' | 'url' | 'command')[];
+  /** The action form of a need asked with `report` (MCR-124): a click names the need, and the service resolves it */
+  need?: boolean;
   /**
    * From the service, never published. `reportOpen`: it names a report in
    * `source`, and whether that report is still open. The rest is what the
