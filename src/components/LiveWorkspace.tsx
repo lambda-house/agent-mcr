@@ -1009,11 +1009,12 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               : <div className="hs-layout-root">{renderNode(layout)}</div>}
             {bgOpened.map(id => <HiddenPaneSlot key={`bg:${id}`} sessionId={id} registerSlot={registerSlot}/>)}
             {opened.map(id => {
-              if (!hosted.some(h => h.id === id)) return null;
+              const h = hosted.find(x => x.id === id);
+              if (!h) return null;
               const el = slotEls[id];
               if (!el) return null;
               const isVisible = visibleSessions.has(id);
-              return createPortal(<TerminalPane key={id} id={id} active={active && isVisible} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active && isVisible} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );

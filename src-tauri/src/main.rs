@@ -24,6 +24,8 @@ mod runner;
 mod program;
 mod agents;
 mod cockpit;
+mod secret_shape;
+mod task_copy;
 mod harness;
 mod harness_preferences;
 mod harness_commands;
@@ -1279,6 +1281,7 @@ fn main() {
             harness_commands::harness_board,
             harness_commands::harness_cockpit,
             harness_commands::harness_cockpit_act,
+            harness_commands::harness_copy_as_task,
             harness_commands::harness_note_post,
             harness_commands::harness_note_remove,
             harness_commands::harness_signal,

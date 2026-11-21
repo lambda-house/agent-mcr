@@ -650,3 +650,18 @@
 .ck-link dt { color: var(--text-muted); }
 .ck-link dd { margin: 0; font-family: var(--font-mono, monospace); overflow-wrap: anywhere; word-break: break-all; user-select: text; }
 .ck-link-warn { color: var(--danger); font-weight: 600; }
+/* Copy as task (MCR-125 v0): the right-click menu on a selection, and its dialog */
+.hs-menu.tc-menu button { display: flex; justify-content: flex-start; padding: 6px 10px; border: 0; border-radius: 5px; background: transparent; color: var(--text); font-size: 12px; text-align: left; cursor: pointer; }
+.hs-menu.tc-menu button:hover, .hs-menu.tc-menu button:focus-visible { background: var(--layer-2); }
+.modal.tc-dialog { width: min(640px, calc(100vw - 32px)); min-width: 0; max-width: none; max-height: calc(100vh - 32px); display: flex; flex-direction: column; overflow: auto; }
+.modal.tc-dialog p { margin-bottom: 10px; }
+.tc-dialog .tc-source { font-size: var(--font-size-sm); }
+.tc-excerpt { flex: 0 1 auto; max-height: 40vh; min-height: 3em; margin: 0 0 4px; padding: 10px; overflow: auto; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--surface-input); color: var(--text-secondary); font: 12px/1.45 "SF Mono", Menlo, Monaco, monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.tc-dialog .tc-count { font-size: 11px; color: var(--text-secondary); text-align: right; }
+.tc-dialog .tc-bad, .tc-dialog .tc-error { color: var(--error-text); }
+.tc-label { display: block; margin: 6px 0 4px; font-size: var(--font-size-sm); font-weight: 600; color: var(--text-primary); }
+.tc-instruction { width: 100%; box-sizing: border-box; margin-bottom: 8px; padding: 8px; resize: vertical; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--surface-input); color: var(--text-primary); font: inherit; font-size: var(--font-size-md); }
+.tc-instruction:focus { outline: 2px solid var(--border-active); outline-offset: -1px; }
+.tc-dialog .tc-note { font-size: 12px; }
+.tc-dialog .modal-actions { align-items: center; }
+.tc-keys { margin-right: auto; font-size: 11px; color: var(--text-secondary); }

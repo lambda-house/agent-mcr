@@ -5,6 +5,9 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
 import { isPaletteKey, PLATFORM } from '../utils/platform';
+import { excerptFromSelection } from '../utils/taskCopy';
+import { isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
+import TaskCopyDialog from './TaskCopyDialog';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
 export const RESIZE_SETTLE_MS = 200;
@@ -38,8 +41,10 @@ function theme(element: HTMLElement) {
  * with no text is saved and its path typed. Ctrl-V reaches the agent as ^V
  * (Claude Code reads the clipboard image itself).
  */
-export default function TerminalPane({ id, active, onQuit, isSession, onSession, focusAt, onFocused }: {
+export default function TerminalPane({ id, name, active, onQuit, isSession, onSession, focusAt, onFocused }: {
   id: string; active: boolean;
+  /** Its name in the Live list, for the Copy as task dialog (MCR-125) */
+  name?: string;
   /** The session ended right after the person pressed keys in it: they quit the agent themselves */
   onQuit?: () => void;
   /** Whether an id is a session the app can show: `mcr:<id>` in the output is then a link */
@@ -63,6 +68,12 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
   const resend = useRef<() => void>(() => {});
   const [ended, setEnded] = useState(false);
   const [notice, setNotice] = useState('');
+  // Copy as task (MCR-125 v0): the right-click menu on a selection, and the dialog with its passage
+  const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [task, setTask] = useState<string | null>(null);
+  const openTask = (selection: string) => { setMenu(null); const excerpt = excerptFromSelection(selection); if (excerpt.trim()) setTask(excerpt); };
+  const opener = useRef(openTask);
+  opener.current = openTask;
 
   useEffect(() => {
     const element = host.current;
@@ -81,8 +92,13 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
     t.loadAddon(new Unicode11Addon());
     t.unicode.activeVersion = '11';
     t.open(element);
-    // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P
-    t.attachCustomKeyEventHandler(e => !isPaletteKey(e, PLATFORM));
+    // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
+    // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
+    t.attachCustomKeyEventHandler(e => !isPaletteKey(e, PLATFORM) && !isTaskKey(e));
+    // The terminal that last had the keyboard answers the app's Copy as task command
+    const mine: TerminalTask = { hasSelection: () => t.hasSelection() && !!t.getSelection().trim(), open: () => opener.current(t.getSelection()) };
+    const claim = () => { terminalTask.current = mine; };
+    t.textarea?.addEventListener('focus', claim);
     term.current = t; fit.current = f;
     // A session pointer in the output is a link to that session (MCR-82).
     // A line the terminal wrapped is read whole, so a pointer cut by the wrap is one link
@@ -243,6 +259,17 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
     element.addEventListener('dragover', onDragOver, true);
     element.addEventListener('drop', onDrop, true);
 
+    // A right click on a selection offers Copy and Copy as task. Taken before
+    // xterm's own handler, which would select the word under the pointer; a
+    // right click without a selection is xterm's as before
+    const onContextMenu = (e: MouseEvent) => {
+      const text = t.hasSelection() ? t.getSelection() : '';
+      if (!text.trim()) return;
+      e.preventDefault(); e.stopPropagation();
+      setMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 80), text });
+    };
+    element.addEventListener('contextmenu', onContextMenu, true);
+
     // Fit once the size has settled. Every new size reaches the agent as a
     // window change, and Claude Code and Codex repaint their whole transcript
     // for each one: fitting on every frame of a window drag floods the
@@ -260,6 +287,9 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
       element.removeEventListener('paste', onPaste, true);
       element.removeEventListener('dragover', onDragOver, true);
       element.removeEventListener('drop', onDrop, true);
+      element.removeEventListener('contextmenu', onContextMenu, true);
+      t.textarea?.removeEventListener('focus', claim);
+      if (terminalTask.current === mine) terminalTask.current = null;
       typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose(); rendered.dispose(); switched.dispose(); reflowed.dispose();
       pointers.current = () => {};
       if (view !== null) void harnessApi.detach(view);
@@ -285,8 +315,29 @@ export default function TerminalPane({ id, active, onQuit, isSession, onSession,
     return () => cancelAnimationFrame(frame);
   }, [focusAt]);
 
+  // The menu closes on a click elsewhere and on Escape
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    window.addEventListener('mousedown', close); window.addEventListener('keydown', key); window.addEventListener('blur', close);
+    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', key); window.removeEventListener('blur', close); };
+  }, [menu]);
+
+  const copied = () => {
+    setTask(null);
+    const said = 'Copied as a task: paste it into the session that is to do it.';
+    setNotice(said);
+    setTimeout(() => setNotice(n => n === said ? '' : n), 4000);
+  };
+
   return <div className="hs-terminal-wrap">
     <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
     {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended. Its output is kept until you forget it.'}</div>}
+    {menu && <div className="hs-menu tc-menu" role="menu" style={{ top: menu.y, left: menu.x }} onMouseDown={e => e.stopPropagation()}>
+      <button type="button" role="menuitem" onClick={() => { const text = menu.text; setMenu(null); navigator.clipboard.writeText(text).catch(e => setNotice(err(e))); }}>Copy</button>
+      <button type="button" role="menuitem" autoFocus onClick={() => openTask(menu.text)}>Copy as task…</button>
+    </div>}
+    {task !== null && <TaskCopyDialog source={id} name={name} excerpt={task} onDone={copied} onCancel={() => setTask(null)}/>}
   </div>;
 }
