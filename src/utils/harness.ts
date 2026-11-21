@@ -217,6 +217,8 @@ export interface CockpitAction {
   sessionEnded?: boolean;
   /** From the service: which of its texts a click would refuse (stored under an earlier rule). Shown as text, no button */
   unclickable?: ('say' | 'options' | 'url' | 'command')[];
+  /** The action form of a need asked with `report` (MCR-124): a click names the need, and the service resolves it */
+  need?: boolean;
   /**
    * From the service, never published. `reportOpen`: it names a report in
    * `source`, and whether that report is still open. The rest is what the

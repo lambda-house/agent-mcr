@@ -467,11 +467,13 @@ fn refuse<T>(path: &str, why: impl std::fmt::Display) -> Result<T, String> {
 /// prefixes of the tokens and keys this operator's tools use, followed by
 /// enough token characters to be one, and a private key block. Defence in
 /// depth beside "no secrets" in the guide: cockpit text is kept on disk and
-/// shown. A refusal names the place and never repeats the match.
+/// shown. A refusal names the place and never repeats the match. Refusals
+/// for other reasons say what they found missing in words, without the
+/// caller's value, so no text a check let through comes back in an error.
 pub fn looks_secret(s: &str) -> bool {
     let token = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');
     let run = |rest: &str, ok: &dyn Fn(char) -> bool| rest.chars().take_while(|c| ok(*c)).count();
-    const PREFIXES: [&str; 8] = ["xoxb-", "xoxp-", "xapp-", "ghp_", "gho_", "github_pat_", "sk-ant-", "glpat-"];
+    const PREFIXES: [&str; 13] = ["xoxb-", "xoxp-", "xapp-", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-ant-", "sk-proj-", "sk-svcacct-", "glpat-"];
     for (at, _) in s.char_indices() {
         let rest = &s[at..];
         // A word that starts here, not the middle of one
@@ -687,6 +689,11 @@ fn type_into(by: &str, session: String, text: String, facts: &Facts) -> Result<D
     }
     placeable(&text).map_err(|why| format!("Refused: the line {why}."))?;
     Ok(Deed::Type { session, text })
+}
+
+/// "Ask more" on a need: its part and id, no text of it.
+fn ask_need_line(part: &str, id: &str) -> String {
+    format!("Explain cockpit need {part}/{id}: what happens if I answer it, and what if I do not?")
 }
 
 fn required(path: &str, s: &str, max: usize) -> Result<(), String> {
@@ -980,7 +987,7 @@ fn need_ref(r: &str) -> Option<(&str, &str)> {
 fn check_need(path: &str, n: &Need, key: &str, part: &Part, who: &Who, facts: &Facts, all: &BTreeMap<String, Part>) -> Result<(), String> {
     ident(&format!("{path}.id"), &n.id)?;
     if part.actions.iter().any(|a| a.id == n.id) {
-        return refuse(&format!("{path}.id"), format!("{:?} is the id of one of your cockpit actions", n.id));
+        return refuse(&format!("{path}.id"), "is the id of one of your cockpit actions");
     }
     if FACT_KINDS.contains(&n.ask.as_str()) || DERIVED_KINDS.contains(&n.ask.as_str()) {
         return refuse(&format!("{path}.ask"), format!("{:?} is built by the harness from what it knows (a prompt, an unsent line, a report, a wait) and cannot be declared", n.ask));
@@ -1065,7 +1072,7 @@ fn check_need(path: &str, n: &Need, key: &str, part: &Part, who: &Who, facts: &F
     } else {
         match part.tracks.iter().find(|t| t.id == n.track) {
             Some(t) => Some(t),
-            None => return refuse(&format!("{path}.track"), format!("names {:?}, which is not one of your tracks", n.track)),
+            None => return refuse(&format!("{path}.track"), "names none of your tracks"),
         }
     };
     if !n.item.is_empty() {
@@ -1074,7 +1081,7 @@ fn check_need(path: &str, n: &Need, key: &str, part: &Part, who: &Who, facts: &F
             None => part.tracks.iter().any(|t| t.items.iter().any(|i| i.id == n.item)),
         };
         if !found {
-            return refuse(&format!("{path}.item"), format!("names {:?}, which is not an item of your tracks", n.item));
+            return refuse(&format!("{path}.item"), "names no item of your tracks");
         }
     }
     let need_exists = |r: &str| need_ref(r).is_some_and(|(by, id)| (by == key && id == n.id) || all.get(by).is_some_and(|p| p.needs.iter().any(|x| x.id == id)));
@@ -1084,7 +1091,7 @@ fn check_need(path: &str, n: &Need, key: &str, part: &Part, who: &Who, facts: &F
     for (i, b) in n.blocks.iter().enumerate() {
         let item = b.strip_prefix("item:").and_then(|r| r.split_once('/')).is_some_and(|(t, i)| part.tracks.iter().any(|x| x.id == t && x.items.iter().any(|y| y.id == i)));
         if !item && !(need_exists(b) && need_ref(b) != Some((key, n.id.as_str()))) {
-            return refuse(&format!("{path}.blocks[{i}]"), format!("names {b:?}, which is neither item:<track>/<item> of your tracks nor need:<part>/<id> of another need"));
+            return refuse(&format!("{path}.blocks[{i}]"), "is neither item:<track>/<item> of your tracks nor need:<part>/<id> of another need");
         }
     }
     if n.cause.len() > MAX_LIST {
@@ -1100,7 +1107,7 @@ fn check_need(path: &str, n: &Need, key: &str, part: &Part, who: &Who, facts: &F
             _ => false,
         };
         if !ok {
-            return refuse(&format!("{path}.cause[{i}]"), format!("names {c:?}, which is not need:<part>/<id>, prompt:<session>, held:<session>, wait:<id> or report:<id> of something the harness has"));
+            return refuse(&format!("{path}.cause[{i}]"), "is not need:<part>/<id>, prompt:<session>, held:<session>, wait:<id> or report:<id> of something the harness has");
         }
     }
     if n.refs.len() > MAX_LIST {
@@ -1468,16 +1475,21 @@ impl Cockpit {
         let chosen = how.chosen.as_str();
         let need = self.parts.get_mut(who.key()).and_then(|p| p.needs.iter_mut().find(|n| n.id == id && n.open()));
         let Some(need) = need else {
-            return refuse("need", format!("names {id:?}, which is not an open need of yours"));
+            return refuse("need", "names no open need of yours");
         };
         if !chosen.is_empty() && !need.options.iter().any(|o| o.id == chosen) {
-            return refuse("chosen", format!("names {chosen:?}, which is not a choice of that need"));
+            return refuse("chosen", "names no choice of that need");
         }
         need.closed = Some(Closed { note: how.note.trim().into(), ..how });
         if let Some(p) = self.parts.get_mut(who.key()) {
             p.updated = now;
         }
         Ok(self.wrote(who.id, now))
+    }
+
+    /// The reports a need of the caller was asked with or names as its cause.
+    pub fn need_reports(&self, who: &Who, id: &str) -> Vec<String> {
+        self.parts.get(who.key()).and_then(|p| p.needs.iter().find(|n| n.id == id)).map_or(Vec::new(), |n| n.cause.iter().filter_map(|c| c.strip_prefix("report:")).map(str::to_owned).collect())
     }
 
     /// Whether `id` is an open need of the caller.
@@ -1623,7 +1635,7 @@ impl Cockpit {
         match act {
             Act::Place if n.ask == "go" => answer(&n.options[0]),
             Act::Choose(i) if matches!(n.ask.as_str(), "decision" | "go") => answer(n.options.get(i).ok_or("Refused: that need has no such choice.")?),
-            Act::Ask => type_into(by, publisher()?, ask_line(&format!("{by}/{}", n.id)), facts),
+            Act::Ask => type_into(by, publisher()?, ask_need_line(by, &n.id), facts),
             Act::Link if !n.place.url.is_empty() => web_link(&n.place.url).map(Deed::Link).map_err(|why| format!("Refused: the link {why}.")),
             Act::Copy if !n.place.command.is_empty() => copyable(&n.place.command).map(|()| Deed::Copy(n.place.command.clone())).map_err(|why| format!("Refused: the command {why}.")),
             _ => Err("Refused: that need has nothing of this kind to click.".into()),
@@ -3014,6 +3026,13 @@ mod tests {
         assert_eq!(c.parts["sup"].needs.len(), 1);
         assert!(c.publish(&SUP, &facts(), &json!({ "tracks": [track()], "actions": [action("typed_word", json!({ "id": "n1", "where": { "session": "ex" }, "say": "go" }))] }), NOW + 7).unwrap_err().contains("need you asked"));
         assert!(published().declare(&SUP, &facts(), &need(json!({ "id": "a1" })), "Q?", NOW).unwrap_err().contains("need.id"));
+        // cockpit_patch keeps them too, and an action may not take a need's id
+        c.patch(&SUP, &facts(), &json!({ "track": { "id": "t1", "line": "moving on" } }), NOW + 8).unwrap();
+        assert_eq!(c.parts["sup"].needs.len(), 1);
+        let e = c.patch(&SUP, &facts(), &json!({ "action": { "id": "n1", "track": "t1", "title": "Say it", "kind": "typed_word", "where": { "session": "ex" }, "say": "go", "risk": "reversible" } }), NOW + 9).unwrap_err();
+        assert!(e.contains("need you asked"), "{e}");
+        c.publish(&SUP, &facts(), &json!({}), NOW + 10).unwrap();
+        assert_eq!((c.parts["sup"].needs.len(), c.parts["sup"].tracks.len()), (1, 0), "a part with needs only stays");
         // Each refusal names the place of the first fault, and stores nothing
         let refused = |n: Value| {
             let mut c = Cockpit::default();
@@ -3070,6 +3089,14 @@ mod tests {
             ["AK", "IA", "ABCDEFGHIJ234567"].concat(),
             ["Bear", "er ", body, ".", body].concat(),
             ["-----BEGIN RSA ", "PRIVATE KEY-----"].concat(),
+            ["xo", "xp-", "1234-", body].concat(),
+            ["gh", "o_", body].concat(),
+            ["gh", "s_", body].concat(),
+            ["gh", "u_", body].concat(),
+            ["gh", "r_", body].concat(),
+            ["gl", "pat-", body].concat(),
+            ["sk", "-proj-", "Ab_cd-", body].concat(),
+            ["sk", "-svcacct-", body].concat(),
         ]
     }
 
@@ -3088,6 +3115,11 @@ mod tests {
             // The same for what cockpit_publish takes, and again at the click (`placeable`)
             assert!(with_action(action("live_check", json!({ "detail": format!("run with {secret}") }))).unwrap_err().contains("credential"));
             assert!(placeable(&format!("use {secret}")).unwrap_err().contains("credential"), "{secret}");
+            assert!(copyable(&format!("echo {secret}")).unwrap_err().contains("credential"), "{secret}");
+            if !secret.contains(' ') {
+                let e = web_link(&format!("https://example.com/hook?t={secret}")).unwrap_err();
+                assert!(e.contains("credential") && !e.contains(&secret), "{e}");
+            }
         }
         for fine in ["the ghp_ prefix of a token", "ask-anthropic", "AKIA keys rotate", "a Bearer token", "risk-free", "task-antelope-1234567890123456789"] {
             assert!(!looks_secret(fine), "{fine}");
@@ -3149,7 +3181,7 @@ mod tests {
         assert!(!read["needs"].as_array().unwrap().iter().any(|n| n["id"] == "n1") && !read["actions"].as_array().unwrap().iter().any(|a| a["id"] == "n1"));
         assert_eq!((&read["closed"][0]["id"], &read["closed"][0]["closed"]["chosen"]), (&json!("n1"), &json!("b")));
         assert!(c.read(&Facts { now: NOW + 2 + CLOSED_KEPT_MS, ..f.clone() }, None)["closed"].as_array().unwrap().is_empty());
-        assert!(c.close(&SUP, &f, "n1", Closed { outcome: "answered".into(), chosen: "".into(), note: "".into(), at: NOW + 4 }).unwrap_err().contains("not an open need"));
+        assert!(c.close(&SUP, &f, "n1", Closed { outcome: "answered".into(), chosen: "".into(), note: "".into(), at: NOW + 4 }).unwrap_err().contains("no open need"));
         assert!(c.close(&SUP, &f, "n2", Closed { outcome: "answered".into(), chosen: "zz".into(), note: "".into(), at: NOW + 4 }).unwrap_err().contains("chosen"));
         assert!(c.close(&SUP, &f, "n2", Closed { outcome: "maybe".into(), chosen: "".into(), note: "".into(), at: NOW + 4 }).unwrap_err().contains("outcome"));
     }
