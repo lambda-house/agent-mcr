@@ -463,36 +463,12 @@ fn refuse<T>(path: &str, why: impl std::fmt::Display) -> Result<T, String> {
     Err(format!("Refused: {path} {why}"))
 }
 
-/// Whether text holds what looks like a credential (MCR-124, M9): the
-/// prefixes of the tokens and keys this operator's tools use, followed by
-/// enough token characters to be one, and a private key block. Defence in
-/// depth beside "no secrets" in the guide: cockpit text is kept on disk and
-/// shown. A refusal names the place and never repeats the match. Refusals
-/// for other reasons say what they found missing in words, without the
-/// caller's value, so no text a check let through comes back in an error.
-pub fn looks_secret(s: &str) -> bool {
-    let token = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');
-    let run = |rest: &str, ok: &dyn Fn(char) -> bool| rest.chars().take_while(|c| ok(*c)).count();
-    const PREFIXES: [&str; 13] = ["xoxb-", "xoxp-", "xapp-", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-ant-", "sk-proj-", "sk-svcacct-", "glpat-"];
-    for (at, _) in s.char_indices() {
-        let rest = &s[at..];
-        // A word that starts here, not the middle of one
-        let starts = s[..at].chars().next_back().is_none_or(|c| !token(c));
-        if starts && PREFIXES.iter().any(|p| rest.starts_with(p) && run(&rest[p.len()..], &token) >= 16) {
-            return true;
-        }
-        if starts && rest.starts_with("sk-") && run(&rest[3..], &|c: char| c.is_ascii_alphanumeric()) >= 20 {
-            return true;
-        }
-        if starts && rest.starts_with("AKIA") && run(&rest[4..], &|c: char| c.is_ascii_uppercase() || c.is_ascii_digit()) >= 16 {
-            return true;
-        }
-        if rest.starts_with("Bearer ") && run(&rest[7..], &|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/' | '=')) >= 20 {
-            return true;
-        }
-    }
-    s.contains("-----BEGIN") && s.contains("PRIVATE KEY")
-}
+/// Whether text holds what looks like a credential (MCR-124, M9): the one
+/// detector in `secret_shape`, also used by Copy as task (MCR-125). A
+/// refusal names the place and never repeats the match. Refusals for other
+/// reasons say what they found missing in words, without the caller's value,
+/// so no text a check let through comes back in an error.
+pub use crate::secret_shape::looks_secret;
 
 const SECRET: &str = "holds what looks like a credential (a token or a private key). Cockpit text is shown and kept on disk: never put a secret in it";
 

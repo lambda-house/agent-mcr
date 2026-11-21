@@ -568,6 +568,17 @@ pub async fn harness_cockpit_act(app: tauri::AppHandle, state: tauri::State<'_, 
     .await
 }
 
+/// "Copy as task" (MCR-125 v0): the operator's instruction and a passage
+/// they selected in a session's terminal, as one task text on the clipboard,
+/// to paste into a session they start themselves. Nothing is started, sent
+/// or stored; no agent can call this. The excerpt is quoted as data after
+/// the operator's words (`task_copy::task_text`).
+#[tauri::command]
+pub async fn harness_copy_as_task(source: String, instruction: String, excerpt: String) -> Result<(), String> {
+    let text = crate::task_copy::task_text(&source, &instruction, &excerpt, crate::secret_shape::looks_secret)?;
+    blocking(move || to_clipboard(&text)).await
+}
+
 /// Text to the system clipboard, through the platform's own tool: the app
 /// has no clipboard library, and the page is not given the text to copy.
 fn to_clipboard(text: &str) -> Result<(), String> {
@@ -595,7 +606,7 @@ fn to_clipboard(text: &str) -> Result<(), String> {
             feed(xclip, text.as_bytes())
         })
     };
-    done.map_err(|e| format!("The command could not be copied: {e}"))
+    done.map_err(|e| format!("Could not copy to the clipboard: {e}"))
 }
 
 /// A note from the person on the bulletin board: `folder` empty means every session.

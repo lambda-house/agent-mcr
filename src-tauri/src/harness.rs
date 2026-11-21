@@ -6726,6 +6726,18 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Copy as task (MCR-125 v0) is the operator's, in the app: no agent or
+    /// supervisor tool hands a terminal passage on, and the service has no op for it.
+    #[test]
+    fn copy_as_task_has_no_mcp_path() {
+        for catalog in [agent_tools(), supervisor_tools()] {
+            for tool in catalog["tools"].as_array().unwrap() {
+                let name = tool["name"].as_str().unwrap();
+                assert!(!name.contains("copy") && !name.contains("excerpt") && !name.contains("selection"), "{name}");
+            }
+        }
+    }
+
     fn store_with(session: &str, state: &str) -> Store {
         let mut store = Store::default();
         store.sessions.insert(session.into(), Tracked { profile: "claude".into(), state: state.into(), ..Tracked::default() });

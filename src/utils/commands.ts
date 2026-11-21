@@ -1,5 +1,6 @@
 import { useStore, canNavigateBack, canNavigateForward, type AppState } from '../store';
 import { liveNav } from './liveNav';
+import { terminalTask, TASK_SHORTCUT } from './terminalTask';
 import { PLATFORM } from './platform';
 import { saveActiveDocument, requestSaveAll } from './save';
 import { exportActiveDocument } from './export';
@@ -221,6 +222,15 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
           shortcut: { mod: true, key: 'e' },
           checked: (s) => s.editMode,
           run: () => state().toggleEditMode(),
+        },
+        // MCR-125 v0: the passage selected in the terminal that last had the keyboard,
+        // with the operator's instruction, as a task text on the clipboard
+        {
+          id: 'edit.copyAsTask',
+          label: 'Copy Terminal Selection as Task…',
+          shortcut: { ...TASK_SHORTCUT },
+          enabled: () => terminalTask.current?.hasSelection() ?? false,
+          run: () => terminalTask.current?.open(),
         },
       ],
     },
