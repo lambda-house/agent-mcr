@@ -4001,8 +4001,9 @@ impl Harness {
                             }
                             let reports = next.need_reports(&who, id);
                             next.close(&who, &facts, id, cockpit::Closed { outcome: "done".into(), at: now, ..cockpit::Closed::default() })?;
-                            s.answered_reports(me, &reports);
+                            // A refused report changes nothing: the need stays open and its mark stands
                             let report = s.report(me, kind, &said)?;
+                            s.answered_reports(me, &reports);
                             s.cockpit = next;
                             Ok(report)
                         }
@@ -6681,6 +6682,21 @@ mod tests {
             assert!(!all["actions"].as_array().unwrap().iter().any(|a| a["kind"] == "report"), "{outcome}");
             assert!(all["sessions"].get("a").is_none_or(|a| a["needsOperator"] != true), "{outcome}");
         }
+        // Ten minutes later, as far as the report limit is concerned
+        h.update(|s| s.reports.iter_mut().filter(|r| r.session == "a").for_each(|r| r.created = 1));
+        // Finished with done: the need's report is answered and the done report is the mark (review L7)
+        let asked = h.agent_tool("a", "report", &json!({"kind": "needs_human", "text": "Ship b's branch?", "need": {"id": "ship", "ask": "question", "actor": "b"}})).unwrap();
+        let rid = asked["report"].as_str().unwrap().to_string();
+        let done = h.agent_tool("a", "report", &json!({"kind": "done", "text": "Shipped", "need": "ship"})).unwrap();
+        {
+            let s = lock(&h.store);
+            assert_eq!(s.sessions["a"].attention.as_ref().unwrap().report.as_deref(), Some("done"));
+            assert_eq!(s.open_report("a").unwrap().id, done["report"].as_str().unwrap());
+            assert_eq!(s.cockpit.parts["a"].needs.iter().find(|n| n.id == "ship").unwrap().closed.as_ref().unwrap().outcome, "done");
+        }
+        let all = h.tool("cockpit_read", &json!({})).unwrap();
+        assert!(!all["needs"].to_string().contains(&rid) && !all["actions"].to_string().contains(&rid));
+        h.update(|s| s.sessions.get_mut("a").unwrap().attention = None);
         // A later report's mark stays: only the need's own report is answered
         h.agent_tool("a", "report", &json!({"kind": "needs_human", "text": "And this?", "need": {"id": "keep", "ask": "question"}})).unwrap();
         let other = h.agent_tool("a", "report", &json!({"kind": "needs_human", "text": "Something else?"})).unwrap()["report"].as_str().unwrap().to_string();

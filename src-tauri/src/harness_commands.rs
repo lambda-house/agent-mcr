@@ -579,6 +579,18 @@ pub async fn harness_copy_as_task(source: String, instruction: String, excerpt: 
     blocking(move || to_clipboard(&text)).await
 }
 
+/// The operator's own copy of a terminal selection (the Copy item of the
+/// terminal's right-click menu, Ctrl+Shift+C on Windows and Linux): through
+/// the platform's tool like every other copy of the app, not the webview's
+/// clipboard API, which the app's webviews do not all grant (MCR-125 review L1).
+#[tauri::command]
+pub async fn harness_copy_text(text: String) -> Result<(), String> {
+    if text.len() > 4 * 1024 * 1024 {
+        return Err("The selection is too large to copy.".into());
+    }
+    blocking(move || to_clipboard(&text)).await
+}
+
 /// Text to the system clipboard, through the platform's own tool: the app
 /// has no clipboard library, and the page is not given the text to copy.
 fn to_clipboard(text: &str) -> Result<(), String> {

@@ -6,7 +6,7 @@ import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
 import { isPaletteKey, PLATFORM } from '../utils/platform';
 import { excerptFromSelection } from '../utils/taskCopy';
-import { isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
+import { isCopyKey, isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
 import TaskCopyDialog from './TaskCopyDialog';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
@@ -71,9 +71,19 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
   // Copy as task (MCR-125 v0): the right-click menu on a selection, and the dialog with its passage
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
   const [task, setTask] = useState<string | null>(null);
-  const openTask = (selection: string) => { setMenu(null); const excerpt = excerptFromSelection(selection); if (excerpt.trim()) setTask(excerpt); };
+  const say = (text: string) => { setNotice(text); setTimeout(() => setNotice(n => n === text ? '' : n), 4000); };
+  const openTask = (selection: string) => {
+    setMenu(null);
+    const excerpt = excerptFromSelection(selection);
+    if (excerpt.trim()) setTask(excerpt);
+    else say('Nothing to copy as a task: the selection holds only the frame the agent draws.');
+  };
   const opener = useRef(openTask);
   opener.current = openTask;
+  // Only a terminal that is shown answers the app's command: never one left behind in another pane
+  const shown = useRef(active);
+  shown.current = active;
+  const copyText = (text: string) => { harnessApi.copyText(text).catch(e => setNotice(err(e))); };
 
   useEffect(() => {
     const element = host.current;
@@ -94,9 +104,17 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     t.open(element);
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
-    t.attachCustomKeyEventHandler(e => !isPaletteKey(e, PLATFORM) && !isTaskKey(e));
-    // The terminal that last had the keyboard answers the app's Copy as task command
-    const mine: TerminalTask = { hasSelection: () => t.hasSelection() && !!t.getSelection().trim(), open: () => opener.current(t.getSelection()) };
+    // On Windows and Linux Ctrl+Shift+C copies the selection, as in other terminals, and is never the agent's
+    t.attachCustomKeyEventHandler(e => {
+      if (isPaletteKey(e, PLATFORM) || isTaskKey(e)) return false;
+      if (isCopyKey(e)) {
+        if (e.type === 'keydown' && t.hasSelection()) copyText(t.getSelection());
+        return false;
+      }
+      return true;
+    });
+    // The terminal that last had the keyboard answers the app's Copy as task command, while it is shown
+    const mine: TerminalTask = { hasSelection: () => shown.current && t.hasSelection() && !!t.getSelection().trim(), open: () => opener.current(t.getSelection()) };
     const claim = () => { terminalTask.current = mine; };
     t.textarea?.addEventListener('focus', claim);
     term.current = t; fit.current = f;
@@ -324,18 +342,13 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', key); window.removeEventListener('blur', close); };
   }, [menu]);
 
-  const copied = () => {
-    setTask(null);
-    const said = 'Copied as a task: paste it into the session that is to do it.';
-    setNotice(said);
-    setTimeout(() => setNotice(n => n === said ? '' : n), 4000);
-  };
+  const copied = () => { setTask(null); say('Copied as a task: paste it into the session that is to do it.'); };
 
   return <div className="hs-terminal-wrap">
     <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
     {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended. Its output is kept until you forget it.'}</div>}
     {menu && <div className="hs-menu tc-menu" role="menu" style={{ top: menu.y, left: menu.x }} onMouseDown={e => e.stopPropagation()}>
-      <button type="button" role="menuitem" onClick={() => { const text = menu.text; setMenu(null); navigator.clipboard.writeText(text).catch(e => setNotice(err(e))); }}>Copy</button>
+      <button type="button" role="menuitem" onClick={() => { const text = menu.text; setMenu(null); copyText(text); }}>Copy</button>
       <button type="button" role="menuitem" autoFocus onClick={() => openTask(menu.text)}>Copy as task…</button>
     </div>}
     {task !== null && <TaskCopyDialog source={id} name={name} excerpt={task} onDone={copied} onCancel={() => setTask(null)}/>}
