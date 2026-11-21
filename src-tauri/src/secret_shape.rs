@@ -12,7 +12,7 @@
 pub fn looks_secret(s: &str) -> bool {
     let token = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');
     let run = |rest: &str, ok: &dyn Fn(char) -> bool| rest.chars().take_while(|c| ok(*c)).count();
-    const PREFIXES: [&str; 8] = ["xoxb-", "xoxp-", "xapp-", "ghp_", "gho_", "github_pat_", "sk-ant-", "glpat-"];
+    const PREFIXES: [&str; 13] = ["xoxb-", "xoxp-", "xapp-", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-ant-", "sk-proj-", "sk-svcacct-", "glpat-"];
     for (at, _) in s.char_indices() {
         let rest = &s[at..];
         // A word that starts here, not the middle of one
@@ -50,6 +50,14 @@ mod tests {
             ["AK", "IA", "ABCDEFGHIJ234567"].concat(),
             ["Bear", "er ", body, ".", body].concat(),
             ["-----BEGIN RSA ", "PRIVATE KEY-----"].concat(),
+            ["xo", "xp-", "1234-", body].concat(),
+            ["gh", "o_", body].concat(),
+            ["gh", "s_", body].concat(),
+            ["gh", "u_", body].concat(),
+            ["gh", "r_", body].concat(),
+            ["gl", "pat-", body].concat(),
+            ["sk", "-proj-", "Ab_cd-", body].concat(),
+            ["sk", "-svcacct-", body].concat(),
         ]
     }
 
