@@ -112,7 +112,7 @@ export function trackStateShown(t: CockpitTrack, now = Date.now()): { text: stri
 
 export const ACTION_KIND: Record<CockpitAction['kind'], string> = {
   typed_word: 'your word', decision: 'decision', secret_step: 'step only you can do', live_check: 'live check',
-  external: 'outside', answer_prompt: 'prompt', report: 'report', held_line: 'unsent line', human_wait: 'waits for you',
+  external: 'outside', question: 'question', answer_prompt: 'prompt', report: 'report', held_line: 'unsent line', human_wait: 'waits for you',
 };
 
 /** How long a line has stood, in plain words: "45 s", "12 min", "2 h 5 min". */

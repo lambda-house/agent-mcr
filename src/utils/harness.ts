@@ -194,7 +194,8 @@ export interface CockpitTrack {
   ownerTyped?: number;
 }
 /** `answer_prompt` and `report` come from the service only (`derived`); sessions publish the others. */
-export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'answer_prompt' | 'report' | 'held_line' | 'human_wait';
+/** `question`: a need asked with `report` that has no choices (MCR-124), in its older action form */
+export type CockpitActionKind = 'typed_word' | 'decision' | 'secret_step' | 'live_check' | 'external' | 'question' | 'answer_prompt' | 'report' | 'held_line' | 'human_wait';
 export interface CockpitAction {
   id: string; title: string; kind: CockpitActionKind;
   track?: string; trackBy?: string; item?: string;

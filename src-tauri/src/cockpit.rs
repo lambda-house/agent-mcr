@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-pub const SCHEMA: u32 = 1;
+/// 2: parts hold `needs` (MCR-124). An older build reads a document of a
+/// later schema as empty, and the store keeps the file aside first (MCR-99)
+pub const SCHEMA: u32 = 2;
 /// The key of the root Supervisor's part: it belongs to the role, so a new
 /// Supervisor session continues it. Session ids are hexadecimal.
 pub const ROOT: &str = "supervisor";
@@ -34,7 +36,20 @@ const RISKS: [&str; 3] = ["reversible", "irreversible", "spend"];
 const URGENCIES: [&str; 3] = ["now", "today", "whenever"];
 /// Fields the service writes. They are taken out of what a session sends, so
 /// a document that was read can be published back.
-const STAMPS: [&str; 8] = ["updated", "since", "by", "live", "trackMissing", "ownerTyped", "sessionEnded", "unclickable"];
+const STAMPS: [&str; 13] = ["updated", "since", "by", "live", "trackMissing", "ownerTyped", "sessionEnded", "unclickable", "closed", "guarded", "attach", "need", "fromAction"];
+/// What a session asks of the operator through `report` (MCR-124)
+const NEED_KINDS: [&str; 6] = ["decision", "go", "question", "secret_step", "live_check", "external"];
+/// What the harness builds from its own facts: never declared by a session
+const FACT_KINDS: [&str; 5] = ["prompt", "held_line", "report", "done", "human_wait"];
+/// The owner's own words: the answer goes only to the acting session (MCR-124)
+const WORDS: [&str; 7] = ["none", "merge", "push", "build", "release", "spend", "paid"];
+const CHOICE_RISKS: [&str; 3] = ["reversible", "irreversible", "spend"];
+const OUTCOMES: [&str; 4] = ["answered", "done", "obsolete", "withdrawn"];
+const MAX_NEEDS: usize = 30;
+/// The longest a publisher may promise to look at a need again: two weeks, in minutes
+const MAX_CHECK_BY: u64 = 14 * 24 * 60;
+/// A closed need stays readable this long ("Closed today")
+pub const CLOSED_KEPT_MS: u64 = 24 * 3_600_000;
 
 const MAX_TRACKS: usize = 12;
 const MAX_ITEMS: usize = 30;
@@ -167,13 +182,147 @@ pub struct Action {
     pub updated: u64,
 }
 
+/// One choice of a need (MCR-124).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Choice {
+    pub id: String,
+    /// What the operator chooses, in the words the session wants back
+    pub label: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub recommended: bool,
+    /// reversible | irreversible | spend (then with `amount`)
+    pub risk: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub amount: String,
+    /// What happens if it is chosen: shown, never placed
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub effect: String,
+}
+
+/// How a need ended, by its publisher's word.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Closed {
+    /// answered | done | obsolete | withdrawn
+    pub outcome: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub chosen: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    pub at: u64,
+}
+
+/// A question a session escalates to the operator with `report` (MCR-124):
+/// the answer goes back down to that session, or to the `actor` it names.
+/// Stored in its publisher's part like an action, and never run: a click
+/// places a line built by the service from ids, unsent.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Need {
+    pub id: String,
+    /// decision | go | question | secret_step | live_check | external
+    pub ask: String,
+    /// The question, one line: the report's text
+    pub text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<Choice>,
+    /// An owner word the answer is (`none` when it is none)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub word: String,
+    /// The placed line is the option's label alone, as a `typed_word`'s `say`
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub exact: bool,
+    /// The session whose input box gets the answer; the publisher when empty
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    #[serde(rename = "where")]
+    pub place: Where,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub track: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub item: String,
+    /// `item:<track>/<item>` of the publisher's tracks, or `need:<part>/<id>`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<String>,
+    /// `need:<part>/<id>`, `prompt:<session>`, `held:<session>`, `wait:<id>`, `report:<id>`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cause: Vec<String>,
+    /// Ticket keys and links
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub urgency: String,
+    /// Minutes: by when the publisher will confirm or change it at the latest
+    #[serde(skip_serializing_if = "zero")]
+    pub check_by: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    #[serde(skip_serializing_if = "zero")]
+    pub since: u64,
+    /// Every declaration is a new one: a click names this stamp
+    #[serde(skip_serializing_if = "zero")]
+    pub updated: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<Closed>,
+}
+
+impl Need {
+    /// An answer that is the owner's own word, or a choice that risks more
+    /// than a step back: a click never places it in this slice (MCR-124 S1)
+    pub fn guarded(&self) -> bool {
+        (!self.word.is_empty() && self.word != "none") || self.ask == "secret_step" || self.options.iter().any(|o| o.risk != "reversible")
+    }
+
+    /// The highest risk of its choices (MCR-124, L4): not a field anyone sets
+    pub fn risk(&self) -> &'static str {
+        if self.ask == "secret_step" {
+            "secret"
+        } else if self.options.iter().any(|o| o.risk == "irreversible") {
+            "irreversible"
+        } else if self.options.iter().any(|o| o.risk == "spend") {
+            "spend"
+        } else {
+            "reversible"
+        }
+    }
+
+    fn open(&self) -> bool {
+        self.closed.is_none()
+    }
+}
+
+/// The line a click on a need's choice places, unsent, in the acting
+/// session's box: built by the service from ids, so a bare "yes" is never
+/// taken for an answer to whatever the session asked last. `part` names the
+/// publisher: need ids are its own (MCR-124, M3).
+fn need_line(part: &str, need: &Need, choice: &Choice) -> String {
+    if need.exact {
+        return choice.label.clone();
+    }
+    let frame = if need.ask == "go" { "Go" } else { "Decision" };
+    let amount = if choice.amount.is_empty() { String::new() } else { format!(" ({})", choice.amount) };
+    format!("{frame} {part}/{}: {}{amount}", need.id, choice.label)
+}
+
 /// What one session published.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct Part {
     pub tracks: Vec<Track>,
     pub actions: Vec<Action>,
+    /// Asked through `report` (MCR-124), never through `cockpit_publish`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<Need>,
     pub updated: u64,
+}
+
+impl Part {
+    fn is_empty(&self) -> bool {
+        self.tracks.is_empty() && self.actions.is_empty() && self.needs.is_empty()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -228,8 +377,8 @@ pub struct Fact {
     pub held: Option<u64>,
     /// Its open `needs_human` report: id, text, when
     pub needs_human: Option<(String, String, u64)>,
-    /// Its open `done` report
-    pub done: Option<String>,
+    /// Its open `done` report: id, text, when
+    pub done: Option<(String, String, u64)>,
     pub waits: Vec<FactWait>,
     /// When the operator last pressed Enter in its terminal, by the app's word
     pub typed: Option<u64>,
@@ -260,8 +409,10 @@ pub const STALE_AFTER_MS: u64 = 6 * 3_600_000;
 pub struct Outdated {
     /// The part it is in: a session id, or `ROOT`
     pub by: String,
-    /// A track; otherwise an action
+    /// A track; otherwise an action or a need
     pub track: bool,
+    /// A need (MCR-124)
+    pub need: bool,
     pub id: String,
     /// The entry's stamp this is said about: a publish after it makes it a new entry
     pub updated: u64,
@@ -312,11 +463,45 @@ fn refuse<T>(path: &str, why: impl std::fmt::Display) -> Result<T, String> {
     Err(format!("Refused: {path} {why}"))
 }
 
+/// Whether text holds what looks like a credential (MCR-124, M9): the
+/// prefixes of the tokens and keys this operator's tools use, followed by
+/// enough token characters to be one, and a private key block. Defence in
+/// depth beside "no secrets" in the guide: cockpit text is kept on disk and
+/// shown. A refusal names the place and never repeats the match.
+pub fn looks_secret(s: &str) -> bool {
+    let token = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');
+    let run = |rest: &str, ok: &dyn Fn(char) -> bool| rest.chars().take_while(|c| ok(*c)).count();
+    const PREFIXES: [&str; 8] = ["xoxb-", "xoxp-", "xapp-", "ghp_", "gho_", "github_pat_", "sk-ant-", "glpat-"];
+    for (at, _) in s.char_indices() {
+        let rest = &s[at..];
+        // A word that starts here, not the middle of one
+        let starts = s[..at].chars().next_back().is_none_or(|c| !token(c));
+        if starts && PREFIXES.iter().any(|p| rest.starts_with(p) && run(&rest[p.len()..], &token) >= 16) {
+            return true;
+        }
+        if starts && rest.starts_with("sk-") && run(&rest[3..], &|c: char| c.is_ascii_alphanumeric()) >= 20 {
+            return true;
+        }
+        if starts && rest.starts_with("AKIA") && run(&rest[4..], &|c: char| c.is_ascii_uppercase() || c.is_ascii_digit()) >= 16 {
+            return true;
+        }
+        if rest.starts_with("Bearer ") && run(&rest[7..], &|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/' | '=')) >= 20 {
+            return true;
+        }
+    }
+    s.contains("-----BEGIN") && s.contains("PRIVATE KEY")
+}
+
+const SECRET: &str = "holds what looks like a credential (a token or a private key). Cockpit text is shown and kept on disk: never put a secret in it";
+
 /// Text an agent wrote, for a place where it is shown: bounded, and without
 /// what would change how it is drawn (control characters, direction overrides).
 fn text(path: &str, s: &str, max: usize, lines: bool) -> Result<(), String> {
     if s.chars().count() > max {
         return refuse(path, format!("is longer than {max} characters"));
+    }
+    if looks_secret(s) {
+        return refuse(path, SECRET);
     }
     if s.chars().any(|c| c.is_control() && !(lines && c == '\n')) {
         return refuse(path, if lines { "holds control characters" } else { "holds a line break or control characters" });
@@ -366,6 +551,9 @@ fn visible_line(s: &str, max: usize) -> Result<(), String> {
     if s.ends_with('\\') {
         return Err("ends with a backslash".into());
     }
+    if looks_secret(s) {
+        return Err(SECRET.into());
+    }
     Ok(())
 }
 
@@ -413,6 +601,9 @@ pub struct Link {
 pub fn web_link(s: &str) -> Result<Link, String> {
     if s.chars().count() > MAX_LINK || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(format!("must be one link without spaces, at most {MAX_LINK} characters"));
+    }
+    if looks_secret(s) {
+        return Err(SECRET.into());
     }
     let url = tauri::Url::parse(s).map_err(|_| "is not a link".to_string())?;
     if url.scheme() != "https" {
@@ -479,6 +670,23 @@ fn decision_line(action: &str, option: &str) -> String {
 /// The question "Ask more" places. No text of the action is in it, only its id.
 fn ask_line(action: &str) -> String {
     format!("Explain cockpit action {action}: what happens if I do it, and what if I do not?")
+}
+
+/// A line for a session's input box, checked at the click as at the
+/// publish: that session runs, takes lines, and is the publisher or works
+/// for it now (the Supervisor reaches every session).
+fn type_into(by: &str, session: String, text: String, facts: &Facts) -> Result<Deed, String> {
+    let Some(fact) = facts.sessions.get(&session).filter(|f| !f.ended) else {
+        return Err("Refused: the session this would be typed into has ended or is gone.".into());
+    };
+    if !fact.agent {
+        return Err("Refused: that session is not an agent with an input box.".into());
+    }
+    if by != ROOT && session != by && !fact.above.iter().any(|s| s == by) {
+        return Err("Refused: that session no longer works for the session that published this.".into());
+    }
+    placeable(&text).map_err(|why| format!("Refused: the line {why}."))?;
+    Ok(Deed::Type { session, text })
 }
 
 fn required(path: &str, s: &str, max: usize) -> Result<(), String> {
@@ -728,6 +936,9 @@ fn check_part(part: &Part, old: Option<&Part>, who: &Who, facts: &Facts, others:
     let mut ids = BTreeSet::new();
     for (i, a) in part.actions.iter().enumerate() {
         check_action(&format!("actions[{i}]"), a, part, old, who, facts, others)?;
+        if part.needs.iter().any(|n| n.id == a.id) {
+            return refuse(&format!("actions[{i}].id"), format!("{:?} is the id of a need you asked with report", a.id));
+        }
         if !ids.insert(a.id.as_str()) {
             return refuse(&format!("actions[{i}].id"), format!("{:?} is used twice", a.id));
         }
@@ -737,6 +948,188 @@ fn check_part(part: &Part, old: Option<&Part>, who: &Who, facts: &Facts, others:
         return refuse("the document", format!("is {size} bytes; a session's part holds at most {MAX_PART_BYTES}"));
     }
     Ok(())
+}
+
+/// Where a need's answer goes: its actor, else the session that asked.
+fn target<'a>(key: &'a str, need: &'a Need, facts: &'a Facts) -> Option<&'a str> {
+    if !need.actor.is_empty() {
+        Some(need.actor.as_str())
+    } else if key == ROOT {
+        facts.root.as_deref()
+    } else {
+        Some(key)
+    }
+}
+
+/// The session a need points the operator at: where its answer goes, or
+/// for a need without choices the session it names, else the one that asked.
+fn need_session<'a>(key: &'a str, need: &'a Need, facts: &'a Facts) -> Option<&'a str> {
+    if !need.place.session.is_empty() && need.actor.is_empty() {
+        return Some(need.place.session.as_str());
+    }
+    target(key, need, facts)
+}
+
+/// `need:<part>/<id>`: the part and the id.
+fn need_ref(r: &str) -> Option<(&str, &str)> {
+    r.strip_prefix("need:")?.split_once('/')
+}
+
+/// Whether a need may stand as a session declares it (MCR-124). `part` is
+/// the publisher's part as it is now, `all` every part.
+fn check_need(path: &str, n: &Need, key: &str, part: &Part, who: &Who, facts: &Facts, all: &BTreeMap<String, Part>) -> Result<(), String> {
+    ident(&format!("{path}.id"), &n.id)?;
+    if part.actions.iter().any(|a| a.id == n.id) {
+        return refuse(&format!("{path}.id"), format!("{:?} is the id of one of your cockpit actions", n.id));
+    }
+    if FACT_KINDS.contains(&n.ask.as_str()) || DERIVED_KINDS.contains(&n.ask.as_str()) {
+        return refuse(&format!("{path}.ask"), format!("{:?} is built by the harness from what it knows (a prompt, an unsent line, a report, a wait) and cannot be declared", n.ask));
+    }
+    one_of(&format!("{path}.ask"), &n.ask, &NEED_KINDS)?;
+    required("text", &n.text, MAX_LINE).map_err(|e| format!("{e}. With need, text is the question in one line; put the rest in need.detail"))?;
+    let word = if n.word.is_empty() { "none" } else { n.word.as_str() };
+    one_of(&format!("{path}.word"), word, &WORDS)?;
+    let ask = n.ask.as_str();
+    let choices = match ask {
+        "decision" => 2..=MAX_OPTIONS,
+        "go" => 1..=1,
+        _ => 0..=0,
+    };
+    if !choices.contains(&n.options.len()) {
+        return refuse(&format!("{path}.options"), match ask {
+            "decision" => format!("must hold 2 to {MAX_OPTIONS} choices"),
+            "go" => "must hold exactly one choice: the go".to_string(),
+            _ => format!("do not go with ask {ask}: it has no choices"),
+        });
+    }
+    if word != "none" && !matches!(ask, "go" | "decision") {
+        return refuse(&format!("{path}.word"), "goes with ask go or decision: an owner word is a choice the operator makes");
+    }
+    let mut ids = BTreeSet::new();
+    for (i, o) in n.options.iter().enumerate() {
+        let at = format!("{path}.options[{i}]");
+        ident(&format!("{at}.id"), &o.id)?;
+        if !ids.insert(o.id.as_str()) {
+            return refuse(&format!("{at}.id"), format!("{:?} is used twice", o.id));
+        }
+        one_of(&format!("{at}.risk"), &o.risk, &CHOICE_RISKS)?;
+        text(&format!("{at}.amount"), &o.amount, MAX_REF, false)?;
+        if (o.risk == "spend") != !o.amount.trim().is_empty() {
+            return refuse(&format!("{at}.amount"), "goes with risk spend, and only with it");
+        }
+        text(&format!("{at}.effect"), &o.effect, MAX_LINE, false)?;
+        // What a click places is the whole line with the service's frame: it must
+        // pass and fit, or the choice would get a button that always refuses
+        placeable(&o.label).or_else(|why| refuse(&format!("{at}.label"), why))?;
+        placeable(&need_line(key, n, o)).or_else(|why| refuse(&format!("{at}.label"), format!("{why} (as the line placed: {})", if n.exact { "the label alone".to_string() } else { format!("\"{} {key}/{}: \" before it", if ask == "go" { "Go" } else { "Decision" }, n.id) })))?;
+    }
+    if n.options.iter().filter(|o| o.recommended).count() > 1 {
+        return refuse(&format!("{path}.options"), "recommend at most one choice");
+    }
+    if n.exact && !(ask == "go" && word == "none" && n.options.iter().all(|o| o.risk == "reversible")) {
+        return refuse(&format!("{path}.exact"), "goes only with ask go, word none and a reversible choice: an owner word is always placed with its frame");
+    }
+    let agent = |at: &str, id: &str| -> Result<(), String> {
+        reach(at, id, who, facts)?;
+        if facts.sessions.get(id).is_some_and(|f| f.agent) { Ok(()) } else { refuse(at, "names a session that is not an agent with a state (a shell, or a terminal without one)") }
+    };
+    if !n.actor.is_empty() {
+        agent(&format!("{path}.actor"), &n.actor)?;
+    }
+    if !n.place.session.is_empty() {
+        if matches!(ask, "decision" | "go") {
+            return refuse(&format!("{path}.where.session"), "does not go with a choice: its answer goes to actor (you, when it is left out)");
+        }
+        agent(&format!("{path}.where.session"), &n.place.session)?;
+    }
+    if !n.place.command.is_empty() {
+        if !matches!(ask, "secret_step" | "live_check") {
+            return refuse(&format!("{path}.where.command"), format!("does not go with ask {ask}"));
+        }
+        copyable(&n.place.command).or_else(|why| refuse(&format!("{path}.where.command"), why))?;
+    }
+    if !n.place.url.is_empty() {
+        if ask != "external" {
+            return refuse(&format!("{path}.where.url"), format!("does not go with ask {ask}"));
+        }
+        web_link(&n.place.url).map(|_| ()).or_else(|why| refuse(&format!("{path}.where.url"), why))?;
+    }
+    match ask {
+        "secret_step" | "live_check" if n.detail.trim().is_empty() => return refuse(&format!("{path}.detail"), "is required: the steps, one per line"),
+        "external" if n.place.url.is_empty() => return refuse(&format!("{path}.where.url"), "is required for ask external"),
+        _ => {}
+    }
+    // Where it belongs: one of the publisher's own tracks
+    let track = if n.track.is_empty() {
+        None
+    } else {
+        match part.tracks.iter().find(|t| t.id == n.track) {
+            Some(t) => Some(t),
+            None => return refuse(&format!("{path}.track"), format!("names {:?}, which is not one of your tracks", n.track)),
+        }
+    };
+    if !n.item.is_empty() {
+        let found = match track {
+            Some(t) => t.items.iter().any(|i| i.id == n.item),
+            None => part.tracks.iter().any(|t| t.items.iter().any(|i| i.id == n.item)),
+        };
+        if !found {
+            return refuse(&format!("{path}.item"), format!("names {:?}, which is not an item of your tracks", n.item));
+        }
+    }
+    let need_exists = |r: &str| need_ref(r).is_some_and(|(by, id)| (by == key && id == n.id) || all.get(by).is_some_and(|p| p.needs.iter().any(|x| x.id == id)));
+    if n.blocks.len() > MAX_LIST {
+        return refuse(&format!("{path}.blocks"), format!("has more than {MAX_LIST} entries"));
+    }
+    for (i, b) in n.blocks.iter().enumerate() {
+        let item = b.strip_prefix("item:").and_then(|r| r.split_once('/')).is_some_and(|(t, i)| part.tracks.iter().any(|x| x.id == t && x.items.iter().any(|y| y.id == i)));
+        if !item && !(need_exists(b) && need_ref(b) != Some((key, n.id.as_str()))) {
+            return refuse(&format!("{path}.blocks[{i}]"), format!("names {b:?}, which is neither item:<track>/<item> of your tracks nor need:<part>/<id> of another need"));
+        }
+    }
+    if n.cause.len() > MAX_LIST {
+        return refuse(&format!("{path}.cause"), format!("has more than {MAX_LIST} entries"));
+    }
+    for (i, c) in n.cause.iter().enumerate() {
+        let session = |id: &str| facts.sessions.contains_key(id);
+        let ok = match c.split_once(':') {
+            Some(("need", _)) => need_exists(c) && need_ref(c) != Some((key, n.id.as_str())),
+            Some(("prompt" | "held", id)) => session(id),
+            Some(("wait", id)) => facts.sessions.values().any(|f| f.waits.iter().any(|w| w.id == id)),
+            Some(("report", id)) => facts.reports.contains_key(id),
+            _ => false,
+        };
+        if !ok {
+            return refuse(&format!("{path}.cause[{i}]"), format!("names {c:?}, which is not need:<part>/<id>, prompt:<session>, held:<session>, wait:<id> or report:<id> of something the harness has"));
+        }
+    }
+    if n.refs.len() > MAX_LIST {
+        return refuse(&format!("{path}.refs"), format!("has more than {MAX_LIST} entries"));
+    }
+    for (i, r) in n.refs.iter().enumerate() {
+        if r.starts_with("https://") {
+            web_link(r).map(|_| ()).or_else(|why| refuse(&format!("{path}.refs[{i}]"), why))?;
+        } else {
+            required(&format!("{path}.refs[{i}]"), r, MAX_REF)?;
+        }
+    }
+    if !n.urgency.is_empty() {
+        one_of(&format!("{path}.urgency"), &n.urgency, &URGENCIES)?;
+    }
+    if n.check_by > MAX_CHECK_BY {
+        return refuse(&format!("{path}.checkBy"), format!("is more than {MAX_CHECK_BY} minutes (two weeks)"));
+    }
+    text(&format!("{path}.why"), &n.why, MAX_WHY, false)?;
+    text(&format!("{path}.detail"), &n.detail, MAX_DETAIL, true)
+}
+
+const NEED_FIELDS: [&str; 16] = ["id", "ask", "options", "word", "exact", "actor", "where", "track", "item", "blocks", "cause", "refs", "urgency", "checkBy", "why", "detail"];
+const CHOICE_FIELDS: [&str; 6] = ["id", "label", "recommended", "risk", "amount", "effect"];
+
+fn known_need(path: &str, need: &Value) -> Result<(), String> {
+    known(path, need, &NEED_FIELDS)?;
+    known(&format!("{path}.where"), &need["where"], &WHERE_FIELDS)?;
+    need["options"].as_array().into_iter().flatten().enumerate().try_for_each(|(i, o)| known(&format!("{path}.options[{i}]"), o, &CHOICE_FIELDS))
 }
 
 /// What a session sent, without the fields the service writes and without
@@ -858,7 +1251,7 @@ impl Cockpit {
     fn accept(&mut self, who: &Who, mut part: Part, now: u64) -> Value {
         let key = who.key().to_string();
         stamp(&mut part, self.parts.get(&key), now);
-        if part.tracks.is_empty() && part.actions.is_empty() {
+        if part.is_empty() {
             self.parts.remove(&key);
         } else {
             self.parts.insert(key, part);
@@ -889,7 +1282,9 @@ impl Cockpit {
             return refuse(extra, "is not a field of cockpit_publish (tracks, actions, order)");
         }
         let field = |name: &str| args.get(name).filter(|v| !v.is_null()).cloned().unwrap_or_else(|| json!([]));
-        let mut part = Part { tracks: parse("tracks", field("tracks"), known_track)?, actions: parse("actions", field("actions"), known_action)?, updated: 0 };
+        // Needs come through `report`, not here: they stay as they are
+        let needs = self.parts.get(who.key()).map(|p| p.needs.clone()).unwrap_or_default();
+        let mut part = Part { tracks: parse("tracks", field("tracks"), known_track)?, actions: parse("actions", field("actions"), known_action)?, needs, updated: 0 };
         for track in part.tracks.iter_mut().filter(|t| t.lead.is_empty()) {
             track.lead = who.id.into();
         }
@@ -954,7 +1349,7 @@ impl Cockpit {
                 return refuse("id", format!("names {id:?}, which is not there"));
             }
             part.updated = now;
-            if part.tracks.is_empty() && part.actions.is_empty() {
+            if part.is_empty() {
                 self.parts.remove(by);
             }
             return Ok(self.wrote(who.id, now));
@@ -1020,6 +1415,76 @@ impl Cockpit {
         Ok(self.accept(who, part, now))
     }
 
+    /// `report` with a need (MCR-124): the caller asks the operator. A need of
+    /// the same id is replaced, and every declaration is a new one (`updated`).
+    /// `text` is the report's text, the question. Checked on its own: the
+    /// report is recorded only after this passed, and named with `cite`.
+    pub fn declare(&mut self, who: &Who, facts: &Facts, need: &Value, said: &str, now: u64) -> Result<Value, String> {
+        self.may_write(who, facts, now)?;
+        if !need.is_object() {
+            return refuse("need", "must be an object: id, ask and what goes with it");
+        }
+        let mut n: Need = parse("need", need.clone(), known_need)?;
+        n.text = said.trim().to_string();
+        let key = who.key().to_string();
+        let mut part = self.parts.get(&key).cloned().unwrap_or_default();
+        part.needs.retain(|x| x.open() || now.saturating_sub(x.closed.as_ref().map_or(0, |c| c.at)) < CLOSED_KEPT_MS);
+        check_need("need", &n, &key, &part, who, facts, &self.parts)?;
+        let before = part.needs.iter().position(|x| x.id == n.id);
+        n.since = before.map(|i| &part.needs[i]).filter(|x| x.open()).map_or(now, |x| x.since);
+        n.updated = now;
+        match before {
+            Some(i) => part.needs[i] = n,
+            None => part.needs.push(n),
+        }
+        if part.needs.iter().filter(|x| x.open()).count() > MAX_NEEDS {
+            return refuse("need", format!("would be your {}th open need; close some first (report kind closed)", MAX_NEEDS + 1));
+        }
+        let size = serde_json::to_vec(&part).map(|b| b.len()).unwrap_or(usize::MAX);
+        if size > MAX_PART_BYTES {
+            return refuse("need", format!("would make your part {size} bytes; it holds at most {MAX_PART_BYTES}"));
+        }
+        part.updated = now;
+        self.parts.insert(key, part);
+        Ok(self.wrote(who.id, now))
+    }
+
+    /// The report a declared need comes from: its first cause, so that the
+    /// need stands for that report and no second row is shown for it.
+    pub fn cite(&mut self, who: &Who, id: &str, report: &str) {
+        if let Some(n) = self.parts.get_mut(who.key()).and_then(|p| p.needs.iter_mut().find(|n| n.id == id && n.open())) {
+            n.cause.insert(0, format!("report:{report}"));
+        }
+    }
+
+    /// The publisher ends one of its needs (`report` kind `closed`, or `done`
+    /// with `need`). Its record of how; it is nobody's consent.
+    /// `how.at` is now.
+    pub fn close(&mut self, who: &Who, facts: &Facts, id: &str, how: Closed) -> Result<Value, String> {
+        let now = how.at;
+        self.may_write(who, facts, now)?;
+        one_of("outcome", &how.outcome, &OUTCOMES)?;
+        text("text", &how.note, MAX_LINE, false).map_err(|e| format!("{e}. With kind closed, text is a short note on how it ended"))?;
+        let chosen = how.chosen.as_str();
+        let need = self.parts.get_mut(who.key()).and_then(|p| p.needs.iter_mut().find(|n| n.id == id && n.open()));
+        let Some(need) = need else {
+            return refuse("need", format!("names {id:?}, which is not an open need of yours"));
+        };
+        if !chosen.is_empty() && !need.options.iter().any(|o| o.id == chosen) {
+            return refuse("chosen", format!("names {chosen:?}, which is not a choice of that need"));
+        }
+        need.closed = Some(Closed { note: how.note.trim().into(), ..how });
+        if let Some(p) = self.parts.get_mut(who.key()) {
+            p.updated = now;
+        }
+        Ok(self.wrote(who.id, now))
+    }
+
+    /// Whether `id` is an open need of the caller.
+    pub fn has_need(&self, who: &Who, id: &str) -> bool {
+        self.parts.get(who.key()).is_some_and(|p| p.needs.iter().any(|n| n.id == id && n.open()))
+    }
+
     /// A restarted session has a new id: its part and every mention follow it.
     pub fn moved(&mut self, from: &str, to: &str) {
         if let Some(part) = self.parts.remove(from) {
@@ -1044,6 +1509,20 @@ impl Cockpit {
             for action in &mut part.actions {
                 rename(&mut action.track_by);
                 rename(&mut action.place.session);
+            }
+            for need in &mut part.needs {
+                rename(&mut need.actor);
+                rename(&mut need.place.session);
+                for r in need.cause.iter_mut().chain(need.blocks.iter_mut()) {
+                    let moved = match r.split_once(':') {
+                        Some((kind @ ("prompt" | "held"), id)) if id == from => Some(format!("{kind}:{to}")),
+                        Some(("need", rest)) => rest.split_once('/').filter(|(by, _)| *by == from).map(|(_, id)| format!("need:{to}/{id}")),
+                        _ => None,
+                    };
+                    if let Some(m) = moved {
+                        *r = m;
+                    }
+                }
             }
         }
         if let Some(sent) = self.writes.remove(from) {
@@ -1074,6 +1553,9 @@ impl Cockpit {
     /// empty input box, nothing being typed) is the service's to check: it
     /// needs the terminal.
     pub fn act(&self, by: &str, id: &str, updated: u64, act: Act, facts: &Facts) -> Result<Deed, String> {
+        if let Some(n) = self.parts.get(by).and_then(|p| p.needs.iter().find(|n| n.id == id)) {
+            return self.act_need(by, n, updated, act, facts);
+        }
         let Some(a) = self.parts.get(by).and_then(|p| p.actions.iter().find(|a| a.id == id)) else {
             return Err("Refused: that action is no longer published. Look at the cockpit again.".into());
         };
@@ -1097,7 +1579,7 @@ impl Cockpit {
             Ok(Deed::Type { session, text })
         };
         match act {
-            Act::Place | Act::Choose(_) if self.outdated(facts).iter().any(|o| !o.track && o.by == by && o.id == id) => {
+            Act::Place | Act::Choose(_) if self.outdated(facts).iter().any(|o| !o.track && !o.need && o.by == by && o.id == id) => {
                 Err("Refused: you typed into that session after this was published, or it has ended. Its publisher has to update the action first.".into())
             }
             Act::Place if a.kind == "typed_word" && !a.place.session.is_empty() => into(a.place.session.clone(), a.say.clone()),
@@ -1112,6 +1594,39 @@ impl Cockpit {
             Act::Link if !a.place.url.is_empty() => web_link(&a.place.url).map(Deed::Link).map_err(|why| format!("Refused: the link {why}.")),
             Act::Copy if !a.place.command.is_empty() => copyable(&a.place.command).map(|()| Deed::Copy(a.place.command.clone())).map_err(|why| format!("Refused: the command {why}.")),
             _ => Err("Refused: that action has nothing of this kind to click.".into()),
+        }
+    }
+
+    /// A click on a need as the panel shows it (MCR-124). The answer goes to
+    /// the acting session as a line the service builds; nothing of the need's
+    /// text but a checked label is in it. A guarded need (an owner word, or a
+    /// choice that risks more than a step back) is not placed by a click in
+    /// this slice: the operator types it in the acting session.
+    fn act_need(&self, by: &str, n: &Need, updated: u64, act: Act, facts: &Facts) -> Result<Deed, String> {
+        if !n.open() {
+            return Err("Refused: that need is closed. Look at the cockpit again.".into());
+        }
+        if n.updated != updated {
+            return Err("Refused: that need was asked again since the panel showed it. Look at it again.".into());
+        }
+        let publisher = || if by == ROOT { facts.root.clone().ok_or("Refused: the Supervisor session does not run".to_string()) } else { Ok(by.to_string()) };
+        let answer = |choice: &Choice| -> Result<Deed, String> {
+            if self.outdated(facts).iter().any(|o| o.need && o.by == by && o.id == n.id) {
+                return Err("Refused: you typed into that session after this was asked, or it has ended. The session that asked has to ask again or close it.".into());
+            }
+            if n.guarded() {
+                return Err("Refused: this asks for an owner word, or a choice that cannot simply be undone. Type it yourself in the terminal of the session that acts on it; a click does not place it.".into());
+            }
+            let session = target(by, n, facts).map(str::to_owned).ok_or("Refused: the Supervisor session does not run")?;
+            type_into(by, session, need_line(by, n, choice), facts)
+        };
+        match act {
+            Act::Place if n.ask == "go" => answer(&n.options[0]),
+            Act::Choose(i) if matches!(n.ask.as_str(), "decision" | "go") => answer(n.options.get(i).ok_or("Refused: that need has no such choice.")?),
+            Act::Ask => type_into(by, publisher()?, ask_line(&format!("{by}/{}", n.id)), facts),
+            Act::Link if !n.place.url.is_empty() => web_link(&n.place.url).map(Deed::Link).map_err(|why| format!("Refused: the link {why}.")),
+            Act::Copy if !n.place.command.is_empty() => copyable(&n.place.command).map(|()| Deed::Copy(n.place.command.clone())).map_err(|why| format!("Refused: the command {why}.")),
+            _ => Err("Refused: that need has nothing of this kind to click.".into()),
         }
     }
 
@@ -1130,7 +1645,7 @@ impl Cockpit {
             let own = |session: &str| key == ROOT && facts.root.as_deref() == Some(session);
             for t in part.tracks.iter().filter(|t| t.state == "waiting_human" && !own(&t.lead)) {
                 if let Some(at) = typed_after(&t.lead, t.updated) {
-                    out.push(Outdated { by: key.clone(), track: true, id: t.id.clone(), updated: t.updated, session: t.lead.clone(), typed: Some(at) });
+                    out.push(Outdated { by: key.clone(), track: true, need: false, id: t.id.clone(), updated: t.updated, session: t.lead.clone(), typed: Some(at) });
                 }
             }
             for a in part.actions.iter().filter(|a| !a.place.session.is_empty()) {
@@ -1142,7 +1657,20 @@ impl Cockpit {
                     },
                     _ => None,
                 };
-                out.push(Outdated { by: key.clone(), track: false, id: a.id.clone(), updated: a.updated, session: session.clone(), typed });
+                out.push(Outdated { by: key.clone(), track: false, need: false, id: a.id.clone(), updated: a.updated, session: session.clone(), typed });
+            }
+            // A need is behind when the operator typed where its answer goes (the
+            // session that asked, by default), or that session is no more
+            for n in part.needs.iter().filter(|n| n.open()) {
+                let Some(session) = need_session(key, n, facts) else { continue };
+                let typed = match facts.sessions.get(session) {
+                    Some(f) if !f.ended => match typed_after(session, n.updated).filter(|_| !own(session)) {
+                        Some(at) => Some(at),
+                        None => continue,
+                    },
+                    _ => None,
+                };
+                out.push(Outdated { by: key.clone(), track: false, need: true, id: n.id.clone(), updated: n.updated, session: session.to_string(), typed });
             }
         }
         out
@@ -1152,7 +1680,11 @@ impl Cockpit {
     /// do there, or a track it leads that says it waits for them. The
     /// service keeps the time of an Enter there exactly for such a session.
     pub fn points_at(&self, session: &str) -> bool {
-        self.parts.values().any(|p| p.actions.iter().any(|a| a.place.session == session) || p.tracks.iter().any(|t| t.lead == session && t.state == "waiting_human"))
+        self.parts.iter().any(|(key, p)| {
+            p.actions.iter().any(|a| a.place.session == session)
+                || p.tracks.iter().any(|t| t.lead == session && t.state == "waiting_human")
+                || p.needs.iter().filter(|n| n.open()).any(|n| n.actor == session || n.place.session == session || (n.actor.is_empty() && key == session))
+        })
     }
 
     /// The document as it is shown: the published parts flattened, in order,
@@ -1171,20 +1703,26 @@ impl Cockpit {
         // Supervisor: otherwise any session could make another tree's
         // "needs you" disappear by naming its id
         let stands = |key: &str, report: &str| facts.reports.get(report).is_some_and(|by| key == ROOT || key == by || facts.sessions.get(by).is_some_and(|f| f.above.iter().any(|s| s == key)));
+        // A need is shown with its part, and to the session it names as its
+        // actor, which acts on the answer (MCR-124, M3)
+        let visible = |key: &str, n: &Need| n.open() && (shown(key) || reader.is_some_and(|me| n.actor == me));
         let cited: BTreeSet<&str> = self
             .parts
             .iter()
             .filter(|(k, _)| shown(k))
             .flat_map(|(key, p)| p.actions.iter().flat_map(|a| a.source.iter()).filter(|s| stands(key, s)).map(String::as_str))
+            .chain(self.parts.iter().flat_map(|(key, p)| {
+                p.needs.iter().filter(|n| visible(key, n)).flat_map(|n| n.cause.iter()).filter_map(|c| c.strip_prefix("report:")).filter(|r| stands(key, r))
+            }))
             .collect();
         // What the harness knows better than the text, on the entry itself (MCR-103)
         let outdated = self.outdated(facts);
-        let mark = |out: &mut Value, key: &str, track: bool, id: &str| {
+        let mark = |out: &mut Value, key: &str, track: bool, need: bool, id: &str| {
             // When the operator typed in a session is that session's own to tell:
             // only for the reader's sessions. That a session an entry of the
             // reader's part points at is no more is the reader's to know, also
             // when the harness has forgotten it and can say nothing else of it
-            if let Some(o) = outdated.iter().find(|o| o.by == key && o.track == track && o.id == id && (o.typed.is_none() || below(&o.session))) {
+            if let Some(o) = outdated.iter().find(|o| o.by == key && o.track == track && o.need == need && o.id == id && (o.typed.is_none() || below(&o.session))) {
                 match o.typed {
                     Some(at) => out["ownerTyped"] = json!(at),
                     None => out["sessionEnded"] = json!(true),
@@ -1199,7 +1737,7 @@ impl Cockpit {
                 named.insert(track.lead.as_str());
                 let mut out = json!(track);
                 out["by"] = json!(key);
-                mark(&mut out, key, true, &track.id);
+                mark(&mut out, key, true, false, &track.id);
                 for (i, item) in track.items.iter().enumerate() {
                     if item.owner != "human" {
                         named.insert(item.owner.as_str());
@@ -1225,7 +1763,7 @@ impl Cockpit {
             for action in &part.actions {
                 let mut out = json!(action);
                 out["by"] = json!(key);
-                mark(&mut out, key, false, &action.id);
+                mark(&mut out, key, false, false, &action.id);
                 // What of it a click would refuse by its text alone: stored before
                 // the allow-list, or under an earlier one. Shown as text, without a button
                 let mut unclickable: Vec<&str> = Vec::new();
@@ -1260,6 +1798,61 @@ impl Cockpit {
                 actions.push(out);
             }
         }
+        // Needs (MCR-124): in full for the one view, and as the action they would
+        // have been for a panel that knows only actions (M5). The action form
+        // points at the session the answer goes to, so the harness's facts of
+        // that session join it as they join an action
+        let mut asked: BTreeMap<(String, String), Value> = BTreeMap::new();
+        for (key, part) in &self.parts {
+            for n in part.needs.iter().filter(|n| visible(key, n)) {
+                if key != ROOT {
+                    named.insert(key.as_str());
+                }
+                for s in [&n.actor, &n.place.session] {
+                    if !s.is_empty() {
+                        named.insert(s.as_str());
+                    }
+                }
+                let mut full = json!(n);
+                full["by"] = json!(key);
+                full["risk"] = json!(n.risk());
+                full["guarded"] = json!(n.guarded());
+                mark(&mut full, key, false, true, &n.id);
+                let mut unclickable: Vec<&str> = Vec::new();
+                if n.guarded() || n.options.iter().any(|o| placeable(&need_line(key, n, o)).is_err()) {
+                    unclickable.push(if n.exact { "say" } else { "options" });
+                }
+                if !n.place.url.is_empty() && web_link(&n.place.url).is_err() {
+                    unclickable.push("url");
+                }
+                if !n.place.command.is_empty() && copyable(&n.place.command).is_err() {
+                    unclickable.push("command");
+                }
+                if !unclickable.is_empty() {
+                    full["unclickable"] = json!(unclickable);
+                }
+                let mut compat = compat_action(key, n, facts);
+                for stamp in ["ownerTyped", "sessionEnded", "unclickable"] {
+                    if let Some(v) = full.get(stamp) {
+                        compat[stamp] = v.clone();
+                    }
+                }
+                let reports: Vec<&str> = n.cause.iter().filter_map(|c| c.strip_prefix("report:")).filter(|r| stands(key, r)).collect();
+                if !reports.is_empty() {
+                    let open = facts.sessions.values().any(|f| f.needs_human.as_ref().is_some_and(|(id, ..)| reports.contains(&id.as_str())));
+                    compat["live"] = json!({ "reportOpen": open });
+                }
+                if let Some(s) = compat["where"]["session"].as_str() {
+                    if !s.is_empty() {
+                        named.insert(facts.sessions.get_key_value(s).map(|(k, _)| k.as_str()).unwrap_or(""));
+                    }
+                }
+                asked.insert((key.clone(), n.id.clone()), full);
+                actions.push(compat);
+            }
+        }
+        named.remove("");
+        let mut finished: Vec<Value> = Vec::new();
         // What needs the operator by the harness's own knowledge, whoever published what
         // (MCR-118): a prompt, the operator's unsent line, an open needs_human report and a
         // human wait past its time. All of a session's facts go into a published action that
@@ -1301,6 +1894,14 @@ impl Cockpit {
                     "title": format!("{who} waits for you, past the time it expected"), "detail": w.on,
                 })));
             }
+            // A finished piece of work: quiet, in the one view only (MCR-124, Q6)
+            if let Some((report, said, since)) = &fact.done {
+                named.insert(id.as_str());
+                finished.push(json!({
+                    "id": format!("done:{report}"), "ask": "done", "derived": "done", "where": { "session": id }, "since": since, "cause": [format!("report:{report}")],
+                    "text": format!("{who} finished a piece of work"), "detail": said, "urgency": "whenever",
+                }));
+            }
             if rows.is_empty() {
                 continue;
             }
@@ -1330,6 +1931,40 @@ impl Cockpit {
             }
         }
         tracks.sort_by_key(|(place, _)| *place);
+        let tracks: Vec<Value> = tracks.into_iter().map(|(_, t)| t).collect();
+        // The one view (MCR-124): every entry as a need, each where it belongs
+        let mut needs: Vec<Value> = actions
+            .iter()
+            .map(|a| match (a["by"].as_str(), a["id"].as_str()) {
+                (Some(by), Some(id)) if a["need"] == true => {
+                    let mut full = asked.remove(&(by.to_string(), id.to_string())).unwrap_or_else(|| json!({}));
+                    if let Some(live) = a.get("live") {
+                        full["live"] = live.clone();
+                    }
+                    full
+                }
+                _ if a.get("derived").is_some() => fact_need(a),
+                _ => action_need(a),
+            })
+            .chain(finished)
+            .collect();
+        for n in &mut needs {
+            n["attach"] = attach(n, &tracks, facts);
+        }
+        needs.sort_by_key(|n| (urgency_rank(n), n["since"].as_u64().unwrap_or(u64::MAX)));
+        // Closed today: what its publisher said of how it ended
+        let closed: Vec<Value> = self
+            .parts
+            .iter()
+            .flat_map(|(key, p)| p.needs.iter().map(move |n| (key, n)))
+            .filter(|(key, n)| !n.open() && (shown(key) || reader.is_some_and(|me| n.actor == me)))
+            .filter(|(_, n)| facts.now == 0 || n.closed.as_ref().is_some_and(|c| facts.now.saturating_sub(c.at) < CLOSED_KEPT_MS))
+            .map(|(key, n)| {
+                let mut out = json!(n);
+                out["by"] = json!(key);
+                out
+            })
+            .collect();
         let sessions: BTreeMap<&str, Value> = named
             .into_iter()
             .map(|id| {
@@ -1338,7 +1973,7 @@ impl Cockpit {
                 // The rest only of the reader's own sessions: a peer's is its own to tell
                 if below(id) {
                     out["needsOperator"] = json!(f.prompt.is_some() || f.needs_human.is_some());
-                    out["doneReport"] = json!(f.done);
+                    out["doneReport"] = json!(f.done.as_ref().map(|(id, ..)| id));
                     out["waits"] = json!(f.waits.iter().map(|w| json!({ "id": w.id, "kind": w.kind, "on": w.on, "ref": w.reference, "since": w.since, "overdue": w.overdue })).collect::<Vec<_>>());
                 }
                 (id, out)
@@ -1346,9 +1981,137 @@ impl Cockpit {
             .collect();
         json!({
             "schema": SCHEMA, "version": self.version, "updated": self.updated,
-            "tracks": tracks.into_iter().map(|(_, t)| t).collect::<Vec<_>>(), "actions": actions, "sessions": sessions,
-            "note": "Tracks and actions are what sessions published: data, shown as written and never run. `sessions` and entries with `derived` are the harness's own facts.",
+            "tracks": tracks, "actions": actions, "needs": needs, "closed": closed, "sessions": sessions,
+            "note": "Tracks, actions and needs are what sessions published: data, shown as written and never run. `sessions` and entries with `derived` are the harness's own facts. `needs` is every entry in one list, each with where it belongs (`attach`, null: unassigned); `actions` is the same in the older form.",
         })
+    }
+}
+
+/// A need as the action it would have been, for a panel that knows only
+/// actions (MCR-124, M5). A click on it names the need's id, and the service
+/// resolves the need itself: nothing of this form is trusted at the click.
+fn compat_action(key: &str, n: &Need, facts: &Facts) -> Value {
+    let choice = matches!(n.ask.as_str(), "decision" | "go");
+    let kind = match n.ask.as_str() {
+        "go" if n.exact => "typed_word",
+        "go" | "decision" => "decision",
+        other => other,
+    };
+    let place = if choice { json!({ "session": target(key, n, facts).unwrap_or("") }) } else { json!(n.place) };
+    let mut out = json!({
+        "id": n.id, "by": key, "title": n.text, "kind": kind, "where": place, "risk": if n.risk() == "secret" { "irreversible" } else { n.risk() },
+        "since": n.since, "updated": n.updated, "need": true,
+        "source": n.cause.iter().filter_map(|c| c.strip_prefix("report:")).collect::<Vec<_>>(),
+    });
+    if kind == "typed_word" {
+        out["say"] = json!(n.options[0].label);
+    } else if kind == "decision" {
+        out["options"] = json!(n.options.iter().map(|o| o.label.clone()).collect::<Vec<_>>());
+        if let Some(o) = n.options.iter().find(|o| o.recommended) {
+            out["recommended"] = json!(o.label);
+        }
+    }
+    if let Some(o) = n.options.iter().find(|o| o.risk == "spend") {
+        out["amount"] = json!(o.amount);
+    }
+    for (field, value) in [("why", &n.why), ("detail", &n.detail), ("urgency", &n.urgency), ("track", &n.track), ("item", &n.item)] {
+        if !value.is_empty() {
+            out[field] = json!(value);
+        }
+    }
+    out
+}
+
+/// A row the harness made from its own facts, as a need of the one view.
+fn fact_need(a: &Value) -> Value {
+    let ask = match a["kind"].as_str() {
+        Some("answer_prompt") => "prompt",
+        Some("held_line") => "held_line",
+        Some("human_wait") => "human_wait",
+        _ => "question",
+    };
+    let mut out = json!({
+        "id": a["id"], "ask": ask, "derived": a["derived"], "text": a["title"], "where": a["where"], "since": a["since"],
+        "urgency": if ask == "prompt" { "now" } else { "today" },
+        "cause": a["source"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|r| format!("report:{r}")).collect::<Vec<_>>(),
+    });
+    if let Some(d) = a.get("detail") {
+        out["detail"] = d.clone();
+    }
+    out
+}
+
+/// A published action as a need of the one view: the same entry, in the
+/// newer words (MCR-124). `fromAction` says it came through cockpit_publish.
+fn action_need(a: &Value) -> Value {
+    let kind = a["kind"].as_str().unwrap_or("");
+    let risk = a["risk"].as_str().unwrap_or("reversible");
+    let amount = a["amount"].clone();
+    let choice = |id: String, label: &Value, recommended: bool| {
+        let mut o = json!({ "id": id, "label": label, "risk": risk });
+        if recommended {
+            o["recommended"] = json!(true);
+        }
+        if risk == "spend" {
+            o["amount"] = amount.clone();
+        }
+        o
+    };
+    let (ask, options) = match kind {
+        "typed_word" => ("go", vec![choice("go".into(), &a["say"], false)]),
+        "decision" => ("decision", a["options"].as_array().into_iter().flatten().enumerate().map(|(i, o)| choice(format!("o{}", i + 1), o, a["recommended"] == *o)).collect()),
+        other => (other, Vec::new()),
+    };
+    let mut out = json!({ "id": a["id"], "by": a["by"], "ask": ask, "text": a["title"], "options": options, "exact": kind == "typed_word", "where": a["where"], "risk": risk, "fromAction": true });
+    for field in ["track", "trackBy", "item", "why", "detail", "urgency", "since", "updated", "live", "ownerTyped", "sessionEnded", "unclickable", "trackMissing", "blocks"] {
+        if let Some(v) = a.get(field) {
+            out[field] = v.clone();
+        }
+    }
+    out["cause"] = json!(a["source"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|r| format!("report:{r}")).collect::<Vec<_>>());
+    out
+}
+
+/// Where an entry of the one view belongs (MCR-124, 1.3): its own track;
+/// the track of its item; for the session it is about, the first track (in
+/// the Supervisor's order) it leads, then one with an open item it owns, then
+/// the nearest one led by a session above it. `null`: unassigned.
+fn attach(n: &Value, tracks: &[Value], facts: &Facts) -> Value {
+    let by = n["by"].as_str().unwrap_or("");
+    let part = n["trackBy"].as_str().filter(|s| !s.is_empty()).unwrap_or(by);
+    let at = |t: &Value| json!({ "by": t["by"], "track": t["id"] });
+    if let Some(id) = n["track"].as_str().filter(|s| !s.is_empty()) {
+        if let Some(t) = tracks.iter().find(|t| t["by"] == part && t["id"] == id) {
+            return at(t);
+        }
+    }
+    if let Some(item) = n["item"].as_str().filter(|s| !s.is_empty()) {
+        if let Some(t) = tracks.iter().find(|t| t["by"] == part && t["items"].as_array().is_some_and(|all| all.iter().any(|i| i["id"] == item))) {
+            return at(t);
+        }
+    }
+    let session = [n["actor"].as_str(), n["where"]["session"].as_str()].into_iter().flatten().find(|s| !s.is_empty()).or(if by == ROOT { facts.root.as_deref() } else { Some(by).filter(|s| !s.is_empty()) });
+    let Some(session) = session else { return Value::Null };
+    let leads = |s: &str| tracks.iter().find(|t| t["lead"] == s);
+    if let Some(t) = leads(session) {
+        return at(t);
+    }
+    if let Some(t) = tracks.iter().find(|t| t["items"].as_array().is_some_and(|all| all.iter().any(|i| i["owner"] == session && i["state"] != "done"))) {
+        return at(t);
+    }
+    facts.sessions.get(session).into_iter().flat_map(|f| f.above.iter()).find_map(|up| leads(up)).map_or(Value::Null, at)
+}
+
+/// How soon an entry of the one view needs the operator: a prompt now,
+/// whatever its publisher said; then the urgency given; then today.
+fn urgency_rank(n: &Value) -> u8 {
+    if n["ask"] == "prompt" || n["live"]["prompt"].is_u64() {
+        return 0;
+    }
+    match n["urgency"].as_str() {
+        Some("now") => 0,
+        Some("whenever") => 2,
+        _ => 1,
     }
 }
 
@@ -1706,7 +2469,7 @@ mod tests {
         f.sessions.get_mut("ex").unwrap().ended = true;
         // Also when the owner had typed there before it ended: ended is what counts
         f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 5);
-        assert_eq!(c.outdated(&f), [Outdated { by: "sup".into(), track: false, id: "a1".into(), updated: NOW, session: "ex".into(), typed: None }]);
+        assert_eq!(c.outdated(&f), [Outdated { by: "sup".into(), track: false, need: false, id: "a1".into(), updated: NOW, session: "ex".into(), typed: None }]);
         let read = c.read(&f, None);
         assert_eq!(read["actions"][0]["sessionEnded"], true);
         assert!(read["actions"][0].get("ownerTyped").is_none());
@@ -1914,7 +2677,7 @@ mod tests {
         f.reports.insert("r1".into(), "peer".into());
         f.sessions.get_mut("ex").unwrap().prompt = Some(NOW + 1);
         f.sessions.get_mut("ex").unwrap().waits = vec![FactWait { id: "w1".into(), kind: "pipeline".into(), on: "CI run".into(), reference: "run 7".into(), since: NOW + 2, overdue: true }];
-        f.sessions.get_mut("ex").unwrap().done = Some("r0".into());
+        f.sessions.get_mut("ex").unwrap().done = Some(("r0".into(), "Shipped".into(), 1));
         f.sessions.get_mut("peer").unwrap().needs_human = Some(("r1".into(), "Which key?".into(), NOW + 3));
         f.sessions.get_mut("sh").unwrap().prompt = Some(NOW + 4);
         let read = c.read(&f, None);
@@ -2219,5 +2982,263 @@ mod tests {
         let old: Cockpit = serde_json::from_str("{}").unwrap();
         assert!(old.parts.is_empty() && old.version == 0);
         assert_eq!(old.read(&facts(), None)["tracks"], json!([]));
+    }
+
+    // ---- Needs (MCR-124, S1) ----
+
+    /// A decision `sup` asks, with what is given in `more` laid over it.
+    fn need(more: Value) -> Value {
+        let mut n = json!({ "id": "n1", "ask": "decision", "options": [
+            { "id": "a", "label": "Use main", "risk": "reversible" },
+            { "id": "b", "label": "Use a branch", "risk": "reversible", "recommended": true },
+        ] });
+        for (k, v) in more.as_object().unwrap() {
+            n[k.as_str()] = v.clone();
+        }
+        n
+    }
+
+    #[test]
+    fn a_need_is_declared_checked_and_replaced_by_its_id() {
+        let mut c = published();
+        c.declare(&SUP, &facts(), &need(json!({ "item": "i1", "actor": "ex", "urgency": "today", "checkBy": 120 })), "Which branch?", NOW).unwrap();
+        let n = &c.parts["sup"].needs[0];
+        assert_eq!((n.text.as_str(), n.since, n.updated, n.actor.as_str(), n.check_by), ("Which branch?", NOW, NOW, "ex", 120));
+        // The same id again replaces it, as a new declaration: a click names the newer stamp
+        c.declare(&SUP, &facts(), &need(json!({})), "Which branch now?", NOW + 5).unwrap();
+        let n = &c.parts["sup"].needs[0];
+        assert_eq!((c.parts["sup"].needs.len(), n.text.as_str(), n.since, n.updated), (1, "Which branch now?", NOW, NOW + 5));
+        assert!(n.actor.is_empty(), "replaced, not merged");
+        // Publishing tracks and actions leaves the needs as they are
+        c.publish(&SUP, &facts(), &json!({ "tracks": [track()] }), NOW + 6).unwrap();
+        assert_eq!(c.parts["sup"].needs.len(), 1);
+        assert!(c.publish(&SUP, &facts(), &json!({ "tracks": [track()], "actions": [action("typed_word", json!({ "id": "n1", "where": { "session": "ex" }, "say": "go" }))] }), NOW + 7).unwrap_err().contains("need you asked"));
+        assert!(published().declare(&SUP, &facts(), &need(json!({ "id": "a1" })), "Q?", NOW).unwrap_err().contains("need.id"));
+        // Each refusal names the place of the first fault, and stores nothing
+        let refused = |n: Value| {
+            let mut c = Cockpit::default();
+            let e = c.declare(&SUP, &facts(), &n, "Which one?", NOW).unwrap_err();
+            assert!(c.parts.is_empty() && c.version == 0, "{e}");
+            e
+        };
+        // What the harness builds from its own facts is never declared (L3)
+        for kind in ["prompt", "held_line", "report", "done", "human_wait", "answer_prompt"] {
+            assert!(refused(need(json!({ "ask": kind }))).contains("built by the harness"), "{kind}");
+        }
+        assert!(refused(need(json!({ "id": "prompt:ex" }))).contains("need.id"));
+        assert!(refused(need(json!({ "ask": "go" }))).contains("exactly one"));
+        assert!(refused(need(json!({ "ask": "question" }))).contains("no choices"));
+        assert!(refused(need(json!({ "ask": "secret_step", "options": [], "detail": "1. open it", "word": "paid" }))).contains("need.word"));
+        assert!(refused(need(json!({ "options": [{ "id": "a", "label": "Pay", "risk": "spend" }, { "id": "b", "label": "Wait", "risk": "reversible" }] }))).contains("need.options[0].amount"));
+        assert!(refused(need(json!({ "options": [{ "id": "a", "label": "Pay", "risk": "reversible", "recommended": true }, { "id": "b", "label": "Wait", "risk": "reversible", "recommended": true }] }))).contains("at most one"));
+        assert!(refused(need(json!({ "actor": "peer" }))).contains("need.actor"));
+        assert!(refused(need(json!({ "actor": "sh" }))).contains("not an agent"));
+        assert!(refused(need(json!({ "where": { "session": "ex" } }))).contains("goes to actor"));
+        assert!(refused(need(json!({ "ask": "go", "exact": true, "word": "push", "options": [{ "id": "go", "label": "push it", "risk": "reversible" }] }))).contains("need.exact"));
+        assert!(refused(need(json!({ "colour": "red" }))).contains("colour"));
+        assert!(refused(need(json!({ "cause": ["report:nope"] }))).contains("need.cause[0]"));
+        assert!(refused(need(json!({ "blocks": ["item:t1/i1"] }))).contains("need.blocks[0]"), "no such track in an empty part");
+        assert!(refused(need(json!({ "track": "t9" }))).contains("need.track"));
+        assert!(refused(need(json!({ "ask": "external", "options": [] }))).contains("need.where.url"));
+        // The framed line must fit (M4): a label that passes alone may not with "Decision sup/n1: " before it
+        let long = "x".repeat(110);
+        assert!(refused(need(json!({ "options": [{ "id": "a", "label": long, "risk": "reversible" }, { "id": "b", "label": "no", "risk": "reversible" }] }))).contains("need.options[0].label"));
+        assert!(refused(need(json!({ "options": [{ "id": "a", "label": "/compact", "risk": "reversible" }, { "id": "b", "label": "no", "risk": "reversible" }] }))).contains("need.options[0].label"));
+        // The question is one line; the rest goes in detail
+        assert!(Cockpit::default().declare(&SUP, &facts(), &need(json!({})), "line one\nline two", NOW).unwrap_err().contains("need.detail"));
+        assert!(Cockpit::default().declare(&SUP, &facts(), &need(json!({})), "", NOW).unwrap_err().contains("text"));
+        // Causes and blocks the harness has: a prompt, a session's wait, another need
+        let mut f = facts();
+        f.sessions.get_mut("ex").unwrap().waits.push(FactWait { id: "w1".into(), kind: "human".into(), ..FactWait::default() });
+        let mut c = published();
+        c.declare(&SUP, &f, &need(json!({ "id": "n2", "cause": ["prompt:ex", "wait:w1"], "blocks": ["item:t1/i2"] })), "Second?", NOW).unwrap();
+        c.declare(&ROOT_WHO, &f, &need(json!({ "id": "n3", "cause": ["need:sup/n2"], "blocks": ["need:sup/n2"] })), "Third?", NOW).unwrap();
+        assert!(c.declare(&ROOT_WHO, &f, &need(json!({ "id": "n4", "cause": ["need:root/n3"] })), "Fourth?", NOW).unwrap_err().contains("cause[0]"), "the root part is called supervisor");
+        assert!(c.declare(&ROOT_WHO, &f, &need(json!({ "id": "n3", "cause": ["need:supervisor/n3"] })), "Itself?", NOW).unwrap_err().contains("cause[0]"));
+    }
+
+    /// Fake credentials, put together at run time so that no scanner takes this file for a leak.
+    fn fakes() -> Vec<String> {
+        let body = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+        vec![
+            ["xo", "xb-", "1234-", body].concat(),
+            ["xa", "pp-", body].concat(),
+            ["gh", "p_", body].concat(),
+            ["git", "hub_pat_", body].concat(),
+            ["sk", "-ant-", body].concat(),
+            ["sk", "-", body].concat(),
+            ["AK", "IA", "ABCDEFGHIJ234567"].concat(),
+            ["Bear", "er ", body, ".", body].concat(),
+            ["-----BEGIN RSA ", "PRIVATE KEY-----"].concat(),
+        ]
+    }
+
+    #[test]
+    fn text_that_looks_like_a_credential_is_refused_without_repeating_it() {
+        for secret in fakes() {
+            assert!(looks_secret(&format!("use {secret} now")), "{secret}");
+            for (field, value) in [("why", json!(format!("use {secret}"))), ("detail", json!(format!("steps:\n{secret}")))] {
+                let mut more = json!({});
+                more[field] = value;
+                let e = Cockpit::default().declare(&SUP, &facts(), &need(more), "Which one?", NOW).unwrap_err();
+                assert!(e.contains(&format!("need.{field}")) && e.contains("credential") && !e.contains(&secret), "{e}");
+            }
+            let e = Cockpit::default().declare(&SUP, &facts(), &need(json!({})), &format!("Use {secret}?"), NOW).unwrap_err();
+            assert!(e.contains("credential") && !e.contains(&secret), "{e}");
+            // The same for what cockpit_publish takes, and again at the click (`placeable`)
+            assert!(with_action(action("live_check", json!({ "detail": format!("run with {secret}") }))).unwrap_err().contains("credential"));
+            assert!(placeable(&format!("use {secret}")).unwrap_err().contains("credential"), "{secret}");
+        }
+        for fine in ["the ghp_ prefix of a token", "ask-anthropic", "AKIA keys rotate", "a Bearer token", "risk-free", "task-antelope-1234567890123456789"] {
+            assert!(!looks_secret(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn a_need_is_one_entry_of_the_one_view_and_an_action_for_an_older_panel() {
+        let mut f = facts();
+        let mut c = published();
+        c.declare(&SUP, &f, &need(json!({ "actor": "ex", "item": "i1" })), "Which branch?", NOW).unwrap();
+        // Asked with a report: it stands for that report, so the report is no row of its own
+        f.reports.insert("r9".into(), "sup".into());
+        f.sessions.get_mut("sup").unwrap().needs_human = Some(("r9".into(), "Which branch?".into(), NOW));
+        c.cite(&SUP, "n1", "r9");
+        let read = c.read(&f, None);
+        let n = read["needs"].as_array().unwrap().iter().find(|n| n["id"] == "n1").unwrap();
+        assert_eq!((&n["attach"], &n["guarded"], &n["risk"], &n["cause"][0]), (&json!({ "by": "sup", "track": "t1" }), &json!(false), &json!("reversible"), &json!("report:r9")));
+        let a = read["actions"].as_array().unwrap().iter().find(|a| a["id"] == "n1").unwrap();
+        assert_eq!((&a["kind"], &a["where"]["session"], &a["options"], &a["recommended"], &a["live"]["reportOpen"]), (&json!("decision"), &json!("ex"), &json!(["Use main", "Use a branch"]), &json!("Use a branch"), &json!(true)));
+        assert!(!read["actions"].as_array().unwrap().iter().any(|a| a["kind"] == "report"));
+        assert!(!read["needs"].as_array().unwrap().iter().any(|n| n["id"] == "report:r9"));
+        // The acting session's prompt joins an entry that points the operator there (here the
+        // older action a1, which comes first), and puts it first
+        f.sessions.get_mut("ex").unwrap().prompt = Some(NOW + 1);
+        let read = c.read(&f, None);
+        assert_eq!(read["needs"][0]["live"]["prompt"], json!(NOW + 1));
+        assert!(!read["needs"].as_array().unwrap().iter().any(|n| n["id"] == "prompt:ex"));
+        let alone = {
+            let mut c = Cockpit::default();
+            c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW).unwrap();
+            c.declare(&SUP, &f, &need(json!({ "actor": "ex" })), "Which branch?", NOW).unwrap();
+            c.read(&f, None)
+        };
+        assert_eq!((&alone["needs"][0]["id"], &alone["needs"][0]["live"]["prompt"]), (&json!("n1"), &json!(NOW + 1)));
+        // A done report is quiet, and only in the one view (Q6)
+        f.sessions.get_mut("peer").unwrap().done = Some(("r8".into(), "Shipped".into(), NOW));
+        let read = c.read(&f, None);
+        let done = read["needs"].as_array().unwrap().iter().find(|n| n["id"] == "done:r8").unwrap();
+        assert_eq!((&done["ask"], &done["urgency"], &done["attach"], &done["detail"]), (&json!("done"), &json!("whenever"), &Value::Null, &json!("Shipped")));
+        assert!(!read["actions"].as_array().unwrap().iter().any(|a| a["id"] == "done:r8"));
+        // A v1 action is in the one view too, in the newer words
+        let a1 = read["needs"].as_array().unwrap().iter().find(|n| n["id"] == "a1").unwrap();
+        assert_eq!((&a1["ask"], &a1["exact"], &a1["options"][0]["label"], &a1["fromAction"]), (&json!("go"), &json!(true), &json!("merge MCR-95"), &json!(true)));
+        // The session that acts reads the need it answers, though not the part (M3)
+        let mine = c.read(&f, Some("ex"));
+        assert!(mine["needs"].as_array().unwrap().iter().any(|n| n["id"] == "n1") && mine["tracks"].as_array().unwrap().is_empty());
+        assert!(!c.read(&f, Some("peer"))["needs"].as_array().unwrap().iter().any(|n| n["id"] == "n1"));
+        // A guarded need: no button in either form
+        c.declare(&SUP, &f, &need(json!({ "id": "n2", "options": [{ "id": "a", "label": "Run it", "risk": "spend", "amount": "40 EUR" }, { "id": "b", "label": "Wait", "risk": "reversible" }] })), "Run the paid step?", NOW).unwrap();
+        let read = c.read(&f, None);
+        let n2 = read["needs"].as_array().unwrap().iter().find(|n| n["id"] == "n2").unwrap();
+        assert_eq!((&n2["guarded"], &n2["risk"], &n2["unclickable"]), (&json!(true), &json!("spend"), &json!(["options"])));
+        let a2 = read["actions"].as_array().unwrap().iter().find(|a| a["id"] == "n2").unwrap();
+        assert_eq!((&a2["unclickable"], &a2["amount"], &a2["where"]["session"]), (&json!(["options"]), &json!("40 EUR"), &json!("sup")));
+        // Closed: out of both lists, readable under closed
+        c.close(&SUP, &f, "n1", Closed { outcome: "answered".into(), chosen: "b".into(), note: "main it is".into(), at: NOW + 2 }).unwrap();
+        let read = c.read(&Facts { now: NOW + 3, ..f.clone() }, None);
+        assert!(!read["needs"].as_array().unwrap().iter().any(|n| n["id"] == "n1") && !read["actions"].as_array().unwrap().iter().any(|a| a["id"] == "n1"));
+        assert_eq!((&read["closed"][0]["id"], &read["closed"][0]["closed"]["chosen"]), (&json!("n1"), &json!("b")));
+        assert!(c.read(&Facts { now: NOW + 2 + CLOSED_KEPT_MS, ..f.clone() }, None)["closed"].as_array().unwrap().is_empty());
+        assert!(c.close(&SUP, &f, "n1", Closed { outcome: "answered".into(), chosen: "".into(), note: "".into(), at: NOW + 4 }).unwrap_err().contains("not an open need"));
+        assert!(c.close(&SUP, &f, "n2", Closed { outcome: "answered".into(), chosen: "zz".into(), note: "".into(), at: NOW + 4 }).unwrap_err().contains("chosen"));
+        assert!(c.close(&SUP, &f, "n2", Closed { outcome: "maybe".into(), chosen: "".into(), note: "".into(), at: NOW + 4 }).unwrap_err().contains("outcome"));
+    }
+
+    #[test]
+    fn every_entry_of_the_one_view_belongs_to_a_track_or_to_none() {
+        let mut f = facts();
+        let mut c = Cockpit::default();
+        c.publish(&SUP, &f, &json!({ "tracks": [track()] }), NOW).unwrap();
+        // The Supervisor's tracks, in its order: sup leads r1; the root leads r2, where peer owns an open item
+        c.publish(&ROOT_WHO, &f, &json!({ "tracks": [
+            { "id": "r1", "title": "Lead", "lead": "sup", "state": "moving" },
+            { "id": "r2", "title": "Root", "lead": "root", "state": "moving", "items": [{ "id": "x", "title": "X", "owner": "peer", "state": "doing" }] },
+        ], "order": [{ "by": "supervisor", "id": "r2" }, { "by": "supervisor", "id": "r1" }] }), NOW).unwrap();
+        for id in ["ex", "sup", "sh", "peer", "root"] {
+            f.sessions.get_mut(id).unwrap().prompt = Some(NOW);
+        }
+        f.root = Some("root".into());
+        let read = c.read(&f, None);
+        let at = |id: &str| read["needs"].as_array().unwrap().iter().find(|n| n["id"] == format!("prompt:{id}")).unwrap()["attach"].clone();
+        assert_eq!(at("ex"), json!({ "by": "sup", "track": "t1" }), "the track it leads");
+        assert_eq!(at("sup"), json!({ "by": "supervisor", "track": "r1" }), "the track it leads");
+        assert_eq!(at("peer"), json!({ "by": "supervisor", "track": "r2" }), "the track where it owns an open item");
+        assert_eq!(at("sh"), json!({ "by": "supervisor", "track": "r1" }), "the track of the session above it");
+        assert_eq!(at("root"), json!({ "by": "supervisor", "track": "r2" }));
+        // Without any of these: unassigned
+        c.parts.remove(ROOT);
+        assert_eq!(c.read(&f, None)["needs"].as_array().unwrap().iter().find(|n| n["id"] == "prompt:peer").unwrap()["attach"], Value::Null);
+    }
+
+    #[test]
+    fn a_click_on_a_need_places_the_line_the_service_builds_in_the_acting_session() {
+        let mut f = facts();
+        let mut c = published();
+        c.declare(&SUP, &f, &need(json!({ "actor": "ex" })), "Which branch?", NOW).unwrap();
+        let stamp = c.parts["sup"].needs[0].updated;
+        assert_eq!(c.act("sup", "n1", stamp, Act::Choose(1), &f).unwrap(), Deed::Type { session: "ex".into(), text: "Decision sup/n1: Use a branch".into() });
+        assert!(c.act("sup", "n1", stamp + 1, Act::Choose(1), &f).unwrap_err().contains("asked again"));
+        assert!(c.act("sup", "n1", stamp, Act::Choose(5), &f).unwrap_err().contains("no such choice"));
+        assert!(c.act("sup", "n1", stamp, Act::Link, &f).unwrap_err().contains("nothing of this kind"));
+        match c.act("sup", "n1", stamp, Act::Ask, &f).unwrap() {
+            Deed::Type { session, text } => assert!(session == "sup" && text.contains("sup/n1")),
+            other => panic!("{other:?}"),
+        }
+        // Without an actor the answer goes to the session that asked; the root part's to the Supervisor session
+        c.declare(&SUP, &f, &need(json!({ "id": "n5" })), "Here?", NOW).unwrap();
+        assert_eq!(c.act("sup", "n5", NOW, Act::Choose(0), &f).unwrap(), Deed::Type { session: "sup".into(), text: "Decision sup/n5: Use main".into() });
+        c.declare(&ROOT_WHO, &f, &need(json!({ "id": "n6" })), "Root?", NOW).unwrap();
+        assert!(c.act(ROOT, "n6", NOW, Act::Choose(0), &f).unwrap_err().contains("does not run"));
+        f.root = Some("root".into());
+        assert_eq!(c.act(ROOT, "n6", NOW, Act::Choose(0), &f).unwrap(), Deed::Type { session: "root".into(), text: "Decision supervisor/n6: Use main".into() });
+        // An exact go places its label alone
+        c.declare(&SUP, &f, &json!({ "id": "n4", "ask": "go", "exact": true, "actor": "ex", "options": [{ "id": "go", "label": "go on", "risk": "reversible" }] }), "Go on?", NOW).unwrap();
+        assert_eq!(c.act("sup", "n4", NOW, Act::Place, &f).unwrap(), Deed::Type { session: "ex".into(), text: "go on".into() });
+        assert_eq!(c.read(&f, None)["actions"].as_array().unwrap().iter().find(|a| a["id"] == "n4").unwrap()["say"], "go on");
+        // Guarded needs are not placed by a click in this slice: an owner word, or a choice that cannot simply be undone
+        c.declare(&SUP, &f, &json!({ "id": "n3", "ask": "go", "word": "push", "actor": "ex", "options": [{ "id": "go", "label": "push MCR-124", "risk": "reversible" }] }), "Push?", NOW).unwrap();
+        assert!(c.act("sup", "n3", NOW, Act::Place, &f).unwrap_err().contains("owner word"));
+        c.declare(&SUP, &f, &need(json!({ "id": "n2", "options": [{ "id": "a", "label": "Drop it", "risk": "irreversible" }, { "id": "b", "label": "Keep it", "risk": "reversible" }] })), "Drop the table?", NOW).unwrap();
+        assert!(c.act("sup", "n2", NOW, Act::Choose(1), &f).unwrap_err().contains("owner word"));
+        // The operator typed in the acting session since: no click until it is asked again
+        f.sessions.get_mut("ex").unwrap().typed = Some(NOW + 1);
+        assert!(c.act("sup", "n1", stamp, Act::Choose(1), &f).unwrap_err().contains("you typed"));
+        let read = c.read(&f, None);
+        assert_eq!(read["needs"].as_array().unwrap().iter().find(|n| n["id"] == "n1").unwrap()["ownerTyped"], NOW + 1);
+        assert!(c.outdated(&f).iter().any(|o| o.need && o.id == "n1" && o.session == "ex"));
+        // An acting session that left the publisher's tree is refused at the click
+        f.sessions.get_mut("ex").unwrap().typed = None;
+        f.sessions.get_mut("ex").unwrap().above.clear();
+        assert!(c.act("sup", "n1", stamp, Act::Choose(1), &f).unwrap_err().contains("no longer works"));
+        // Closed: nothing to click
+        c.close(&SUP, &f, "n1", Closed { outcome: "obsolete".into(), chosen: "".into(), note: "".into(), at: NOW + 2 }).unwrap();
+        assert!(c.act("sup", "n1", stamp, Act::Choose(1), &f).unwrap_err().contains("closed"));
+    }
+
+    #[test]
+    fn needs_follow_a_restart_and_point_the_harness_at_their_sessions() {
+        let mut c = Cockpit::default();
+        c.declare(&SUP, &facts(), &need(json!({ "actor": "ex", "cause": ["prompt:ex"] })), "Which?", NOW).unwrap();
+        c.declare(&SUP, &facts(), &need(json!({ "id": "n2" })), "Mine?", NOW).unwrap();
+        assert!(c.points_at("ex") && c.points_at("sup") && !c.points_at("peer"));
+        c.moved("ex", "ex2");
+        c.moved("sup", "sup2");
+        let n = &c.parts["sup2"].needs[0];
+        assert_eq!((n.actor.as_str(), n.cause[0].as_str()), ("ex2", "prompt:ex2"));
+        // A document of the first schema is read as it was, with no needs
+        let v1 = json!({ "schema": 1, "version": 3, "parts": { "sup": { "tracks": [track()], "actions": [] } } });
+        assert!(readable(&v1));
+        assert_eq!(load(v1).parts["sup"].needs.len(), 0);
+        assert!(!readable(&json!({ "schema": SCHEMA + 1 })));
     }
 }
