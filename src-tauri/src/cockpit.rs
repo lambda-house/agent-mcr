@@ -3233,6 +3233,18 @@ mod tests {
         assert!(c.act("sup", "n1", stamp, Act::Choose(1), &f).unwrap_err().contains("closed"));
     }
 
+    /// The owner's words are one list for the cockpit and the agent profiles
+    /// (MCR-126 L1, owner's decision 16651): `profiles::OWNER_WORDS` on the
+    /// MCR-126 P1 branch. Until one copy is deleted at the merge, both must
+    /// hold exactly these, in this order; the merge replaces this literal with
+    /// `profiles::OWNER_WORDS`.
+    #[test]
+    fn the_owner_words_are_the_shared_list_with_none_first() {
+        const OWNER_WORDS: [&str; 6] = ["merge", "push", "build", "release", "spend", "paid"];
+        assert_eq!(WORDS[0], "none");
+        assert_eq!(WORDS[1..], OWNER_WORDS);
+    }
+
     #[test]
     fn needs_follow_a_restart_and_point_the_harness_at_their_sessions() {
         let mut c = Cockpit::default();
