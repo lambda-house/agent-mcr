@@ -50,6 +50,8 @@ struct Draft {
     told: Option<std::time::Instant>,
     /// A thread is telling the service again after a call that failed
     retrying: bool,
+    /// When the last key reached this count (ms since 1970), for `prune`
+    last_key: u64,
 }
 
 /// While the person types on, the service is told again this often. It may
@@ -110,6 +112,19 @@ impl Draft {
                 }
             }
         }
+    }
+}
+
+/// The service's word on a line the app told it of (MCR-122). Where the app
+/// said "unsent" and the service keeps no draft, the keys answered a question
+/// the session asked (a digit at a permission menu): the app forgets its
+/// count, or it would tell the same line again at the next key and hold every
+/// message and task until Enter. Keys typed while the call was under way are
+/// forgotten with it; the next key is told anew. A service of an earlier
+/// build answers without `draft`, and nothing changes.
+fn settle(drafts: &mut BTreeMap<String, Draft>, id: &str, told_unsent: bool, answer: &serde_json::Value) {
+    if told_unsent && answer["draft"] == false {
+        drafts.remove(id);
     }
 }
 
@@ -455,8 +470,33 @@ pub async fn harness_outside_supervisors(app: tauri::AppHandle, on: bool) -> Res
 }
 
 #[tauri::command]
-pub async fn harness_list() -> Result<Value, String> {
-    blocking(|| service(json!({"op": "sessions"}))).await
+pub async fn harness_list(state: State<'_, HarnessState>) -> Result<Value, String> {
+    let drafts = state.drafts.clone();
+    blocking(move || {
+        let list = service(json!({"op": "sessions"}))?;
+        if let Ok(mut drafts) = drafts.lock() {
+            prune(&mut drafts, &list);
+        }
+        Ok(list)
+    })
+    .await
+}
+
+/// The app's count of a line the service has since ended by itself
+/// (MCR-122): the prompt it answered moved on, or the screen showed the box
+/// empty. The list says the session holds no draft and that this changed
+/// after the last key the app saw there; the count goes, or the next key
+/// (Up in an empty box, a letter typed and deleted) would raise the same
+/// hold again, and an agent whose screen cannot prove an empty box would
+/// stay held until Enter. A count the service has not heard of yet (its
+/// change is older than the last key) stays.
+fn prune(drafts: &mut BTreeMap<String, Draft>, list: &Value) {
+    for session in list["sessions"].as_array().into_iter().flatten() {
+        let (Some(id), h) = (session["id"].as_str(), &session["harness"]) else { continue };
+        if h["draft"] == false && h["typed"].as_u64().is_some_and(|changed| drafts.get(id).is_some_and(|d| changed > d.last_key)) {
+            drafts.remove(id);
+        }
+    }
 }
 
 /// Earlier Claude and Codex sessions that can continue here (ids, folders, times).
@@ -929,6 +969,7 @@ pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -
         let draft = drafts.entry(id.clone()).or_default();
         let was = draft.unsent();
         draft.key(&data);
+        draft.last_key = runner::now_ms();
         let unsent = draft.unsent();
         let tell = enter || was != unsent || (unsent && draft.told.is_none_or(|at| at.elapsed() >= DRAFT_RETELL));
         if !unsent {
@@ -947,8 +988,14 @@ pub fn terminal_input(view: u64, data: String, state: State<'_, HarnessState>) -
             let draft = drafts.lock().is_ok_and(|drafts| drafts.get(id).is_some_and(Draft::unsent));
             // Two ops: a service of the build before takes every `operator_input` for an Enter
             let op = if enter { "operator_input" } else { "operator_draft" };
-            if service(json!({"op": op, "id": id, "draft": draft})).is_err() && draft {
-                retell(drafts.clone(), id.to_string(), std::time::Duration::from_secs(2), 30, |id| service(json!({"op": "operator_draft", "id": id, "draft": true})).is_ok());
+            match service(json!({"op": op, "id": id, "draft": draft})) {
+                Ok(answer) => {
+                    if let Ok(mut drafts) = drafts.lock() {
+                        settle(&mut drafts, id, draft, &answer);
+                    }
+                }
+                Err(_) if draft => retell(drafts.clone(), id.to_string(), std::time::Duration::from_secs(2), 30, |id| service(json!({"op": "operator_draft", "id": id, "draft": true})).is_ok()),
+                Err(_) => {}
             }
         });
     }
@@ -1018,6 +1065,61 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hold_the_service_ended_is_not_raised_again_by_the_next_key() {
+        // A digit at Codex's question, told before the service knew it asked: the service
+        // then ended the hold itself (the question was answered), the app still counts the digit
+        let mut drafts: BTreeMap<String, Draft> = BTreeMap::new();
+        let d = drafts.entry("s".into()).or_default();
+        d.key("2");
+        d.last_key = 1_000;
+        let list = |draft: bool, typed: u64| json!({"sessions": [{"id": "s", "harness": {"draft": draft, "typed": typed}}]});
+        // Without the list's word: a letter typed and deleted leaves the hold up
+        let mut stale = Draft { chars: 1, last_key: 1_000, ..Draft::default() };
+        stale.key("x");
+        stale.key("\x7f");
+        assert!(stale.unsent(), "the count of the digit stays");
+        // The service holds a draft, or changed it before the last key: the count stays
+        prune(&mut drafts, &list(true, 2_000));
+        prune(&mut drafts, &list(false, 500));
+        assert!(drafts.contains_key("s"));
+        // The service ended it after the last key: the count goes, and the next keys count alone
+        prune(&mut drafts, &list(false, 2_000));
+        assert!(!drafts.contains_key("s"));
+        let fresh = drafts.entry("s".into()).or_default();
+        fresh.key("x");
+        fresh.key("\x7f");
+        assert!(!fresh.unsent());
+        // Up from the empty box and Down again leave nothing either
+        fresh.key("\x1b[A");
+        fresh.key("\x1b[B");
+        assert!(!fresh.unsent());
+        // Sessions the app has no count for, and lists without sessions, change nothing
+        prune(&mut drafts, &json!({"error": "x"}));
+        prune(&mut drafts, &json!({"sessions": [{"id": "other", "harness": {"draft": false, "typed": 9}}]}));
+    }
+
+    #[test]
+    fn a_key_the_service_takes_for_an_answer_is_forgotten_by_the_app() {
+        // A digit pressed at Claude Code's permission menu: the app counts it as a line
+        let mut drafts: BTreeMap<String, Draft> = BTreeMap::new();
+        drafts.entry("s".into()).or_default().key("2");
+        assert!(drafts["s"].unsent());
+        // An older service answers nothing about the line: the count stays
+        settle(&mut drafts, "s", true, &json!({}));
+        assert!(drafts.contains_key("s"));
+        // The service keeps a draft: so does the app
+        settle(&mut drafts, "s", true, &json!({"draft": true}));
+        assert!(drafts.contains_key("s"));
+        // The service keeps none (the session asks): the app forgets the key, so it is not told again
+        settle(&mut drafts, "s", true, &json!({"draft": false}));
+        assert!(!drafts.contains_key("s"));
+        // A word the app sent about an empty box changes nothing here
+        drafts.entry("t".into()).or_default().key("x");
+        settle(&mut drafts, "t", false, &json!({"draft": false}));
+        assert!(drafts.contains_key("t"));
+    }
 
     #[test]
     fn a_draft_follows_the_keys_and_errs_towards_unsent() {

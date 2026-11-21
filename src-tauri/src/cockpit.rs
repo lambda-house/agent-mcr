@@ -1282,8 +1282,8 @@ impl Cockpit {
                 live.insert("held".into(), json!(since));
                 rows.push(json!({
                     "id": format!("held:{id}"), "kind": "held_line", "derived": "held", "where": { "session": id }, "since": since,
-                    "title": format!("Your unsent line in {who}: press Enter there to send it, Ctrl+C to clear it"),
-                    "detail": "Messages and tasks for it wait until the line is sent or cleared.",
+                    "title": format!("Messages and tasks for {who} wait for a line you have not sent there"),
+                    "detail": "If its input box is empty, press Enter there: nothing is sent and the hold ends. If it holds text, send it, or delete it.",
                 }));
             }
             if let Some((report, said, since)) = fact.needs_human.as_ref().filter(|(report, ..)| !cited.contains(report.as_str())) {
@@ -2135,7 +2135,9 @@ mod tests {
         let read = c.read(&f, None);
         let held = read["actions"].as_array().unwrap().iter().find(|a| a["kind"] == "held_line").unwrap();
         assert_eq!((&held["derived"], &held["since"], &held["where"]["session"]), (&json!("held"), &json!(NOW - 90_000), &json!("peer")));
-        assert!(held["title"].as_str().unwrap().contains("press Enter there to send it, Ctrl+C to clear it"));
+        assert!(held["title"].as_str().unwrap().contains("wait for a line you have not sent there"));
+        // Never Ctrl+C: in a working agent it stops the turn (MCR-122)
+        assert!(held["detail"].as_str().unwrap().contains("If its input box is empty, press Enter there") && !held.to_string().contains("Ctrl+C"));
         // Not the Supervisor's own line: its box is under the panel
         f.sessions.get_mut("root").unwrap().held = Some(NOW - 90_000);
         assert!(!rows(&c, &f).iter().any(|(_, s)| s == "root"));

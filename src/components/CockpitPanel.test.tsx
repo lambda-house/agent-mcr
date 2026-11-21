@@ -337,13 +337,15 @@ it('shows a session at a prompt with nothing published, at the first read, and d
 
 it('shows how long an unsent line has stood, and an overdue human wait with what the session registered (MCR-118)', async () => {
   vi.mocked(harnessApi.cockpit).mockResolvedValue({ schema: 1, version: 0, updated: 0, sessions: { b1: { name: 'Builder' }, r1: { name: 'Reviewer' } }, tracks: [], actions: [
-    { id: 'held:b1', title: 'Your unsent line in Builder: press Enter there to send it, Ctrl+C to clear it', kind: 'held_line', derived: 'held', where: { session: 'b1' }, since: Date.now() - 12 * 60_000, detail: 'Messages and tasks for it wait until the line is sent or cleared.' },
+    { id: 'held:b1', title: 'Messages and tasks for Builder wait for a line you have not sent there', kind: 'held_line', derived: 'held', where: { session: 'b1' }, since: Date.now() - 12 * 60_000, detail: 'If its input box is empty, press Enter there: nothing is sent and the hold ends. If it holds text, send it, or delete it.' },
     { id: 'wait:w1', title: 'Reviewer waits for you, past the time it expected', kind: 'human_wait', derived: 'wait', where: { session: 'r1' }, since: Date.now() - 3600_000, detail: 'a go for the fault run' },
   ] });
   await show();
   const held = host.querySelector('[data-action="held:b1"]')!;
   expect(held.textContent).toContain('unsent for 12 min');
-  expect(held.textContent).toContain('press Enter there to send it, Ctrl+C to clear it');
+  expect(held.textContent).toContain('If its input box is empty, press Enter there: nothing is sent and the hold ends.');
+  // Never Ctrl+C: in a working agent it stops the turn (MCR-122)
+  expect(host.textContent).not.toContain('Ctrl+C');
   expect(held.querySelector('.ck-urgency')!.textContent).toBe('today');
   const wait = host.querySelector('[data-action="wait:w1"]')!;
   expect(wait.textContent).toContain('It registered: a go for the fault run');

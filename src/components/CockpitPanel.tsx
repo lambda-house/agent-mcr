@@ -74,7 +74,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         if (!alive.current) return;
         if (done.link) setLink(done.link);
         if (done.placed) {
-          setSaid({ text: `Placed in the input box of ${who(done.placed).name}, not sent. Press Enter there to send it, Ctrl+C to clear it.`, bad: false });
+          setSaid({ text: `Placed in the input box of ${who(done.placed).name}, not sent. Press Enter there to send it, or delete it there.`, bad: false });
           onSession(done.placed);
         }
         if (done.opened) setSaid({ text: `Opened ${done.opened} in your browser.`, bad: false });

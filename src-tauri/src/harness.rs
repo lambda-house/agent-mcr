@@ -2096,10 +2096,19 @@ const HELD_TELL_MS: u64 = 60_000;
 /// cockpit's "Needs you" (MCR-118): soon enough to be found, late enough
 /// not to come and go while a line is typed
 const HELD_SHOW_MS: u64 = 30_000;
+/// A draft that began this long before a prompt was marked, or later, is
+/// taken for the keys that answered it once the prompt is answered, where
+/// the screen cannot tell (MCR-122). Short: a line typed ahead just before a
+/// prompt is a line, and would otherwise lose its hold at the answer
+const ANSWER_LEAD_MS: u64 = 3_000;
+/// A draft unchanged this long is looked for on screen, at most this often
+/// per session: an empty input box there ends it (MCR-122)
+const DRAFT_CHECK_MS: u64 = 15_000;
 /// The mark on a session whose unsent line keeps a message or a task waiting.
-const HELD_MARK: &str = "A message or a task waits for this session, and you have an unsent line in its input box. Nothing is typed into your line: press Enter to send it, or Ctrl+C to empty it, in this terminal";
+/// Never Ctrl+C: in a working agent it stops the turn (MCR-122)
+const HELD_MARK: &str = "A message or a task waits for this session, and the harness counts an unsent line in its input box. Nothing is typed into it meanwhile. If the box is empty, press Enter in this terminal: nothing is sent and the hold ends. If it holds text, send it, or delete it";
 /// What a hold is, for the sessions that wait on it.
-const HELD_NOTE: &str = "The operator has an unsent line in this session's input box. No inbox notice or task is typed into it until they press Enter or Ctrl+C in that terminal; only the operator can do that";
+const HELD_NOTE: &str = "The operator has an unsent line in this session's input box. No inbox notice or task is typed into it until they send or delete it in that terminal (an Enter in an empty box ends it too); only the operator can do that";
 
 /// The hold of a session by the operator's unsent line, for who waits on it
 /// (`overview`, `session_status`, `list_peers`): null when there is none.
@@ -2114,6 +2123,39 @@ fn held_info(harness: &Value, now: u64) -> Value {
 /// reported itself (`report`) stays until the operator acts on it.
 fn drop_prompt(tracked: &mut Tracked) {
     if tracked.attention.as_ref().is_some_and(|a| a.report.is_none()) {
+        answered(tracked, now_ms());
+        tracked.attention = None;
+    }
+}
+
+/// A prompt of the session was answered: it moved on (MCR-122). The keys
+/// that answered it (a digit, which Claude Code takes without Enter, an
+/// arrow) reached the app as typing and may have left a "draft" there, which
+/// only Enter or Ctrl+C would end and which held every message and task.
+/// Where the screen can prove an empty input box (Claude Code), the answer
+/// changes nothing here: `check_drafts` ends such a hold from the screen, and
+/// a line the operator typed ahead just before the prompt keeps its hold. For
+/// the others, a draft that began after the prompt was marked, or at most
+/// `ANSWER_LEAD_MS` before (the key can come just before the hook that marks
+/// the prompt), was that answer and goes. Call it before the mark is taken.
+fn answered(tracked: &mut Tracked, now: u64) {
+    if adapter(&tracked.profile).shows_empty_input_box() {
+        return;
+    }
+    let Some(since) = tracked.attention.as_ref().filter(|a| a.kind == "permission").map(|a| a.since) else { return };
+    if tracked.draft && tracked.typed.saturating_add(ANSWER_LEAD_MS) >= since {
+        clear_draft(tracked, now);
+    }
+}
+
+/// The harness no longer counts an unsent line in this session. `typed` is
+/// set to now, so `held` keeps out of the box for `DRAFT_QUIET_MS` more: a key
+/// the app is telling just now lands before anything is typed there.
+fn clear_draft(tracked: &mut Tracked, now: u64) {
+    tracked.draft = false;
+    tracked.typed = now;
+    tracked.held_told = false;
+    if tracked.attention.as_ref().is_some_and(|a| a.text == HELD_MARK) {
         tracked.attention = None;
     }
 }
@@ -2156,6 +2198,7 @@ fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
         // the session returns to what it was doing before
         (Seen::Answered { announced }, Some(a)) if tracked.state == "waiting" && (a.guess || (announced && !adapter(&tracked.profile).reports_from_start())) => {
             let was = if a.was.is_empty() || a.was == "waiting" { "working".to_string() } else { a.was.clone() };
+            answered(tracked, now);
             tracked.attention = None;
             store.set_state(session, &was);
             false
@@ -2371,6 +2414,12 @@ pub struct Harness {
     /// Screens for tests, in place of the runner's
     #[cfg(test)]
     shown: Mutex<BTreeMap<String, String>>,
+    /// When a held session's screen was last read for an empty input box (`check_drafts`)
+    drafts_checked: Mutex<BTreeMap<String, u64>>,
+    /// When the app last said a session has an unsent line, by any word
+    /// (`operator_draft` says so again while the person types): kept here,
+    /// not in the store, which is written only when the draft changes
+    draft_words: Mutex<BTreeMap<String, u64>>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -2521,7 +2570,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_words: Mutex::new(BTreeMap::new()) };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -3165,7 +3214,7 @@ impl Harness {
             return Some("that session is not idle by its own word: it works, or has not reported yet");
         }
         if t.draft {
-            return Some("that session already has an unsent line in its input box. Send or clear it first (Enter or Ctrl+C there)");
+            return Some("that session already has an unsent line in its input box. Send it or delete it there first (with an empty box, an Enter there ends the hold)");
         }
         if held(t, now) {
             return Some("a line was just cleared in that session; try again in a few seconds");
@@ -3408,6 +3457,46 @@ impl Harness {
     /// Waits that ran past their time: first the session's supervisor is
     /// told (or the root Supervisor), then, after as long again, the operator.
     /// A timer in the service, so nothing has to poll.
+    /// A hold whose line is not on screen (MCR-122): the app counts keys, and
+    /// a key that went somewhere else (a menu that no hook reported, a
+    /// program in front) stays a "draft" until Enter. For a session whose
+    /// agent can show an empty input box (`Adapter::empty_input_box`), a
+    /// draft unchanged for `DRAFT_CHECK_MS` is looked for on screen, at most
+    /// that often; an empty box ends it. Text in the box, a menu or a screen
+    /// that proves nothing change nothing. What waited for the line goes out
+    /// at the next tick, after `DRAFT_QUIET_MS`.
+    fn check_drafts(&self) {
+        let now = now_ms();
+        // Quiet: no word about the line for the check time either, so a person typing on is never read for
+        let word = |id: &str| lock(&self.draft_words).get(id).copied().unwrap_or(0);
+        let held: Vec<(String, String)> = lock(&self.store)
+            .sessions
+            .iter()
+            .filter(|(id, t)| t.draft && t.state != ENDED && now.saturating_sub(t.typed.max(word(id))) >= DRAFT_CHECK_MS && adapter(&t.profile).shows_empty_input_box())
+            .map(|(id, t)| (id.clone(), t.profile.clone()))
+            .collect();
+        lock(&self.drafts_checked).retain(|id, _| held.iter().any(|(h, _)| h == id));
+        // (the store's lock is never taken inside this one: the order is store, then words)
+        let drafted: BTreeSet<String> = lock(&self.store).sessions.iter().filter(|(_, t)| t.draft).map(|(id, _)| id.clone()).collect();
+        lock(&self.draft_words).retain(|id, _| drafted.contains(id));
+        for (id, profile) in held {
+            if lock(&self.drafts_checked).get(&id).is_some_and(|at| now.saturating_sub(*at) < DRAFT_CHECK_MS) {
+                continue;
+            }
+            lock(&self.drafts_checked).insert(id.clone(), now);
+            let before = word(&id);
+            if !self.screen(&id).is_some_and(|screen| adapter(&profile).empty_input_box(&screen)) {
+                continue;
+            }
+            // Asked again: a word told while the screen was read is a line begun since
+            self.update(|s| {
+                if let Some(t) = s.sessions.get_mut(&id).filter(|t| t.draft && word(&id) == before && now_ms().saturating_sub(t.typed.max(before)) >= DRAFT_CHECK_MS) {
+                    clear_draft(t, now_ms());
+                }
+            });
+        }
+    }
+
     /// Tell the operator, once, that a message or a task has waited a while
     /// for their unsent line (MCR-85), and the session's supervisor why its
     /// idle executor takes nothing. Nothing is typed into the session.
@@ -4507,6 +4596,9 @@ impl Harness {
                 // cannot know that; it says so again when the person types on
                 let asks = |t: &Tracked| t.attention.as_ref().is_some_and(|a| a.kind == "permission");
                 let draft = req["draft"].as_bool().unwrap_or(false) && !lock(&self.store).sessions.get(id).is_some_and(|t| !t.draft && asks(t));
+                if draft {
+                    lock(&self.draft_words).insert(id.to_string(), now_ms());
+                }
                 // Sent at every Enter in a terminal, and most change nothing: the store is written only for one that does
                 // The time of an Enter is kept for the cockpit (MCR-103): at once
                 // for a session it points the operator at, so that "you typed
@@ -4544,7 +4636,9 @@ impl Harness {
                         }
                     });
                 }
-                Ok(json!({}))
+                // The service's word on the line, for the app's own count (MCR-122): a key
+                // that answered a question is no line, and the app cannot know that
+                Ok(json!({ "draft": lock(&self.store).sessions.get(id).is_some_and(|t| t.draft) }))
             }
             // What the app shows of the reports and the bulletin board
             "board" => Ok(lock(&self.store).board()),
@@ -4784,7 +4878,7 @@ impl Harness {
                 // would send it, and text would be sent with it; the approval
                 // the operator gives for this call shows neither
                 if lock(&self.store).sessions.get(id).is_some_and(|t| t.draft) {
-                    return Err("Refused: the operator has an unsent line in that session's input box. Anything written there now would send it or be sent with it. Only the operator ends it: Enter or Ctrl+C in that terminal.".into());
+                    return Err("Refused: the operator has an unsent line in that session's input box. Anything written there now would send it or be sent with it. Only the operator ends it, by sending or deleting it in that terminal.".into());
                 }
                 refuse_if_waiting(id)?;
                 // Both ways ask for the draft again with the writer's lock
@@ -5330,6 +5424,7 @@ pub fn serve(dir: &Path) -> Result<(), String> {
             stalls.nudge(&session);
         }
         stalls.tell_assigners();
+        stalls.check_drafts();
         stalls.tell_held();
         stalls.escalate_waits();
         stalls.tell_outdated();
@@ -7437,6 +7532,104 @@ mod tests {
         }
         let after = lock(&harness.store).sessions["x"].clone();
         assert_eq!((after.state.as_str(), after.attention.is_none(), after.operator_sent, after.draft), ("working", true, 0, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_that_answered_a_prompt_holds_nothing_once_the_prompt_is_answered() {
+        // MCR-122: a digit pressed at a permission question, told before the mark of the question
+        let dir = std::env::temp_dir().join(format!("agent-mcr-answered-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        harness.update(|s| {
+            for (id, profile) in [("codex", "codex"), ("codex-line", "codex"), ("claude", "claude"), ("claude-line", "claude"), ("guessed", "codex")] {
+                s.sessions.insert(id.into(), Tracked { profile: profile.into(), state: "working".into(), hooked: true, precise: true, ..Tracked::default() });
+            }
+        });
+        let tracked = |id: &str| lock(&harness.store).sessions[id].clone();
+        let word = |id: &str, draft: bool| harness.control(&json!({"op": "operator_draft", "id": id, "draft": draft})).unwrap();
+        let ask = |s: &mut Store, id: &str, since: u64| s.sessions.get_mut(id).unwrap().attention = Some(Attention { kind: "permission".into(), text: "Allow?".into(), since, ..Attention::default() });
+        let begun = |s: &mut Store, id: &str, at: u64| {
+            let t = s.sessions.get_mut(id).unwrap();
+            (t.draft, t.typed) = (true, at);
+        };
+        let now = now_ms();
+        // Where the screen cannot tell (Codex): a draft begun just before the mark was the answer
+        assert_eq!(word("codex", true)["draft"], true);
+        harness.update(|s| {
+            ask(s, "codex", now_ms() + 1_000);
+            apply_hook(s, "codex", "PostToolUse", &json!({}));
+        });
+        assert!(!tracked("codex").draft, "the key was the answer");
+        assert!(held(&tracked("codex"), now_ms()), "for the quiet time, so a key told just now lands first");
+        // A line typed ahead 10 s before the question is a line: it keeps its hold through the answer
+        harness.update(|s| {
+            begun(s, "codex-line", now - 10_000);
+            ask(s, "codex-line", now);
+            apply_hook(s, "codex-line", "PostToolUse", &json!({}));
+        });
+        assert!(tracked("codex-line").draft);
+        // Where the screen can (Claude Code), the answer changes nothing: the screen ends a digit's hold
+        // (`an_empty_input_box_on_screen_ends_a_hold`), and a line typed ahead stays held
+        harness.update(|s| {
+            begun(s, "claude", now);
+            ask(s, "claude", now + 500);
+            apply_hook(s, "claude", "PostToolUse", &json!({}));
+            begun(s, "claude-line", now - 10_000);
+            ask(s, "claude-line", now);
+            apply_hook(s, "claude-line", "PostToolUse", &json!({}));
+        });
+        assert!(tracked("claude").draft && tracked("claude-line").draft);
+        // A key at a question the service knows of: no draft, and the app is told so
+        harness.update(|s| ask(s, "codex", now_ms()));
+        assert_eq!(word("codex", true)["draft"], false);
+        // A prompt the harness read from the screen and then saw go
+        harness.update(|s| {
+            apply_look(s, "guessed", Seen::Asking("Run this?".into()), now);
+            begun(s, "guessed", now + 5);
+            apply_look(s, "guessed", Seen::Answered { announced: false }, now + 10);
+        });
+        assert!(!tracked("guessed").draft);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_input_box_on_screen_ends_a_hold() {
+        // MCR-122: a key that went elsewhere stays a "draft" in the app until Enter; the screen says better
+        let dir = std::env::temp_dir().join(format!("agent-mcr-empty-box-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let old = now_ms() - DRAFT_CHECK_MS;
+        harness.update(|s| {
+            for (id, profile, typed) in [("empty", "claude", old), ("text", "claude", old), ("menu", "claude", old), ("fresh", "claude", now_ms()), ("codex", "codex", old), ("shell", "shell", old)] {
+                s.sessions.insert(id.into(), Tracked { profile: profile.into(), state: "working".into(), draft: true, typed, ..Tracked::default() });
+            }
+            s.post(Message { to: "empty".into(), text: "hello".into(), ..Message::default() });
+        });
+        let menu = "(text)\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. Yes, and switch to auto mode\n   3. No\n".to_string();
+        for (id, screen) in [("empty", claude_idle_screen()), ("text", claude_idle_screen().replace("\u{276f}\n", "\u{276f} half a line\n")), ("menu", menu), ("fresh", claude_idle_screen()), ("codex", claude_idle_screen()), ("shell", claude_idle_screen())] {
+            lock(&harness.shown).insert(id.into(), screen);
+        }
+        let draft = |id: &str| lock(&harness.store).sessions[id].draft;
+        harness.check_drafts();
+        // Only the empty box ends its hold: text, a menu, a key just typed, and agents whose screen proves nothing keep theirs
+        assert_eq!(["empty", "text", "menu", "fresh", "codex", "shell"].map(draft), [false, true, true, true, true, true]);
+        // Read at most once per check time: a line typed in the meantime is not looked for again at once
+        assert!(lock(&harness.drafts_checked).contains_key("text") && !lock(&harness.drafts_checked).contains_key("fresh"));
+        lock(&harness.shown).insert("text".into(), claude_idle_screen());
+        harness.check_drafts();
+        assert!(draft("text"));
+        lock(&harness.drafts_checked).insert("text".into(), now_ms() - DRAFT_CHECK_MS);
+        harness.check_drafts();
+        assert!(!draft("text"));
+        // A person who types on says so again every second: such a line is not read for, and a word
+        // told while the screen was read keeps the hold
+        harness.update(|s| { s.sessions.insert("typing".into(), Tracked { profile: "claude".into(), state: "working".into(), draft: true, typed: old, ..Tracked::default() }); });
+        lock(&harness.shown).insert("typing".into(), claude_idle_screen());
+        harness.control(&json!({"op": "operator_draft", "id": "typing", "draft": true})).unwrap();
+        harness.check_drafts();
+        assert!(draft("typing") && !lock(&harness.drafts_checked).contains_key("typing"));
+        // What waited for the line is no longer held once the quiet time is over
+        let empty = lock(&harness.store).sessions["empty"].clone();
+        assert!(held(&empty, now_ms()) && !held(&empty, now_ms() + DRAFT_QUIET_MS));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
