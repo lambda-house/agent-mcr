@@ -28,6 +28,7 @@ mod secret_shape;
 mod task_copy;
 mod harness;
 mod harness_preferences;
+mod profiles;
 mod harness_commands;
 mod session_analysis;
 mod session_analysis_commands;

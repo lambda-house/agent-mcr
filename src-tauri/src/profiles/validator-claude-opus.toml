@@ -1,0 +1,25 @@
+# Validator for Codex-made work. acceptEdits with edits denied (best-effort,
+# M2) so its gates can run; findings go into the report and Jira, not code.
+id = "validator@claude-opus"
+version = 1
+role = "validator"
+adapter = "claude"
+summary = "Reviews another lineage's work in a scratch worktree and gives a verdict"
+
+[inference]
+model = "opus"
+effort = "xhigh"
+
+[permissions]
+mode = "acceptEdits"
+worktree = "scratch"
+
+[tools]
+deny = ["Edit", "Write"]
+
+[contract]
+done = ["refs", "verdict", "unverified"]
+independent = true
+
+[limits]
+max_executors = 0

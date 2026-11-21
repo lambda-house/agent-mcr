@@ -1,0 +1,33 @@
+# Alerts and SRE: watches, triages and proposes. That it changes nothing in a
+# cluster rests on a read-only kube credential (RBAC) and the read-only
+# Kubernetes MCP, not on the deny list below, which is best-effort (M2).
+# Stated read-only allow set (L8): routine polls go only through the MCP
+# servers in mcp.require, which the operator's own allow rules cover; a Bash
+# kubectl is a one-off the operator approves.
+id = "sre@claude-sonnet"
+version = 1
+role = "sre"
+adapter = "claude"
+summary = "Watches alerts, triages and proposes; changes nothing in the clusters"
+
+[inference]
+model = "sonnet"
+effort = "medium"
+
+[permissions]
+mode = "manual"
+
+[tools]
+deny = ["Edit", "Write", "Bash(kubectl apply:*)", "Bash(kubectl delete:*)", "Bash(sops:*)"]
+
+[context]
+mcp.require = ["kubernetes"]
+
+[contract]
+done = ["refs", "unverified"]
+report_status_every_min = 60
+owner_words = ["restart", "scale"]
+
+[limits]
+max_executors = 0
+tokens_soft = 3_000_000

@@ -41,8 +41,12 @@ const STAMPS: [&str; 13] = ["updated", "since", "by", "live", "trackMissing", "o
 const NEED_KINDS: [&str; 6] = ["decision", "go", "question", "secret_step", "live_check", "external"];
 /// What the harness builds from its own facts: never declared by a session
 const FACT_KINDS: [&str; 5] = ["prompt", "held_line", "report", "done", "human_wait"];
-/// The owner's own words: the answer goes only to the acting session (MCR-124)
-const WORDS: [&str; 7] = ["none", "merge", "push", "build", "release", "spend", "paid"];
+/// The owner's own words: the answer goes only to the acting session (MCR-124).
+/// `none` and the one shared list of MCR-126 (`profiles::OWNER_WORDS`)
+const WORDS: [&str; 1 + crate::profiles::OWNER_WORDS.len()] = {
+    let w = crate::profiles::OWNER_WORDS;
+    ["none", w[0], w[1], w[2], w[3], w[4], w[5]]
+};
 const CHOICE_RISKS: [&str; 3] = ["reversible", "irreversible", "spend"];
 const OUTCOMES: [&str; 4] = ["answered", "done", "obsolete", "withdrawn"];
 const MAX_NEEDS: usize = 30;
@@ -3234,15 +3238,11 @@ mod tests {
     }
 
     /// The owner's words are one list for the cockpit and the agent profiles
-    /// (MCR-126 L1, owner's decision 16651): `profiles::OWNER_WORDS` on the
-    /// MCR-126 P1 branch. Until one copy is deleted at the merge, both must
-    /// hold exactly these, in this order; the merge replaces this literal with
-    /// `profiles::OWNER_WORDS`.
+    /// (MCR-126 L1, owner's decision 16651): `none`, then `profiles::OWNER_WORDS`.
     #[test]
     fn the_owner_words_are_the_shared_list_with_none_first() {
-        const OWNER_WORDS: [&str; 6] = ["merge", "push", "build", "release", "spend", "paid"];
         assert_eq!(WORDS[0], "none");
-        assert_eq!(WORDS[1..], OWNER_WORDS);
+        assert_eq!(WORDS[1..], crate::profiles::OWNER_WORDS);
     }
 
     #[test]

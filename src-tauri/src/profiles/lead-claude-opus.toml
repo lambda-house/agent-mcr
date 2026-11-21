@@ -1,0 +1,28 @@
+# A lead below the root Supervisor: runs one track with its own executors
+# through the mcr task tools (owner's decision 16697 B). Like an implementer
+# that has executors; never the root Supervisor.
+id = "lead@claude-opus"
+version = 1
+role = "lead"
+adapter = "claude"
+summary = "Leads one track below the Supervisor with its own executors; never merges"
+
+[inference]
+model = "opus"
+effort = "high"
+
+[permissions]
+mode = "acceptEdits"
+
+[tools]
+deny = ["Bash(git push:*)", "Bash(gh pr merge:*)"]
+
+[context]
+skills = ["main-line", "discovered-work", "close-out"]
+
+[contract]
+done = ["refs", "unverified"]
+report_status_every_min = 60
+
+[limits]
+max_executors = 12

@@ -1,0 +1,20 @@
+# A lead on Codex: C2 is enough to supervise executors below the root
+# (owner's decision 16697 B). Its model is the operator's Codex default.
+id = "lead@codex"
+version = 1
+role = "lead"
+adapter = "codex"
+summary = "Leads one track below the Supervisor with its own executors; never merges"
+
+[inference]
+effort = "high"
+
+[permissions]
+mode = "workspace-write"
+
+[contract]
+done = ["refs", "unverified"]
+report_status_every_min = 60
+
+[limits]
+max_executors = 12

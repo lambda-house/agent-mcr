@@ -1,0 +1,22 @@
+# Validator for Claude-made work: another agent kind, in a scratch worktree of
+# the subject's commit, in a mode that can run the gates (M3). The model is
+# the operator's Codex default until the owner names one.
+id = "validator@codex"
+version = 1
+role = "validator"
+adapter = "codex"
+summary = "Reviews another lineage's work in a scratch worktree and gives a verdict"
+
+[inference]
+effort = "high"
+
+[permissions]
+mode = "workspace-write"
+worktree = "scratch"
+
+[contract]
+done = ["refs", "verdict", "unverified"]
+independent = true
+
+[limits]
+max_executors = 0
