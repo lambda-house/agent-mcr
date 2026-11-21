@@ -6682,6 +6682,8 @@ mod tests {
             assert!(!all["actions"].as_array().unwrap().iter().any(|a| a["kind"] == "report"), "{outcome}");
             assert!(all["sessions"].get("a").is_none_or(|a| a["needsOperator"] != true), "{outcome}");
         }
+        // Ten minutes later, as far as the report limit is concerned
+        h.update(|s| s.reports.iter_mut().filter(|r| r.session == "a").for_each(|r| r.created = 1));
         // Finished with done: the need's report is answered and the done report is the mark (review L7)
         let asked = h.agent_tool("a", "report", &json!({"kind": "needs_human", "text": "Ship b's branch?", "need": {"id": "ship", "ask": "question", "actor": "b"}})).unwrap();
         let rid = asked["report"].as_str().unwrap().to_string();
