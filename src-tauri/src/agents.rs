@@ -266,6 +266,22 @@ pub struct Launch<'a> {
     pub own_hooks: bool,
 }
 
+/// What an agent profile may set for a program (MCR-126). Each of these is
+/// passed by one fixed flag of the adapter in a later slice; a profile that
+/// sets anything the adapter cannot pass is refused, never dropped.
+#[derive(Default, Clone, Copy)]
+pub struct Expresses {
+    pub model: bool,
+    pub fallback_model: bool,
+    pub efforts: &'static [&'static str],
+    /// Permission modes (Claude) or sandboxes (Codex) it can be started in.
+    /// Only modes that keep the human answering prompts, or that a profile
+    /// check refuses by role; never a bypass or a danger mode
+    pub modes: &'static [&'static str],
+    /// Tool deny and only lists
+    pub tools: bool,
+}
+
 /// How the current turn of an agent is stopped.
 pub enum Interrupt {
     /// Typed into the terminal
@@ -385,6 +401,15 @@ pub trait Adapter: Sync {
     /// its id. Activity seen in files, not verified liveness.
     fn subagents(&self, _home: &Path, _transcript: Option<&str>, _conversation: Option<&str>, _since: u64) -> Vec<Subagent> {
         Vec::new()
+    }
+    /// What an agent profile may set for it (MCR-126): nothing by default
+    fn expresses(&self) -> Expresses {
+        Expresses::default()
+    }
+    /// It is started with the `mcr` MCP server; otherwise it reaches the
+    /// harness tools through the command form (`--harness-tool`) only
+    fn takes_mcp(&self) -> bool {
+        false
     }
 }
 
@@ -518,6 +543,21 @@ impl Adapter for Claude {
     fn subagents(&self, home: &Path, transcript: Option<&str>, _conversation: Option<&str>, since: u64) -> Vec<Subagent> {
         transcript.map(|t| crate::harness::subagents(home, t, since)).unwrap_or_default()
     }
+    /// `--model`, `--fallback-model`, `--effort`, `--permission-mode`,
+    /// `--tools` and `--disallowedTools` (Claude Code 2.1.330). Never
+    /// `--allowedTools`: an allow rule skips the operator's prompt
+    fn expresses(&self) -> Expresses {
+        Expresses {
+            model: true,
+            fallback_model: true,
+            efforts: &["low", "medium", "high", "xhigh", "max"],
+            modes: &["plan", "manual", "acceptEdits", "auto"],
+            tools: true,
+        }
+    }
+    fn takes_mcp(&self) -> bool {
+        true
+    }
 }
 
 impl Adapter for Codex {
@@ -637,6 +677,15 @@ impl Adapter for Codex {
     }
     fn subagents(&self, home: &Path, _transcript: Option<&str>, conversation: Option<&str>, since: u64) -> Vec<Subagent> {
         conversation.map(|c| crate::harness::codex_subagents(home, c, since)).unwrap_or_default()
+    }
+    /// `-m`, `-c model_reasoning_effort` and `-s` with `-a on-request`
+    /// (codex-cli 0.170; the effort key is still to verify live). No
+    /// fallback model and no tool lists: Codex has no flag for them
+    fn expresses(&self) -> Expresses {
+        Expresses { model: true, fallback_model: false, efforts: &["low", "medium", "high"], modes: &["read-only", "workspace-write"], tools: false }
+    }
+    fn takes_mcp(&self) -> bool {
+        true
     }
 }
 

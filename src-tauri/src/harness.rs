@@ -34,7 +34,7 @@ const IDLE_EXIT: Duration = Duration::from_secs(600);
 const MAX_LIVE: usize = 40;
 /// Levels of supervisor above a session, and executors one session may have
 const MAX_DEPTH: usize = 5;
-const MAX_EXECUTORS: usize = 12;
+pub(crate) const MAX_EXECUTORS: usize = 12;
 /// Open waits one session may have registered, and waits kept in all
 const MAX_OPEN_WAITS: usize = 10;
 const MAX_WAITS: usize = 400;
@@ -947,6 +947,11 @@ pub struct Tracked {
     /// at once, and its mark is raised when the prompt goes (MCR-124, M7)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_report: Option<String>,
+    /// The agent profile it was launched with (MCR-126), set by the harness
+    /// at launch and never from what the agent says. None: a bare profile
+    /// (its adapter, as every session before P2)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_profile: Option<crate::profiles::ProfileRef>,
     /// The operator or the supervisor named it (output only)
     #[serde(skip_deserializing)]
     pub named: bool,
@@ -1909,7 +1914,7 @@ impl Store {
         let children: Vec<Value> = if remaining == 0 { Vec::new() } else {
             self.executors(id).iter().filter(|e| visible.contains_key(e.as_str())).map(|e| self.overview_node(e, visible, now, remaining - 1)).collect()
         };
-        json!({
+        let out = json!({
             "id": id, "name": h["name"], "role": if s["meta"]["role"] == "supervisor" { json!("supervisor") } else { h["role"].clone() },
             "profile": h["profile"], "folder": s["cwd"], "state": h["state"], "stateAgeSeconds": age_seconds(now, h["since"].as_u64().unwrap_or(0)),
             "stateFromHooks": h["precise"] == true && h["hooked"] == true, "status": h["status"], "statusAgeSeconds": age_seconds(now, h["statusSince"].as_u64().unwrap_or(0)),
@@ -1917,8 +1922,18 @@ impl Store {
             "lastOpenReport": self.open_report(id).map(|r| json!({"id": r.id, "kind": r.kind, "text": short_text(&r.text, 240), "ageSeconds": age_seconds(now, r.created)})),
             "attention": if attention.is_null() { Value::Null } else { json!({"kind": attention["kind"], "text": short_text(attention["text"].as_str().unwrap_or(""), 240), "ageSeconds": age_seconds(now, attention["since"].as_u64().unwrap_or(0))}) },
             "needsOperator": !attention.is_null() && attention["kind"] != "notification", "held": held_info(h, now), "executors": children,
-        })
+        });
+        with_profile(out, h)
     }
+}
+
+/// A session's entry with what it shows of its profile (MCR-126): the agent
+/// profile it was launched with, the role kind, the part and the level.
+fn with_profile(mut out: Value, h: &Value) -> Value {
+    if let Some(m) = out.as_object_mut() {
+        m.extend(crate::profiles::session_facts(h));
+    }
+    out
 }
 
 /// Reports the app lists, newest last.
@@ -3913,7 +3928,7 @@ impl Harness {
                     .filter(|s| s["exit"].is_null() && s["id"] != me)
                     .map(|s| {
                         let h = &s["harness"];
-                        json!({
+                        with_profile(json!({
                             "id": s["id"], "name": h["name"], "profile": h["profile"], "cwd": s["cwd"], "state": h["state"], "status": h["status"],
                             "role": if s["meta"]["role"] == "supervisor" { json!("supervisor") } else { h["role"].clone() },
                             "folder": folder_relation(&mine, s["cwd"].as_str().unwrap_or("")),
@@ -3921,7 +3936,7 @@ impl Harness {
                             "held": held_info(h, now_ms()),
                             "supervisor": h["supervisor"],
                             "relation": relation(s["id"].as_str().unwrap_or("")),
-                        })
+                        }), h)
                     })
                     .filter(|p| !args["same_folder"].as_bool().unwrap_or(false) || !p["folder"].is_null())
                     .collect();
@@ -4915,14 +4930,15 @@ impl Harness {
 
     fn brief(session: &Value) -> Value {
         let h = &session["harness"];
-        json!({
+        let out = json!({
             "id": session["id"], "name": h["name"], "profile": h["profile"], "cwd": session["cwd"],
             "state": h["state"], "stateSince": h["since"], "stateFromHooks": h["precise"] == true && h["hooked"] == true, "stateNote": Self::state_note(session),
             "held": held_info(h, now_ms()),
             "attention": h["attention"], "openTasks": session["openTasks"], "agentSession": h["agentSession"],
             "pid": session["pid"], "exit": session["exit"], "title": session["title"], "lastOutput": session["lastOutput"],
             "status": h["status"], "role": h["role"], "unread": session["unread"], "subagents": session["subagents"],
-        })
+        });
+        with_profile(out, h)
     }
 
     /// A supervisor tool call (root, D5). The one thing it can't do is answer
@@ -4948,7 +4964,7 @@ impl Harness {
         match name {
             // Without a caller: read only. `supervise` passes the Supervisor session
             "cockpit_publish" | "cockpit_patch" | "cockpit_read" => self.cockpit_tool(None, name, args),
-            "profiles_list" => Ok(json!({ "profiles": crate::harness_preferences::HarnessPreferences::load(&self.dir)?.profiles() })),
+            "profiles_list" => crate::profiles::list_tool(&self.dir, args),
             "overview" => {
                 let sessions = self.sessions()?;
                 Ok(lock(&self.store).overview(&sessions, None, now_ms()))
@@ -5451,7 +5467,7 @@ fn supervisor_tools() -> Value {
         tool("bulletin_list", "Every live note on the bulletin board: who left it, for which folder, when it expires.", json!({}), &[]),
         tool("bulletin_post", "Leave a note that sessions read when they start and while it lasts. With `cwd` it is for sessions in that folder, its subfolders and the folders above; without, for every session.", json!({"text": {"type": "string"}, "expires_hours": {"type": "integer", "description": "How long it stays true: 1 to 336"}, "cwd": {"type": "string", "description": "Folder it is about (absolute path)"}}), &["text", "expires_hours"]),
         tool("bulletin_remove", "Take a note off the bulletin board.", json!({"note": {"type": "string", "description": "Note id from bulletin_list"}}), &["note"]),
-        tool("profiles_list", "The launch profiles and the commands they run.", json!({}), &[]),
+        tool("profiles_list", "The launch profiles and the commands they run (profiles), every adapter with its capability level (adapters: C0 terminal, C1 screen, C2 turns and tools, C3 hooks from the start), and the agent profiles (role@variant: model, effort, mode, owner words, whether usable), with the files that were refused and why. Agent profiles are listed and checked only: sessions are not started from them yet. With compare, the fields in which two agent profiles differ.", json!({"compare": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2, "description": "Two agent profile ids, for example [\"validator@codex\", \"validator@claude-opus\"]"}}), &[]),
         tool("waits_list", "What sessions registered that they wait for outside themselves (a pipeline, an integration, a person, a peer), with when they expected it to be over and whether it was escalated. Open ones by default.", json!({"session": {"type": "string", "description": "Only waits of this session id"}, "all": {"type": "boolean", "description": "Also the cleared ones"}}), &[]),
         tool("wait_resolve", "End a session's wait after you unblocked it or found it is over; the session is told with your note.", json!({"wait": {"type": "string"}, "note": {"type": "string", "description": "What happened or what you did"}}), &["wait", "note"]),
         cockpit[0].clone(), cockpit[1].clone(), cockpit[2].clone(),
@@ -6346,6 +6362,73 @@ mod tests {
         assert!(tool_cli(&dir, "terminal_write", None, true).unwrap_err().contains("approval"));
         assert!(tool_cli(&dir, "session_list", Some("[]".into()), true).unwrap_err().contains("JSON object"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn profiles_list_v2_shows_levels_agent_profiles_refusals_and_compare() {
+        let dir = Path::new("/tmp").join(format!("mcr-profiles-{}", runner::random_id()));
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("profiles/bad.toml"), "id = \"implementer@y\"\nversion = 1\nrole = \"implementer\"\nadapter = \"claude\"\n[permissions]\nmode = \"bypassPermissions\"\n").unwrap();
+        let harness = Harness::open(&dir);
+        let out = harness.tool("profiles_list", &json!({"compare": ["validator@codex", "validator@claude-opus"]})).unwrap();
+        // The launch profiles stay where they were
+        assert!(out["profiles"].as_array().unwrap().iter().any(|p| p["id"] == "claude" && p["command"].is_string()));
+        let adapter = |id: &str| out["adapters"].as_array().unwrap().iter().find(|a| a["id"] == id).unwrap().clone();
+        assert_eq!(adapter("claude")["level"], "C3");
+        assert_eq!(adapter("claude")["supervisorSafe"], true);
+        assert_eq!(adapter("codex")["level"], "C2");
+        assert_eq!(adapter("pi")["enabled"], false);
+        let implementer = out["agentProfiles"].as_array().unwrap().iter().find(|p| p["id"] == "implementer@claude-opus").unwrap().clone();
+        assert_eq!(implementer["usable"], true);
+        assert_eq!(implementer["origin"], "builtin");
+        assert!(implementer["ownerWords"].as_array().unwrap().contains(&json!("build")));
+        assert_eq!(out["invalid"][0]["file"], "bad.toml");
+        assert!(out["invalid"][0]["error"].as_str().unwrap().contains("permissions.mode"));
+        assert!(out["ceiling"].as_str().unwrap().contains("best-effort"));
+        assert!(out["compare"]["differences"].as_array().unwrap().iter().any(|d| d["field"] == "adapter"));
+        assert!(harness.tool("profiles_list", &json!({"compare": ["validator@codex"]})).unwrap_err().contains("two"));
+        assert!(harness.tool("profiles_list", &json!({"compare": ["validator@codex", "implementer@y"]})).unwrap_err().contains("no valid agent profile"));
+        // A disabled adapter makes its profiles unusable, with the reason
+        harness.control(&json!({"op": "harness_preferences", "preferences": {"enabledProfiles": ["claude", "shell"], "supervisorProfile": "claude"}})).unwrap();
+        let out = harness.tool("profiles_list", &json!({})).unwrap();
+        let codex = out["agentProfiles"].as_array().unwrap().iter().find(|p| p["id"] == "validator@codex").unwrap().clone();
+        assert_eq!(codex["usable"], false);
+        assert!(codex["why"].as_str().unwrap().contains("disabled"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sessions_show_their_profile_level_and_part_from_the_harness_record() {
+        // An older store has no agent profile: it reads as bare
+        let old: Tracked = serde_json::from_value(json!({"profile": "codex", "role": "reviewer of MCR-1", "ownHooks": true})).unwrap();
+        assert!(old.agent_profile.is_none());
+        let brief = Harness::brief(&json!({"id": "a", "harness": serde_json::to_value(&old).unwrap()}));
+        assert_eq!(brief["profile"], "codex");
+        assert_eq!(brief["agentProfile"], Value::Null);
+        assert_eq!(brief["roleKind"], "custom");
+        assert_eq!(brief["part"], "reviewer of MCR-1");
+        assert_eq!(brief["role"], "reviewer of MCR-1");
+        assert_eq!(brief["level"], "C3", "Codex with its own hooks reporting");
+        // A session launched with a profile (P2 sets it) shows it
+        let launched = Tracked {
+            profile: "claude".into(),
+            agent_profile: Some(crate::profiles::ProfileRef { id: "implementer@claude-opus".into(), version: 1, role: crate::profiles::Role::Implementer, digest: "d".into() }),
+            ..Tracked::default()
+        };
+        let h = serde_json::to_value(&launched).unwrap();
+        let brief = Harness::brief(&json!({"id": "b", "harness": h}));
+        assert_eq!(brief["agentProfile"]["id"], "implementer@claude-opus");
+        assert_eq!(brief["roleKind"], "implementer");
+        assert_eq!(brief["level"], "C3");
+        let back: Tracked = serde_json::from_value(serde_json::to_value(&launched).unwrap()).unwrap();
+        assert_eq!(back.agent_profile, launched.agent_profile);
+        // The overview of a tree carries the same facts
+        let mut store = Store::default();
+        store.sessions.insert("b".into(), launched);
+        let sessions = vec![json!({"id": "b", "cwd": "/w", "exit": null, "meta": {}, "harness": h})];
+        let tree = store.overview(&sessions, None, 0);
+        assert_eq!(tree["sessions"][0]["roleKind"], "implementer");
+        assert_eq!(tree["sessions"][0]["level"], "C3");
     }
 
     fn launch<'a>(profile: &'a str) -> Launch<'a> {

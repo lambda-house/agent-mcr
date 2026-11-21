@@ -1,0 +1,31 @@
+# Implementer: one issue on a branch, the full gate, a hand-in; never merges.
+# The push denies are best-effort (M2): the boundary is branch protection.
+id = "implementer@claude-opus"
+version = 1
+role = "implementer"
+adapter = "claude"
+summary = "Builds one issue on a branch, runs the gate, hands in; never merges"
+
+[inference]
+model = "opus"
+effort = "high"
+fallback_model = "sonnet"
+
+[permissions]
+mode = "acceptEdits"
+push = "none"
+
+[tools]
+deny = ["Bash(git push:*)", "Bash(gh pr merge:*)"]
+
+[context]
+skills = ["discovered-work", "close-out"]
+
+[contract]
+done = ["refs", "gates", "unverified"]
+report_status_every_min = 60
+
+[limits]
+max_executors = 2
+tokens_soft = 8_000_000
+reservations = ["mac-gate", "mermaid"]

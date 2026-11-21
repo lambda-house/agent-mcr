@@ -1,0 +1,28 @@
+# Backlog: review, plan, assess, argue, triage. manual with edits denied
+# rather than plan, so it can post its comments and reports (M3).
+id = "backlog@claude-opus"
+version = 1
+role = "backlog"
+adapter = "claude"
+summary = "Reviews, plans, assesses and triages the backlog against the real state"
+
+[inference]
+model = "opus"
+effort = "high"
+
+[permissions]
+mode = "manual"
+
+[tools]
+deny = ["Edit", "Write"]
+
+[context]
+skills = ["discovered-work"]
+mcp.require = ["atlassian"]
+
+[contract]
+done = ["refs"]
+report_status_every_min = 120
+
+[limits]
+max_executors = 2

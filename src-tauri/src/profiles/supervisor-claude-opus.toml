@@ -1,0 +1,25 @@
+# The root Supervisor: runs the owner's requests as tracks and delegates by profile.
+# Needs C3 and the per-call approval of terminal_write; never auto (MCR-126 M8).
+id = "supervisor@claude-opus"
+version = 1
+role = "supervisor"
+adapter = "claude"
+summary = "Runs the owner's requests as tracks, delegates by profile, keeps the cockpit true"
+
+[inference]
+model = "opus"
+effort = "high"
+
+[permissions]
+mode = "acceptEdits"
+
+[context]
+skills = ["main-line", "discovered-work", "close-out"]
+mcp.require = ["atlassian"]
+
+[contract]
+done = ["refs"]
+report_status_every_min = 60
+
+[limits]
+max_executors = 12

@@ -41,8 +41,12 @@ const STAMPS: [&str; 13] = ["updated", "since", "by", "live", "trackMissing", "o
 const NEED_KINDS: [&str; 6] = ["decision", "go", "question", "secret_step", "live_check", "external"];
 /// What the harness builds from its own facts: never declared by a session
 const FACT_KINDS: [&str; 5] = ["prompt", "held_line", "report", "done", "human_wait"];
-/// The owner's own words: the answer goes only to the acting session (MCR-124)
-const WORDS: [&str; 7] = ["none", "merge", "push", "build", "release", "spend", "paid"];
+/// The owner's own words: the answer goes only to the acting session (MCR-124).
+/// `none` and the one shared list of MCR-126 (`profiles::OWNER_WORDS`)
+const WORDS: [&str; 1 + crate::profiles::OWNER_WORDS.len()] = {
+    let w = crate::profiles::OWNER_WORDS;
+    ["none", w[0], w[1], w[2], w[3], w[4], w[5]]
+};
 const CHOICE_RISKS: [&str; 3] = ["reversible", "irreversible", "spend"];
 const OUTCOMES: [&str; 4] = ["answered", "done", "obsolete", "withdrawn"];
 const MAX_NEEDS: usize = 30;
