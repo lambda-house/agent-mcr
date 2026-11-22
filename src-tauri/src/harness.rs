@@ -4909,7 +4909,7 @@ impl Harness {
                     store.sessions.get(id).is_some_and(|t| {
                         t.state != ENDED
                             && (t.draft != draft
-                                || (enter && (t.injected != 0 || t.attention.as_ref().is_some_and(|a| a.kind != "permission")))
+                                || (enter && (t.injected != 0 || t.pending_report.is_some() || t.attention.as_ref().is_some_and(|a| a.kind != "permission")))
                                 || (enter && (now.saturating_sub(t.operator_sent) >= SENT_STEP_MS || store.cockpit.points_at(id))))
                     })
                 };
@@ -4928,6 +4928,9 @@ impl Harness {
                             if enter {
                                 t.operator_sent = now;
                                 t.injected = 0;
+                                // The owner's Enter answers a report kept behind a prompt too
+                                // (MCR-132); the prompt's own mark stays until the agent moves on
+                                t.pending_report = None;
                                 if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
                                     t.attention = None;
                                 }
@@ -7118,7 +7121,7 @@ mod tests {
     /// MCR-132: an open needs_human report with its need stays open, with its
     /// mark, through what the session does next: a status report, the hooks of
     /// its turn, a task typed in, a permission prompt. The owner's Enter there
-    /// answers it.
+    /// answers it, also while a prompt stands in front of it.
     #[test]
     fn a_status_report_leaves_an_open_need_and_its_mark_as_they_are() {
         let dir = socket_test_dir("mcr-132-");
@@ -7193,9 +7196,21 @@ mod tests {
         assert_eq!(shown(&h), listed);
         h.hook("lead", "PostToolUse", &json!({}));
         assert_eq!((open(&h), shown(&h)), (standing, listed));
-        // The owner's Enter in the session answers it
+        // The owner's Enter in the session answers it, also while a prompt
+        // stands in front of it: the prompt stays marked, and once it is gone
+        // the report's mark does not come back
+        h.hook("lead", "Notification", &json!({"notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"}));
+        assert_eq!(open(&h).1, Some(rid.clone()));
         h.control(&json!({"op": "operator_input", "id": "lead", "draft": false})).unwrap();
+        {
+            let s = lock(&h.store);
+            assert_eq!(s.sessions["lead"].attention.as_ref().unwrap().kind, "permission");
+            assert!(s.sessions["lead"].pending_report.is_none());
+            assert!(s.open_report("lead").is_none());
+        }
+        h.hook("lead", "PostToolUse", &json!({}));
         assert_eq!(open(&h), (None, None));
+        assert_eq!(shown(&h).0, Value::Null);
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
