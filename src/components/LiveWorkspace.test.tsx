@@ -208,6 +208,27 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
   });
 });
 
+describe('executors in a worktree below their lead (MCR-133)', () => {
+  const lead: Hosted = { ...running, id: 'lead', cwd: '/work/teob-ai', started: 1, harness: { profile: 'claude', state: 'idle', name: 'Lead' } as Hosted['harness'] };
+  const wt = '/work/teob-ai/.claude/worktrees/agent-mcr-129';
+  const worker: Hosted = { ...running, id: 'w1', cwd: wt, started: 2, harness: { profile: 'claude', state: 'working', name: 'Worker', supervisor: 'lead' } as Hosted['harness'] };
+
+  it('lists the executor in its lead\'s section with a tag, and its folder\'s earlier conversations there too', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([lead, worker]);
+    vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'claude', id: 'old', cwd: '/work/teob-ai/.claude/worktrees/agent-mcr-120', modified: 1, title: 'Earlier worker' }]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(folders().map(f => f.getAttribute('aria-label'))).toEqual(['Folder /work/teob-ai']);
+    expect(rows().map(r => [r.getAttribute('data-depth'), r.querySelector('.hs-rel.subdir')?.textContent ?? null])).toEqual([[null, null], ['1', 'agent-mcr-129']]);
+    expect(rows()[1].querySelector('.hs-rel.subdir')!.getAttribute('title')).toBe(`Works in ${wt}`);
+    await act(async () => (host.querySelector('.hs-earlier-toggle') as HTMLButtonElement).click());
+    const earlier = host.querySelector('.hs-earlier-row .hs-resume')!;
+    expect(earlier.querySelector('.hs-rel.subdir')?.textContent).toBe('agent-mcr-120');
+    expect(earlier.getAttribute('title')).toContain('in /work/teob-ai/.claude/worktrees/agent-mcr-120');
+    // A session is still started in the section's own folder
+    expect(button('Start a session in /work/teob-ai')).not.toBeNull();
+  });
+});
+
 describe('Live workspace', () => {
   it('gives its terminals the same session check while the same sessions run, and a new one when that changes', async () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();

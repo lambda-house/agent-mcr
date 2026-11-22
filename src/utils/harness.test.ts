@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeLiveList } from '../store';
-import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report, directorySections, pathBelow, subfolderTag, type Resumable } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -123,6 +123,82 @@ describe('supervisors and executors', () => {
     const all = [session('lead', '/w'), session('worker', '/w', 'lead'), session('helper', '/w', 'worker'), session('solo', '/w')];
     expect([...executorsBelow('lead', all)].sort()).toEqual(['helper', 'worker']);
     expect(executorsBelow('solo', all).size).toBe(0);
+  });
+});
+
+describe('executors in a folder below their supervisor (MCR-133)', () => {
+  const session = (id: string, cwd: string, supervisor?: string, started = 1): Hosted => ({
+    id, pid: 1, argv: ['claude'], cwd, started, cols: 120, rows: 32, title: '', lastOutput: 1, exit: null,
+    meta: { profile: 'claude', label: 'Claude Code' }, harness: { profile: 'claude', state: 'idle', name: id, supervisor } as Hosted['harness'],
+  });
+  const past = (id: string, cwd: string, modified = 5): Resumable => ({ agent: 'claude', id, cwd, modified });
+  const lead = '/u/work/teob-ai';
+  const wt = (name: string, under = lead) => `${under}/.claude/worktrees/${name}`;
+  /** Each section as `path: rows`, a row as `id:depth[tag]` */
+  const shape = (sessions: Hosted[], resumable: Resumable[] = [], pinned: string[] = []) => directorySections(sessions, resumable, pinned).map(d => {
+    const tag = (cwd: string) => subfolderTag(d.path, cwd)?.tag;
+    const rows = relationRows(d.sessions, sessions).map(r => `${r.session.id}:${r.depth}${tag(r.session.cwd) ? `[${tag(r.session.cwd)}]` : ''}`);
+    const earlier = d.earlier.map(r => `${r.id}${tag(r.cwd) ? `[${tag(r.cwd)}]` : ''}`);
+    return `${d.path}: ${rows.join(' ')}${earlier.length ? ` | ${earlier.join(' ')}` : ''}`;
+  });
+
+  it('lists an executor in <lead>/.claude/worktrees/x under its lead, tagged x, with the full path to show', () => {
+    const all = [session('lead', lead), session('x', wt('agent-mcr-129'), 'lead'), session('y', wt('agent-mcr-130'), 'lead')];
+    expect(shape(all)).toEqual([`${lead}: lead:0 x:1[agent-mcr-129] y:1[agent-mcr-130]`]);
+    expect(subfolderTag(lead, wt('agent-mcr-129'))).toEqual({ tag: 'agent-mcr-129', path: wt('agent-mcr-129') });
+    expect(subfolderTag(lead, lead)).toBeNull();
+  });
+
+  it('lists a two-level executor in tree order under its supervisor', () => {
+    const inner = wt('helper', wt('x'));
+    const all = [session('lead', lead), session('x', wt('x'), 'lead'), session('solo', lead), session('helper', inner, 'x')];
+    expect(shape(all)).toEqual([`${lead}: lead:0 x:1[x] helper:2[helper] solo:0`]);
+  });
+
+  it('keeps an executor outside its supervisor\'s folder where it was, naming its supervisor', () => {
+    const all = [session('lead', lead), session('far', '/u/work/infra', 'lead')];
+    expect(shape(all)).toEqual(['/u/work/infra: far:0', `${lead}: lead:0`]);
+    expect(relationRows(all.filter(h => h.cwd === '/u/work/infra'), all)[0].elsewhere?.id).toBe('lead');
+  });
+
+  it('keeps an executor of the root Supervisor in its own folder', () => {
+    const root = { ...session('root', '/u/sup'), meta: { profile: 'claude', label: 'Claude Code', role: 'supervisor' } } as Hosted;
+    expect(shape([root, session('x', '/u/sup/x', 'root')]).sort()).toEqual(['/u/sup/x: x:0', '/u/sup: root:0']);
+  });
+
+  it('gives a subfolder its own section for a session that is not such an executor', () => {
+    const all = [session('lead', lead), session('x', wt('x'), 'lead'), session('own', wt('x')), session('other', wt('o'), 'someone-else')];
+    expect(shape(all)).toEqual([`${lead}: lead:0 x:1[x]`, `${wt('o')}: other:0`, `${wt('x')}: own:0`]);
+  });
+
+  it('folds earlier conversations from a folder inside a listed section into it, with the same tag', () => {
+    const all = [session('lead', lead), session('x', wt('x'), 'lead')];
+    const history = [past('old-x', wt('x'), 9), past('old-y', wt('y'), 7), past('old-lead', lead, 8), past('deep', `${wt('y')}/sub`, 6), past('far', '/u/work/infra', 3)];
+    expect(shape(all, history)).toEqual([
+      `${lead}: lead:0 x:1[x] | old-x[x] old-lead old-y[y] deep[sub]`,
+      '/u/work/infra:  | far',
+    ]);
+    // The nearest listed section takes them: a pinned subfolder keeps its own
+    expect(shape(all, history, [wt('y')])).toEqual([
+      `${lead}: lead:0 x:1[x] | old-x[x] old-lead`,
+      '/u/work/infra:  | far',
+      `${wt('y')}:  | old-y deep[sub]`,
+    ]);
+  });
+
+  it('does not let a folder with nothing but history gather another\'s', () => {
+    expect(shape([], [past('a', '/u/w', 2), past('b', '/u/w/sub', 1)])).toEqual(['/u/w:  | a', '/u/w/sub:  | b']);
+  });
+
+  it('tells inside by whole folder names', () => {
+    expect(pathBelow('/a/teob-ai', '/a/teob')).toBe('');
+    expect(pathBelow('/a/teob/x', '/a/teob')).toBe('x');
+    expect(pathBelow('/a/teob/x/', '/a/teob/')).toBe('x');
+    expect(pathBelow('/a/teob', '/a/teob')).toBe('');
+    expect(pathBelow('/a', '/')).toBe('a');
+    expect(pathBelow('C:\\w\\x\\y', 'C:\\w')).toBe('x/y');
+    const all = [session('lead', '/a/teob'), session('x', '/a/teob-ai', 'lead')];
+    expect(shape(all, [past('p', '/a/teob-ai/z')])).toEqual(['/a/teob: lead:0', '/a/teob-ai: x:0 | p[z]']);
   });
 });
 
