@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Agent MCR (Agent Mission Control Room) is a local harness for coding-agent sessions, built on MDViewer. The harness architecture, its signed decisions and the delivery sequence are in `docs/AGENT_HARNESS_DESIGN.md`. Read it before changing harness code. `upstream` is `lambda-house/mdviewer-mj`; viewer fixes are merged from there.
+Agent MCR (Agent Mission Control Room) is a local harness for coding-agent sessions, built on MDViewer. The harness architecture, its signed decisions and the delivery sequence are in `docs/AGENT_HARNESS_DESIGN.md`. Read it before changing harness code. `upstream` is `lambda-house/mdviewer-mj`; viewer fixes are merged from there, and the shared frontend packages in `packages/` come from there by `git subtree` (see "Shared packages" below).
 
 The window has two surfaces (Tauri 2.0, React 19, TypeScript). Sessions holds Live (hosted terminals) and Journal (search in the index of past sessions). Documents shows the agents' Markdown and nothing else: instructions, rules, memory, plans, skills, agents and commands, from the agents' own folders and from the folders their sessions work in, with the Markdown reader (Shiki, Mermaid, tabs, table of contents, find, editor). The general file tree, text search across folders, history, saved workspaces, Open File/Folder, drag and drop and "Open with" are removed: do not bring them back.
 
@@ -14,7 +14,7 @@ The window has two surfaces (Tauri 2.0, React 19, TypeScript). Sessions holds Li
 npm install              # Install dependencies
 npm run dev              # Start Vite dev server (port 1420)
 npm run tauri dev        # Run full Tauri desktop app in dev mode
-npm run build            # TypeScript check + Vite build
+npm run build            # TypeScript check (app, then packages/) + Vite build
 npm test                 # Frontend unit tests (Vitest)
 npm run build:app        # Build Agent MCR.app (release, ad-hoc signed)
 npm run build:win        # Build a per-user Windows NSIS installer
@@ -126,6 +126,16 @@ Memory reader windows use a validated `memoryDocument` URL and isolated, read-on
 ### Path Alias
 
 TypeScript path alias `@/*` maps to `src/*` (configured in tsconfig.json and vite.config.ts).
+
+### Shared packages (`packages/`)
+
+npm workspaces (`@lambda-house/tokens`, `ui`, `workbench`, `reader`, `journal`) shared with MDViewer. `packages/` is a squashed `git subtree` of `lambda-house/mdviewer-mj`'s `packages/`. The plan is the shared UI spec, `20261122_ui-concept.md` in mdviewer-mj; the sync commands and rules are in `packages/README.md`.
+
+- Do not change `packages/` here first. Changes are made in mdviewer-mj and merged in with `git subtree merge --squash`. A change that had to be made here goes back to mdviewer-mj as a patch before anything else touches that package.
+- Shared code imports nothing from the app: no `src/`, no `@/`, no `@tauri-apps/*`, no app store. It gets what it needs through host interfaces the app passes in. `packages/layers.test.ts` enforces the layer order and the allowed libraries; `tsc -p packages` type-checks without the app's alias.
+- Harness features (Live, Board, Slack, the cockpit) stay in this app's `src/`, and so do the MDViewer features removed here: they never go into `packages/`.
+- Colours, spacing, radii and type sizes come from `@lambda-house/tokens` once phase 1 lands; component CSS gets no literal colours.
+- A pane whose content is expensive to recreate (terminal, editor, rendered document) is `keepAlive`.
 
 ## Configuration
 

@@ -3,10 +3,13 @@
   "version": "0.1.1",
   "description": "Markdown Document Viewer",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite",
     "dev:web": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && tsc -p packages && vite build",
     "build:web": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
