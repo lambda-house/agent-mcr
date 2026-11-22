@@ -237,7 +237,9 @@ pub async fn harness_status() -> Result<Value, String> {
         let settings = service(json!({"op": "settings"}))?;
         // The service can outlive an app update and return an older settings shape.
         let preferences = crate::harness_preferences::HarnessPreferences::load(&config_dir()?)?;
-        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"], "programQuery": settings["programQuery"], "storeNotice": settings["storeNotice"] }))
+        // Agent profiles for the start menu (MCR-126 P2): ids only reach the service, which loads and checks them itself
+        let agent_profiles = crate::profiles::picker(&config_dir()?, &preferences);
+        Ok(json!({ "runner": hello, "service": service_info, "profiles": preferences.profiles(), "agentProfiles": agent_profiles, "supervisorProfile": preferences.supervisor_profile, "home": home, "supervisorCommand": supervisor, "outsideSupervisors": settings["outsideSupervisors"], "codexHooks": settings["codexHooks"], "codexHooksReporting": settings["codexHooksReporting"], "programQuery": settings["programQuery"], "storeNotice": settings["storeNotice"] }))
     })
     .await
 }

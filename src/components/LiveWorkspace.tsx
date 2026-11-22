@@ -10,7 +10,7 @@ import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou, ProgramLine } from './SessionRow';
-import { canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { agentProfileTitle, canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { useStore } from '../store';
 import ConfirmDialog from './ConfirmDialog';
 import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
@@ -37,7 +37,7 @@ const storedWidth = (): number | null => {
   try { const v = Number(localStorage.getItem(LIST_WIDTH_KEY)); return v >= LIST_MIN_WIDTH ? v : null; } catch { return null; }
 };
 
-interface Action { label: string; icon: React.ReactNode; run: () => void }
+interface Action { label: string; icon: React.ReactNode; run: () => void; title?: string }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
 function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean }) {
@@ -57,7 +57,7 @@ function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-acti
       setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
     }}>{icon ?? <MoreHorizontal size={14}/>}</button>
     {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }} onKeyDown={e => { if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return; e.preventDefault(); const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('button')); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); buttons[(index + (e.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus(); }}>
-      {actions.map(a => <button key={a.label} type="button" role="menuitem" onClick={() => { setAt(null); a.run(); }}>{a.icon} {a.label}</button>)}
+      {actions.map(a => <button key={a.label} type="button" role="menuitem" title={a.title} onClick={() => { setAt(null); a.run(); }}>{a.icon} {a.label}</button>)}
     </div>}
   </span>;
 }
@@ -732,7 +732,11 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               <span className="hs-dir-path" title={d.path}>{shortPath(name)}</span>
               <span className="hs-dir-rule"/>
               <RowMenu className="hs-dir-tools" label={`Start a session in ${d.path}`} title={`Start a session in ${name}`} icon={<Plus size={13}/>} disabled={!status?.profiles.length || starting}
-                actions={(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) }))}/>
+                actions={[
+                  ...(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) })),
+                  // Agent profiles (MCR-126 P2): the id goes to the service, which starts the session from it
+                  ...(status?.agentProfiles ?? []).map(p => ({ label: p.id, title: agentProfileTitle(p), icon: <AgentMark profile={p.adapter} size={13}/>, run: () => void start(p.id, d.path) })),
+                ]}/>
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
               {!d.sessions.some(h => !h.exit) && <button type="button" className="hs-dir-start" title={`Hide ${name}: it goes to Hidden folders at the end of the list. Nothing is deleted`} aria-label={`Hide folder ${d.path}`} onClick={() => hideFolder(d.path)}><EyeOff size={12}/></button>}

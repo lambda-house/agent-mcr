@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeLiveList } from '../store';
-import { DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
+import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -361,5 +361,15 @@ describe('programHint (MCR-115)', () => {
     expect(programHint(hosted())).toBeNull();
     expect(programHint(hosted({ program: {} }))).toBeNull();
     expect(programHint(hosted({ program: { records: [{ state: 'done', at: now }] }, exit: { code: 0, signal: null, at: now } }))).toBeNull();
+  });
+});
+
+describe('agentProfileTitle', () => {
+  it('says what a profile is and how it runs, leaving out what it does not set', () => {
+    expect(agentProfileTitle({ id: 'implementer@claude-opus', version: 1, role: 'implementer', adapter: 'claude', summary: 'Builds one issue', model: 'opus', effort: 'high', mode: 'acceptEdits' }))
+      .toBe('Builds one issue (v1; model opus, effort high, mode acceptEdits)');
+    expect(agentProfileTitle({ id: 'lead@codex', version: 2, role: 'lead', adapter: 'codex', summary: '', model: null, effort: 'high', mode: 'workspace-write' }))
+      .toBe('lead@codex (v2; effort high, mode workspace-write)');
+    expect(agentProfileTitle({ id: 'custom@pi', version: 1, role: 'custom', adapter: 'pi', summary: 'Pi' })).toBe('Pi (v1)');
   });
 });
