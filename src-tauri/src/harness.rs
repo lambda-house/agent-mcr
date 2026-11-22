@@ -4416,14 +4416,17 @@ impl Harness {
         Ok(out)
     }
 
-    /// The hosted session a connection comes from: its process descends from
-    /// one of the runner's children. Nothing the caller says is trusted.
-    fn caller(&self, peer: &peer::Peer) -> Result<String, String> {
-        match self.who(peer) {
-            Caller::Session { id, .. } => Ok(id),
-            Caller::Outside => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
-            Caller::Unknown => Err("Cannot tell which process is calling".into()),
-        }
+    /// Counts a connected `mcr` bridge of a session, or one fewer; the
+    /// session has the tools for as long as one is connected.
+    fn bridged(&self, id: &str, by: isize) {
+        self.update(|s| {
+            let count = s.bridges.entry(id.to_string()).or_default();
+            *count = count.saturating_add_signed(by);
+            let tools = *count > 0;
+            if let Some(t) = s.sessions.get_mut(id) {
+                t.tools = tools;
+            }
+        });
     }
 
     /// Where a connection comes from, by the caller's process alone.
@@ -4444,29 +4447,30 @@ impl Harness {
         }
     }
 
-    fn agent(&self, mut reader: BufReader<Stream>, mut writer: Stream, mcp_client: bool, peer: &peer::Peer) -> std::io::Result<()> {
+    /// `who` is the caller's process, asked through `Bridge`: once at connect
+    /// and again at each request while it is unknown (MCR-129).
+    fn agent(&self, mut reader: impl BufRead, mut writer: impl Write, mcp_client: bool, who: impl Fn() -> Caller) -> std::io::Result<()> {
         // Refused callers still get a working MCP server whose tools say why
-        let me = self.caller(peer);
-        // The session has the tools for as long as a bridge of its is connected
-        let bridged = |by: isize| {
-            if let (true, Ok(id)) = (mcp_client, &me) {
-                self.update(|s| {
-                    let count = s.bridges.entry(id.clone()).or_default();
-                    *count = count.saturating_add_signed(by);
-                    let tools = *count > 0;
-                    if let Some(t) = s.sessions.get_mut(id) {
-                        t.tools = tools;
-                    }
-                });
+        let mut bridge = Bridge::default();
+        // The session has the tools for as long as a bridge of its is connected,
+        // counted from the moment it is known and released for that same id
+        let mut counted: Option<String> = None;
+        let identify = |bridge: &mut Bridge, counted: &mut Option<String>| {
+            let me = bridge.caller(&who);
+            if let (true, None, Ok(id)) = (mcp_client, &*counted, &me) {
+                self.bridged(id, 1);
+                *counted = Some(id.clone());
             }
+            me
         };
-        bridged(1);
+        let _ = identify(&mut bridge, &mut counted);
         let mut protocol = Protocol::default();
         let result = loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
                 Ok(None) | Err(_) => break Ok(()),
             };
+            let me = identify(&mut bridge, &mut counted);
             let call = |name: &str, args: Value| match &me {
                 Ok(me) => self.agent_tool(me, name, &args),
                 Err(e) => Err(e.clone()),
@@ -4477,21 +4481,23 @@ impl Harness {
                 }
             }
         };
-        bridged(-1);
+        if let Some(id) = counted {
+            self.bridged(&id, -1);
+        }
         result
     }
 
     /// The `mcr-memory` MCP server for one bridge (`--memory-mcp`). Memory is for
     /// hosted sessions: who calls is taken from the caller's process, as for
-    /// `mcr`, and anybody else gets a server that lists nothing and says why.
-    fn memory_mcp(&self, mut reader: BufReader<Stream>, mut writer: Stream, peer: &peer::Peer) -> std::io::Result<()> {
-        let me = self.caller(peer);
+    /// `mcr` (`Bridge`), and anybody else gets a server that lists nothing and says why.
+    fn memory_mcp(&self, mut reader: impl BufRead, mut writer: impl Write, who: impl Fn() -> Caller) -> std::io::Result<()> {
+        let mut bridge = Bridge::default();
         loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
                 Ok(None) | Err(_) => return Ok(()),
             };
-            if let Some(reply) = self.memory.handle(&me, &frame) {
+            if let Some(reply) = self.memory.handle(&bridge.caller(&who), &frame) {
                 writeln!(writer, "{reply}")?;
             }
         }
@@ -5323,10 +5329,10 @@ impl Harness {
                 return self.supervise(reader, writer, &peer, req["cli"] == true);
             }
             if req["op"] == "agent" {
-                return self.agent(reader, writer, req["cli"] != true, &peer);
+                return self.agent(reader, writer, req["cli"] != true, || self.who(&peer));
             }
             if req["op"] == "memory" {
-                return self.memory_mcp(reader, writer, &peer);
+                return self.memory_mcp(reader, writer, || self.who(&peer));
             }
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
@@ -5543,6 +5549,32 @@ enum Caller {
     /// A process outside every hosted session
     Outside,
     Unknown,
+}
+
+/// Who an `mcr` or `mcr-memory` bridge connection is, by the caller's process
+/// alone (MCR-129). A connection made while the service could not tell (the
+/// runner did not answer, the ancestry could not be read) asks again at each
+/// request instead of keeping that refusal; the first answer that is not
+/// `Unknown` is kept for the rest of the connection, so an identified
+/// connection never becomes another session and `Outside` stays refused.
+#[derive(Default)]
+struct Bridge {
+    known: Option<Caller>,
+}
+
+impl Bridge {
+    /// The hosted session this connection comes from: its process descends
+    /// from one of the runner's children. Nothing the caller says is trusted.
+    fn caller(&mut self, who: impl FnOnce() -> Caller) -> Result<String, String> {
+        if matches!(self.known, None | Some(Caller::Unknown)) {
+            self.known = Some(who());
+        }
+        match &self.known {
+            Some(Caller::Session { id, .. }) => Ok(id.clone()),
+            Some(Caller::Outside) => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
+            Some(Caller::Unknown) | None => Err("Cannot tell which process is calling".into()),
+        }
+    }
 }
 
 fn supervisor_info() -> Value {
@@ -6016,6 +6048,89 @@ mod tests {
     fn socket_test_dir(prefix: &str) -> PathBuf {
         let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
         base.join(format!("{prefix}{}", runner::random_id()))
+    }
+
+    /// MCR-129: a bridge that connected while the service could not tell who
+    /// called asks again at each request, keeps the first answer, never moves
+    /// to another session, and `Outside` is never asked again.
+    #[test]
+    fn a_bridge_asks_who_again_until_it_knows() {
+        let session = |id: &str| Caller::Session { id: id.into(), supervisor: false };
+        let mut bridge = Bridge::default();
+        assert!(bridge.caller(|| Caller::Unknown).unwrap_err().contains("Cannot tell"));
+        assert!(bridge.caller(|| Caller::Unknown).unwrap_err().contains("Cannot tell"));
+        assert_eq!(bridge.caller(|| session("a")), Ok("a".into()));
+        assert_eq!(bridge.caller(|| session("b")), Ok("a".into()));
+        assert_eq!(bridge.caller(|| Caller::Unknown), Ok("a".into()));
+        let mut outside = Bridge::default();
+        assert!(outside.caller(|| Caller::Outside).unwrap_err().contains("not one of them"));
+        assert!(outside.caller(|| session("a")).unwrap_err().contains("not one of them"));
+    }
+
+    /// MCR-129: an `mcr` bridge whose caller is unknown at connect is served
+    /// once a later call can tell, and the session's `tools` flag goes on then
+    /// and off at the close, for that same session.
+    #[test]
+    fn an_unidentified_agent_bridge_is_identified_at_a_later_call() {
+        let dir = state_dir(None);
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        let frames = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}, "capabilities": {}}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "read_inbox", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_inbox", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "read_inbox", "arguments": {}}}),
+        ];
+        let input: String = frames.iter().map(|f| format!("{f}\n")).collect();
+        // Unknown at connect and for the first three frames, then session "a";
+        // a later answer of "b" must never be taken
+        let asked = std::cell::Cell::new(0);
+        let who = || {
+            asked.set(asked.get() + 1);
+            match asked.get() {
+                1..=4 => Caller::Unknown,
+                5 => Caller::Session { id: "a".into(), supervisor: false },
+                _ => Caller::Session { id: "b".into(), supervisor: false },
+            }
+        };
+        // Each line written records whether "a" had the tools at that moment
+        struct Probe<'a> {
+            h: &'a Harness,
+            out: Vec<u8>,
+            tools: Vec<bool>,
+        }
+        impl Write for Probe<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.out.extend_from_slice(buf);
+                if buf.contains(&b'\n') {
+                    self.tools.push(lock(&self.h.store).sessions["a"].tools);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut probe = Probe { h: &h, out: Vec::new(), tools: Vec::new() };
+        h.agent(std::io::Cursor::new(input), &mut probe, true, who).unwrap();
+        let replies: Vec<Value> = String::from_utf8(probe.out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 4);
+        assert!(replies[1].to_string().contains("Cannot tell which process is calling"), "{}", replies[1]);
+        for reply in &replies[2..] {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            assert!(!reply.to_string().contains("Cannot tell"), "{reply}");
+        }
+        assert_eq!(asked.get(), 5);
+        assert_eq!(probe.tools, [false, false, true, true]);
+        let store = lock(&h.store);
+        assert!(!store.sessions["a"].tools);
+        assert_eq!(store.bridges.get("a"), Some(&0));
+        assert!(!store.bridges.contains_key("b"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A folder with a state file as `state` gives it, for the load tests (MCR-99).
