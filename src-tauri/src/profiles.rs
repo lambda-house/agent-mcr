@@ -432,13 +432,14 @@ impl Loaded {
     }
 }
 
-const BUILT_INS: [(&str, &str); 8] = [
+const BUILT_INS: [(&str, &str); 9] = [
     ("supervisor-claude-opus.toml", include_str!("profiles/supervisor-claude-opus.toml")),
     ("lead-claude-opus.toml", include_str!("profiles/lead-claude-opus.toml")),
     ("lead-codex.toml", include_str!("profiles/lead-codex.toml")),
     ("sre-claude-sonnet.toml", include_str!("profiles/sre-claude-sonnet.toml")),
     ("backlog-claude-opus.toml", include_str!("profiles/backlog-claude-opus.toml")),
     ("implementer-claude-opus.toml", include_str!("profiles/implementer-claude-opus.toml")),
+    ("implementer-codex.toml", include_str!("profiles/implementer-codex.toml")),
     ("validator-codex.toml", include_str!("profiles/validator-codex.toml")),
     ("validator-claude-opus.toml", include_str!("profiles/validator-claude-opus.toml")),
 ];
@@ -1751,6 +1752,49 @@ mod tests {
         let claude = ids(&["claude"]);
         assert!(!claude.is_empty() && claude.iter().all(|id| !id.ends_with("codex")));
         assert!(ids(&[]).is_empty());
+    }
+
+    /// MCR-130: the implementer on Codex is a built-in, mirrors the Claude
+    /// implementer within what Codex passes, is offered only with Codex on, and
+    /// a lead@claude-opus creator starts it without an error
+    #[test]
+    fn implementer_on_codex_is_a_usable_built_in() {
+        let dir = Path::new("/nonexistent-config-dir");
+        let loaded = load(dir);
+        let e = loaded.get("implementer@codex").expect("built-in implementer@codex");
+        let p = &e.profile;
+        assert_eq!((e.origin, p.role, p.adapter.as_str(), p.version), (Origin::Builtin, Role::Implementer, "codex", 1));
+        assert_eq!((p.inference.model.as_deref(), p.inference.effort.as_deref(), p.inference.fallback_model.as_deref()), (None, Some("high"), None));
+        assert_eq!((p.permissions.mode.as_deref(), p.permissions.push), (Some("workspace-write"), Push::None));
+        assert!(p.tools.deny.is_empty() && p.tools.only.is_none(), "Codex takes no tool lists");
+        assert_eq!(p.context.skills, vec!["discovered-work".to_string(), "close-out".to_string()]);
+        assert_eq!(p.contract.done, vec![DoneField::Refs, DoneField::Gates, DoneField::Unverified]);
+        assert_eq!(p.contract.report_status_every_min, Some(60));
+        assert_eq!(p.limits.max_executors, Some(0));
+        assert_eq!(p.limits.reservations, vec!["mac-gate".to_string(), "mermaid".to_string()]);
+        // The Claude implementer's contract, owner words and summary, on another adapter
+        let claude = &loaded.get("implementer@claude-opus").unwrap().profile;
+        assert_eq!((&p.contract.done, &p.context.skills, p.owner_words(), &p.summary), (&claude.contract.done, &claude.context.skills, claude.owner_words(), &claude.summary));
+        // Usable where Codex is on, as profiles_list says it
+        let prefs = |enabled: &[&str]| crate::harness_preferences::HarnessPreferences { enabled_profiles: enabled.iter().map(|s| s.to_string()).collect(), supervisor_profile: None };
+        let listed = summary(e, prefs(&["claude", "codex"]).require_enabled(&p.adapter));
+        assert_eq!((listed["origin"].as_str(), listed["usable"].as_bool()), (Some("builtin"), Some(true)));
+        assert_eq!(summary(e, prefs(&["claude"]).require_enabled(&p.adapter))["usable"], false);
+        let offered = |enabled: &[&str]| picker(dir, &prefs(enabled)).iter().any(|x| x["id"] == "implementer@codex");
+        assert!(offered(&["codex"]) && offered(&["claude", "codex"]));
+        assert!(!offered(&["claude"]) && !offered(&[]));
+        // Below a lead@claude-opus: no error, still workspace-write, and the
+        // lead's push denies are named as not passed rather than dropped silently
+        let (low, notes) = lower_of(&choose(dir, "implementer@codex").unwrap(), &choose(dir, "lead@claude-opus").unwrap().profile).unwrap();
+        assert_eq!(low.profile.permissions.mode.as_deref(), Some("workspace-write"));
+        assert_eq!(low.profile.limits.max_executors, Some(0));
+        assert!(notes.iter().any(|n| n.contains("cannot be passed to codex")), "{notes:?}");
+        assert!(notes.iter().all(|n| !n.contains("permissions.mode")), "{notes:?}");
+        assert_eq!(parse(&low.text, Origin::Operator).unwrap(), low.profile);
+        // What reaches Codex's command line: the sandbox with on-request approvals and the effort
+        let words = crate::agents::adapter("codex").profile_words(&low.profile).unwrap();
+        assert_eq!(words[..4], ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]);
+        assert!(words.iter().any(|w| w.contains("model_reasoning_effort") && w.contains("high")), "{words:?}");
     }
 
     /// 16771 L2: the role plugin is written without following a link
