@@ -20,15 +20,15 @@ export const QUIT_WINDOW_MS = 10_000;
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 
-/** Colours from the Sessions palette the pane sits in (light and dark). */
+/** Colours from the shared tokens (@lambda-house/tokens), light or dark. */
 function theme(element: HTMLElement) {
   const css = getComputedStyle(element);
   const v = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
   return {
-    background: v('--sc-bg', '#101519'),
-    foreground: v('--sc-text', '#e4ecef'),
-    cursor: v('--sc-accent', '#91d6b3'),
-    selectionBackground: v('--sc-card', '#1c252c'),
+    background: v('--canvas', '#1e1e1e'),
+    foreground: v('--text', '#cccccc'),
+    cursor: v('--accent', '#4fc1ff'),
+    selectionBackground: v('--selected', '#094771'),
   };
 }
 

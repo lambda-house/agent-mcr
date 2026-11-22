@@ -489,7 +489,6 @@
 }
 
 /* Sessions running in Live: the harness's state, names and figures */
-.cmd-backdrop { --sc-panel: var(--surface-1); --sc-muted: var(--text-muted); --sc-border: var(--line); --sc-accent: var(--accent); }
 .cmd-status .hs-dot { margin-top: 0; width: 6px; height: 6px; }
 .cmd-status--live { border: 1px solid var(--accent-line, var(--line)); padding: 0 7px; color: var(--text-soft, var(--text)); }
 .cmd-status--waiting { background: var(--warn-bg); color: var(--warn); }

@@ -1,4 +1,4 @@
-/* Small shared controls (src/ui/index.tsx). Colours come from the surface tokens in settings-modal.css */
+/* Small shared controls (src/ui/index.tsx). Colours and sizes come from @lambda-house/tokens */
 .ui-btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-2); font: inherit; font-size: var(--fs-12); font-weight: 500; line-height: 1; white-space: nowrap; border: 1px solid transparent; border-radius: var(--r-sm); cursor: pointer; user-select: none; transition: background-color var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard); }
 .ui-btn[disabled] { opacity: 0.55; cursor: default; }
 .ui-btn--sm { height: 28px; padding: 0 10px; }

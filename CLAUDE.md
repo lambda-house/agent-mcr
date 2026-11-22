@@ -134,7 +134,7 @@ npm workspaces (`@lambda-house/tokens`, `ui`, `workbench`, `reader`, `journal`) 
 - Do not change `packages/` here first. Changes are made in mdviewer-mj and merged in with `git subtree merge --squash`. A change that had to be made here goes back to mdviewer-mj as a patch before anything else touches that package.
 - Shared code imports nothing from the app: no `src/`, no `@/`, no `@tauri-apps/*`, no app store. It gets what it needs through host interfaces the app passes in. `packages/layers.test.ts` enforces the layer order and the allowed libraries; `tsc -p packages` type-checks without the app's alias.
 - Harness features (Live, Board, Slack, the cockpit) stay in this app's `src/`, and so do the MDViewer features removed here: they never go into `packages/`.
-- Colours, spacing, radii and type sizes come from `@lambda-house/tokens` once phase 1 lands; component CSS gets no literal colours.
+- Colours, spacing, radii and type sizes come from `@lambda-house/tokens` (`packages/tokens/tokens.css`, loaded first in `main.tsx`). Every colour a rule uses is a variable: shared ones from the tokens (states `--ok`/`--warn`/`--danger`, identity `--cat-*`, filled buttons `--accent-fill` with `--text-on-accent`), feature ones (`--syntax-*`) from the `:root` block at the top of `index.css`. `TerminalPane` reads `--canvas`, `--text`, `--accent` and `--selected` for the xterm theme. New CSS uses the tokens' names; the old names (`--surface-bg`, `--layer-1`, …) are aliases at the end of `tokens.css`, to be deleted once unused. The Sessions `--sc-*` palette is gone.
 - A pane whose content is expensive to recreate (terminal, editor, rendered document) is `keepAlive`.
 
 ## Configuration

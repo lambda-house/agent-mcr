@@ -10,6 +10,7 @@ import '@fontsource/inter/700.css';
 import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
+import '@lambda-house/tokens/tokens.css';
 import './styles/index.css';
 import './styles/ui.css';
 import { pluginRegistry, usePluginVersion } from './plugins';
