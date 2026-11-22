@@ -5,7 +5,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
-import { isPaletteKey, PLATFORM } from '../utils/platform';
+import { isPaletteKey } from '../utils/platform';
 import { excerptFromSelection } from '../utils/taskCopy';
 import { isCopyKey, isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
 import TaskCopyDialog from './TaskCopyDialog';
@@ -107,7 +107,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
     // On Windows and Linux Ctrl+Shift+C copies the selection, as in other terminals, and is never the agent's
     t.attachCustomKeyEventHandler(e => {
-      if (isPaletteKey(e, PLATFORM) || isTaskKey(e)) return false;
+      if (isPaletteKey(e) || isTaskKey(e)) return false;
       if (isCopyKey(e)) {
         if (e.type === 'keydown' && t.hasSelection()) copyText(t.getSelection());
         return false;

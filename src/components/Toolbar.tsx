@@ -14,7 +14,8 @@ import { useStore, MIN_ZOOM, MAX_ZOOM } from '../store';
 import { exportActiveDocument } from '../utils/export';
 import type { MenuItem } from '../utils/commands';
 import clsx from 'clsx';
-import MainMenu from './MainMenu';
+import { MainMenu } from '@lambda-house/workbench';
+import { flushEditorChanges } from '../utils/editorRegistry';
 import WorkspaceSwitch from './WorkspaceSwitch';
 
 // ============================================================
@@ -134,7 +135,7 @@ const Toolbar: React.FC<ToolbarProps> = ({
       {/* Left Section */}
       <div className="toolbar-group">
         {onOpenSessions && <WorkspaceSwitch active="documents" onChange={workspace => { if (workspace === 'sessions') onOpenSessions(); }} />}
-        <MainMenu items={menu} />
+        <MainMenu items={menu} useCommandContext={useStore} onOpen={flushEditorChanges} buttonClassName="toolbar-button" />
         {onToggleFilePanel && <button
           className={clsx('toolbar-button', filePanelVisible && 'active')}
           onClick={onToggleFilePanel}

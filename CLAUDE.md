@@ -34,7 +34,8 @@ Frontend unit tests are Vitest files next to the code (`src/utils/*.test.ts`; DO
 
 - **Components** (`src/components/`):
   - `App.tsx` - Main shell; its key handler runs the commands of `utils/commands.ts`
-  - `MainMenu.tsx` - Toolbar menu (top left): every command, grouped, with its shortcut
+  - `MainMenu` (from `@lambda-house/workbench`) - Toolbar menu (top left): every command, grouped, with its shortcut
+  - `SessionCommandPanel.tsx` - The command panel: the workbench `Palette` with sessions (Live rows under their folders, quick filters, preview), views, actions and the app's commands. It opens through the command `app.commandPalette` (Ctrl+Shift+P, ⇧⌘P; ⌘S is Save), set in the store's `paletteOpen`; the `command-panel` plugin hosts it in Sessions only, and `paletteHosted` keeps the command disabled over Documents. `TerminalPane` lets the key through (`isPaletteKey`)
   - `DocumentPanel.tsx` - Center markdown renderer with ErrorBoundary. Scroll positions per document are anchored to the block at the top of the view (`utils/scrollAnchor.ts`), so late Mermaid output doesn't move the restored text
   - `TabBar.tsx` - Tab strip: preview tab, context menu, back/forward, overflow scrolling
   - `TocSidebar.tsx` - Right sidebar table of contents
@@ -47,7 +48,7 @@ Frontend unit tests are Vitest files next to the code (`src/utils/*.test.ts`; DO
 
 - **Hooks** (`src/hooks/`): `useSmoothWheelScroll` - velocity-based wheel scrolling shared by the document, file panel and TOC
 
-- **Commands** (`src/utils/commands.ts`): `buildMenu` is the one list of commands (label, shortcut, `enabled`/`checked`, `run`). The menu renders it and the key handler in `App.tsx` matches key presses against it, so a new command or shortcut goes there, not into either of them. `run` must be safe when `enabled` is false (shortcuts don't check it)
+- **Commands** (`src/utils/commands.ts`): `buildMenu` is the one list of commands (label, shortcut, `enabled`/`checked`, `run`; the types and `commandForKey`/`formatShortcut` are `@lambda-house/workbench`'s, typed with `AppState`). The menu renders it, the command panel lists it (through `appMenu`, set in `App.tsx`; `palette: false` keeps a command out), the native menu's events run it by id (`utils/nativeMenu.test.ts` fails if an item in `main.rs` has no command) and the key handler in `App.tsx` matches key presses against it, so a new command or shortcut goes there, not into either of them. `run` must be safe when `enabled` is false (shortcuts don't check it)
 
 - **Markdown Processing** (`src/utils/markdown.ts`):
   - markdown-it with `html: false` (raw HTML is escaped; every custom renderer rule must escape what it emits with `escapeHtml`)

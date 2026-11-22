@@ -1,13 +1,15 @@
 import { homePath } from '../utils/paths';
-import { isPaletteKey, paletteShortcut, PLATFORM } from '../utils/platform';
-import { Fragment, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type Ref } from 'react';
-import { createPortal } from 'react-dom';
+import { paletteShortcut, PLATFORM } from '../utils/platform';
+import { useMemo, useState } from 'react';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
-import { DescList, Kbd, ScrollArea, StatusDot, cx } from '@lambda-house/ui';
+import { DescList, Kbd, StatusDot, cx } from '@lambda-house/ui';
+import { Palette, commandItems, matchesQuery, useMenu, type PaletteItem } from '@lambda-house/workbench';
 import { cacheState, compact, contextWindow, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
 import { hostedState, liveSessionLabel, runningFor, shortPath, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { TopTabPlugin } from '../plugins/sdk';
+import { useStore } from '../store';
+import { appMenu } from '../utils/commands';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
 import { EarlierRow, HostedRow, rowIdle, useHostedByConversation } from './SessionRow';
@@ -34,19 +36,7 @@ export interface SessionCommandPanelProps {
 
 type QuickFilter = 'all' | 'live' | 'codex' | 'claude' | 'working';
 
-interface CommandEntry {
-  id: string;
-  group: 'Sessions' | 'Navigate' | 'Actions';
-  label: string;
-  hint?: string;
-  provider?: string;
-  status?: string;
-  session?: Session;
-  /** The hosted session running this conversation now */
-  live?: Hosted;
-  kind: 'session' | 'nav' | 'action';
-  onRun: () => void;
-}
+const GROUPS = ['Sessions', 'Navigate', 'Actions', 'Commands'];
 
 function statusClass(status?: string): string {
   if (status === 'working') return 'cmd-status cmd-status--working';
@@ -75,6 +65,50 @@ function cacheDetail(s: Session, now: number): string | null {
   return cache.assumed ? 'Unknown (Codex records no lifetime)' : `Cold for ${runningFor(cache.until, now)}`;
 }
 
+/** The side panel for a session: the facts the row only hints at. */
+function SessionPreview({ session, label, status, live, opensInLive }: { session: Session; label: string; status: string; live?: Hosted; opensInLive: boolean }) {
+  const cache = cacheDetail(session, Date.now());
+  return (
+    <>
+      <div className="cmd-preview__head">
+        <span className="cmd-preview__brand">
+          <AgentMark profile={session.provider} size={15} />
+          {session.provider}
+        </span>
+        <span className={cx(statusClass(status), live && 'cmd-status--live')}>
+          {live ? <span className={`hs-dot ${status}`} aria-hidden="true" /> : status === 'working' && <StatusDot tone="success" size="sm" />}
+          {live ? `In Live · ${statusText(status, live)}` : status}
+        </span>
+      </div>
+      <h3 className="cmd-preview__title">{label}</h3>
+      {live?.harness?.status && <p className="cmd-preview__status">{live.harness.status}</p>}
+      {live?.harness?.attention && <p className="cmd-preview__status cmd-preview__status--needs">{live.harness.attention.text}</p>}
+      <SessionFigures session={session} />
+      <DescList
+        items={[
+          ...(label !== formatSessionTitle(session) ? [{ label: 'Started as', value: formatSessionTitle(session) }] : []),
+          { label: 'Workspace', value: session.cwd ? homePath(session.cwd) : 'Unknown', mono: true },
+          { label: 'Model', value: session.model ? `${session.model}${session.effort ? ` · ${session.effort}` : ''}` : 'Unknown' },
+          { label: 'Context', value: contextDetail(session) },
+          ...(cache ? [{ label: 'Cache', value: cache }] : []),
+          { label: 'Tokens', value: session.usageKnown ? compact(totalTokens(session.usage)) : 'Unknown' },
+          { label: 'Events', value: session.eventCount.toLocaleString() },
+          { label: 'Updated', value: session.modified ? formatAge(session.modified) : 'Unknown' },
+        ]}
+      />
+      <div className="cmd-preview__footer">
+        <Kbd>↵</Kbd> {opensInLive ? 'Show in Live' : 'Open session inspector'}
+      </div>
+    </>
+  );
+}
+
+/**
+ * The command panel: the workbench's Palette with the sessions (drawn as the
+ * Live list draws them, under their folders), the views, a few actions and
+ * the app's commands. It opens through the command app.commandPalette
+ * (Ctrl+Shift+P, ⇧⌘P); it has no key of its own.
+ */
 export default function SessionCommandPanel({
   open,
   onOpenChange,
@@ -93,37 +127,15 @@ export default function SessionCommandPanel({
 }: SessionCommandPanelProps) {
   // Hosted sessions, asked for each time the panel opens: their names and states win over the index's
   const liveByKey = useHostedByConversation(open);
+  const menu = useMenu(appMenu);
   const [query, setQuery] = useState('');
   const [quickFilter, setQuickFilter] = useState<QuickFilter>('all');
-  const [active, setActive] = useState(0);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const listRef = useRef<HTMLElement>(null);
-  const id = useId();
-  const listId = `${id}-list`;
 
   const shortcut = paletteShortcut(PLATFORM);
   const close = () => {
     onOpenChange(false);
     setQuery('');
   };
-
-  useEffect(() => {
-    const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (isPaletteKey(event, PLATFORM)) {
-        event.preventDefault();
-        onOpenChange(!open);
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open, onOpenChange]);
-
-  useEffect(() => {
-    if (open) {
-      setActive(0);
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [open]);
 
   const scopedSessions = useMemo(() => {
     if (!enabled) return [];
@@ -143,9 +155,9 @@ export default function SessionCommandPanel({
     [scopedSessions, liveByKey],
   );
 
-  const items = useMemo<CommandEntry[]>(() => {
-    const q = query.trim().toLowerCase();
-    const next: CommandEntry[] = [];
+  const items = useMemo<PaletteItem[]>(() => {
+    if (!open) return [];
+    const next: PaletteItem[] = [];
 
     if (enabled) {
       const matchingSessions = scopedSessions
@@ -166,169 +178,81 @@ export default function SessionCommandPanel({
       for (const s of matchingSessions) if (!place.has(s.cwd)) place.set(s.cwd, place.size);
       matchingSessions.sort((a, b) => place.get(a.cwd)! - place.get(b.cwd)!);
 
-      for (const s of matchingSessions) {
+      matchingSessions.forEach((s, i) => {
         const key = sessionKey(s);
         const live = liveByKey.get(key);
         const title = live ? liveSessionLabel(live, { [s.id]: formatSessionTitle(s) }) : formatSessionTitle(s);
+        const status = rowStatus(s, live);
+        // The folder is a heading over its sessions, as in the Live list, not a part of each row
+        const heading = matchingSessions[i - 1]?.cwd !== s.cwd;
         next.push({
           id: `session:${key}`,
           group: 'Sessions',
           label: title,
-          provider: s.provider,
-          status: rowStatus(s, live),
-          session: s,
-          live,
-          kind: 'session',
-          onRun: () => {
+          // The heading is not part of the option, so the option's name says the folder
+          ariaLabel: [title, live ? STATE_LABEL[hostedState(live)] : '', s.cwd ? `in ${homePath(s.cwd)}` : ''].filter(Boolean).join(', '),
+          className: cx('cmd-item--session', !live && 'hs-resume', live && rowIdle(live) && 'idle'),
+          heading: heading
+            ? <div className="cmd-dir" title={s.cwd} aria-hidden="true"><span className="hs-dir-path">{s.cwd ? shortPath(homePath(s.cwd)) : 'Unknown folder'}</span></div>
+            : undefined,
+          // The row of the Live list: the live one for a conversation that runs now, the earlier one otherwise
+          row: live
+            ? <HostedRow hosted={live} label={title} session={s}/>
+            : <EarlierRow agent={s.provider} title={title} modified={s.modified}/>,
+          preview: <SessionPreview session={s} label={title} status={status} live={live} opensInLive={!!live && !!onOpenLive} />,
+          run: () => {
             if (live && onOpenLive) onOpenLive(live.id);
             else onSelectSession(key);
-            close();
           },
         });
-      }
+      });
     }
 
-    const navEntries: CommandEntry[] = [
-      {
-        id: 'nav:live',
-        group: 'Navigate',
-        label: 'Live workspace',
-        hint: 'Active agents & panes',
-        kind: 'nav',
-        onRun: () => {
-          onNavigateView('live');
-          close();
-        },
-      },
+    const nav: PaletteItem[] = [
+      { id: 'nav:live', group: 'Navigate', label: 'Live workspace', hint: 'Active agents & panes', icon: <Compass size={14} />, run: () => onNavigateView('live') },
       ...topTabs.map((t) => ({
-        id: `nav:plugin:${t.id}`,
-        group: 'Navigate' as const,
-        label: t.label,
-        hint: t.title || 'Plugin view',
-        kind: 'nav' as const,
-        onRun: () => {
-          onNavigateView(t.id);
-          close();
-        },
+        id: `nav:plugin:${t.id}`, group: 'Navigate', label: t.label, hint: t.title || 'Plugin view', icon: <Compass size={14} />, run: () => onNavigateView(t.id),
       })),
-      {
-        id: 'nav:settings',
-        group: 'Navigate',
-        label: 'Settings',
-        hint: 'Connections, memories, agent access',
-        kind: 'nav',
-        onRun: () => {
-          close();
-          onOpenSettings();
-        },
-      },
+      { id: 'nav:settings', group: 'Navigate', label: 'Settings', hint: 'Connections, memories, agent access', icon: <Settings size={14} />, run: onOpenSettings },
     ];
-
-    for (const entry of navEntries) {
-      if (!q || entry.label.toLowerCase().includes(q) || entry.hint?.toLowerCase().includes(q)) {
-        next.push(entry);
-      }
-    }
-
-    const actionEntries: CommandEntry[] = enabled
+    const actions: PaletteItem[] = enabled
       ? [
-          {
-            id: 'action:refresh',
-            group: 'Actions',
-            label: 'Refresh session index',
-            hint: 'Rescan local transcripts',
-            kind: 'action',
-            onRun: () => {
-              onRefresh();
-              close();
-            },
-          },
-          {
-            id: 'action:history-view',
-            group: 'Actions',
-            label: 'Open session inspector',
-            hint: 'Full transcript & filters view',
-            kind: 'action',
-            onRun: () => {
-              onNavigateView('history');
-              close();
-            },
-          },
-        ]
+        { id: 'action:refresh', group: 'Actions', label: 'Refresh session index', hint: 'Rescan local transcripts', icon: <RefreshCw size={14} />, run: onRefresh },
+        { id: 'action:history-view', group: 'Actions', label: 'Open session inspector', hint: 'Full transcript & filters view', icon: <Activity size={14} />, run: () => onNavigateView('history') },
+      ]
       : [
-          {
-            id: 'action:enable',
-            group: 'Actions',
-            label: 'Enable session access',
-            hint: 'Connect local Codex & Claude transcripts',
-            kind: 'action',
-            onRun: () => {
-              onEnableAccess();
-              close();
-            },
-          },
-        ];
-
-    for (const entry of actionEntries) {
-      if (!q || entry.label.toLowerCase().includes(q) || entry.hint?.toLowerCase().includes(q)) {
-        next.push(entry);
-      }
+        { id: 'action:enable', group: 'Actions', label: 'Enable session access', hint: 'Connect local Codex & Claude transcripts', icon: <Shield size={14} />, run: onEnableAccess },
+      ];
+    for (const entry of [...nav, ...actions]) {
+      if (matchesQuery(query, entry.label, entry.hint)) next.push(entry);
     }
 
-    return next;
-  }, [
-    enabled,
-    scopedSessions,
-    liveByKey,
-    quickFilter,
-    query,
-    topTabs,
-    onSelectSession,
-    onOpenLive,
-    onNavigateView,
-    onOpenSettings,
-    onRefresh,
-    onEnableAccess,
-  ]);
+    // The app's own commands, as its menu offers them now
+    return [...next, ...commandItems(menu, useStore.getState(), query)];
+  }, [open, enabled, scopedSessions, liveByKey, quickFilter, query, topTabs, menu, onSelectSession, onOpenLive, onNavigateView, onOpenSettings, onRefresh, onEnableAccess]);
 
-  const groups = useMemo(() => {
-    const order: CommandEntry['group'][] = ['Sessions', 'Navigate', 'Actions'];
-    return order
-      .map((group) => ({ group, items: items.filter((item) => item.group === group) }))
-      .filter((entry) => entry.items.length > 0);
-  }, [items]);
-
-  const flat = useMemo(() => groups.flatMap((g) => g.items), [groups]);
-  const clampedActive = flat.length > 0 ? Math.min(active, flat.length - 1) : 0;
-  const activeItem = flat[clampedActive];
-
-  useEffect(() => {
-    if (!open || !listRef.current || !activeItem) return;
-    const el = listRef.current.querySelector(`[data-index="${clampedActive}"]`) as HTMLElement | null;
-    el?.scrollIntoView?.({ block: 'nearest' });
-  }, [open, clampedActive, activeItem]);
-
-  const onPanelKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      close();
-      return;
-    }
-    if (event.key === 'ArrowDown') {
-      event.preventDefault();
-      setActive((prev) => (flat.length ? (prev + 1) % flat.length : 0));
-      return;
-    }
-    if (event.key === 'ArrowUp') {
-      event.preventDefault();
-      setActive((prev) => (flat.length ? (prev - 1 + flat.length) % flat.length : 0));
-      return;
-    }
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      activeItem?.onRun();
-    }
-  };
+  const filters = (
+    <>
+      <div className="cmd-pills" role="group" aria-label="Quick filter">
+        {(['all', 'live', 'codex', 'claude', 'working'] as QuickFilter[]).map((f) => (
+          <button key={f} type="button" className={cx('cmd-pill', quickFilter === f && 'cmd-pill--active')} onClick={() => setQuickFilter(f)}>
+            {f === 'working' && <StatusDot tone="success" size="sm" />}
+            {f === 'live' && <span className="hs-dot running" aria-hidden="true" />}
+            {f === 'codex' && <AgentMark profile="codex" size={12} />}
+            {f === 'claude' && <AgentMark profile="claude" size={12} />}
+            <span>{f === 'all' ? 'All' : f === 'live' ? 'In Live' : f === 'working' ? 'Working' : f === 'codex' ? 'Codex' : 'Claude'}</span>
+            {enabled && <span className="cmd-pill__count">{counts[f]}</span>}
+          </button>
+        ))}
+      </div>
+      {directory && (
+        <span className="cmd-dir-badge" title={directory}>
+          <span>in {homePath(directory)}</span>
+          <button type="button" aria-label="Search all folders" onClick={onClearDirectory}><X size={11} /></button>
+        </span>
+      )}
+    </>
+  );
 
   return (
     <>
@@ -346,269 +270,19 @@ export default function SessionCommandPanel({
         </button>
       )}
 
-      {open &&
-        createPortal(
-          <div
-            className="cmd-backdrop"
-            onMouseDown={(event) => {
-              if (event.target === event.currentTarget) close();
-            }}
-          >
-            <div
-              className="cmd-panel"
-              role="dialog"
-              aria-modal="true"
-              aria-label="Control panel"
-              onKeyDown={onPanelKeyDown}
-            >
-              <div className="cmd-search">
-                <span className="cmd-search__icon" aria-hidden="true">
-                  <Search size={16} />
-                </span>
-                <input
-                  ref={inputRef}
-                  className="cmd-search__input"
-                  role="combobox"
-                  aria-expanded="true"
-                  aria-controls={listId}
-                  aria-activedescendant={activeItem ? `${id}-${activeItem.id}` : undefined}
-                  aria-autocomplete="list"
-                  aria-label="Search sessions and commands"
-                  placeholder="Search sessions, tickets, models, or commands…"
-                  value={query}
-                  onChange={(event) => {
-                    setQuery(event.target.value);
-                    setActive(0);
-                  }}
-                />
-                {query && (
-                  <button
-                    type="button"
-                    className="cmd-search__clear"
-                    aria-label="Clear search"
-                    onClick={() => {
-                      setQuery('');
-                      setActive(0);
-                      inputRef.current?.focus();
-                    }}
-                  >
-                    <X size={14} />
-                  </button>
-                )}
-              </div>
-
-              <div className="cmd-subbar">
-                <div className="cmd-pills" role="group" aria-label="Quick filter">
-                  {(['all', 'live', 'codex', 'claude', 'working'] as QuickFilter[]).map((f) => (
-                    <button
-                      key={f}
-                      type="button"
-                      className={cx('cmd-pill', quickFilter === f && 'cmd-pill--active')}
-                      onClick={() => {
-                        setQuickFilter(f);
-                        setActive(0);
-                      }}
-                    >
-                      {f === 'working' && <StatusDot tone="success" size="sm" />}
-                      {f === 'live' && <span className="hs-dot running" aria-hidden="true" />}
-                      {f === 'codex' && <AgentMark profile="codex" size={12} />}
-                      {f === 'claude' && <AgentMark profile="claude" size={12} />}
-                      <span>
-                        {f === 'all' ? 'All' : f === 'live' ? 'In Live' : f === 'working' ? 'Working' : f === 'codex' ? 'Codex' : 'Claude'}
-                      </span>
-                      {enabled && <span className="cmd-pill__count">{counts[f]}</span>}
-                    </button>
-                  ))}
-                </div>
-                {directory && (
-                  <span className="cmd-dir-badge" title={directory}>
-                    <span>in {homePath(directory)}</span>
-                    <button type="button" aria-label="Search all folders" onClick={onClearDirectory}>
-                      <X size={11} />
-                    </button>
-                  </span>
-                )}
-              </div>
-
-              <div className="cmd-body">
-                <div className="cmd-list-wrap">
-                  <ScrollArea
-                    autoHeight
-                    maxHeight="calc(min(78vh, 720px) - 144px)"
-                    style={{ flex: 'none' }}
-                    viewRef={listRef as Ref<HTMLElement>}
-                    viewProps={{ className: 'cmd-list', id: listId, role: 'listbox', 'aria-label': 'Commands' }}
-                  >
-                    {groups.map((entry) => (
-                      <div key={entry.group} className="cmd-group" role="group" aria-label={entry.group}>
-                        <div className="cmd-group__head" aria-hidden="true">
-                          <span className="cmd-group__label">{entry.group}</span>
-                          <span className="cmd-group__count">{entry.items.length}</span>
-                        </div>
-                        {entry.items.map((item) => {
-                          const index = flat.findIndex((candidate) => candidate.id === item.id);
-                          const isActive = activeItem?.id === item.id;
-                          const iconNode =
-                            item.id === 'nav:settings' ? (
-                              <Settings size={14} />
-                            ) : item.id === 'action:refresh' ? (
-                              <RefreshCw size={14} />
-                            ) : item.id === 'action:enable' ? (
-                              <Shield size={14} />
-                            ) : item.kind === 'nav' ? (
-                              <Compass size={14} />
-                            ) : (
-                              <Activity size={14} />
-                            );
-                          const session = item.session;
-                          // The folder is a heading over its sessions, as in the Live list, not a part of each row
-                          const heading = session && entry.items[entry.items.indexOf(item) - 1]?.session?.cwd !== session.cwd;
-                          const option = {
-                            id: `${id}-${item.id}`,
-                            'data-index': index,
-                            role: 'option',
-                            'aria-selected': isActive,
-                            onMouseMove: () => setActive(index),
-                            onClick: () => item.onRun(),
-                          };
-                          const enter = <span className="cmd-item__enter" aria-hidden="true"><Kbd>↵</Kbd></span>;
-                          if (session) return (
-                            <Fragment key={item.id}>
-                              {heading && <div className="cmd-dir" title={session.cwd} aria-hidden="true"><span className="hs-dir-path">{session.cwd ? shortPath(homePath(session.cwd)) : 'Unknown folder'}</span></div>}
-                              {/* The row of the Live list: the live one for a conversation that runs now, the earlier one otherwise.
-                                  The heading is not part of the option, so the option's name says the folder */}
-                              <div {...option} aria-label={[item.label, item.live ? STATE_LABEL[hostedState(item.live)] : '', session.cwd ? `in ${homePath(session.cwd)}` : ''].filter(Boolean).join(', ')} className={cx('cmd-item cmd-item--session', !item.live && 'hs-resume', item.live && rowIdle(item.live) && 'idle', isActive && 'cmd-item--active')}>
-                                {item.live
-                                  ? <HostedRow hosted={item.live} label={item.label} session={session}/>
-                                  : <EarlierRow agent={session.provider} title={item.label} modified={session.modified}/>}
-                                {enter}
-                              </div>
-                            </Fragment>
-                          );
-                          return (
-                            <div key={item.id} {...option} className={cx('cmd-item', isActive && 'cmd-item--active')}>
-                              <span className="cmd-item__icon" aria-hidden="true">{iconNode}</span>
-                              <span className="cmd-item__main">
-                                <span className="cmd-item__label">{item.label}</span>
-                              </span>
-                              <span className="cmd-item__right">
-                                {item.hint && <span className="cmd-item__hint">{item.hint}</span>}
-                                {enter}
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ))}
-                    {flat.length === 0 && (
-                      <div className="cmd-empty">
-                        Nothing matches <span className="cmd-empty__query">“{query}”</span>
-                      </div>
-                    )}
-                  </ScrollArea>
-                </div>
-
-                <aside className="cmd-preview" aria-label="Selection preview">
-                  {activeItem?.session ? (
-                    <>
-                      <div className="cmd-preview__head">
-                        <span className="cmd-preview__brand">
-                          <AgentMark profile={activeItem.session.provider} size={15} />
-                          {activeItem.session.provider}
-                        </span>
-                        <span className={cx(statusClass(activeItem.status), activeItem.live && 'cmd-status--live')}>
-                          {activeItem.live ? <span className={`hs-dot ${activeItem.status}`} aria-hidden="true" /> : activeItem.status === 'working' && <StatusDot tone="success" size="sm" />}
-                          {activeItem.live ? `In Live · ${statusText(activeItem.status ?? '', activeItem.live)}` : activeItem.status}
-                        </span>
-                      </div>
-                      <h3 className="cmd-preview__title">{activeItem.label}</h3>
-                      {activeItem.live?.harness?.status && <p className="cmd-preview__status">{activeItem.live.harness.status}</p>}
-                      {activeItem.live?.harness?.attention && <p className="cmd-preview__status cmd-preview__status--needs">{activeItem.live.harness.attention.text}</p>}
-                      <SessionFigures session={activeItem.session} />
-                      <DescList
-                        items={[
-                          ...(activeItem.label !== formatSessionTitle(activeItem.session)
-                            ? [{ label: 'Started as', value: formatSessionTitle(activeItem.session) }]
-                            : []),
-                          {
-                            label: 'Workspace',
-                            value: activeItem.session.cwd
-                              ? homePath(activeItem.session.cwd)
-                              : 'Unknown',
-                            mono: true,
-                          },
-                          {
-                            label: 'Model',
-                            value: activeItem.session.model
-                              ? `${activeItem.session.model}${activeItem.session.effort ? ` · ${activeItem.session.effort}` : ''}`
-                              : 'Unknown',
-                          },
-                          { label: 'Context', value: contextDetail(activeItem.session) },
-                          ...(cacheDetail(activeItem.session, Date.now()) ? [{ label: 'Cache', value: cacheDetail(activeItem.session, Date.now()) }] : []),
-                          {
-                            label: 'Tokens',
-                            value: activeItem.session.usageKnown
-                              ? compact(totalTokens(activeItem.session.usage))
-                              : 'Unknown',
-                          },
-                          {
-                            label: 'Events',
-                            value: activeItem.session.eventCount.toLocaleString(),
-                          },
-                          {
-                            label: 'Updated',
-                            value: activeItem.session.modified
-                              ? formatAge(activeItem.session.modified)
-                              : 'Unknown',
-                          },
-                        ]}
-                      />
-                      <div className="cmd-preview__footer">
-                        <Kbd>↵</Kbd> {activeItem.live && onOpenLive ? 'Show in Live' : 'Open session inspector'}
-                      </div>
-                    </>
-                  ) : activeItem ? (
-                    <>
-                      <div className="cmd-preview__head">
-                        <span className="cmd-preview__brand">{activeItem.group}</span>
-                      </div>
-                      <h3 className="cmd-preview__title">{activeItem.label}</h3>
-                      {activeItem.hint && (
-                        <p style={{ margin: 0, fontSize: 'var(--fs-12)', color: 'var(--text-muted)' }}>
-                          {activeItem.hint}
-                        </p>
-                      )}
-                      <div className="cmd-preview__footer">
-                        <Kbd>↵</Kbd> Run command
-                      </div>
-                    </>
-                  ) : (
-                    <p style={{ margin: 0, fontSize: 'var(--fs-12)', color: 'var(--text-muted)' }}>
-                      Select a session or command to preview details.
-                    </p>
-                  )}
-                </aside>
-              </div>
-
-              <div className="cmd-foot" aria-hidden="true">
-                <div className="cmd-foot__group">
-                  <span className="cmd-foot__keys">
-                    <Kbd>↑</Kbd>
-                    <Kbd>↓</Kbd> move
-                  </span>
-                  <span className="cmd-foot__keys">
-                    <Kbd>↵</Kbd> open
-                  </span>
-                  <span className="cmd-foot__keys">
-                    <Kbd>esc</Kbd> close
-                  </span>
-                </div>
-                <span>{flat.length} results</span>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
+      <Palette
+        open={open}
+        onClose={close}
+        query={query}
+        onQueryChange={setQuery}
+        items={items}
+        groups={GROUPS}
+        label="Control panel"
+        placeholder="Search sessions, tickets, models, or commands…"
+        toolbar={filters}
+        showPreview
+        emptyPreview={<p className="cmd-preview__text">Select a session or command to preview details.</p>}
+      />
     </>
   );
 }

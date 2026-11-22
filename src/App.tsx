@@ -9,7 +9,7 @@ import {
   followLocalLink,
   onAgentFilesChanged,
 } from './utils/tauri';
-import { buildMenu, menuCommands, commandForKey } from './utils/commands';
+import { appMenu, buildMenu, menuCommands, commandForKey } from './utils/commands';
 import { getFileName, resolveLinkPath } from './utils/files';
 import Toolbar from './components/Toolbar';
 import AgentPanel from './components/AgentPanel';
@@ -265,6 +265,9 @@ const App: React.FC = () => {
   // The commands, with their shortcuts, are defined in utils/commands.ts;
   // the toolbar's menu shows the same list
   const menu = useMemo(() => buildMenu({ reopenClosedTab: handleReopenClosedTab }), [handleReopenClosedTab]);
+
+  // The command palette lists the same commands
+  useEffect(() => appMenu.set(menu), [menu]);
 
   // The system menu uses the same commands as the toolbar menu.
   useEffect(() => {

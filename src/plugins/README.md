@@ -6,7 +6,7 @@ These files and directories are isolated from upstream core files:
 
 - `src/plugins/` — Plugin SDK (`sdk.ts`, `usePlugins.ts`, `index.ts`) and plugins:
   - `src/plugins/layouts/` — split panes in Live: preset bar, split and close buttons (core keeps the pane tree)
-  - `src/plugins/command-panel/` — command palette (Cmd+S on macOS, Ctrl+Shift+P on Windows and Linux)
+  - `src/plugins/command-panel/` — hosts the command panel in Sessions (Ctrl+Shift+P, ⇧⌘P on macOS; the key is the command `app.commandPalette`)
 - `src/utils/paneLayout.ts` + `src/utils/paneLayout.test.ts`
 
 ## 2. Core integration points (small hooks in upstream files)

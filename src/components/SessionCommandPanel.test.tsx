@@ -98,79 +98,28 @@ describe('Command panel', () => {
     expect(document.body.textContent).not.toContain('MEM-12');
   });
 
-  it('opens on Cmd+S even while the terminal has focus, and leaves Ctrl+K and Ctrl+S alone', async () => {
+  const panel = (open: boolean, onOpenChange = () => {}) => <SessionCommandPanel open={open} onOpenChange={onOpenChange} enabled sessions={[]}
+    directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>;
+
+  it('has no key of its own: the command app.commandPalette opens it', async () => {
     const onOpenChange = vi.fn();
-    await act(async () => root.render(<SessionCommandPanel open={false} hideTrigger onOpenChange={onOpenChange} enabled sessions={[]}
-      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
-    const term = document.createElement('div');
-    term.className = 'hs-terminal';
-    const textarea = document.createElement('textarea');
-    term.appendChild(textarea);
-    host.appendChild(term);
-    textarea.focus();
-
-    const ctrlK = new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true });
-    const ctrlS = new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true, cancelable: true });
-    await act(async () => {
-      textarea.dispatchEvent(ctrlK);
-      textarea.dispatchEvent(ctrlS);
-    });
-    expect(onOpenChange).not.toHaveBeenCalled();
-    expect(ctrlK.defaultPrevented).toBe(false);
-    expect(ctrlS.defaultPrevented).toBe(false);
-
-    const cmdS = new KeyboardEvent('keydown', { key: 's', metaKey: true, bubbles: true, cancelable: true });
-    await act(async () => {
-      textarea.dispatchEvent(cmdS);
-    });
-    expect(cmdS.defaultPrevented).toBe(true);
-    expect(onOpenChange).toHaveBeenCalledWith(true);
-  });
-
-  it('leaves Cmd+Shift+S (Save All) alone', async () => {
-    const onOpenChange = vi.fn();
-    await act(async () => root.render(<SessionCommandPanel open={false} hideTrigger onOpenChange={onOpenChange} enabled sessions={[]}
-      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
-    for (const key of ['s', 'S']) {
-      const saveAll = new KeyboardEvent('keydown', { key, metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
-      await act(async () => { window.dispatchEvent(saveAll); });
-      expect(saveAll.defaultPrevented).toBe(false);
-    }
-    expect(onOpenChange).not.toHaveBeenCalled();
-  });
-
-  it('opens on Ctrl+Shift+P off macOS, even in a terminal, and leaves Ctrl+S (Save, shell history search) alone', async () => {
-    platform.current = 'windows';
-    const onOpenChange = vi.fn();
-    await act(async () => root.render(<SessionCommandPanel open={false} onOpenChange={onOpenChange} enabled sessions={[]}
-      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
-    const trigger = host.querySelector('.cmd-trigger-btn')!;
-    expect(trigger.querySelector('kbd')?.textContent).toBe('Ctrl+Shift+P');
-    expect(trigger.getAttribute('aria-keyshortcuts')).toBe('Control+Shift+P');
-    expect(trigger.getAttribute('title')).toContain('Ctrl+Shift+P');
-    expect(host.textContent).not.toContain('⌘');
-
-    const textarea = document.createElement('textarea');
-    host.appendChild(textarea);
-    textarea.focus();
-    for (const init of [{ key: 's', ctrlKey: true }, { key: 'S', ctrlKey: true, shiftKey: true }, { key: 's', metaKey: true }, { key: 'p', ctrlKey: true }]) {
+    await act(async () => root.render(panel(false, onOpenChange)));
+    for (const init of [{ key: 's', metaKey: true }, { key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true }, { key: 'P', code: 'KeyP', metaKey: true, shiftKey: true }]) {
       const press = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true });
-      await act(async () => { textarea.dispatchEvent(press); });
+      await act(async () => { window.dispatchEvent(press); });
       expect(press.defaultPrevented).toBe(false);
     }
     expect(onOpenChange).not.toHaveBeenCalled();
-
-    const palette = new KeyboardEvent('keydown', { key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
-    await act(async () => { textarea.dispatchEvent(palette); });
-    expect(palette.defaultPrevented).toBe(true);
-    expect(onOpenChange).toHaveBeenCalledWith(true);
   });
 
-  it('shows Cmd+S on macOS', async () => {
-    await act(async () => root.render(<SessionCommandPanel open={false} onOpenChange={() => {}} enabled sessions={[]}
-      directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
-    const trigger = host.querySelector('.cmd-trigger-btn')!;
-    expect(trigger.querySelector('kbd')?.textContent).toBe('⌘S');
-    expect(trigger.getAttribute('aria-keyshortcuts')).toBe('Meta+S');
+  it('shows its key the way the platform writes it', async () => {
+    await act(async () => root.render(panel(false)));
+    const trigger = () => host.querySelector('.cmd-trigger-btn')!;
+    expect(trigger().querySelector('kbd')?.textContent).toBe('⇧⌘P');
+    expect(trigger().getAttribute('aria-keyshortcuts')).toBe('Meta+Shift+P');
+    platform.current = 'windows';
+    await act(async () => root.render(panel(false)));
+    expect(trigger().querySelector('kbd')?.textContent).toBe('Ctrl+Shift+P');
+    expect(trigger().getAttribute('title')).toContain('Ctrl+Shift+P');
   });
 });
