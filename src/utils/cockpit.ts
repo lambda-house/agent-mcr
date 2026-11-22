@@ -103,11 +103,37 @@ export function clickable(a: CockpitAction, part: 'say' | 'options' | 'url' | 'c
   return !a.unclickable?.includes(part);
 }
 
-/** How a track's state reads: the published word, unless the harness knows that the operator has answered in its lead's terminal since. */
-export function trackStateShown(t: CockpitTrack, now = Date.now()): { text: string; tone: CockpitTrack['state'] | 'answered' | 'stale' } {
-  if (t.state === 'waiting_human' && t.ownerTyped) return { text: `you typed ${formatAge(t.ownerTyped, now)}`, tone: 'answered' };
-  if (t.updated && now - t.updated > STALE_AFTER_MS && t.state !== 'done' && t.state !== 'parked') return { text: `stale: ${TRACK_STATE[t.state]}`, tone: 'stale' };
-  return { text: TRACK_STATE[t.state], tone: t.state };
+/**
+ * How a track's state reads: the published word, unless the harness knows
+ * that the operator has answered in its lead's terminal since. `old`: not
+ * updated for `STALE_AFTER_MS` while it was not resting; the panel says that
+ * once and quietly (a dimmed state and age), never as a word on the state (MCR-127).
+ */
+export function trackStateShown(t: CockpitTrack, now = Date.now()): { text: string; tone: CockpitTrack['state'] | 'answered'; old: boolean } {
+  const old = isOld(t, now) && t.state !== 'done' && t.state !== 'parked';
+  if (t.state === 'waiting_human' && t.ownerTyped) return { text: `you typed ${formatAge(t.ownerTyped, now)}`, tone: 'answered', old };
+  return { text: TRACK_STATE[t.state], tone: t.state, old };
+}
+
+/** A published entry not updated for `STALE_AFTER_MS`: its text may be behind. */
+export function isOld(entry: { updated?: number }, now = Date.now()): boolean {
+  return !!entry.updated && now - entry.updated > STALE_AFTER_MS;
+}
+
+/** What the age of a published entry says in its tooltip. */
+export function ageTitle(entry: { updated?: number }, now = Date.now()): string | undefined {
+  if (!entry.updated) return undefined;
+  const when = `Published ${formatAge(entry.updated, now)}`;
+  return isOld(entry, now) ? `${when}. Not updated for more than ${STALE_AFTER_MS / 3600_000} h: the published text may be behind` : when;
+}
+
+/**
+ * Who published a track, when it is worth saying: only when the publisher is
+ * not its lead and not the Supervisor, whose panel this is and who publishes
+ * most tracks led by others (MCR-127: "by Supervisor" stood on every row).
+ */
+export function trackPublisher(t: CockpitTrack): string | null {
+  return t.by && t.by !== t.lead && t.by !== ROOT_PART ? t.by : null;
 }
 
 export const ACTION_KIND: Record<CockpitAction['kind'], string> = {
@@ -188,14 +214,16 @@ export function liveFacts(h: Hosted): string[] {
   ].filter(Boolean);
 }
 
-/** Why a published entry may not be true any more; empty when nothing says so. */
-export function staleMarks(entry: { by?: string; updated?: number }, cockpit: Cockpit, hosted: Hosted[], label: (h: Hosted) => string, now = Date.now()): string[] {
+/**
+ * Why a published entry may not be true any more, besides its age (which the
+ * row shows once, dimmed when old: `isOld`); empty when nothing says so.
+ */
+export function staleMarks(entry: { by?: string }, cockpit: Cockpit, hosted: Hosted[], label: (h: Hosted) => string): string[] {
   const marks: string[] = [];
   if (entry.by) {
     const by = named(entry.by, cockpit, hosted, label);
     if (by.standing !== 'running') marks.push(by.standing === 'gone' ? 'its publisher is gone' : `its publisher ${by.name} ended`);
   }
-  if (entry.updated && now - entry.updated > STALE_AFTER_MS) marks.push(`not updated since ${formatAge(entry.updated, now)}`);
   return marks;
 }
 

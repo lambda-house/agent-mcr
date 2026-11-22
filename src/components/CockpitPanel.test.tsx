@@ -267,41 +267,69 @@ it('says that the session of an action has ended', async () => {
   expect(word.querySelector('.ck-urgency')).toBeNull();
 });
 
-it('names the publisher apart from the lead when the Supervisor published a track another session leads', async () => {
+it('does not name the Supervisor as the publisher of a track another session leads, nor a lead that published its own (MCR-127)', async () => {
   vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, tracks: [{ ...doc.tracks[0], by: 'supervisor' }, { ...doc.tracks[0], id: 'own' }], actions: [] });
   await show();
-  const led = host.querySelector('[data-track="store"]')!;
-  expect(led.querySelector('.ck-role')!.textContent).toBe('lead');
-  expect(led.querySelector('.ck-age')!.textContent).toContain('by Supervisor');
-  // Published by its own lead: one name says both
-  const own = host.querySelector('[data-track="own"]')!;
-  expect(own.querySelector('.ck-role')).toBeNull();
-  expect(own.querySelector('.ck-age')!.textContent).not.toContain('by ');
+  for (const id of ['store', 'own']) {
+    const row = host.querySelector(`[data-track="${id}"]`)!;
+    expect(row.querySelector('.ck-role'), id).toBeNull();
+    expect(row.querySelector('.ck-track-meta')!.textContent, id).toBe('Buildera while ago');
+  }
 });
 
-it('keeps the room of a track row for its title: who and when give way, whole in their tooltips (MCR-105)', async () => {
+it('shows a track row\'s lead whole, its age once, and the summary and "waits on" each on a line of its own (MCR-127)', async () => {
   const long = 'Vadim plugin Windows branches merge status';
   vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, sessions: { ...doc.sessions, b1: { name: long } }, tracks: [{ ...doc.tracks[0], by: 'supervisor' }], actions: [] });
   await act(async () => root.render(<CockpitPanel active hosted={[session('b1', long), session('r1', 'Reviewer')]} label={label} onSession={() => {}}/>)); await flush();
-  const line = host.querySelector('[data-track="store"] .ck-track-line')!;
-  // The title stands alone; the lead, the publisher and the age are one group after it, which the
-  // stylesheet cuts first and moves under the title in a narrow column
+  const row = host.querySelector('[data-track="store"]')!;
+  const line = row.querySelector('.ck-track-line')!;
   expect([...line.children].map(c => c.className.split(' ')[0])).toEqual(['ck-expand', 'ck-state', 'ck-track-title', 'ck-track-meta']);
+  // The Supervisor published it: its panel does not say "by Supervisor" on every row
   const meta = line.querySelector('.ck-track-meta')!;
-  expect([...meta.children].map(c => c.className.split(' ')[0])).toEqual(['ck-role', 'ck-session', 'ck-age']);
-  expect(meta.querySelector('.ck-session')!.getAttribute('title')).toBe(`Open ${long}`);
-  expect(meta.querySelector('.ck-age')!.getAttribute('title')).toBe('by Supervisor · a while ago');
-  // A cut line of the track says itself whole in its tooltip
-  expect(host.querySelector('[data-track="store"] .ck-line')!.getAttribute('title')).toBe('review done, merge waits');
+  expect([...meta.children].map(c => c.className.split(' ')[0])).toEqual(['ck-session', 'ck-age']);
+  expect(meta.textContent).not.toContain('Supervisor');
+  expect(meta.querySelector('.ck-session')!.textContent).toBe(long);
+  // The age, once, with what it means in the tooltip
+  expect(row.textContent!.match(/a while ago/g)).toHaveLength(1);
+  expect(meta.querySelector('.ck-age')!.getAttribute('title')).toBe('Published a while ago');
+  // The summary and whom it waits on: each a line of its own, nothing in a tooltip because nothing is cut
+  const lines = [...row.querySelectorAll(':scope > .ck-track-text')];
+  expect(lines.map(l => l.textContent)).toEqual(['review done, merge waits', 'waits on you, CI run 7']);
+  expect(lines[1].classList.contains('ck-track-waits')).toBe(true);
 });
 
-it('gives the title of a track a floor and never breaks it at any letter (MCR-105)', () => {
+it('names a publisher who is neither the lead nor the Supervisor, and an old track once and quietly (MCR-127)', async () => {
+  const old = Date.now() - 2 * 86400_000;
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, tracks: [{ ...doc.tracks[0], by: 'r1', updated: old }, { id: 'lost', title: 'Lost lead', lead: '2bf718883cd7', by: 'supervisor', state: 'moving', updated: old }], actions: [] });
+  await show();
+  const row = host.querySelector('[data-track="store"]')!;
+  const meta = row.querySelector('.ck-track-meta')!;
+  expect([...meta.children].map(c => c.textContent)).toEqual(['lead', 'Builder', 'by Reviewer', 'a while ago']);
+  // Old: no "stale:" on the state, no second age; the age is dimmed and says why in its tooltip
+  expect(row.querySelector('.ck-state')!.textContent).toBe('waits for you');
+  expect(row.textContent).not.toMatch(/stale|not updated since/);
+  expect(row.classList.contains('old')).toBe(true);
+  const age = meta.querySelector('.ck-age')!;
+  expect(age.classList.contains('ck-old')).toBe(true);
+  expect(age.getAttribute('title')).toContain('the published text may be behind');
+  // A gone lead the cockpit kept no name of: words, with its pointer in the tooltip only
+  const lost = host.querySelector('[data-track="lost"] .ck-session.gone')!;
+  expect(lost.textContent).toBe('a gone session');
+  expect(lost.getAttribute('title')).toBe('mcr:2bf718883cd7: the harness has no such session any more');
+});
+
+it('never cuts a track row: no ellipsis, the title breaks only a word wider than itself (MCR-105, MCR-127)', () => {
   // The declarations of the first rule whose selector list is exactly this
   const rule = (selector: string) => { const at = css.indexOf(`\n${selector} {`); return at < 0 ? '' : css.slice(at, css.indexOf('}', at)); };
   // "anywhere" made the title's smallest width one letter: the row then ran down the page letter by letter
   expect(css).not.toMatch(/\.ck-track[^{]*\{[^}]*overflow-wrap: anywhere/);
   expect(rule('.ck-track-title')).toContain('min-width: min(10em, 100%)');
-  expect(rule('.ck-track-meta')).toContain('min-width: 0');
+  // Who leads and when wrap to the next line instead of being cut
+  expect(rule('.ck-track-line')).toContain('flex-wrap: wrap');
+  expect(rule('.ck-track-meta')).toContain('flex-wrap: wrap');
+  for (const selector of ['.ck-track-line', '.ck-track-title', '.ck-track-meta', '.ck-track > p.ck-track-text']) {
+    expect(rule(selector), selector).not.toMatch(/text-overflow: ellipsis|white-space: nowrap|overflow: hidden/);
+  }
   expect(css).toMatch(/@container ck-col \(max-width: 460px\) \{[^@]*\.ck-track-meta \{ flex: 1 1 100%/);
 });
 

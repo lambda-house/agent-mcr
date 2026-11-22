@@ -558,7 +558,6 @@
 @container (min-width: 900px) {
   .ck-body { display: flex; gap: 18px; overflow: hidden; }
   .ck-col { flex: 1 1 0; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
-  .ck-col:first-of-type:not(:only-of-type) { flex-grow: 1.4; }
 }
 .ck-body h3 { position: sticky; top: 0; z-index: 1; background: var(--surface-1); margin: 0 0 3px; padding-top: 6px; font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--sc-muted); }
 .ck-body ul { list-style: none; margin: 0; padding: 0; }
@@ -590,7 +589,6 @@
 .ck-action.behind > .ck-action-head strong { font-weight: 500; color: var(--sc-muted); }
 .ck-live.answered { color: var(--sc-accent); border-color: var(--sc-accent); }
 .ck-state.answered { background: var(--layer-1); color: var(--sc-accent); min-width: 0; white-space: nowrap; }
-.ck-state.stale { background: var(--layer-1); color: var(--danger); min-width: 0; white-space: nowrap; }
 .ck-role { color: var(--sc-muted); font-size: 10.5px; }
 .ck-source { display: flex; gap: 10px; flex-wrap: wrap; color: var(--sc-muted); font-size: 11px; }
 .ck-risk.irreversible, .ck-risk.spend { color: var(--danger); }
@@ -603,7 +601,6 @@
 .ck-track.done, .ck-track.parked, .ck-item.done { opacity: .6; }
 .ck-line { color: var(--sc-text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ck-waits { color: var(--sc-muted); white-space: nowrap; }
-.ck-track-sub { display: flex; gap: 10px; margin: 1px 0 0 23px; min-width: 0; }
 .ck-track-body { margin: 3px 0 4px 23px; }
 .session-cockpit .ck-lead, .ck-lead { display: flex; align-items: flex-start; gap: 6px; width: 100%; height: auto; padding: 3px 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .ck-lead:hover { background: var(--layer-1); }
@@ -611,22 +608,24 @@
 .ck-item-title { flex: 1 1 12em; min-width: min(10em, 100%); overflow-wrap: break-word; }
 .ck-item .ck-waits { min-width: 0; white-space: normal; overflow-wrap: break-word; }
 .ck-item .ck-line { flex: 1 1 100%; }
-/* A track's row (MCR-105). The title gets the most room and has a floor; it wraps between words only
-   (a word breaks only when it is wider than the whole title). Who leads, who published and when give way:
-   cut with an ellipsis, whole in the tooltip. In a narrow column they go to a smaller second line. */
+/* A track's row (MCR-105, MCR-127). The title wraps between words (a word breaks only when it is wider
+   than the whole title). Who leads and when stand beside it when both fit and on the next line when they
+   don't (flex-wrap), at the right: never cut, so a lead's name is read whole. The age is said once; an old
+   entry is dimmed, once and quietly, with the reason in the tooltip. The summary and "waits on" are lines of
+   their own under the title, wrapped, never cut. */
 .ck-col { container: ck-col / inline-size; }
-.ck-track-line { flex-wrap: nowrap; align-items: baseline; }
-.ck-track-title { flex: 1 1 auto; min-width: min(10em, 100%); overflow-wrap: break-word; }
-.ck-track-meta { flex: 0 4 auto; max-width: 45%; min-width: 0; display: flex; align-items: baseline; gap: 7px; overflow: hidden; white-space: nowrap; padding-bottom: 2px; }
-.ck-track-meta > * { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.ck-track-meta > .ck-role { flex-shrink: 0; }
-.ck-track-meta > .ck-session { min-width: 3em; flex-shrink: 3; }
-.ck-track-meta > .ck-age { margin-left: 0; flex-shrink: 0; max-width: 60%; }
+.ck-track-line { flex-wrap: wrap; align-items: baseline; row-gap: 1px; }
+.ck-track-title { flex: 1 1 16em; min-width: min(10em, 100%); overflow-wrap: break-word; }
+.ck-track-meta { flex: 0 1 auto; margin-left: auto; min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; align-items: baseline; justify-content: flex-end; column-gap: 7px; padding-bottom: 2px; }
+.session-cockpit .ck-track-meta .ck-session, .ck-track-meta .ck-session { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: break-word; text-align: right; }
+.ck-track-meta > .ck-age { margin-left: 0; }
+.ck-old { opacity: .6; font-style: italic; }
+.ck-track.old > .ck-track-line > .ck-state { background: var(--layer-1); color: var(--sc-muted); }
+.ck-track > p.ck-track-text { margin: 1px 0 0 23px; color: var(--sc-text); overflow-wrap: break-word; }
+.ck-track > p.ck-track-waits { color: var(--sc-muted); }
 @container ck-col (max-width: 460px) {
-  .ck-track-line { flex-wrap: wrap; row-gap: 0; }
-  .ck-track-title { flex-basis: 0; }
-  .ck-track-meta { flex: 1 1 100%; max-width: none; padding-left: 23px; font-size: 11px; }
-  .ck-track-meta .ck-session { font-size: 11px; }
+  .ck-track-meta { flex: 1 1 100%; justify-content: flex-start; padding-left: 23px; font-size: 11px; }
+  .session-cockpit .ck-track-meta .ck-session, .ck-track-meta .ck-session { font-size: 11px; text-align: left; }
 }
 .ck-resizer { flex: 0 0 5px; cursor: row-resize; touch-action: none; }
 .ck-resizer:hover, .ck-resizer:active { background: color-mix(in srgb, var(--sc-accent) 45%, transparent); }

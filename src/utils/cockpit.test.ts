@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionSource, clickable, foldRows, harnessChips, harnessSaw, heldFor, liveFacts, named, needsYouRows, ROWS_PER_PUBLISHER, STALE_AFTER_MS, staleMarks, stillAwaits, shownUrgency, trackStateShown, trackWaits, urgencyRank } from './cockpit';
+import { actionSource, ageTitle, clickable, foldRows, harnessChips, harnessSaw, heldFor, isOld, liveFacts, named, needsYouRows, ROOT_PART, ROWS_PER_PUBLISHER, STALE_AFTER_MS, staleMarks, stillAwaits, shownUrgency, trackPublisher, trackStateShown, trackWaits, urgencyRank } from './cockpit';
 import type { Cockpit, CockpitAction, Hosted } from './harness';
 
 const NOW = 100 * 3600_000;
@@ -60,20 +60,28 @@ describe('the join with the session list', () => {
   it('does not call a session ended because the list has not shown it yet', () => {
     const late = named('a', doc, [], label);
     expect(late).toEqual({ id: 'a', name: 'stale name', standing: 'running' });
-    expect(staleMarks({ by: 'a', updated: NOW }, doc, [], label, NOW)).toEqual([]);
+    expect(staleMarks({ by: 'a' }, doc, [], label)).toEqual([]);
   });
 });
 
 describe('stale marks', () => {
   const doc = cockpit({ sessions: { ended: { name: 'Old one', ended: true }, lost: { gone: true } } });
   const hosted = [session('a')];
-  it('marks nothing on a fresh entry of a running publisher', () => {
-    expect(staleMarks({ by: 'a', updated: NOW - STALE_AFTER_MS + 1000 }, doc, hosted, label, NOW)).toEqual([]);
+  it('marks nothing for a running publisher, however old the entry: its age is the row\'s to show (MCR-127)', () => {
+    const old = { by: 'a', updated: NOW - STALE_AFTER_MS - 3600_000 };
+    expect(staleMarks(old, doc, hosted, label)).toEqual([]);
   });
-  it('marks an entry older than the limit, and one whose publisher ended or is gone', () => {
-    expect(staleMarks({ by: 'a', updated: NOW - STALE_AFTER_MS - 3600_000 }, doc, hosted, label, NOW)).toEqual(['not updated since 7 h ago']);
-    expect(staleMarks({ by: 'ended', updated: NOW }, doc, hosted, label, NOW)).toEqual(['its publisher Old one ended']);
-    expect(staleMarks({ by: 'lost', updated: NOW - 2 * STALE_AFTER_MS }, doc, hosted, label, NOW)).toEqual(['its publisher is gone', 'not updated since 12 h ago']);
+  it('marks an entry whose publisher ended or is gone', () => {
+    expect(staleMarks({ by: 'ended' }, doc, hosted, label)).toEqual(['its publisher Old one ended']);
+    expect(staleMarks({ by: 'lost' }, doc, hosted, label)).toEqual(['its publisher is gone']);
+  });
+  it('says an entry is old once, in the tooltip of its age', () => {
+    expect(isOld({ updated: NOW - STALE_AFTER_MS + 1000 }, NOW)).toBe(false);
+    expect(isOld({ updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toBe(true);
+    expect(isOld({}, NOW)).toBe(false);
+    expect(ageTitle({ updated: NOW - 60_000 }, NOW)).toBe('Published 1 min ago');
+    expect(ageTitle({ updated: NOW - STALE_AFTER_MS - 3600_000 }, NOW)).toBe('Published 7 h ago. Not updated for more than 6 h: the published text may be behind');
+    expect(ageTitle({}, NOW)).toBeUndefined();
   });
 });
 
@@ -100,17 +108,25 @@ describe('what the harness knows to be behind (MCR-103)', () => {
     expect(rows.map(stillAwaits)).toEqual([true, true, false, false]);
   });
 
-  it('reads a waiting track as answered once the owner typed in its lead, and an old one as stale', () => {
+  it('reads a waiting track as answered once the owner typed in its lead, and an old one as old without a word on its state', () => {
     const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'waiting_human' as const, updated: NOW - 40 * 60000 };
-    expect(trackStateShown(track, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human' });
-    expect(trackStateShown({ ...track, ownerTyped: NOW - 36 * 60000 }, NOW)).toEqual({ text: 'you typed 36 min ago', tone: 'answered' });
+    expect(trackStateShown(track, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human', old: false });
+    expect(trackStateShown({ ...track, ownerTyped: NOW - 36 * 60000 }, NOW)).toEqual({ text: 'you typed 36 min ago', tone: 'answered', old: false });
     // Only a track that says it waits for the owner is answered by their typing
     expect(trackStateShown({ ...track, state: 'moving', ownerTyped: NOW }, NOW).tone).toBe('moving');
-    expect(trackStateShown({ ...track, state: 'moving', updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'stale: moving', tone: 'stale' });
-    expect(trackStateShown({ ...track, updated: NOW - STALE_AFTER_MS - 1 }, NOW).tone).toBe('stale');
-    // What rests is not stale for resting
-    expect(trackStateShown({ ...track, state: 'parked', updated: 1 }, NOW).tone).toBe('parked');
-    expect(trackStateShown({ ...track, state: 'done', updated: 1 }, NOW).tone).toBe('done');
+    // Old: said once and quietly by the row, never as "stale:" on the state (MCR-127)
+    expect(trackStateShown({ ...track, state: 'moving', updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'moving', tone: 'moving', old: true });
+    expect(trackStateShown({ ...track, updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human', old: true });
+    // What rests is not old for resting
+    expect(trackStateShown({ ...track, state: 'parked', updated: 1 }, NOW)).toEqual({ text: 'parked', tone: 'parked', old: false });
+    expect(trackStateShown({ ...track, state: 'done', updated: 1 }, NOW).old).toBe(false);
+  });
+
+  it('names who published a track only when it is neither its lead nor the Supervisor (MCR-127)', () => {
+    const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'moving' as const };
+    expect(trackPublisher(track)).toBeNull();
+    expect(trackPublisher({ ...track, by: ROOT_PART })).toBeNull();
+    expect(trackPublisher({ ...track, by: 'b' })).toBe('b');
   });
 
   it('no longer says that a track waits on the owner once they typed there', () => {
