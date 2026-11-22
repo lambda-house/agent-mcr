@@ -57,7 +57,7 @@ const MAX_SENT: usize = 40;
 /// The name agents see the harness tools under (`mcp__mcr__…` in Claude Code)
 pub const AGENT_SERVER: &str = "mcr";
 /// What every hosted agent is told at launch, whatever its kind.
-pub const PEER_NOTE: &str = "You run in a terminal hosted by Agent MCR, next to other agent sessions (Claude Code, Codex and others) that the same operator runs on this machine. The `mcr` MCP tools connect you to them and to the operator. When you start: call list_peers to see who works in your folder and in what role, and bulletin_read for the notes left for sessions like yours. While you work: set_status with your role and what you are doing; send_message, ask, reply and read_inbox to reach a peer; report with kind needs_human when you cannot go on without the operator, and with kind done when a piece of work is complete; bulletin_post for a fact that later sessions must know, with an honest expiry. The `guide` tool of the mcr server (in Claude Code also the skills agent-mcr:peers and agent-mcr:reporting) has the working rules; read it before your first message or report. A mcr:<id> in a prompt is the operator pointing at a peer session: pass it to these tools as it is.";
+pub const PEER_NOTE: &str = "You run in a terminal hosted by Agent MCR, next to other agent sessions (Claude Code, Codex and others) that the same operator runs on this machine. The `mcr` MCP tools connect you to them and to the operator. When you start: call list_peers to see who works in your folder and in what role, and bulletin_read for the notes left for sessions like yours. While you work: set_status with your role and what you are doing; send_message, ask, reply and read_inbox to reach a peer; report with kind needs_human when you cannot go on without the operator, and with kind done when a piece of work is complete; bulletin_post for a fact that later sessions must know, with an honest expiry. The `guide` tool of the mcr server (in Claude Code also the skills agent-mcr:peers and agent-mcr:reporting) has the working rules; read it before your first message or report. When whoami names an agent profile, the guide also holds your role (in Claude Code the skill agent-mcr:role): read it before you start. A mcr:<id> in a prompt is the operator pointing at a peer session: pass it to these tools as it is.";
 
 /// Working rules, part one: the peers. With `REPORT_GUIDE` it is the answer of
 /// the `guide` tool, and each part is a Claude Code skill, so every agent kind
@@ -181,6 +181,20 @@ pub fn claude_plugin() -> [(&'static str, String); 3] {
         "---\nname: reporting\ndescription: How to tell the operator of Agent MCR that you need their assessment or that a piece of work is complete (the mcr report tool), and how to read and leave notes for later sessions on the bulletin board (bulletin_read, bulletin_post). Read before your first report or note, when you are blocked on a human decision, and when you finish a task.\n---\n\n{REPORT_GUIDE}"
     );
     [(".claude-plugin/plugin.json", manifest.to_string()), ("skills/peers/SKILL.md", peers), ("skills/reporting/SKILL.md", reporting)]
+}
+
+/// The plugin of a session with a role: the two skills and its role guide
+/// as the skill `agent-mcr:role` (MCR-126 P2), in a folder per role.
+pub fn role_plugin(role: &str) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = claude_plugin().into_iter().collect();
+    files.push((
+        "skills/role/SKILL.md",
+        format!(
+            "---\nname: role\ndescription: Your role in Agent MCR as your agent profile sets it ({role}): its contract, what done means for it, its owner words and what it never does. Read at the start of a session, before you report done, and before any step that may need the owner's word.\n---\n\n{}",
+            crate::profiles::role_guide(role)
+        ),
+    ));
+    files
 }
 
 /// The name the hosted supervisor session sees the supervisor tools under
@@ -384,10 +398,11 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
 
 /// The agent kind a `session_create` starts: the resumed transcript's, as
 /// `create` takes it, else `profile`. `None`: no such transcript (`create` says so).
-fn asked_profile(home: &Path, args: &Value) -> Option<String> {
+fn asked_profile(config_dir: &Path, home: &Path, args: &Value) -> Option<String> {
     match args["resume"].as_str().filter(|s| !s.is_empty()) {
         Some(id) => find_resumable(home, id).map(|r| r.agent.to_string()),
-        None => Some(args["profile"].as_str().unwrap_or("").to_string()),
+        // An agent profile's adapter (MCR-126); one that cannot be used is refused at the launch
+        None => Some(args["profile"].as_str().unwrap_or("")).map(|p| crate::profiles::choose(config_dir, p).map(|l| l.profile.adapter).unwrap_or_else(|_| p.to_string())),
     }
 }
 
@@ -1290,6 +1305,7 @@ impl Store {
                     done: open.filter(|r| r.kind == "done").map(|r| (r.id.clone(), r.text.clone(), r.created)),
                     typed: Some(t.operator_sent).filter(|at| *at > 0),
                     waits: self.open_waits(id).iter().map(|w| cockpit::FactWait { id: w.id.clone(), kind: w.kind.clone(), on: w.on.clone(), reference: w.reference.clone(), since: w.created, overdue: w.expect_by <= now }).collect(),
+                    words: t.agent_profile.as_ref().map(|r| r.words.clone()).unwrap_or_default(),
                 };
                 (id.clone(), fact)
             })
@@ -2882,13 +2898,13 @@ impl Harness {
         let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
         let profile = prefs.supervisor_profile.ok_or("Choose a supervisor in Settings → Harnesses")?;
         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true)
+        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true, None)
     }
 
     fn create(&self, req: &Value) -> Result<Value, String> {
         // Who assigns and who created is known from the caller's process, never from
         // what the app or a supervisor sends: only `executor_create` sets it
-        self.create_as(&without_assigner(req), false)
+        self.create_as(&without_assigner(req), false, None)
     }
 
     /// End a session's agent and continue its conversation in a new process,
@@ -2897,8 +2913,34 @@ impl Harness {
     /// the messages; the old terminal output is dropped (the agent prints the
     /// conversation again). Without a transcript to continue it starts fresh
     /// in the same folder.
-    fn restart(&self, id: &str, force: bool) -> Result<Value, String> {
+    /// A session started from an agent profile is started again from the
+    /// version it ran (its pin, 16647 L5), or with `refresh` from the profile
+    /// as it is now, lowered again to its creator's where it was created by
+    /// one. Both are settled before the old process is ended.
+    fn restart(&self, id: &str, force: bool, refresh: bool) -> Result<Value, String> {
         let old = self.session(id)?;
+        let (recorded, creator) = {
+            let store = lock(&self.store);
+            let t = store.sessions.get(id);
+            let creator = t.and_then(|t| t.created_by.clone()).and_then(|c| store.sessions.get(&c).and_then(|c| c.agent_profile.clone()));
+            (t.and_then(|t| t.agent_profile.clone()), creator)
+        };
+        let launch = match recorded {
+            None => None,
+            Some(r) if refresh => {
+                let now = match r.id.strip_prefix("custom@bare-") {
+                    Some(bare) => crate::profiles::bare(bare).ok_or("That bare agent cannot be started from a profile")?,
+                    None => crate::profiles::choose(&self.dir, &r.id)?,
+                };
+                Some(match (r.lowered, creator) {
+                    (true, Some(c)) => crate::profiles::lower_of(&now, &crate::profiles::pinned(&self.dir, &c)?.profile)?.0,
+                    // Without the creator's ceiling the profile as it is now could be wider
+                    (true, None) => return Err("This session's profile was lowered to its creator's, which is no longer here: restart it without refresh_profile".into()),
+                    (false, _) => now,
+                })
+            }
+            Some(r) => Some(crate::profiles::pinned(&self.dir, &r)?),
+        };
         let profile = old["harness"]["profile"].as_str().unwrap_or("").to_string();
         crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
         if !adapter(&profile).is_agent() {
@@ -2942,7 +2984,7 @@ impl Harness {
                 Some(conversation) => req["resume"] = json!(conversation),
                 None => req["profile"] = json!(profile),
             }
-            self.create_as(&req, old["meta"]["role"] == "supervisor")
+            self.create_as(&req, old["meta"]["role"] == "supervisor", launch.clone())
         })();
         let new = match started {
             Ok(new) => new,
@@ -3008,16 +3050,28 @@ impl Harness {
         Ok(out)
     }
 
-    fn create_as(&self, req: &Value, supervisor: bool) -> Result<Value, String> {
+    /// `pinned`: the agent profile to launch, settled by the caller (a
+    /// restart's pin, an executor's lowered profile). Otherwise `profile` in
+    /// `req` is an adapter id (a bare launch) or an agent profile id, taken
+    /// as it is now (MCR-126 P2). Never profile text from a request.
+    fn create_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>) -> Result<Value, String> {
         let home = dirs::home_dir().ok_or("Home directory unavailable")?;
         let resume = req["resume"].as_str().filter(|s| !s.is_empty());
         let found = match resume {
             Some(id) => Some(find_resumable(&home, id).ok_or_else(|| format!("No Claude or Codex session {id} to resume"))?),
             None => None,
         };
-        let profile = match &found {
-            Some(r) => r.agent.to_string(),
-            None => req["profile"].as_str().unwrap_or("").to_string(),
+        let asked = req["profile"].as_str().unwrap_or("");
+        let chosen = match pinned {
+            Some(l) => Some(l),
+            None if crate::profiles::is_profile_id(asked) => Some(crate::profiles::choose(&self.dir, asked)?),
+            None => None,
+        };
+        let profile = match (&found, &chosen) {
+            (Some(r), Some(c)) if r.agent != c.profile.adapter => return Err(format!("The conversation to resume is {}'s; the profile {} is for {}", r.agent, c.profile.id, c.profile.adapter)),
+            (Some(r), _) => r.agent.to_string(),
+            (None, Some(c)) => c.profile.adapter.clone(),
+            (None, None) => asked.to_string(),
         };
         let label = profiles().iter().find(|p| p.id == profile).ok_or_else(|| format!("Unknown profile {profile:?}"))?.label;
         crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
@@ -3070,7 +3124,23 @@ impl Harness {
         }
         let settings = self.dir.join(if supervisor { "claude-supervisor-hooks.json" } else { "claude-hooks.json" });
         let mcp = self.dir.join(if supervisor { "claude-supervisor-mcp.json" } else { "claude-mcp.json" });
-        let plugin = self.dir.join("claude-plugin");
+        // A session with a role gets the plugin with its role skill too (agent-mcr:role);
+        // the bare root Supervisor gets the supervisor's (16647 M5)
+        let role = chosen.as_ref().map(|c| c.profile.role.as_str()).or(supervisor.then_some("supervisor"));
+        let plugin = match role {
+            Some(role) if agent.files(&exe, supervisor).iter().any(|(name, _)| name.starts_with("claude-plugin/")) => {
+                let folder = self.dir.join(format!("claude-plugin-{role}"));
+                for (name, content) in role_plugin(role) {
+                    let path = folder.join(name);
+                    if std::fs::read(&path).ok().as_deref() != Some(content.as_bytes()) {
+                        std::fs::create_dir_all(path.parent().unwrap_or(&folder)).map_err(|e| e.to_string())?;
+                        std::fs::write(&path, content).map_err(|e| e.to_string())?;
+                    }
+                }
+                folder
+            }
+            _ => self.dir.join("claude-plugin"),
+        };
         let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
         if cfg!(windows) {
             if let Some(text) = task {
@@ -3099,7 +3169,14 @@ impl Harness {
             // Free text never goes in Windows argv; it is queued and typed when ready.
             task: if cfg!(windows) { None } else { task },
             own_hooks: lock(&self.store).codex_hooks,
+            agent: chosen.as_ref().map(|c| &c.profile),
         })?;
+        // The text launched is kept, so a restart starts the same version (L5)
+        if let Some(c) = &chosen {
+            crate::profiles::pin(&self.dir, c)?;
+            let keep: std::collections::BTreeSet<String> = lock(&self.store).sessions.values().filter_map(|t| t.agent_profile.as_ref().map(|r| r.digest.clone())).collect();
+            crate::profiles::prune_pins(&self.dir, &keep, now_ms());
+        }
         spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
         let id = runner::random_id()[..12].to_string();
         spawn_env.insert("AGENT_MCR_SESSION".into(), id.clone());
@@ -3148,6 +3225,7 @@ impl Harness {
                     supervisor: above.clone(),
                     // Set only by `executor_create`: the session that may end it later
                     created_by: above.clone().filter(|up| *up == assigner),
+                    agent_profile: chosen.as_ref().map(|c| c.reference()),
                     ..Tracked::default()
                 },
             );
@@ -3927,6 +4005,14 @@ impl Harness {
                 let store = lock(&self.store);
                 out["supervisor"] = json!(store.sessions.get(me).and_then(|t| t.supervisor.clone()));
                 out["executors"] = json!(store.executors(me));
+                // The fields of the version it runs, from its pin; the core owner words without one
+                match store.sessions.get(me).and_then(|t| t.agent_profile.clone()) {
+                    Some(r) => match crate::profiles::pinned(&self.dir, &r) {
+                        Ok(l) => out["profileDetails"] = crate::profiles::details(&l),
+                        Err(e) => out["profileDetails"] = json!({ "error": e }),
+                    },
+                    None => out["ownerWords"] = json!(crate::profiles::OWNER_WORDS),
+                }
                 out
             }
             "list_peers" => {
@@ -4149,7 +4235,23 @@ impl Harness {
                 self.wait_for(timeout, |s| (s.unread(me) > 0).then_some(()));
                 Self::inbox(self.update(|s| s.take_unread(me)))
             }
-            "guide" => json!({ "guide": format!("{PEER_GUIDE}\n{REPORT_GUIDE}") }),
+            "guide" => {
+                // The third part is the caller's role guide (MCR-126 P2): from the version it runs
+                // Not in the scrutinee: `session` below may update the store, and the lock is not re-entrant
+                let recorded = lock(&self.store).sessions.get(me).and_then(|t| t.agent_profile.clone());
+                let role = match recorded {
+                    Some(r) => Some(match crate::profiles::pinned(&self.dir, &r) {
+                        Ok(l) => format!("{}\nYour profile: {} v{}{}. whoami shows its fields.\n", crate::profiles::role_guide(l.profile.role.as_str()), l.profile.id, l.profile.version, if l.lowered { ", lowered to your creator's ceiling" } else { "" }),
+                        Err(e) => format!("{}\nYour profile {} v{} cannot be read now ({e}); its role guide is above.\n", crate::profiles::role_guide(&r.role), r.id, r.version),
+                    }),
+                    None if self.session(me).is_ok_and(|s| s["meta"]["role"] == "supervisor") => Some(format!("{}\nYou were started without an agent profile: a bare Supervisor.\n", crate::profiles::role_guide("supervisor"))),
+                    None => None,
+                };
+                match role {
+                    Some(role) => json!({ "guide": format!("{PEER_GUIDE}\n{REPORT_GUIDE}\n{role}") }),
+                    None => json!({ "guide": format!("{PEER_GUIDE}\n{REPORT_GUIDE}") }),
+                }
+            }
             "set_status" => {
                 let line = |key: &str, max: usize| args[key].as_str().map(|v| v.chars().filter(|c| !c.is_control()).take(max).collect::<String>());
                 let (status, role) = (line("text", 200), line("role", 80));
@@ -4241,9 +4343,25 @@ impl Harness {
             "executor_create" => {
                 let mine = self.session(me)?;
                 let profile = args["profile"].as_str().filter(|p| !p.is_empty()).unwrap_or(mine["harness"]["profile"].as_str().unwrap_or("")).to_string();
-                if !adapter(&profile).is_agent() {
-                    return Err("An executor is an agent session: profile claude or codex".into());
+                // Never wider than the creator's own profile (16639 9.2, 16647 L6): an
+                // agent profile, or a bare adapter taken as its bare line, is lowered to it
+                let own = lock(&self.store).sessions.get(me).and_then(|t| t.agent_profile.clone());
+                let own = match own {
+                    Some(r) => Some(crate::profiles::pinned(&self.dir, &r).map_err(|e| format!("Refused: your own profile's ceiling cannot be read, so no executor is started ({e})"))?.profile),
+                    None => None,
+                };
+                let asked = if crate::profiles::is_profile_id(&profile) { Some(crate::profiles::choose(&self.dir, &profile)?) } else { own.as_ref().and_then(|_| crate::profiles::bare(&profile)) };
+                if !adapter(asked.as_ref().map_or(profile.as_str(), |a| a.profile.adapter.as_str())).is_agent() {
+                    return Err("An executor is an agent session: a profile id (see whoami and the guide), claude or codex".into());
                 }
+                let (launch, lowered) = match (asked, &own) {
+                    (Some(a), Some(own)) => {
+                        let (l, notes) = crate::profiles::lower_of(&a, own)?;
+                        // A bare request that the ceiling leaves as it was stays a bare launch
+                        if notes.is_empty() && !crate::profiles::is_profile_id(&profile) { (None, notes) } else { (Some(l), notes) }
+                    }
+                    (a, _) => (a, Vec::new()),
+                };
                 if let Some(task) = args["task"].as_str() {
                     plain_prompt(task)?;
                 }
@@ -4266,9 +4384,12 @@ impl Harness {
                 let created = self.create_as(&json!({
                     "profile": profile, "cwd": cwd, "name": args["name"], "role": args["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("executor"),
                     "task": args["task"], "supervisor": me, "by": me,
-                }), false)?;
+                }), false, launch)?;
                 let mut out = Self::brief(&created);
                 out["task"] = created["task"].clone();
+                if !lowered.is_empty() {
+                    out["lowered"] = json!(lowered);
+                }
                 out["note"] = json!("Started as your executor; the operator sees it in the session list under yours. Follow its first task with task_wait, or end your turn: you are told in your inbox when the task ends. You cannot answer its permission prompts.");
                 out
             }
@@ -4718,7 +4839,7 @@ impl Harness {
             // The operator connects a session to a supervising one, or detaches it
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
             "supervisor" => self.supervisor(req),
-            "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true),
+            "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true, req["refreshProfile"] == true),
             "settings" => {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
@@ -4966,7 +5087,7 @@ impl Harness {
         };
         // The agent kind a first task would go to
         let tasked = match name {
-            "session_create" if args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => dirs::home_dir().and_then(|home| asked_profile(&home, args)),
+            "session_create" if args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => dirs::home_dir().and_then(|home| asked_profile(&self.dir, &home, args)),
             _ => None,
         };
         match name {
@@ -5062,7 +5183,7 @@ impl Harness {
                 };
                 Ok(json!({ "interrupted": true }))
             }
-            "session_restart" => self.restart(text("session")?, args["force"] == true).map(|s| {
+            "session_restart" => self.restart(text("session")?, args["force"] == true, args["refresh_profile"] == true).map(|s| {
                 let mut brief = Self::brief(&s);
                 brief["replaced"] = s["replaced"].clone();
                 brief["resumed"] = s["resumed"].clone();
@@ -5449,7 +5570,7 @@ fn supervisor_tools() -> Value {
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
         tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
-            "profile": {"type": "string", "description": "Enabled harness id (see profiles_list)"},
+            "profile": {"type": "string", "description": "An agent profile id such as implementer@claude-opus (see profiles_list), or an enabled harness id for a session without a profile"},
             "role": {"type": "string", "description": "The part it plays (reviewer, implementer of X): its peers see it in list_peers"},
             "cwd": {"type": "string", "description": "Working folder (absolute path)"},
             "name": {"type": "string", "description": "A short name shown to the operator"},
@@ -5465,7 +5586,7 @@ fn supervisor_tools() -> Value {
         tool("terminal_read", "The session's terminal as text (last lines).", json!({"session": session, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"]),
         tool("terminal_write", "Type raw input into a session's terminal. Escape sequences in input are not interpreted: to press Enter, set submit to true (a trailing \\r or \\n written out as two characters counts as submit too). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}, "submit": {"type": "boolean", "description": "Press Enter after the text, as a separate key 250 ms later; the text goes in as a paste when the program asked for that"}}), &["session", "input"]),
         tool("session_interrupt", "Stop the current turn (Esc for Claude, Ctrl-C otherwise).", json!({"session": session}), &["session"]),
-        tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}}), &["session"]),
+        tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}, "refresh_profile": {"type": "boolean", "description": "A session started from an agent profile restarts with the version it ran; true takes the profile as it is now"}}), &["session"]),
         tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
         tool("session_forget", "Drop an ended session and its terminal output.", json!({"session": session}), &["session"]),
         tool("messages_list", "Messages, newest last. Full objects for small lists; brief returns compact rows with columns and a session-name dictionary; source is set for a message no session sent (from Slack, or a notice of the harness). Text is cut at Unicode characters; truncated is explicit. Filters apply before limit.", json!({"session": {"type": "string"}, "pair": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2, "description": "Both directions between exactly these two session ids"}, "since": {"type": ["number", "string"], "description": "Last N minutes (number), or strictly after a message id (string); unknown ids are errors"}, "brief": {"type": ["boolean", "integer"], "description": "First N characters (1..500), true = 48, false = full text. Defaults to 48 above 20 returned messages"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
@@ -5519,7 +5640,7 @@ fn agent_tools() -> Value {
         tool("bulletin_post", "Leave a note for the sessions that start after you: a fact they must know and would not find in the code. Not for messages to one peer or for your own progress.", json!({"text": {"type": "string", "description": "The fact, complete without your context"}, "expires_hours": {"type": "integer", "description": "How long it stays true or useful: 1 to 336. A stale note misleads; choose shorter when unsure"}, "until_i_end": {"type": "boolean", "description": "Also remove it when your session ends: for what is about your running work"}, "scope": {"type": "string", "enum": ["folder", "all"], "description": "folder (default): sessions in your folder, below and above it. all: every session"}}), &["text", "expires_hours"], false),
         tool("bulletin_remove", "Take back a note of yours that is no longer true.", json!({"note": {"type": "string", "description": "Note id from bulletin_read"}}), &["note"], false),
         tool("executor_create", "Start a new agent session that works for you: your executor. The operator sees it under your session. It starts in your folder with your agent kind unless you say otherwise. Give it a first task here or later with task_assign. Use it for work that should run next to yours with its own context; not for a quick question (ask a peer) or a subtask your own subagents can do.", json!({
-            "profile": {"type": "string", "description": "claude or codex (default: your own)"},
+            "profile": {"type": "string", "description": "An agent profile id such as implementer@claude-opus, or claude or codex for a session without a profile (default: your own agent kind). It is lowered to your own profile where it would be wider"},
             "cwd": {"type": "string", "description": "Working folder: your own (default) or a folder below it, absolute path"},
             "name": {"type": "string", "description": "A short name shown to the operator"},
             "role": {"type": "string", "description": "Its part, in a few words"},
@@ -6420,7 +6541,7 @@ mod tests {
         // A session launched with a profile (P2 sets it) shows it
         let launched = Tracked {
             profile: "claude".into(),
-            agent_profile: Some(crate::profiles::ProfileRef { id: "implementer@claude-opus".into(), version: 1, role: "implementer".into(), digest: "d".into() }),
+            agent_profile: Some(crate::profiles::ProfileRef { id: "implementer@claude-opus".into(), version: 1, role: "implementer".into(), digest: "d".into(), ..Default::default() }),
             ..Tracked::default()
         };
         let h = serde_json::to_value(&launched).unwrap();
@@ -6595,6 +6716,116 @@ mod tests {
         assert_eq!(mine["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(mine["sessions"][0], *child);
         assert!(s.overview(&sessions, Some("unknown"), 10000)["sessions"].as_array().unwrap().is_empty());
+    }
+
+    /// MCR-126 P2 through the service, with a runner that records what it is
+    /// asked to start: a session from an agent profile, the refusals before
+    /// anything starts, an executor lowered to its creator's profile, and a
+    /// restart that will not start a version it cannot pin.
+    #[test]
+    #[cfg(unix)]
+    fn sessions_start_from_agent_profiles_and_executors_are_lowered() {
+        let dir = socket_test_dir("mcr-p2-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dunce::canonicalize(&dir).unwrap().display().to_string();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let spawned: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = spawned.clone();
+        let folder = cwd.clone();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "spawn" => {
+                        seen.lock().unwrap().push(req.clone());
+                        json!({})
+                    }
+                    // Notices typed into the lead about its new executor
+                    "write" => json!({}),
+                    // Codex's screen, read for its input box: nothing on it yet
+                    "snapshot" => json!({"data": ""}),
+                    "list" => {
+                        let mut sessions = vec![json!({"id": "lead", "cwd": folder, "meta": {"profile": "claude"}}), json!({"id": "lost", "cwd": folder, "meta": {"profile": "claude"}})];
+                        sessions.extend(seen.lock().unwrap().iter().map(|r| json!({"id": r["id"], "cwd": r["cwd"], "meta": r["meta"]})));
+                        json!({ "sessions": sessions })
+                    }
+                    // A restart that refuses must not have ended anything
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        let line = |i: usize| spawned.lock().unwrap()[i]["argv"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect::<Vec<_>>().join(" ");
+
+        // From a built-in profile: its words on the line, its role skill, its record and its pin
+        let started = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": cwd, "name": "impl"})).unwrap();
+        let id = started["id"].as_str().unwrap().to_string();
+        let first = line(0);
+        assert!(first.contains("exec claude '--permission-mode' 'acceptEdits' '--model' 'opus' '--fallback-model' 'sonnet' '--effort' 'high' '--disallowedTools' 'Bash(git push:*)' 'Bash(gh pr merge:*)' --mcp-config"), "{first}");
+        assert!(first.contains("claude-plugin-implementer"), "{first}");
+        assert!(dir.join("claude-plugin-implementer/skills/role/SKILL.md").is_file());
+        assert_eq!((started["agentProfile"]["id"].as_str(), started["roleKind"].as_str(), started["profileLabel"].as_str()), (Some("implementer@claude-opus"), Some("implementer"), Some("implementer@claude-opus v1")));
+        let recorded = lock(&h.store).sessions[&id].agent_profile.clone().unwrap();
+        assert_eq!(crate::profiles::pinned(&dir, &recorded).unwrap().profile.id, "implementer@claude-opus");
+        // A bare launch is today's line, with no record
+        h.tool("session_create", &json!({"profile": "claude", "cwd": cwd})).unwrap();
+        assert!(line(1).contains("exec claude --permission-mode acceptEdits --mcp-config"));
+        assert!(lock(&h.store).sessions.values().filter(|t| t.agent_profile.is_some()).count() == 1);
+
+        // Refused before anything starts
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("profiles/mine.toml"), "id = \"custom@mine\"\nversion = 1\nrole = \"custom\"\nadapter = \"claude\"\n[permissions]\nmode = \"manual\"\n").unwrap();
+        assert!(h.tool("session_create", &json!({"profile": "custom@mine", "cwd": cwd})).unwrap_err().contains("not approved"));
+        assert!(h.tool("session_create", &json!({"profile": "custom@nothing", "cwd": cwd})).unwrap_err().contains("No usable agent profile"));
+        assert!(h.tool("session_create", &json!({"profile": "supervisor@claude-opus", "cwd": cwd})).unwrap_err().contains("root Supervisor only"));
+        assert_eq!(spawned.lock().unwrap().len(), 2);
+
+        // An executor never wider than its creator: a backlog lead (manual, edits denied)
+        let backlog = crate::profiles::choose(&dir, "backlog@claude-opus").unwrap();
+        crate::profiles::pin(&dir, &backlog).unwrap();
+        h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), agent_profile: Some(backlog.reference()), ..Tracked::default() });
+        });
+        let out = h.agent_tool("lead", "executor_create", &json!({"profile": "implementer@claude-opus", "name": "worker"})).unwrap();
+        assert!(out["lowered"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("lowered to manual")), "{out}");
+        let lowered = line(2);
+        assert!(lowered.contains("'--permission-mode' 'manual'") && lowered.contains("'--disallowedTools' 'Bash(git push:*)' 'Bash(gh pr merge:*)' 'Edit' 'Write' --mcp-config"), "{lowered}");
+        let record = lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.clone().unwrap();
+        assert!(record.lowered && record.id == "implementer@claude-opus");
+        assert!(crate::profiles::pinned(&dir, &record).unwrap().profile.tools.deny.contains(&"Edit".to_string()));
+        // A bare Codex for it is lowered too: its sandbox drops to read-only
+        let out = h.agent_tool("lead", "executor_create", &json!({"profile": "codex"})).unwrap();
+        assert!(line(3).contains("'--sandbox' 'read-only' '--ask-for-approval' 'on-request'"), "{}", line(3));
+        assert_eq!(lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.as_ref().unwrap().id, "custom@bare-codex");
+        // What the lead is told of itself
+        let me = h.agent_tool("lead", "whoami", &json!({})).unwrap();
+        assert_eq!((me["profileDetails"]["mode"].as_str(), me["profileDetails"]["role"].as_str()), (Some("manual"), Some("backlog")));
+        assert!(h.agent_tool("lead", "guide", &json!({})).unwrap()["guide"].as_str().unwrap().contains("## Backlog analyst"));
+        assert!(h.agent_tool(&id, "guide", &json!({})).unwrap()["guide"].as_str().unwrap().contains("## Implementer"));
+
+        // A session whose pinned version is gone is not restarted, and nothing is ended
+        let gone = crate::profiles::ProfileRef { digest: "0".repeat(64), ..recorded.clone() };
+        h.update(|s| {
+            s.sessions.insert("lost".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), agent_profile: Some(gone), ..Tracked::default() });
+        });
+        assert!(h.tool("session_restart", &json!({"session": "lost"})).unwrap_err().contains("pinned copy"));
+        // Nor does a session without its pin start executors
+        assert!(h.agent_tool("lost", "executor_create", &json!({"profile": "claude"})).unwrap_err().contains("ceiling cannot be read"));
+        assert_eq!(spawned.lock().unwrap().len(), 4);
+        // A lowered one whose creator is gone is not refreshed to the wider profile
+        h.update(|s| s.sessions.get_mut("lost").unwrap().agent_profile = Some(crate::profiles::ProfileRef { lowered: true, ..recorded.clone() }));
+        assert!(h.tool("session_restart", &json!({"session": "lost", "refresh_profile": true})).unwrap_err().contains("no longer here"));
+
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -7580,12 +7811,12 @@ mod tests {
         assert!(find_resumable(&home, "../../etc/passwd").is_none());
         assert!(resumable(&home, now_ms() + 60_000, 10).is_empty());
         // A first task goes to the agent of the resumed transcript, whatever `profile` says (MCR-76)
-        assert_eq!(asked_profile(&home, &json!({"resume": a, "task": "go"})).as_deref(), Some("claude"));
-        assert_eq!(asked_profile(&home, &json!({"resume": b, "profile": "shell"})).as_deref(), Some("codex"));
-        assert!(asked_profile(&home, &json!({"resume": c})).is_none());
-        assert_eq!(asked_profile(&home, &json!({"profile": "shell"})).as_deref(), Some("shell"));
-        assert_eq!(asked_profile(&home, &json!({"resume": "", "profile": "pi"})).as_deref(), Some("pi"));
-        assert_eq!(asked_profile(&home, &json!({})).as_deref(), Some(""));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": a, "task": "go"})).as_deref(), Some("claude"));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": b, "profile": "shell"})).as_deref(), Some("codex"));
+        assert!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": c})).is_none());
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"profile": "shell"})).as_deref(), Some("shell"));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": "", "profile": "pi"})).as_deref(), Some("pi"));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({})).as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&home);
     }
 

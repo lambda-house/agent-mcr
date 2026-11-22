@@ -99,8 +99,19 @@ export interface Resumable {
   /** From the service: its folder is no longer on disk (MCR-107) */
   gone?: boolean;
 }
+/** An agent profile the app may start a session from (MCR-126): the service loads and checks it again */
+export interface AgentProfileChoice { id: string; version: number; role: string; adapter: string; summary: string; model?: string | null; effort?: string | null; mode?: string | null }
+
+/** The tooltip of a profile in a start menu: what it is and how it runs */
+export function agentProfileTitle(p: AgentProfileChoice): string {
+  const how = [p.model && `model ${p.model}`, p.effort && `effort ${p.effort}`, p.mode && `mode ${p.mode}`].filter(Boolean).join(', ');
+  return `${p.summary || p.id} (v${p.version}${how ? `; ${how}` : ''})`;
+}
+
 export interface HarnessStatus {
   runner: { protocol: number; pid: number; version: string; exe: string }; profiles: Profile[]; home: string;
+  /** Agent profiles for the start menu; absent from an older build */
+  agentProfiles?: AgentProfileChoice[];
   supervisorProfile?: string | null;
   /** Run once in a terminal to give an outside agent the supervisor tools */
   supervisorCommand?: string;
