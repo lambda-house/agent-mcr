@@ -305,6 +305,10 @@ pub struct ProfileRef {
     /// check of a need's word (16715 L3), which reads the store alone
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<String>,
+    /// The creator's profile it was started under (16771 M2): a refresh is
+    /// lowered to it again, whether or not it was lowered at the start
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<Box<ProfileRef>>,
 }
 
 /// `Tracked.agent_profile` as stored: anything this build cannot read as a
@@ -784,15 +788,17 @@ pub struct Launchable {
     pub text: String,
     pub digest: String,
     pub lowered: bool,
+    /// The creator's profile it is started under, if any
+    pub ceiling: Option<ProfileRef>,
 }
 
 impl Launchable {
     fn of(e: &Entry) -> Self {
-        Launchable { profile: e.profile.clone(), text: e.text.clone(), digest: e.digest.clone(), lowered: false }
+        Launchable { profile: e.profile.clone(), text: e.text.clone(), digest: e.digest.clone(), lowered: false, ceiling: None }
     }
     /// What the session records (`Tracked.agent_profile`)
     pub fn reference(&self) -> ProfileRef {
-        ProfileRef { id: self.profile.id.clone(), version: self.profile.version, role: self.profile.role.as_str().into(), digest: self.digest.clone(), lowered: self.lowered, words: self.profile.contract.owner_words.clone() }
+        ProfileRef { id: self.profile.id.clone(), version: self.profile.version, role: self.profile.role.as_str().into(), digest: self.digest.clone(), lowered: self.lowered, words: self.profile.contract.owner_words.clone(), ceiling: self.ceiling.clone().map(Box::new) }
     }
 }
 
@@ -869,7 +875,7 @@ pub fn pinned(config_dir: &Path, r: &ProfileRef) -> Result<Launchable, String> {
     if profile.id != r.id || profile.version != r.version {
         return Err(missing());
     }
-    Ok(Launchable { profile, text, digest: r.digest.clone(), lowered: r.lowered })
+    Ok(Launchable { profile, text, digest: r.digest.clone(), lowered: r.lowered, ceiling: r.ceiling.as_deref().cloned() })
 }
 
 /// Drop pinned versions that no session in `keep` (digests) names and that
@@ -918,7 +924,7 @@ pub fn bare(adapter_id: &str) -> Option<Launchable> {
     };
     let text = toml::to_string(&p).ok()?;
     let profile = parse(&text, Origin::Builtin).ok()?;
-    Some(Launchable { profile, digest: digest(text.as_bytes()), text, lowered: false })
+    Some(Launchable { profile, digest: digest(text.as_bytes()), text, lowered: false, ceiling: None })
 }
 
 /// The order of the ceiling (16639 9.2): plan and read-only lowest, then
@@ -949,6 +955,21 @@ pub fn lower_of(asked: &Launchable, caller: &AgentProfile) -> Result<(Launchable
             notes.push(format!("permissions.mode {mode} is lowered to {lower}, your own ceiling"));
             p.permissions.mode = Some(lower.to_string());
         }
+    }
+    // A creator that may not edit (Edit or Write denied, or left out of its
+    // only list) cannot reach an adapter without tool lists through the deny
+    // rules: its sandbox takes the read-only rank instead (16771 M1)
+    let edits_denied = ["Edit", "Write"].iter().any(|t| caller.tools.deny.iter().any(|d| d == t) || caller.tools.only.as_ref().is_some_and(|o| !o.iter().any(|x| x == t)));
+    if edits_denied && !can.tools {
+        if let Some(mode) = p.permissions.mode.clone().filter(|m| mode_rank(m) > 0) {
+            let lower = can.modes.iter().find(|m| mode_rank(m) == 0).ok_or_else(|| format!("{} has no read-only mode, and you may not edit", p.adapter))?;
+            notes.push(format!("permissions.mode {mode} is lowered to {lower}: you may not edit, and {} cannot take your deny rules", p.adapter));
+            p.permissions.mode = Some(lower.to_string());
+        }
+    }
+    // Whether MCP writes (report, set_status) pass in plan is not verified (16647 M3)
+    if p.permissions.mode.as_deref() == Some("plan") && asked.profile.permissions.mode.as_deref() != Some("plan") {
+        return Err(format!("Your ceiling would start {} in plan mode, where it is not yet verified that it can report or set its status (MCR-126 M3): start a Codex executor, which runs read-only, or ask the operator", p.id));
     }
     if caller.permissions.push == Push::None && p.permissions.push != Push::None {
         notes.push("permissions.push is lowered to none, as yours".into());
@@ -1002,7 +1023,7 @@ pub fn lower_of(asked: &Launchable, caller: &AgentProfile) -> Result<(Launchable
     let body = toml::to_string(&p).map_err(|e| e.to_string())?;
     let text = format!("# {} v{} lowered to the ceiling of {} v{} (MCR-126 L6)\n{body}", p.id, p.version, caller.id, caller.version);
     let checked = parse(&text, Origin::Operator).map_err(|e| format!("The lowered profile is refused: {e}"))?;
-    Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true }, notes))
+    Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true, ceiling: asked.ceiling.clone() }, notes))
 }
 
 /// The role guide every profile session gets (16639 section 6, as amended
@@ -1090,6 +1111,51 @@ pub fn picker(config_dir: &Path, prefs: &crate::harness_preferences::HarnessPref
             json!({ "id": p.id, "version": p.version, "role": p.role, "adapter": p.adapter, "summary": p.summary, "model": p.inference.model, "effort": p.inference.effort, "mode": p.permissions.mode })
         })
         .collect()
+}
+
+/// The profile a session takes at a restart with `refresh_profile`: as it is
+/// now (a built-in, an approved file, or a bare line), lowered again to the
+/// ceiling it was started under, which is kept pinned (16771 M2)
+pub fn refreshed(config_dir: &Path, r: &ProfileRef) -> Result<Launchable, String> {
+    let now = match r.id.strip_prefix("custom@bare-") {
+        Some(adapter) => bare(adapter).ok_or("That bare agent cannot be started from a profile")?,
+        None => choose(config_dir, &r.id)?,
+    };
+    match r.ceiling.as_deref() {
+        Some(c) => {
+            let cap = pinned(config_dir, c).map_err(|e| format!("The ceiling this session was started under cannot be read ({e}): restart it without refresh_profile"))?;
+            let (mut l, _) = lower_of(&now, &cap.profile)?;
+            l.ceiling = Some(c.clone());
+            Ok(l)
+        }
+        // Lowered without a recorded ceiling: the profile as it is now could be wider
+        None if r.lowered => Err("This session's profile was lowered to a ceiling that is not recorded: restart it without refresh_profile".into()),
+        None => Ok(now),
+    }
+}
+
+/// Writes files under `root` in the config folder, each only when it differs:
+/// no folder is followed through a link and no file is written through one
+/// (16771 L2). `files` are relative paths without `..`
+pub fn write_tree(root: &Path, files: &[(&str, String)]) -> Result<(), String> {
+    real_dir(root)?;
+    for (name, content) in files {
+        let rel = Path::new(name);
+        if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return Err(format!("{name}: not a plain relative path"));
+        }
+        let mut dir = root.to_path_buf();
+        for part in rel.parent().into_iter().flat_map(|p| p.components()) {
+            dir = dir.join(part);
+            real_dir(&dir)?;
+        }
+        let path = root.join(rel);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) && std::fs::read(&path).ok().as_deref() == Some(content.as_bytes()) {
+            continue;
+        }
+        write_private(&dir, rel.file_name().and_then(|n| n.to_str()).ok_or("No file name")?, content.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// What a session is told of its profile in `whoami`: the fields, never the file
@@ -1614,5 +1680,102 @@ mod tests {
         assert_eq!(back, r);
         let old: ProfileRef = serde_json::from_value(json!({"id": "x@y", "version": 1, "role": "custom", "digest": "d"})).unwrap();
         assert!(!old.lowered && old.words.is_empty());
+    }
+
+    /// 16771 M1: a creator that may not edit gives a Codex executor no way to
+    /// edit; L3: no executor is lowered into plan while plan is unverified
+    #[test]
+    fn a_creator_that_may_not_edit_lowers_a_codex_executor_to_read_only() {
+        let dir = Path::new("/nonexistent-config-dir");
+        let get = |id: &str| choose(dir, id).unwrap();
+        let mut validator = get("validator@claude-opus").profile;
+        validator.limits.max_executors = Some(2);
+        let (low, notes) = lower_of(&bare("codex").unwrap(), &validator).unwrap();
+        assert_eq!(low.profile.permissions.mode.as_deref(), Some("read-only"));
+        assert!(notes.iter().any(|n| n.contains("may not edit")), "{notes:?}");
+        // Edits left out of an only list count as denied
+        let mut reader = get("lead@claude-opus").profile;
+        reader.tools.only = Some(vec!["Read".into(), "Grep".into(), "Bash".into()]);
+        assert!(lower_of(&bare("codex").unwrap(), &reader).is_err(), "an only list Codex cannot take still refuses");
+        // A creator that may edit leaves Codex as it is
+        let (same, _) = lower_of(&bare("codex").unwrap(), &get("implementer@claude-opus").profile).unwrap();
+        assert_eq!(same.profile.permissions.mode.as_deref(), Some("workspace-write"));
+        // Below a read-only Codex creator, Claude would run in plan: refused until plan is verified
+        let mut codex = get("validator@codex").profile;
+        codex.permissions.mode = Some("read-only".into());
+        assert!(lower_of(&get("implementer@claude-opus"), &codex).unwrap_err().contains("plan"));
+    }
+
+    /// 16771 M2: a refresh is lowered to the ceiling the session started
+    /// under, also when the profile fitted it then and has widened since
+    #[test]
+    fn a_refresh_is_lowered_to_the_ceiling_it_started_under() {
+        let dir = temp("mcr-refresh-");
+        let backlog = choose(&dir, "backlog@claude-opus").unwrap();
+        pin(&dir, &backlog).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        let file = |mode: &str, version: u32| format!("id = \"custom@mine\"\nversion = {version}\nrole = \"custom\"\nadapter = \"claude\"\n[permissions]\nmode = \"{mode}\"\n[tools]\ndeny = [\"Edit\", \"Write\"]\n[limits]\nmax_executors = 1\n");
+        std::fs::write(dir.join("profiles/mine.toml"), file("manual", 1)).unwrap();
+        approve(&dir, "mine.toml", 1).unwrap();
+        // It fits the backlog creator: started as it is, with the ceiling recorded
+        let (mut started, notes) = lower_of(&choose(&dir, "custom@mine").unwrap(), &backlog.profile).unwrap();
+        assert!(notes.is_empty() && !started.lowered);
+        started.ceiling = Some(backlog.reference());
+        pin(&dir, &started).unwrap();
+        let r = started.reference();
+        // The operator widens it later
+        std::fs::write(dir.join("profiles/mine.toml"), file("acceptEdits", 2)).unwrap();
+        approve(&dir, "mine.toml", 2).unwrap();
+        let again = refreshed(&dir, &r).unwrap();
+        assert_eq!((again.profile.version, again.profile.permissions.mode.as_deref()), (2, Some("manual")));
+        assert!(again.lowered && again.reference().ceiling.is_some());
+        // Without a ceiling it takes the profile as it is now; a lowered one without one refuses
+        assert_eq!(refreshed(&dir, &ProfileRef { ceiling: None, ..r.clone() }).unwrap().profile.permissions.mode.as_deref(), Some("acceptEdits"));
+        assert!(refreshed(&dir, &ProfileRef { ceiling: None, lowered: true, ..r.clone() }).unwrap_err().contains("not recorded"));
+        // A ceiling whose pin is gone refuses
+        std::fs::remove_file(pin_path(&dir, &backlog.profile.id, &backlog.digest).unwrap()).unwrap();
+        assert!(refreshed(&dir, &r).unwrap_err().contains("ceiling"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_picker_offers_usable_profiles_and_never_the_supervisor() {
+        let dir = Path::new("/nonexistent-config-dir");
+        let ids = |enabled: &[&str]| -> Vec<String> {
+            let prefs = crate::harness_preferences::HarnessPreferences { enabled_profiles: enabled.iter().map(|s| s.to_string()).collect(), supervisor_profile: None };
+            picker(dir, &prefs).iter().map(|p| p["id"].as_str().unwrap().to_string()).collect()
+        };
+        let both = ids(&["claude", "codex"]);
+        assert!(both.contains(&"implementer@claude-opus".to_string()) && both.contains(&"validator@codex".to_string()));
+        assert!(!both.iter().any(|id| id.starts_with("supervisor@")));
+        let claude = ids(&["claude"]);
+        assert!(!claude.is_empty() && claude.iter().all(|id| !id.ends_with("codex")));
+        assert!(ids(&[]).is_empty());
+    }
+
+    /// 16771 L2: the role plugin is written without following a link
+    #[test]
+    #[cfg(unix)]
+    fn plugin_files_are_never_written_through_a_link() {
+        let dir = temp("mcr-tree-");
+        let files = [("skills/role/SKILL.md", "role".to_string()), ("a.json", "{}".to_string())];
+        write_tree(&dir.join("plugin"), &files).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("plugin/skills/role/SKILL.md")).unwrap(), "role");
+        // A link in place of a file is replaced, its target untouched
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "keep").unwrap();
+        std::fs::remove_file(dir.join("plugin/a.json")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("plugin/a.json")).unwrap();
+        write_tree(&dir.join("plugin"), &files).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(std::fs::symlink_metadata(dir.join("plugin/a.json")).unwrap().is_file());
+        // A folder that is a link is refused
+        std::fs::remove_dir_all(dir.join("plugin/skills")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("plugin/skills")).unwrap();
+        assert!(write_tree(&dir.join("plugin"), &files).is_err());
+        assert!(std::fs::read_dir(dir.join("elsewhere")).unwrap().next().is_none());
+        assert!(write_tree(&dir.join("plugin"), &[("../x", String::new())]).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

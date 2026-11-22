@@ -2915,30 +2915,15 @@ impl Harness {
     /// in the same folder.
     /// A session started from an agent profile is started again from the
     /// version it ran (its pin, 16647 L5), or with `refresh` from the profile
-    /// as it is now, lowered again to its creator's where it was created by
-    /// one. Both are settled before the old process is ended.
+    /// as it is now, lowered again to the ceiling it was started under (its
+    /// creator's profile, recorded at the start). Both are settled before the
+    /// old process is ended.
     fn restart(&self, id: &str, force: bool, refresh: bool) -> Result<Value, String> {
         let old = self.session(id)?;
-        let (recorded, creator) = {
-            let store = lock(&self.store);
-            let t = store.sessions.get(id);
-            let creator = t.and_then(|t| t.created_by.clone()).and_then(|c| store.sessions.get(&c).and_then(|c| c.agent_profile.clone()));
-            (t.and_then(|t| t.agent_profile.clone()), creator)
-        };
+        let recorded = lock(&self.store).sessions.get(id).and_then(|t| t.agent_profile.clone());
         let launch = match recorded {
             None => None,
-            Some(r) if refresh => {
-                let now = match r.id.strip_prefix("custom@bare-") {
-                    Some(bare) => crate::profiles::bare(bare).ok_or("That bare agent cannot be started from a profile")?,
-                    None => crate::profiles::choose(&self.dir, &r.id)?,
-                };
-                Some(match (r.lowered, creator) {
-                    (true, Some(c)) => crate::profiles::lower_of(&now, &crate::profiles::pinned(&self.dir, &c)?.profile)?.0,
-                    // Without the creator's ceiling the profile as it is now could be wider
-                    (true, None) => return Err("This session's profile was lowered to its creator's, which is no longer here: restart it without refresh_profile".into()),
-                    (false, _) => now,
-                })
-            }
+            Some(r) if refresh => Some(crate::profiles::refreshed(&self.dir, &r)?),
             Some(r) => Some(crate::profiles::pinned(&self.dir, &r)?),
         };
         let profile = old["harness"]["profile"].as_str().unwrap_or("").to_string();
@@ -3130,13 +3115,7 @@ impl Harness {
         let plugin = match role {
             Some(role) if agent.files(&exe, supervisor).iter().any(|(name, _)| name.starts_with("claude-plugin/")) => {
                 let folder = self.dir.join(format!("claude-plugin-{role}"));
-                for (name, content) in role_plugin(role) {
-                    let path = folder.join(name);
-                    if std::fs::read(&path).ok().as_deref() != Some(content.as_bytes()) {
-                        std::fs::create_dir_all(path.parent().unwrap_or(&folder)).map_err(|e| e.to_string())?;
-                        std::fs::write(&path, content).map_err(|e| e.to_string())?;
-                    }
-                }
+                crate::profiles::write_tree(&folder, &role_plugin(role))?;
                 folder
             }
             _ => self.dir.join("claude-plugin"),
@@ -3174,7 +3153,13 @@ impl Harness {
         // The text launched is kept, so a restart starts the same version (L5)
         if let Some(c) = &chosen {
             crate::profiles::pin(&self.dir, c)?;
-            let keep: std::collections::BTreeSet<String> = lock(&self.store).sessions.values().filter_map(|t| t.agent_profile.as_ref().map(|r| r.digest.clone())).collect();
+            // The versions sessions run, and the ceilings they were started under
+            let keep: std::collections::BTreeSet<String> = lock(&self.store)
+                .sessions
+                .values()
+                .filter_map(|t| t.agent_profile.as_ref())
+                .flat_map(|r| std::iter::once(r.digest.clone()).chain(r.ceiling.as_ref().map(|c| c.digest.clone())))
+                .collect();
             crate::profiles::prune_pins(&self.dir, &keep, now_ms());
         }
         spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
@@ -4345,18 +4330,27 @@ impl Harness {
                 let profile = args["profile"].as_str().filter(|p| !p.is_empty()).unwrap_or(mine["harness"]["profile"].as_str().unwrap_or("")).to_string();
                 // Never wider than the creator's own profile (16639 9.2, 16647 L6): an
                 // agent profile, or a bare adapter taken as its bare line, is lowered to it
-                let own = lock(&self.store).sessions.get(me).and_then(|t| t.agent_profile.clone());
-                let own = match own {
-                    Some(r) => Some(crate::profiles::pinned(&self.dir, &r).map_err(|e| format!("Refused: your own profile's ceiling cannot be read, so no executor is started ({e})"))?.profile),
+                let own_ref = lock(&self.store).sessions.get(me).and_then(|t| t.agent_profile.clone());
+                let own = match &own_ref {
+                    Some(r) => Some(crate::profiles::pinned(&self.dir, r).map_err(|e| format!("Refused: your own profile's ceiling cannot be read, so no executor is started ({e})"))?.profile),
                     None => None,
                 };
+                // Its profile's limit on executors, besides the harness's own (16771 M1)
+                if let Some(max) = own.as_ref().and_then(|o| o.limits.max_executors) {
+                    let running = lock(&self.store).executors(me).len();
+                    if running >= max as usize {
+                        return Err(format!("Refused: your profile allows {max} executors, and you have {running}"));
+                    }
+                }
                 let asked = if crate::profiles::is_profile_id(&profile) { Some(crate::profiles::choose(&self.dir, &profile)?) } else { own.as_ref().and_then(|_| crate::profiles::bare(&profile)) };
                 if !adapter(asked.as_ref().map_or(profile.as_str(), |a| a.profile.adapter.as_str())).is_agent() {
                     return Err("An executor is an agent session: a profile id (see whoami and the guide), claude or codex".into());
                 }
                 let (launch, lowered) = match (asked, &own) {
                     (Some(a), Some(own)) => {
-                        let (l, notes) = crate::profiles::lower_of(&a, own)?;
+                        let (mut l, notes) = crate::profiles::lower_of(&a, own)?;
+                        // Recorded whether or not it was lowered, for a refresh (16771 M2)
+                        l.ceiling = own_ref.clone();
                         // A bare request that the ceiling leaves as it was stays a bare launch
                         if notes.is_empty() && !crate::profiles::is_profile_id(&profile) { (None, notes) } else { (Some(l), notes) }
                     }
@@ -6802,7 +6796,19 @@ mod tests {
         // A bare Codex for it is lowered too: its sandbox drops to read-only
         let out = h.agent_tool("lead", "executor_create", &json!({"profile": "codex"})).unwrap();
         assert!(line(3).contains("'--sandbox' 'read-only' '--ask-for-approval' 'on-request'"), "{}", line(3));
-        assert_eq!(lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.as_ref().unwrap().id, "custom@bare-codex");
+        let record = lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.clone().unwrap();
+        assert_eq!(record.id, "custom@bare-codex");
+        // Started under the lead's profile, which is recorded for a refresh (16771 M2)
+        assert_eq!(record.ceiling.as_deref().map(|c| c.id.as_str()), Some("backlog@claude-opus"));
+        // The lead's profile allows two executors: a third is refused (16771 M1)
+        assert!(h.agent_tool("lead", "executor_create", &json!({"profile": "claude"})).unwrap_err().contains("allows 2 executors"));
+        // A validator's allows none, so it starts no Codex that could edit what it reviews
+        let validator = crate::profiles::choose(&dir, "validator@claude-opus").unwrap();
+        crate::profiles::pin(&dir, &validator).unwrap();
+        h.update(|s| {
+            s.sessions.insert("lost".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), agent_profile: Some(validator.reference()), ..Tracked::default() });
+        });
+        assert!(h.agent_tool("lost", "executor_create", &json!({"profile": "codex"})).unwrap_err().contains("allows 0 executors"));
         // What the lead is told of itself
         let me = h.agent_tool("lead", "whoami", &json!({})).unwrap();
         assert_eq!((me["profileDetails"]["mode"].as_str(), me["profileDetails"]["role"].as_str()), (Some("manual"), Some("backlog")));
@@ -6820,7 +6826,7 @@ mod tests {
         assert_eq!(spawned.lock().unwrap().len(), 4);
         // A lowered one whose creator is gone is not refreshed to the wider profile
         h.update(|s| s.sessions.get_mut("lost").unwrap().agent_profile = Some(crate::profiles::ProfileRef { lowered: true, ..recorded.clone() }));
-        assert!(h.tool("session_restart", &json!({"session": "lost", "refresh_profile": true})).unwrap_err().contains("no longer here"));
+        assert!(h.tool("session_restart", &json!({"session": "lost", "refresh_profile": true})).unwrap_err().contains("not recorded"));
 
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
