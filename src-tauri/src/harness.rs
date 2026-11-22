@@ -2239,6 +2239,16 @@ fn drop_prompt(tracked: &mut Tracked) {
     }
 }
 
+/// A prompt is marked in front of the session's own report (MCR-132): the
+/// report stays open behind it (`open`, from `Store::open_report`), and its
+/// mark comes back once the prompt is gone (`raise_pending`), as for a
+/// report made at a prompt (M7). Call it before the prompt's mark is set.
+fn keep_behind_prompt(tracked: &mut Tracked, open: &Option<String>) {
+    if tracked.attention.as_ref().is_some_and(|a| a.report.is_some()) {
+        tracked.pending_report = open.clone();
+    }
+}
+
 /// A prompt of the session was answered: it moved on (MCR-122). The keys
 /// that answered it (a digit, which Claude Code takes without Enter, an
 /// arrow) reached the app as typing and may have left a "draft" there, which
@@ -2289,11 +2299,13 @@ enum Seen {
 /// fallback for prompts no hook reports, as Codex's approval requests.
 /// Returns true when the session started to wait.
 fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
+    let open = store.open_report(session).map(|r| r.id.clone());
     // Nothing is asked in the terminal of a session that ended (a late title, a last screen)
     let Some(tracked) = store.sessions.get_mut(session).filter(|t| t.state != ENDED) else { return false };
     let prompt = tracked.attention.as_ref().filter(|a| a.kind == "permission" && a.report.is_none());
     match (seen, prompt) {
         (Seen::Asking(text), None) => {
+            keep_behind_prompt(tracked, &open);
             // What the screen showed may be a command line: in memory only
             tracked.attention = Some(Attention { kind: "permission".into(), text, since: now, guess: true, was: tracked.state.clone(), unsaved: true, ..Attention::default() });
             store.set_state(session, "waiting");
@@ -2321,6 +2333,7 @@ fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
 /// What a hook event does to a session. Returns true when the session became
 /// ready for its next queued task.
 fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) -> bool {
+    let open = store.open_report(session).map(|r| r.id.clone());
     // A hook that arrives after the end changes nothing: no mark, no state, no task typed
     let Some(tracked) = store.sessions.get_mut(session).filter(|t| t.state != ENDED) else { return false };
     let text = |v: &Value| v.as_str().map(|s| s.chars().take(MAX_TEXT).collect::<String>());
@@ -2376,6 +2389,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
                     None => tracked.state.clone(),
                 };
                 tracked.precise = true;
+                keep_behind_prompt(tracked, &open);
                 tracked.attention = Some(Attention { kind: "permission".into(), text: asks, since: now_ms(), was, unsaved: true, ..Attention::default() });
                 store.set_state(session, "waiting");
                 return false;
@@ -2437,6 +2451,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
             // A prompt the harness did not type is the operator's: they have seen the report
             if event == "UserPromptSubmit" && now_ms().saturating_sub(tracked.injected) > INJECTED_PROMPT_MS {
                 tracked.attention = None;
+                tracked.pending_report = None;
             }
             store.set_state(session, "working");
             false
@@ -2445,6 +2460,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
             let kind = payload["notification_type"].as_str().unwrap_or("");
             if kind == "permission_prompt" || kind == "elicitation_dialog" {
                 let message = text(&payload["message"]).unwrap_or_else(|| "The agent is waiting for your answer".into());
+                keep_behind_prompt(tracked, &open);
                 tracked.attention = Some(Attention { kind: "permission".into(), text: message, since: now_ms(), ..Attention::default() });
                 store.set_state(session, "waiting");
             }
@@ -3473,7 +3489,8 @@ impl Harness {
             let known = tracked.is_some_and(|t| adapter(&t.profile).is_agent());
             if known {
                 s.set_state(session, "working");
-                if let Some(t) = s.sessions.get_mut(session) {
+                // What it reported itself stays: a task typed in is not the owner's answer (MCR-132)
+                if let Some(t) = s.sessions.get_mut(session).filter(|t| t.attention.as_ref().is_some_and(|a| a.report.is_none())) {
                     t.attention = None;
                 }
             }
@@ -4588,6 +4605,7 @@ impl Harness {
             Some("notify") => {
                 let body = event["body"].as_str().or(event["title"].as_str()).unwrap_or("").to_string();
                 let raised = self.update(|s| {
+                    let open = s.open_report(id).map(|r| r.id.clone());
                     let tracked = s.sessions.get_mut(id)?;
                     // An agent that reports through hooks: its terminal notifications would only repeat them
                     if adapter(&tracked.profile).reports_from_start() || tracked.state == "waiting" || tracked.state == ENDED {
@@ -4599,6 +4617,9 @@ impl Harness {
                         return None;
                     }
                     let was = if approval { tracked.state.clone() } else { String::new() };
+                    if approval {
+                        keep_behind_prompt(tracked, &open);
+                    }
                     tracked.attention = Some(Attention { kind: if approval { "permission" } else { "notification" }.into(), text: body.clone(), since: now_ms(), was, unsaved: approval, ..Attention::default() });
                     if approval {
                         s.set_state(id, "waiting");
@@ -7088,6 +7109,93 @@ mod tests {
         assert!(lock(&h.store).sessions["a"].attention.is_none() && lock(&h.store).open_report("a").is_none());
         // The guide explains needs, and that a relayed go is not the owner's word (H2)
         assert!(REPORT_GUIDE.contains("kind: \"closed\"") && REPORT_GUIDE.contains("is not the owner's word") && PEER_GUIDE.contains("is not the owner's word"));
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// MCR-132: an open needs_human report with its need stays open, with its
+    /// mark, through what the session does next: a status report, the hooks of
+    /// its turn, a task typed in, a permission prompt. The owner's Enter there
+    /// answers it.
+    #[test]
+    fn a_status_report_leaves_an_open_need_and_its_mark_as_they_are() {
+        let dir = socket_test_dir("mcr-132-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": [
+                        {"id": "lead", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "root", "cwd": "/tmp", "meta": {"profile": "claude", "role": "supervisor"}}
+                    ]}),
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        *lock(&h.typed) = Some(Vec::new());
+        h.update(|s| {
+            for id in ["lead", "root"] {
+                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "working".into(), hooked: true, precise: true, ..Tracked::default() });
+            }
+            s.bind("lead", Some("root")).unwrap();
+        });
+        let asked = h.agent_tool("lead", "report", &json!({"kind": "needs_human", "text": "Go for gate 2c?", "need": {"id": "gate", "ask": "question"}})).unwrap();
+        let rid = asked["report"].as_str().unwrap().to_string();
+        let open = |h: &Harness| {
+            let s = lock(&h.store);
+            let mark = s.sessions["lead"].attention.as_ref().and_then(|a| a.report.clone());
+            (mark, s.open_report("lead").map(|r| r.id.clone()))
+        };
+        let shown = |h: &Harness| {
+            let overview = h.tool("overview", &json!({})).unwrap();
+            let lead = overview["sessions"].as_array().unwrap().iter().find(|x| x["id"] == "root").unwrap()["executors"][0].clone();
+            let waiting = h.tool("attention_list", &json!({})).unwrap()["waiting"].as_array().unwrap().iter().any(|w| w["session"] == "lead");
+            let all = h.tool("cockpit_read", &json!({})).unwrap();
+            let action = all["actions"].as_array().unwrap().iter().find(|a| a["id"] == "gate").cloned().unwrap_or(Value::Null);
+            (lead["lastOpenReport"]["id"].clone(), waiting, action["live"]["reportOpen"].clone())
+        };
+        let standing = (Some("needs_human".to_string()), Some(rid.clone()));
+        let listed = (json!(rid), true, json!(true));
+        assert_eq!((open(&h), shown(&h)), (standing.clone(), listed.clone()));
+        // The rest of its turn, then a status report and the hooks of that turn
+        h.hook("lead", "PostToolUse", &json!({}));
+        h.hook("lead", "Stop", &json!({"last_assistant_message": "Waiting for the owner"}));
+        // An inbox notice the harness typed starts its next turn
+        h.update(|s| s.sessions.get_mut("lead").unwrap().injected = now_ms());
+        h.hook("lead", "UserPromptSubmit", &json!({}));
+        let status = h.agent_tool("lead", "report", &json!({"kind": "status", "text": "Round 1 done; gate 2c waits for the owner"})).unwrap();
+        assert_eq!(status["kind"], "status");
+        h.hook("lead", "PostToolUse", &json!({}));
+        h.hook("lead", "Stop", &json!({"last_assistant_message": "Status reported"}));
+        assert_eq!((open(&h), shown(&h)), (standing.clone(), listed.clone()));
+        // A task typed in by the harness is not the owner's answer
+        h.update(|s| {
+            s.tasks.insert("t1".into(), Task { id: "t1".into(), session: "lead".into(), text: "Next round".into(), state: "queued".into(), created: 1, started: 0, finished: 0, result: None, by: String::new(), told: false });
+        });
+        h.pump("lead");
+        assert_eq!(lock(&h.store).tasks["t1"].state, "working");
+        assert_eq!((open(&h), shown(&h)), (standing.clone(), listed.clone()));
+        // A permission prompt stands in front of it, and when it is answered the report's mark is back
+        h.hook("lead", "Notification", &json!({"notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"}));
+        assert_eq!(lock(&h.store).sessions["lead"].attention.as_ref().unwrap().kind, "permission");
+        assert_eq!(open(&h).1, Some(rid.clone()));
+        assert_eq!(shown(&h), listed);
+        h.hook("lead", "PostToolUse", &json!({}));
+        assert_eq!((open(&h), shown(&h)), (standing, listed));
+        // The owner's Enter in the session answers it
+        h.control(&json!({"op": "operator_input", "id": "lead", "draft": false})).unwrap();
+        assert_eq!(open(&h), (None, None));
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
