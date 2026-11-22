@@ -93,6 +93,85 @@ export function foldRows(rows: CockpitAction[], open: ReadonlySet<string>): { sh
   return { shown, folded };
 }
 
+/**
+ * The track a need belongs to in the one view (MCR-131), or null for the
+ * Unassigned group:
+ * 1. its own `track` (of its publisher's part, or of `trackBy`), when that track exists;
+ * 2. else the first track, in published order, led by its session (`where.session`,
+ *    else its publisher's own box) or by the nearest supervisor above that session;
+ * 3. else, when that session is the root Supervisor, the first track the Supervisor published.
+ * A need whose track was removed (`trackMissing`) is Unassigned. The relation
+ * between sessions is the Live list's (`supervisor`), so a session that left
+ * the list is attached by its own lead only.
+ */
+export function attachTrack(a: CockpitAction, tracks: CockpitTrack[], hosted: Hosted[]): CockpitTrack | null {
+  if (a.trackMissing) return null;
+  if (a.track) {
+    const own = tracks.find(t => t.id === a.track && t.by === (a.trackBy ?? a.by ?? t.by));
+    if (own) return own;
+  }
+  const session = a.where?.session || a.by;
+  if (!session) return null;
+  const root = hosted.find(h => !h.exit && isSupervisor(h));
+  // The root Supervisor's part key and its session are the same session
+  const canon = (id: string) => (root && id === root.id ? ROOT_PART : id);
+  const byId = new Map(hosted.map(h => [h.id, h]));
+  const seen = new Set<string>();
+  for (let at: string | undefined = session; at && !seen.has(canon(at)); at = byId.get(at)?.harness?.supervisor || undefined) {
+    seen.add(canon(at));
+    const id = canon(at);
+    const led = tracks.find(t => canon(t.lead) === id);
+    if (led) return led;
+  }
+  if (canon(session) === ROOT_PART) return tracks.find(t => t.by === ROOT_PART) ?? null;
+  return null;
+}
+
+/** What the harness itself saw among a group's needs, for its header row: each kind once, a prompt first. */
+export function harnessMarks(rows: CockpitAction[]): string[] {
+  const has = (derived: CockpitAction['derived'], live: (l: NonNullable<CockpitAction['live']>) => unknown) => rows.some(a => a.derived === derived || (!a.derived && a.live && live(a.live)));
+  return [
+    has('prompt', l => l.prompt) ? 'at a prompt' : '',
+    has('held', l => l.held) ? 'unsent line' : '',
+    has('report', l => l.report) ? 'open report' : '',
+    has('wait', l => l.waits?.length) ? 'late wait' : '',
+  ].filter(Boolean);
+}
+
+/** A track of the one view with its needs, or the Unassigned group (`track` null). */
+export interface NeedGroup {
+  track: CockpitTrack | null;
+  /** Shown, in the order of `needsYouRows` */
+  rows: CockpitAction[];
+  /** Per publisher, how many of this group's rows are folded away */
+  folded: Map<string, number>;
+  /** What the harness saw among them (`harnessMarks`) */
+  marks: string[];
+}
+
+/**
+ * The one "Tracks and needs" view (MCR-131): every track in published order,
+ * each with its needs, and an Unassigned group first when it holds any. Inside
+ * a group the needs keep the order of `needsYouRows`; the per-publisher fold
+ * (`foldRows`) is counted over the whole view, so one session cannot fill it
+ * by spreading its rows over tracks. `open` holds the unfolded publishers.
+ */
+export function oneView(cockpit: Cockpit, hosted: Hosted[], open: ReadonlySet<string>): { unassigned: NeedGroup | null; tracks: NeedGroup[]; all: CockpitAction[] } {
+  const all = needsYouRows(cockpit);
+  const { shown } = foldRows(all, open);
+  const visible = new Set(shown);
+  const groups = new Map<CockpitTrack | null, NeedGroup>([[null, { track: null, rows: [], folded: new Map(), marks: [] }]]);
+  for (const t of cockpit.tracks) groups.set(t, { track: t, rows: [], folded: new Map(), marks: [] });
+  for (const a of all) {
+    const g = groups.get(attachTrack(a, cockpit.tracks, hosted))!;
+    if (visible.has(a)) g.rows.push(a);
+    else if (a.by) g.folded.set(a.by, (g.folded.get(a.by) ?? 0) + 1);
+  }
+  for (const g of groups.values()) g.marks = harnessMarks(g.rows);
+  const unassigned = groups.get(null)!;
+  return { unassigned: unassigned.rows.length || unassigned.folded.size ? unassigned : null, tracks: cockpit.tracks.map(t => groups.get(t)!), all };
+}
+
 /** Whether a click on this part of a published action is offered: it still stands, the panel knows its stamp, and the service has not said that its text would be refused. */
 export function clickable(a: CockpitAction, part: 'say' | 'options' | 'url' | 'command' | 'ask'): boolean {
   if (a.derived || !a.by || !a.updated) return false;
