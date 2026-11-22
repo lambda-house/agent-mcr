@@ -4,7 +4,7 @@ import ConfirmDialog from './ConfirmDialog';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
-import { ACTION_KIND, actionSource, clickable, foldRows, harnessChips, harnessSaw, liveFacts, named, needsYouRows, shownUrgency, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
+import { ACTION_KIND, actionSource, ageTitle, clickable, foldRows, harnessChips, harnessSaw, isOld, liveFacts, named, needsYouRows, shownUrgency, staleMarks, stillAwaits, trackPublisher, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
 import { harnessApi, type Cockpit, type CockpitAct, type CockpitAction, type CockpitLink, type CockpitTrack, type Hosted } from '../utils/harness';
 
 /**
@@ -34,6 +34,8 @@ const store = (key: string, value: string) => { try { localStorage.setItem(key, 
 function SessionLink({ who, onSession }: { who: Named; onSession: (id: string) => void }) {
   // Running by the service's word, not in the list yet: named, and not called ended
   if (!who.hosted && who.standing === 'running') return <span className="ck-session you" title={`${who.name}: not in the session list yet`}>{who.name}</span>;
+  // A gone session the cockpit kept no name of is said in words, its id only in the tooltip (MCR-127)
+  if (!who.hosted && who.standing === 'gone' && who.name === who.id) return <span className="ck-session gone" title={`mcr:${who.id}: the harness has no such session any more`}>a gone session</span>;
   if (!who.hosted) return <span className="ck-session gone" title={`${who.name}: ${who.standing === 'gone' ? 'the harness has no such session any more' : 'this session ended'}`}>{who.name}{who.standing === 'gone' ? ' (gone)' : ' (ended)'}</span>;
   const h = who.hosted;
   return <button type="button" className="ck-session" title={`Open ${who.name}`} onClick={() => onSession(h.id)}>{who.name}</button>;
@@ -161,7 +163,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
       )}
       {said && <p className={said.bad ? 'ck-said bad' : 'ck-said'} role={said.bad ? 'alert' : 'status'}>{said.text}</p>}
       <p className="ck-source">
-        {actionSource(a, publisher ? publisher.name : 'a session')}
+        <span className={!a.derived && isOld(a) ? 'ck-old' : undefined} title={a.derived ? undefined : ageTitle(a)}>{actionSource(a, publisher ? publisher.name : 'a session')}</span>
         {track && <span>track: {track.title}</span>}
         {a.trackMissing && <span className="ck-stale">its track was removed</span>}
         {a.blocks?.length ? <span>blocks: {a.blocks.join(', ')}</span> : null}
@@ -195,30 +197,27 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
   const waits = trackWaits(t, id => who(id).name);
   const items = t.items ?? [];
   const state = trackStateShown(t);
-  // Who wrote the text is not always who leads the work: the Supervisor publishes tracks led by others
-  const publishedByOther = t.by !== t.lead;
-  const age = `${publishedByOther ? `by ${who(t.by).name} · ` : ''}${t.updated ? formatAge(t.updated) : ''}`;
+  // Who wrote the text, when it is neither the lead nor the Supervisor whose panel this is (MCR-127)
+  const publisher = trackPublisher(t);
   return (
-    <li className={`ck-track ${t.state}${state.tone === 'stale' ? ' stale' : ''}`} data-track={t.id}>
+    <li className={`ck-track ${t.state}${state.old ? ' old' : ''}`} data-track={t.id}>
       <div className="ck-track-line">
         <button type="button" className="ck-expand" aria-expanded={open} aria-label={`${open ? 'Hide' : 'Show'} the items of ${t.title}`} disabled={!items.length} onClick={() => setOpen(o => !o)}>
           {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}
         </button>
         <span className={`ck-state ${state.tone}`} title={state.tone === 'answered' ? 'From the harness: you pressed Enter in the lead session\'s terminal after this track was published as waiting for you. Its publisher was told to update it' : undefined}>{state.text}</span>
         <strong className="ck-track-title">{t.title}</strong>
-        {/* Who and when give way to the title: cut with an ellipsis, whole in the tooltip, and on a
-            line of their own under the title when the column is narrow (MCR-105) */}
+        {/* Who leads and when, never cut: beside the title when both fit, else on the next line (MCR-127) */}
         <span className="ck-track-meta">
-          {publishedByOther && <span className="ck-role">lead</span>}
+          {publisher && <span className="ck-role">lead</span>}
           <SessionLink who={lead} onSession={onSession}/>
+          {publisher && <span className="ck-role">by {who(publisher).name}</span>}
           <Stale marks={staleMarks(t, cockpit, hosted, label)}/>
-          <span className="ck-age" title={age || undefined}>{age}</span>
+          {t.updated ? <span className={state.old ? 'ck-age ck-old' : 'ck-age'} title={ageTitle(t)}>{formatAge(t.updated)}</span> : null}
         </span>
       </div>
-      {(t.line || waits.length > 0) && <div className="ck-track-sub">
-        {t.line && <span className="ck-line" title={t.line}>{t.line}</span>}
-        {waits.length > 0 && <span className="ck-waits">waits on {waits.join(', ')}</span>}
-      </div>}
+      {t.line && <p className="ck-track-text">{t.line}</p>}
+      {waits.length > 0 && <p className="ck-track-text ck-track-waits">waits on {waits.join(', ')}</p>}
       {open && (
         <div className="ck-track-body">
           {lead.hosted && (() => {
