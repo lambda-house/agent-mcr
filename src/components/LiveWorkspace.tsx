@@ -2,7 +2,7 @@ import { basename as base, isAbsolutePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
-import { Button, Dialog } from '@/ui';
+import { Button, ConfirmDialog, Dialog, Menu } from '@lambda-house/ui';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
@@ -12,7 +12,6 @@ import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics'
 import { EarlierRow, HostedRow, hostedDetail, needsYou, ProgramLine } from './SessionRow';
 import { canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { useStore } from '../store';
-import ConfirmDialog from './ConfirmDialog';
 import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
 import { liveNav } from '../utils/liveNav';
 import { PLATFORM } from '../utils/platform';
@@ -40,25 +39,17 @@ const storedWidth = (): number | null => {
 interface Action { label: string; icon: React.ReactNode; run: () => void }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
-function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean }) {
+function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false, wrapItems = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean; wrapItems?: boolean }) {
   const [at, setAt] = useState<{ top: number; right: number } | null>(null);
   const wrap = useRef<HTMLSpanElement>(null);
-  useEffect(() => {
-    if (!at) return;
-    const outside = (e: MouseEvent) => { if (!wrap.current?.contains(e.target as Node)) setAt(null); };
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setAt(null); };
-    document.addEventListener('mousedown', outside); document.addEventListener('keydown', key);
-    return () => { document.removeEventListener('mousedown', outside); document.removeEventListener('keydown', key); };
-  }, [at]);
   return <span className={className} ref={wrap}>
     <button type="button" className={buttonClassName} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={e => {
       // Fixed position: the list scrolls and would clip a menu placed inside it
       const box = e.currentTarget.getBoundingClientRect();
       setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
     }}>{icon ?? <MoreHorizontal size={14}/>}</button>
-    {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }} onKeyDown={e => { if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return; e.preventDefault(); const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('button')); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); buttons[(index + (e.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus(); }}>
-      {actions.map(a => <button key={a.label} type="button" role="menuitem" onClick={() => { setAt(null); a.run(); }}>{a.icon} {a.label}</button>)}
-    </div>}
+    {at && <Menu label={label} at={at} anchorRef={wrap} wrap={wrapItems} onClose={() => setAt(null)}
+      items={actions.map(a => ({ key: a.label, label: a.label, icon: a.icon, onSelect: a.run }))}/>}
   </span>;
 }
 
@@ -596,7 +587,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
 
   const closeNewAgent = () => { setNewAgentOpen(false); setProjectFilter(''); setResume(''); };
   const defaultNewAgent = () => (
-    <Dialog open={newAgentOpen} onClose={closeNewAgent} title="New agent" footer={<>
+    <Dialog open={newAgentOpen} onClose={closeNewAgent} title="New agent" size="lg" footerLayout="spread" footer={<>
       <Button variant="ghost" size="sm" onClick={closeNewAgent}>Cancel</Button>
       <button type="button" className="hs-start hs-start--solid" disabled={!status || (!selectedResume && !status.profiles.some(p => p.id === profile)) || (!cwd && !selectedResume) || starting} onClick={() => void start(profile, cwd, selectedResume?.id ?? '')}>
         <Play size={12}/> {starting ? 'Starting…' : selectedResume ? `Resume ${selectedResume.agent === 'claude' ? 'Claude' : 'Codex'}` : `Start ${(status?.profiles ?? []).find(p => p.id === profile)?.label ?? profile}`}
@@ -719,7 +710,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
       <div className="hs-add">
         <Button variant="ghost" size="sm" title="Choose a folder to work in" aria-label="Add project" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}><Plus size={14}/> Add project</Button>
       </div>
-      <RowMenu className="hs-notifications-wrap" buttonClassName="hs-notifications" label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
+      <RowMenu className="hs-notifications-wrap" buttonClassName="hs-notifications" wrapItems label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
         icon={<><BellRing size={14}/> Notifications{waiting.length > 0 && ` · ${waiting.length}`}</>}
         actions={waiting.map(h => ({ label: `${sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
       {gate && <BackgroundGate stopped={gate === 'stopped'} onAllowed={connect}/>}

@@ -181,7 +181,7 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
     await act(async () => ([...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes('Shell')) as HTMLButtonElement).click()); await flush();
     expect(host.querySelector('[data-terminal="e1"]')).not.toBeNull();
     await act(async () => (host.querySelector('.hs-cleanup') as HTMLButtonElement).click());
-    await act(async () => ([...document.querySelectorAll('.modal button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
+    await act(async () => ([...document.querySelectorAll('[role="alertdialog"] button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
     expect(host.querySelector('[data-terminal="e1"]')).toBeNull();
     expect(host.querySelector('[role="alert"]')!.textContent).toContain('1 of 2 ended sessions could not be removed: runner unreachable');
   });
@@ -194,7 +194,7 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
     const cleanup = host.querySelector('.hs-cleanup') as HTMLButtonElement;
     expect(cleanup.textContent).toContain('Remove ended sessions · 2');
     await act(async () => cleanup.click());
-    const dialog = document.querySelector('.modal')!;
+    const dialog = document.querySelector('[role="alertdialog"]')!;
     expect(dialog.textContent).toContain('Remove 2 ended sessions from the list?');
     expect(dialog.textContent).toContain('conversations stay on disk');
     expect(harnessApi.forget).not.toHaveBeenCalled();
@@ -202,7 +202,7 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
     await act(async () => ([...dialog.querySelectorAll('button')].find(b => b.textContent === 'Cancel') as HTMLButtonElement).click());
     expect(harnessApi.forget).not.toHaveBeenCalled();
     await act(async () => cleanup.click());
-    await act(async () => ([...document.querySelectorAll('.modal button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
+    await act(async () => ([...document.querySelectorAll('[role="alertdialog"] button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
     expect(vi.mocked(harnessApi.forget).mock.calls.map(c => c[0]).sort()).toEqual(['e1', 'e2']);
     expect(harnessApi.signal).not.toHaveBeenCalled();
   });
@@ -579,7 +579,7 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     await act(async () => button('Notifications').click());
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-    expect(items.map(b => b.textContent)).toEqual([' Reviewer: Which branch?', ' Builder: Build passed']);
+    expect(items.map(b => b.textContent)).toEqual(['Reviewer: Which branch?', 'Builder: Build passed']);
     await act(async () => items[1].click()); await flush();
     expect(host.querySelector('.hs-pane:not([hidden]) [data-terminal="done"]')).not.toBeNull();
     expect(harnessApi.ack).toHaveBeenCalledWith('done', 6);

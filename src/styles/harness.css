@@ -1,7 +1,4 @@
-/* Live view: hosted agent terminals (inside .session-cockpit; colours from @lambda-house/tokens) */
-.hs-view-switch { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; }
-.session-cockpit .hs-view-switch button { height: 23px; padding: 0 9px; border: 0; border-radius: 4px; background: transparent; color: var(--text-muted); font-size: 11px; font-weight: 500; gap: 5px; }
-.session-cockpit .hs-view-switch button[aria-current='page'] { color: var(--text); background: var(--surface-2); }
+
 
 /* Nothing in the Live view may spill into the scrolling Sessions area: a scroll bar that comes and goes there changes the terminal's size, which refits it, which brings the bar back */
 .hs-live-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; overflow: hidden; background: var(--canvas); }
@@ -80,12 +77,6 @@
 .hs-past-edit-actions button { border: 1px solid var(--line); background: var(--layer-2); color: var(--text-soft); border-radius: 5px; padding: 2px 6px; cursor: pointer; display: inline-flex; align-items: center; }
 .hs-past-edit-actions button:hover { color: var(--text); border-color: var(--line-strong); }
 .hs-past-warn { font-size: 10px; color: var(--warn); background: var(--warn-bg); padding: 1px 5px; border-radius: 999px; }
-
-/* New agent modal (airy Command Palette + Project Session prototypes) */
-.ui-dialog:has(.hs-modal-body) { width: min(580px, 100%); }
-.ui-dialog:has(.hs-modal-body) .ui-dialog__header { padding: 18px 22px 12px; }
-.ui-dialog:has(.hs-modal-body) .ui-dialog__body { padding: 4px 22px 20px; }
-.ui-dialog:has(.hs-modal-body) .ui-dialog__footer { padding: 14px 22px 18px; justify-content: space-between; }
 
 .hs-modal-body { display: flex; flex-direction: column; gap: 18px; }
 
@@ -175,11 +166,8 @@
 .hs-actions { display: flex; flex: 0 0 auto; padding-right: 4px; opacity: 0.45; transition: opacity .12s ease; }
 .hs-list li:hover .hs-actions, .hs-list li.selected .hs-actions, .hs-supervisor:hover .hs-actions, .hs-actions:focus-within { opacity: 1; }
 .hs-supervisor-open strong .hs-dot { display: inline-block; margin: 0 0 1px 7px; }
-.hs-menu { position: fixed; z-index: 30; min-width: 170px; display: flex; flex-direction: column; padding: 4px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); box-shadow: var(--shadow-lg); }
-.session-cockpit .hs-menu button { justify-content: flex-start; gap: 7px; padding: 6px 8px; border: 0; border-radius: 5px; background: transparent; color: var(--text); font-size: 12px; text-align: left; }
-.session-cockpit .hs-menu button:hover { background: var(--layer-2); color: var(--text); }
-.session-cockpit .hs-actions button { padding: 4px; border-color: transparent; background: transparent; color: var(--text-muted); }
-.session-cockpit .hs-actions button:hover { color: var(--text); }
+.session-cockpit .hs-actions > button { padding: 4px; border-color: transparent; background: transparent; color: var(--text-muted); }
+.session-cockpit .hs-actions > button:hover { color: var(--text); }
 .hs-empty { padding: 10px 8px; color: var(--text-muted); font-size: 12px; }
 
 .hs-terminals { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; margin: 8px 8px 8px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-1); overflow: hidden; }
@@ -436,9 +424,6 @@
 .session-cockpit :is(.hs-add button, .hs-notifications) { border: 1px solid transparent; background: transparent; box-shadow: none; }
 .session-cockpit :is(.hs-add button, .hs-notifications):hover:not(:disabled) { background: var(--layer-1); }
 .hs-notifications-wrap { display: block; }
-.hs-notifications-wrap .hs-menu { max-width: min(420px, calc(100vw - 24px)); max-height: 50vh; overflow: auto; }
-.hs-notifications-wrap .hs-menu button { white-space: normal; overflow-wrap: anywhere; }
-.hs-notifications-wrap .hs-menu svg { flex: 0 0 14px; }
 /* Board: reports to the person, and the notes sessions left for each other */
 .hs-board { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 0; overflow: hidden; }
 .hs-board > .hs-error { grid-column: 1 / -1; }
@@ -650,9 +635,6 @@
 .ck-link dt { color: var(--text-muted); }
 .ck-link dd { margin: 0; font-family: var(--font-mono, monospace); overflow-wrap: anywhere; word-break: break-all; user-select: text; }
 .ck-link-warn { color: var(--danger); font-weight: 600; }
-/* Copy as task (MCR-125 v0): the right-click menu on a selection, and its dialog */
-.hs-menu.tc-menu button { display: flex; justify-content: flex-start; padding: 6px 10px; border: 0; border-radius: 5px; background: transparent; color: var(--text); font-size: 12px; text-align: left; cursor: pointer; }
-.hs-menu.tc-menu button:hover, .hs-menu.tc-menu button:focus-visible { background: var(--layer-2); }
 .modal.tc-dialog { width: min(640px, calc(100vw - 32px)); min-width: 0; max-width: none; max-height: calc(100vh - 32px); display: flex; flex-direction: column; overflow: auto; }
 .modal.tc-dialog p { margin-bottom: 10px; }
 .tc-dialog .tc-source { font-size: var(--font-size-sm); }

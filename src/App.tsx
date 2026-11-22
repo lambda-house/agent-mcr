@@ -1,5 +1,6 @@
 import React, { useEffect, useCallback, useMemo, useState } from 'react';
 import { useStore, PANEL_MIN_WIDTH, TOC_MIN_WIDTH, type Heading, type RestoredDocument } from './store';
+import { Splitter } from '@lambda-house/ui';
 import {
   isTauri,
   readFile,
@@ -14,7 +15,6 @@ import Toolbar from './components/Toolbar';
 import AgentPanel from './components/AgentPanel';
 import DocumentPanel from './components/DocumentPanel';
 import TocSidebar from './components/TocSidebar';
-import Resizer from './components/Resizer';
 import StatusBar from './components/StatusBar';
 import SettingsModal from './components/SettingsModal';
 import SaveAllDialog from './components/SaveAllDialog';
@@ -414,7 +414,7 @@ const App: React.FC = () => {
       <div className="main-content">
         {filePanelVisible && <AgentPanel width={panelWidth} />}
 
-        {!documentWindowPath && <Resizer
+        {!documentWindowPath && <Splitter
           side="left"
           width={panelWidth}
           minWidth={PANEL_MIN_WIDTH}
@@ -426,7 +426,7 @@ const App: React.FC = () => {
 
         <DocumentPanel onHeadingsChange={handleHeadingsChange} />
 
-        <Resizer
+        <Splitter
           side="right"
           width={tocWidth}
           minWidth={TOC_MIN_WIDTH}

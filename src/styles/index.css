@@ -185,6 +185,10 @@ a:hover {
   background: var(--surface-bg);
 }
 
+/* Documents and Sessions: both stay mounted, so returning restores the selected session/tab */
+.workspace-surface { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
+.workspace-surface[hidden] { display: none; }
+
 .main-content {
   display: flex;
   flex: 1;
@@ -387,95 +391,6 @@ a:hover {
 }
 
 /* ============================================================
-   Resizer
-   ============================================================ */
-
-.resizer {
-  width: 4px;
-  cursor: col-resize;
-  background: transparent;
-  transition: background var(--transition-fast);
-  position: relative;
-  z-index: 10;
-}
-
-.resizer:hover,
-.resizer.active {
-  background: var(--border-active);
-}
-
-.resizer::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: -4px;
-  right: -4px;
-}
-
-/* Hidden panel: the separator stays at the window edge */
-.resizer.collapsed {
-  background: var(--border-subtle);
-}
-
-.resizer.collapsed::before {
-  /* Wider grab area, but only on the window-interior side */
-  left: 0;
-  right: 0;
-}
-
-.resizer-left.collapsed::before {
-  right: -8px;
-}
-
-.resizer-right.collapsed::before {
-  left: -8px;
-}
-
-.resizer-grip {
-  position: absolute;
-  top: 50%;
-  width: 14px;
-  height: 48px;
-  margin-top: -24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--surface-overlay);
-  border: 1px solid var(--border-default);
-  color: var(--text-secondary);
-  box-shadow: var(--shadow-md);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--transition-normal), transform var(--transition-normal);
-}
-
-.resizer-left .resizer-grip {
-  left: 0;
-  border-left: none;
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  transform: translateX(-100%);
-}
-
-.resizer-right .resizer-grip {
-  right: 0;
-  border-right: none;
-  border-radius: var(--radius-md) 0 0 var(--radius-md);
-  transform: translateX(100%);
-}
-
-.resizer.reveal .resizer-grip {
-  opacity: 1;
-  pointer-events: auto;
-  cursor: pointer;
-  transform: translateX(0);
-}
-
-.resizer.reveal {
-  background: var(--border-active);
-}
-
-/* ============================================================
    File Panel
    ============================================================ */
 
@@ -487,49 +402,6 @@ a:hover {
   overflow: hidden;
   min-width: var(--panel-min-width);
   max-width: var(--panel-max-width);
-}
-
-.file-panel-header {
-  height: 40px;
-  min-height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-.file-panel-title {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-secondary);
-}
-
-.file-panel-actions {
-  display: flex;
-  gap: 4px;
-}
-
-.file-panel-action {
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  transition: all var(--transition-fast);
-}
-
-.file-panel-action:hover {
-  background: var(--hover-bg);
-  color: var(--text-primary);
-}
-
-.file-panel-action.spinning svg {
-  animation: spin 1s linear infinite;
 }
 
 @keyframes spin {
@@ -905,34 +777,6 @@ a:hover {
   margin: 0 auto;
 }
 
-/* Document Empty State */
-.document-empty {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-secondary);
-}
-
-.document-empty-icon {
-  width: 64px;
-  height: 64px;
-  margin-bottom: 24px;
-  opacity: 0.3;
-}
-
-.document-empty-title {
-  font-size: var(--font-size-xl);
-  font-weight: 600;
-  margin-bottom: 8px;
-  color: var(--text-primary);
-}
-
-.document-empty-subtitle {
-  font-size: var(--font-size-md);
-}
-
 /* ============================================================
    Markdown Styles
    ============================================================ */
@@ -1302,24 +1146,6 @@ a:hover {
   border-left: none;
 }
 
-.toc-header {
-  height: 40px;
-  min-height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-.toc-title {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-secondary);
-}
-
 .toc-list {
   flex: 1;
   overflow-y: auto;
@@ -1354,13 +1180,6 @@ a:hover {
 .toc-item.level-4 { padding-left: 48px; }
 .toc-item.level-5 { padding-left: 60px; }
 .toc-item.level-6 { padding-left: 72px; }
-
-.toc-empty {
-  padding: 24px 12px;
-  text-align: center;
-  color: var(--text-disabled);
-  font-size: var(--font-size-sm);
-}
 
 /* ============================================================
    Status Bar
@@ -1473,47 +1292,6 @@ a:hover {
   display: flex;
   gap: 12px;
   justify-content: flex-end;
-}
-
-.modal-btn {
-  padding: 8px 16px;
-  border-radius: var(--radius-md);
-  font-size: var(--font-size-sm);
-  font-weight: 500;
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-
-.modal-btn-secondary {
-  background: var(--surface-input);
-  border: 1px solid var(--border-default);
-  color: var(--text-primary);
-}
-
-.modal-btn-secondary:hover {
-  background: var(--hover-bg);
-  border-color: var(--border-active);
-}
-
-.modal-btn-danger {
-  background: var(--error-bg);
-  border: 1px solid var(--error-text);
-  color: var(--error-text);
-}
-
-.modal-btn-danger:hover {
-  background: var(--danger-hover-bg);
-}
-
-/* The default button of a dialog */
-.modal-btn-primary {
-  background: var(--border-active);
-  border: 1px solid var(--border-active);
-  color: var(--text-on-accent);
-}
-
-.modal-btn-primary:hover {
-  filter: brightness(1.15);
 }
 
 /* Files a dialog is about, right under the sentence that introduces them */
@@ -1670,26 +1448,6 @@ a:hover {
   position: relative;
   transform: translateY(0);
   box-shadow: none;
-}
-
-/* ============================================================
-   Empty State Hint
-   ============================================================ */
-
-.document-empty-hint {
-  margin-top: 16px;
-  font-size: var(--font-size-sm);
-  color: var(--text-disabled);
-}
-
-.document-empty-hint kbd {
-  display: inline-block;
-  padding: 2px 6px;
-  background: var(--surface-overlay);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
 }
 
 /* ============================================================
@@ -2222,19 +1980,6 @@ a:hover {
 .settings-color-input::-webkit-color-swatch {
   border: none;
   border-radius: 2px;
-}
-
-/* ============================================================
-   History Panel
-   ============================================================ */
-
-/* ============================================================
-   Drag & Drop Overlay
-   ============================================================ */
-
-.toc-header .panel-zoom-badge {
-  margin-left: auto;
-  margin-right: 4px;
 }
 
 /* ============================================================

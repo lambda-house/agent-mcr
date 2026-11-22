@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, CheckCheck, ChevronDown, ChevronRight, EyeOff, Folder, RefreshCw, Search } from 'lucide-react';
+import { Button, PaneFrame } from '@lambda-house/ui';
 import clsx from 'clsx';
 import { useStore } from '../store';
 import {
@@ -193,25 +194,21 @@ const AgentPanel: React.FC<{ width: number }> = ({ width }) => {
   };
 
   return (
-    <aside className="file-panel" style={{ width }} data-zoom-panel="files">
-      <div className="file-panel-header">
-        <span className="file-panel-title">Agent documents</span>
-        <div className="file-panel-actions">
-          <PanelZoomBadge panel="files" />
-          {enabled && <>
-            <button className="file-panel-action" onClick={handleMarkAllRead} title="Mark everything as read"
-              disabled={!entries.some((e) => e.unread)}>
-              <CheckCheck size={16} />
-            </button>
-            <button className={clsx('file-panel-action', loading && 'spinning')} onClick={refresh} title="Refresh" disabled={loading}>
-              <RefreshCw size={16} />
-            </button>
-            <button className="file-panel-action" onClick={handleDisable} title="Stop reading agent documents">
-              <EyeOff size={16} />
-            </button>
-          </>}
-        </div>
-      </div>
+    <PaneFrame
+      as="aside"
+      className="file-panel"
+      style={{ width }}
+      data-zoom-panel="files"
+      title="Agent documents"
+      tools={<>
+        <PanelZoomBadge panel="files" />
+        {enabled && <>
+          <Button variant="ghost" size="xs" icon={<CheckCheck size={16} />} onClick={handleMarkAllRead} title="Mark everything as read" aria-label="Mark everything as read" disabled={!entries.some((e) => e.unread)} />
+          <Button variant="ghost" size="xs" icon={<RefreshCw size={16} />} onClick={refresh} title="Refresh" aria-label="Refresh" disabled={loading} busy={loading} />
+          <Button variant="ghost" size="xs" icon={<EyeOff size={16} />} onClick={handleDisable} title="Stop reading agent documents" aria-label="Stop reading agent documents" />
+        </>}
+      </>}
+    >
 
       {enabled === null && <p className="agent-panel-empty">Loading agent documents…</p>}
       {enabled === false && (
@@ -259,7 +256,7 @@ const AgentPanel: React.FC<{ width: number }> = ({ width }) => {
           </nav>
         </>
       )}
-    </aside>
+    </PaneFrame>
   );
 };
 

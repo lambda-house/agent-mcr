@@ -1,4 +1,5 @@
 import { homePath } from '../utils/paths';
+import { Button, Segmented, Tabs } from '@lambda-house/ui';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, ChevronRight, ClipboardList, History, MessageSquare, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
 import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
@@ -106,19 +107,16 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   return <section className="session-cockpit">
     <header className="sc-topbar">
       <WorkspaceSwitch active="sessions" onChange={workspace => { if (workspace === 'documents') onClose(); }}/>
-      <nav className="hs-view-switch" aria-label="Sessions view">
-        <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
-        {topTabs.map(t => (
-          <button key={t.id} type="button" aria-current={view === t.id ? 'page' : undefined} title={t.title} onClick={() => setView(t.id)}>
-            {t.icon} {t.label}
-          </button>
-        ))}
-        <button type="button" aria-current={view === 'history' ? 'page' : undefined} onClick={() => setView('history')} title="Find an earlier session: by text, folder, agent or time"><History size={13}/> Journal</button>
-        <button type="button" aria-current={view === 'board' ? 'page' : undefined} onClick={() => setView('board')} title="What sessions reported to you, and the notes they left for each other"><ClipboardList size={13}/> Board</button>
-        <button type="button" aria-current={view === 'slack' ? 'page' : undefined} onClick={() => setView('slack')} title="Slack: what is listened to, what sessions may post, and posts that wait for your approval"><MessageSquare size={13}/> Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</button>
-      </nav>
+      <Segmented label="Sessions view" value={view} onChange={setView} options={[
+        { value: 'live', label: 'Live', icon: <Terminal size={13}/> },
+        ...topTabs.map(t => ({ value: t.id, label: t.label, icon: t.icon, title: t.title })),
+        { value: 'history', label: 'Journal', icon: <History size={13}/>, title: 'Find an earlier session: by text, folder, agent or time' },
+        { value: 'board', label: 'Board', icon: <ClipboardList size={13}/>, title: 'What sessions reported to you, and the notes they left for each other' },
+        { value: 'slack', icon: <MessageSquare size={13}/>, title: 'Slack: what is listened to, what sessions may post, and posts that wait for your approval',
+          label: <>Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</> },
+      ]}/>
       <div className="sc-top-actions">
-        <button onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"><Settings size={14}/></button>
+        <Button variant="ghost" size="sm" icon={<Settings size={14}/>} onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"/>
       </div>
       {enabled && <details className="sc-summary">
         <summary><span className="sc-summary-working">{working} working</span><span> · {filtered.length.toLocaleString()} sessions</span><ChevronRight size={12}/></summary>
@@ -152,7 +150,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     {view === 'history' && <>
     {error && <div className="sc-banner" role="alert">{error}</div>}
     {!enabled ? <div className="sc-welcome"><div className="sc-logo"><Bot size={36}/></div><p className="sc-eyebrow">YOUR AGENTIC LANDSCAPE</p><h1>See the work.<br/>Follow every agent.</h1><p>Codex and Claude sessions, their agents, models, tokens, tools and linked work. One view across all recorded workspaces on this machine.</p>
-      <button className="sc-primary" disabled={!isTauri() || enabled === null} onClick={async () => { try { setEnabled(await sessionApi.enable()); } catch(e) {setError(err(e));} }}><Shield size={16}/>{isTauri() ? 'Enable session access' : 'Open the desktop app to connect local sessions'}</button><small>Local transcripts · no transcript edits · remote connections on demand</small></div> : <>
+      <Button variant="primary" disabled={!isTauri() || enabled === null} onClick={async () => { try { setEnabled(await sessionApi.enable()); } catch(e) {setError(err(e));} }}><Shield size={16}/>{isTauri() ? 'Enable session access' : 'Open the desktop app to connect local sessions'}</Button><small>Local transcripts · no transcript edits · remote connections on demand</small></div> : <>
       <div className="sc-body ss-body"><aside className="sc-session-list ss-list" aria-label="Session search">
         <div className="sc-search ss-search"><Search size={14}/><input aria-label="Search sessions" placeholder="Find a task, ticket, model or tool…" value={query} onChange={e => setQuery(e.target.value)}/></div>
         <details className="ss-filters">
@@ -176,7 +174,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         {!filtered.length && <div className="sc-empty">{busy ? 'Indexing transcripts…' : 'No sessions match these filters.'}</div>}
       </aside>
       <main className="sc-detail">{chosen ? <><div className="sc-detail-heading"><div className="sc-session-meta"><span className={`sc-provider ${chosen.provider}`}>{chosen.provider}</span><span className={`sc-status ${chosen.status}`}>{chosen.status}</span><span>{origin(chosen)==='human' ? 'Human session' : origin(chosen)} · {chosen.name}</span></div><h2 title={label(chosen)}>{label(chosen)}</h2><p title={chosen.cwd}>{chosen.cwd}</p><div className="sc-detail-info"><span><Zap size={14}/>{chosen.model || 'Unknown model'} {chosen.effort && `· ${chosen.effort}`}</span><span>{compact(totalTokens(chosen.usage))} recorded tokens</span><span>{chosen.eventCount.toLocaleString()} events</span>{!chosen.parentId && isTauri() && <button className="ss-resume" title="Continue this session in a hosted terminal, in its folder" onClick={() => void resumeLive(chosen)}><Play size={11}/> Resume in Live</button>}</div></div>
-        <nav className="sc-tabs" aria-label="Session details">{['activity','agents','usage','memories','linked work'].map(t => <button key={t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>{t}{t === 'agents' && <span>{descendants.length - 1}</span>}</button>)}</nav>
+        <div className="sc-tabs"><Tabs label="Session details" value={tab} onChange={setTab} tabs={['activity','agents','usage','memories','linked work'].map(t => ({ value: t, label: t.replace(/\b\w/g, c => c.toUpperCase()), count: t === 'agents' ? descendants.length - 1 : undefined }))}/></div>
         <div className="sc-detail-content">
         {tab === 'activity' && <>{focusedEvidence?.session === selected && <button onClick={()=>setFocusedEvidence(null)}>Back to activity</button>}<div className="sc-section-row"><h3>Activity <span className="sc-activity-count">{events.length} / {chosen.eventCount} · {olderEvents ? 'earlier' : 'latest'} · newest first</span></h3><select title="Message previews are capped at 12,000 characters" aria-label="Event type" value={eventFilter} onChange={e => setEventFilter(e.target.value)}>{['all','user','assistant','tool','result','error'].map(t => <option key={t}>{t}</option>)}</select></div>
           <div className="sc-history-actions">{olderEvents && <button onClick={() => setOlderEvents(null)}>Back to latest</button>}{events[0]?.seq > 1 && <button disabled={historyBusy} onClick={async () => { const version=contextVersion.current; setHistoryBusy(true); try { const page=await sessionApi.events(chosen.provider,chosen.id,events[0].seq-1); if(contextVersion.current===version) setOlderEvents(page); } catch(e) {setError(err(e));} finally {setHistoryBusy(false);} }}>{historyBusy ? 'Loading earlier activity…' : 'Earlier activity'}</button>}</div>

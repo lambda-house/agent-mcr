@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { Menu } from '@lambda-house/ui';
 import { Terminal, type IDecoration, type IMarker } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
@@ -333,24 +334,16 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     return () => cancelAnimationFrame(frame);
   }, [focusAt]);
 
-  // The menu closes on a click elsewhere and on Escape
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
-    window.addEventListener('mousedown', close); window.addEventListener('keydown', key); window.addEventListener('blur', close);
-    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', key); window.removeEventListener('blur', close); };
-  }, [menu]);
 
   const copied = () => { setTask(null); say('Copied as a task: paste it into the session that is to do it.'); };
 
   return <div className="hs-terminal-wrap">
     <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
     {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended. Its output is kept until you forget it.'}</div>}
-    {menu && <div className="hs-menu tc-menu" role="menu" style={{ top: menu.y, left: menu.x }} onMouseDown={e => e.stopPropagation()}>
-      <button type="button" role="menuitem" onClick={() => { const text = menu.text; setMenu(null); copyText(text); }}>Copy</button>
-      <button type="button" role="menuitem" autoFocus onClick={() => openTask(menu.text)}>Copy as task…</button>
-    </div>}
+    {menu && <Menu label="Selection" at={{ top: menu.y, left: menu.x }} focusIndex={1} onClose={() => setMenu(null)} items={[
+      { label: 'Copy', onSelect: () => copyText(menu.text) },
+      { label: 'Copy as task…', onSelect: () => openTask(menu.text) },
+    ]}/>}
     {task !== null && <TaskCopyDialog source={id} name={name} excerpt={task} onDone={copied} onCancel={() => setTask(null)}/>}
   </div>;
 }

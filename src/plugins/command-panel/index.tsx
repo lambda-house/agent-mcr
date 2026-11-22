@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Search } from 'lucide-react';
-import { Kbd } from '@/ui';
+import { Kbd } from '@lambda-house/ui';
 import { paletteShortcut, PLATFORM } from '../../utils/platform';
 import { createPlugin, pluginRegistry, type GlobalOverlayContext } from '../sdk';
 import SessionCommandPanel from '../../components/SessionCommandPanel';

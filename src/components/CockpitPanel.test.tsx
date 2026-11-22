@@ -133,20 +133,20 @@ it('asks before a link is opened, with Cancel as the default, and shows where it
   await show();
   const pr = host.querySelector('[data-action="pr"]')!;
   await act(async () => ([...pr.querySelectorAll('button.ck-do')].find(b => b.textContent === 'Open link…')! as HTMLButtonElement).click()); await flush();
-  const dialog = document.querySelector('.modal')!;
+  const dialog = document.querySelector('[role="alertdialog"]')!;
   // Over the whole window: outside the panel, whose columns are containers that would box it in (MCR-105)
-  expect(dialog.closest('.modal-overlay')!.parentElement).toBe(document.body);
+  expect(dialog.closest('.ui-dialog__backdrop')!.parentElement).toBe(document.body);
   expect(host.contains(dialog)).toBe(false);
   expect([...dialog.querySelectorAll('.ck-link dd')].map(d => d.textContent)).toEqual(['example.com', '/a', 'token=abc']);
   expect(dialog.querySelector('.ck-link-warn')!.textContent).toContain('not on your list of known hosts');
   // Cancel has the focus: Enter cancels, and only the link's parts were asked for
   expect((document.activeElement as HTMLElement).textContent).toBe('Cancel');
   await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); }); await flush();
-  expect(document.querySelector('.modal')).toBeNull();
+  expect(document.querySelector('[role="alertdialog"]')).toBeNull();
   expect(vi.mocked(harnessApi.cockpitAct).mock.calls.map(c => c[3])).toEqual(['link']);
   // Asked again and answered with a click on the action: the service is asked to open, by ids
   await act(async () => ([...pr.querySelectorAll('button.ck-do')].find(b => b.textContent === 'Open link…')! as HTMLButtonElement).click()); await flush();
-  await act(async () => ([...document.querySelectorAll('.modal button')].find(b => b.textContent === 'Open link')! as HTMLButtonElement).click()); await flush();
+  await act(async () => ([...document.querySelectorAll('[role="alertdialog"] button')].find(b => b.textContent === 'Open link')! as HTMLButtonElement).click()); await flush();
   expect(vi.mocked(harnessApi.cockpitAct).mock.calls.map(c => [c[0], c[1], c[2], c[3]])).toEqual([['b1', 'pr', 9, 'link'], ['b1', 'pr', 9, 'link'], ['b1', 'pr', 9, 'open']]);
   expect(pr.querySelector('.ck-said')!.textContent).toBe('Opened example.com in your browser.');
 });

@@ -42,8 +42,7 @@ Frontend unit tests are Vitest files next to the code (`src/utils/*.test.ts`; DO
   - `FindBar.tsx` - Ctrl+F find in document (CSS Custom Highlight API; highlights are changed in place, WebKitGTK doesn't repaint replaced ones). A jump and the scroll restore both use `utils/scrollHold.ts` to keep their offset while late output changes the layout
   - `Editor.tsx` - CodeMirror 6 source editor (Ctrl+E), lazy-loaded; per-document state lives in `utils/editorRegistry.ts`, saving in `utils/save.ts`
   - `Toolbar.tsx` - Top bar with search, zoom, theme controls
-  - `ConfirmDialog.tsx` - Modal question; buttons in the platform's order (`utils/platform.ts`). `SaveAllDialog.tsx` uses it
-  - `Resizer.tsx` - Panel separators: drag to resize, drag to the edge or double-click to hide/show
+  - Shared controls come from `@lambda-house/ui` (`packages/ui`; the app's own `src/ui` is gone): `Button`, `ConfirmDialog` (buttons in the platform's order, `cancelIsDefault` for questions like opening an agent's link; `SaveAllDialog.tsx`, the cockpit and Live use it), `Dialog` (`size="lg"` for the new-agent form), `Splitter` (panel separators: drag to resize, drag to the edge or double-click to hide/show), `Segmented` (`WorkspaceSwitch.tsx`, the Live/Journal/Board/Slack switch), `Tabs`, `Menu` (tab, row and terminal menus; it renders in place), `PaneFrame` (agent documents, Contents), `EmptyState`, `Kbd`, `Badge`, `Notice`, `SettingRow`, `DescList`, `StatusDot`, `ScrollArea`. `TaskCopyDialog` keeps its own frame (its keys belong to the text field); `MainMenu` still draws its own menu
   - `StatusBar.tsx` - Bottom status bar (auto-hides)
 
 - **Hooks** (`src/hooks/`): `useSmoothWheelScroll` - velocity-based wheel scrolling shared by the document, file panel and TOC
@@ -136,6 +135,7 @@ npm workspaces (`@lambda-house/tokens`, `ui`, `workbench`, `reader`, `journal`) 
 - Harness features (Live, Board, Slack, the cockpit) stay in this app's `src/`, and so do the MDViewer features removed here: they never go into `packages/`.
 - Colours, spacing, radii and type sizes come from `@lambda-house/tokens` (`packages/tokens/tokens.css`, loaded first in `main.tsx`). Every colour a rule uses is a variable: shared ones from the tokens (states `--ok`/`--warn`/`--danger`, identity `--cat-*`, filled buttons `--accent-fill` with `--text-on-accent`), feature ones (`--syntax-*`) from the `:root` block at the top of `index.css`. `TerminalPane` reads `--canvas`, `--text`, `--accent` and `--selected` for the xterm theme. New CSS uses the tokens' names; the old names (`--surface-bg`, `--layer-1`, …) are aliases at the end of `tokens.css`, to be deleted once unused. The Sessions `--sc-*` palette is gone.
 - A pane whose content is expensive to recreate (terminal, editor, rendered document) is `keepAlive`.
+- `@lambda-house/ui/ui.css` loads after the tokens and before `index.css`. App CSS never targets `ui-*` classes: a control that needs another look gets a prop (in `packages/`, made in mdviewer-mj first). App element rules that could reach a shared control skip it without changing their weight: `.session-cockpit button:where(:not([class^="ui-"],[class*=" ui-"]))`. Menus render in place, so a descendant rule over a menu's owner reaches its items: use a child combinator (`.hs-actions > button`) or the same exclusion.
 
 ## Configuration
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { SettingRow } from '@/ui';
+import { SettingRow } from '@lambda-house/ui';
 import { memoryApi, memoryStateLine, type MemoryStatus } from '../utils/harness';
 
 const POLL_MS = 1500;

@@ -8,7 +8,7 @@ import {
   FileText,
   Terminal,
 } from 'lucide-react';
-import { Badge, Button, Kbd, Notice, SettingRow } from '@/ui';
+import { Badge, Button, Kbd, Notice, SettingRow } from '@lambda-house/ui';
 import { useStore } from '../store';
 import { getAppVersion } from '../utils/tauri';
 import { pluginRegistry, usePluginVersion } from '../plugins';

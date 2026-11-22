@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import ConfirmDialog from './ConfirmDialog';
+import { ConfirmDialog } from '@lambda-house/ui';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
