@@ -555,10 +555,6 @@
 .ck-panel { container-type: inline-size; }
 .ck-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 12px 8px; }
 .ck-empty { flex: 1 0 100%; }
-@container (min-width: 900px) {
-  .ck-body { display: flex; gap: 18px; overflow: hidden; }
-  .ck-col { flex: 1 1 0; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
-}
 .ck-body h3 { position: sticky; top: 0; z-index: 1; background: var(--surface-1); margin: 0 0 3px; padding-top: 6px; font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--sc-muted); }
 .ck-body ul { list-style: none; margin: 0; padding: 0; }
 .ck-empty { margin: 8px 0; color: var(--sc-muted); }
@@ -598,7 +594,8 @@
 .ck-state { flex-shrink: 0; min-width: 62px; padding: 0 6px; border-radius: 8px; font-size: 10.5px; text-align: center; background: var(--layer-1); color: var(--sc-muted); }
 .ck-state.moving, .ck-state.doing { color: var(--sc-accent); }
 .ck-state.waiting_human, .ck-state.blocked { background: var(--danger-soft); color: var(--danger); }
-.ck-track.done, .ck-track.parked, .ck-item.done { opacity: .6; }
+/* A resting track is dimmed, its needs are not: they still wait for the person (MCR-131) */
+.ck-track.done > :not(.ck-track-needs), .ck-track.parked > :not(.ck-track-needs), .ck-item.done { opacity: .6; }
 .ck-line { color: var(--sc-text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ck-waits { color: var(--sc-muted); white-space: nowrap; }
 .ck-track-body { margin: 3px 0 4px 23px; }
@@ -623,6 +620,13 @@
 .ck-track.old > .ck-track-line > .ck-state { background: var(--layer-1); color: var(--sc-muted); }
 .ck-track > p.ck-track-text { margin: 1px 0 0 23px; color: var(--sc-text); overflow-wrap: break-word; }
 .ck-track > p.ck-track-waits { color: var(--sc-muted); }
+/* The one view (MCR-131): a track's needs stand under its line and items, indented to its title; what the
+   harness saw among them is a mark on the header row, never a move. Unassigned comes first, when it holds any. */
+.ck-track-needs { margin: 4px 0 2px 23px; min-width: 0; }
+.ck-track-needs .ck-action:last-child { margin-bottom: 2px; }
+.ck-track-needs .ck-more { margin: 0 0 4px; }
+.ck-mark { flex: 0 1 auto; }
+.ck-unassigned > .ck-track-line .ck-track-title { color: var(--sc-muted); }
 @container ck-col (max-width: 460px) {
   .ck-track-meta { flex: 1 1 100%; justify-content: flex-start; padding-left: 23px; font-size: 11px; }
   .session-cockpit .ck-track-meta .ck-session, .ck-track-meta .ck-session { font-size: 11px; text-align: left; }

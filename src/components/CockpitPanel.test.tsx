@@ -45,10 +45,20 @@ beforeEach(() => {
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); });
 
-it('puts what needs the person first, the prompt before the published action, then one line per track', async () => {
+it('shows one list: Unassigned first with what belongs to no track, then each track with its needs under it (MCR-131)', async () => {
   await show();
+  expect([...host.querySelectorAll('.ck-body h3')].map(h => h.textContent)).toEqual(['Tracks and needs']);
+  expect(host.textContent).not.toContain('Needs you');
   expect([...host.querySelectorAll('.ck-action')].map(a => a.getAttribute('data-action'))).toEqual(['prompt:r1', 'word']);
-  expect([...host.querySelectorAll('.ck-track')].map(t => t.getAttribute('data-track'))).toEqual(['store', 'gone']);
+  expect([...host.querySelectorAll('.ck-tracks > .ck-track')].map(t => t.getAttribute('data-track') ?? t.getAttribute('data-group'))).toEqual(['unassigned', 'store', 'gone']);
+  // The prompt of a session no track leads is Unassigned, and marked there; the typed word sits in its track
+  const unassigned = host.querySelector('[data-group="unassigned"]')!;
+  expect(unassigned.querySelector('.ck-track-title')!.textContent).toBe('Unassigned');
+  expect(unassigned.querySelector('.ck-mark')!.textContent).toBe('at a prompt');
+  expect(host.querySelector('[data-track="store"] .ck-track-needs [data-action="word"]')).not.toBeNull();
+  expect(host.querySelector('[data-track="store"] .ck-mark')).toBeNull();
+  expect(host.querySelector('[data-track="gone"] .ck-track-needs')).toBeNull();
+  // One total at the top, over every track and Unassigned
   expect(host.querySelector('.ck-head')!.textContent).toContain('2 need you');
   const track = host.querySelector('[data-track="store"]')!;
   expect(track.textContent).toContain('waits for you');
@@ -177,6 +187,36 @@ it('folds the rows of a publisher that has many, and keeps the harness\'s own ro
   expect(more.textContent).toBe('2 more from Builder');
   await act(async () => more.click());
   expect(host.querySelectorAll('.ck-action')).toHaveLength(6);
+});
+
+it('has no Unassigned group when every need has a track, and marks a track whose needs the harness saw', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [doc.actions[0], { ...doc.actions[1], id: 'prompt:b1', where: { session: 'b1' } }] });
+  await show();
+  expect(host.querySelector('[data-group="unassigned"]')).toBeNull();
+  const store = host.querySelector('[data-track="store"]')!;
+  expect([...store.querySelectorAll('.ck-action')].map(a => a.getAttribute('data-action'))).toEqual(['prompt:b1', 'word']);
+  expect(store.querySelector('.ck-track-line .ck-mark')!.textContent).toBe('at a prompt');
+  // The needs stand under the line, whether the items are open or not
+  await act(async () => (store.querySelector('.ck-expand') as HTMLButtonElement).click());
+  expect(store.querySelector('.ck-track-body + .ck-track-needs')).not.toBeNull();
+});
+
+it('dims a parked track and not the needs under it', () => {
+  expect(css).toContain('.ck-track.done > :not(.ck-track-needs), .ck-track.parked > :not(.ck-track-needs), .ck-item.done { opacity: .6; }');
+  expect(css).not.toContain('.ck-track.done, .ck-track.parked');
+});
+
+it('keeps the need choices of S1 clickable inside a track, with the recommended one said', async () => {
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [
+    { id: 'branch', title: 'Which branch?', kind: 'decision', by: 'b1', track: 'store', where: { session: 'b1' }, options: ['Use main', 'Use a branch'], recommended: 'Use a branch', risk: 'reversible', need: true, updated: 11 },
+  ] });
+  vi.mocked(harnessApi.cockpitAct).mockResolvedValue({ placed: 'b1' });
+  await show();
+  const row = host.querySelector('[data-track="store"] [data-action="branch"]')!;
+  const buttons = [...row.querySelectorAll('.ck-choices button.ck-do')] as HTMLButtonElement[];
+  expect(buttons.map(b => b.textContent)).toEqual(['Use main', 'Use a branch (recommended by its publisher)']);
+  await act(async () => buttons[1].click()); await flush();
+  expect(vi.mocked(harnessApi.cockpitAct).mock.calls).toEqual([['b1', 'branch', 11, 'choose', 1]]);
 });
 
 it('opens a track to its items, with the lead as its row in the list', async () => {
