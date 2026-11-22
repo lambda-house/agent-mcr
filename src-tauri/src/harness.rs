@@ -6133,6 +6133,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// MCR-129 (review 16964): an `mcr-memory` bridge whose caller is unknown at
+    /// connect lists nothing then, and is served once a later call can tell;
+    /// it never moves to another session and takes no `mcr` bridge count.
+    #[test]
+    fn an_unidentified_memory_bridge_is_served_once_a_later_call_can_tell() {
+        let rig = crate::memory::tests::Rig::signed_in();
+        let dir = state_dir(None);
+        let mut h = Harness::open(&dir);
+        h.memory = rig.memory.clone();
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        let frames = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}, "capabilities": {}}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_list", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "memory_list", "arguments": {}}}),
+        ];
+        let input: String = frames.iter().map(|f| format!("{f}\n")).collect();
+        // Unknown for the first three frames, then "a"; "b" must never be taken
+        let asked = std::cell::Cell::new(0);
+        let who = || {
+            asked.set(asked.get() + 1);
+            match asked.get() {
+                1..=3 => Caller::Unknown,
+                4 => Caller::Session { id: "a".into(), supervisor: false },
+                _ => Caller::Session { id: "b".into(), supervisor: false },
+            }
+        };
+        let mut out = Vec::new();
+        h.memory_mcp(std::io::Cursor::new(input), &mut out, who).unwrap();
+        let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 4);
+        assert_eq!(replies[0]["result"]["instructions"], "Cannot tell which process is calling");
+        assert_eq!(replies[1]["result"]["tools"], json!([]));
+        for reply in &replies[2..] {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            assert_eq!(reply["result"]["content"][0]["text"], json!({"memory": "mcr-agents"}).to_string(), "{reply}");
+        }
+        assert_eq!(asked.get(), 4);
+        let store = lock(&h.store);
+        assert!(!store.sessions["a"].tools && store.bridges.is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writer that hands each line it is given to the test.
+    struct Lines(std::sync::mpsc::Sender<String>, Vec<u8>);
+    impl Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.1.extend_from_slice(buf);
+            while let Some(end) = self.1.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.1.drain(..=end).collect();
+                let _ = self.0.send(String::from_utf8_lossy(&line).into_owned());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// MCR-129 (review 16964): two `mcr` bridges of one session are counted
+    /// apart, and the session keeps the tools until the last one is closed.
+    #[test]
+    fn two_bridges_of_one_session_are_counted_apart() {
+        let dir = state_dir(None);
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        let seen = || {
+            let store = lock(&h.store);
+            (store.bridges.get("a").copied().unwrap_or(0), store.sessions["a"].tools)
+        };
+        let ping = |n: u64| format!("{}\n", json!({"jsonrpc": "2.0", "id": n, "method": "ping"}));
+        let mut counts = vec![seen()];
+        std::thread::scope(|scope| {
+            // A bridge is open once it answered a ping: it counted itself before reading it
+            let open = |n: u64| {
+                let (reader, mut feed) = std::io::pipe().unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let h = &h;
+                let served = scope.spawn(move || h.agent(BufReader::new(reader), Lines(tx, Vec::new()), true, || Caller::Session { id: "a".into(), supervisor: false }));
+                feed.write_all(ping(n).as_bytes()).unwrap();
+                rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                (feed, served)
+            };
+            let (first, first_served) = open(1);
+            counts.push(seen());
+            let (second, second_served) = open(2);
+            counts.push(seen());
+            drop(first);
+            first_served.join().unwrap().unwrap();
+            counts.push(seen());
+            drop(second);
+            second_served.join().unwrap().unwrap();
+            counts.push(seen());
+        });
+        assert_eq!(counts, [(0, false), (1, true), (2, true), (1, true), (0, false)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCR-129 (review 16964): a bridge whose writer fails gives back the count
+    /// it took for the session it was identified as.
+    #[test]
+    fn a_bridge_whose_writer_fails_gives_its_count_back() {
+        let dir = state_dir(None);
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        struct Broken<'a>(&'a Harness, Vec<bool>);
+        impl Write for Broken<'_> {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.1.push(lock(&self.0.store).sessions["a"].tools);
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Unknown at connect, "a" at the first frame, whose answer cannot be written
+        let asked = std::cell::Cell::new(0);
+        let who = || {
+            asked.set(asked.get() + 1);
+            if asked.get() == 1 { Caller::Unknown } else { Caller::Session { id: "a".into(), supervisor: false } }
+        };
+        let input = format!("{}\n{}\n", json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}), json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+        let mut broken = Broken(&h, Vec::new());
+        assert!(h.agent(std::io::Cursor::new(input), &mut broken, true, who).is_err());
+        assert_eq!(broken.1, [true]);
+        assert_eq!(asked.get(), 2);
+        let store = lock(&h.store);
+        assert_eq!(store.bridges.get("a"), Some(&0));
+        assert!(!store.sessions["a"].tools);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A folder with a state file as `state` gives it, for the load tests (MCR-99).
     fn state_dir(state: Option<&[u8]>) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mcr-store-{}", runner::random_id()));
