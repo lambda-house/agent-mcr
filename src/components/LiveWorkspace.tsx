@@ -145,7 +145,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     harnessApi.status().then(s => {
       if (!Array.isArray(s.profiles)) throw new Error('An older harness service returned no launch profiles. Update the app and restart the harness service.');
       if (mounted.current) {
-        setStatus(s);
+        // A focus asks again; the same answer keeps the held one, so nothing below starts over (MCR-139)
+        setStatus(held => keepSame(held, s));
         setGate(null);
         setError('');
         setCwd(c => c || s.home);
@@ -176,10 +177,17 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // Earlier sessions to resume; without the Sessions grant there are none to offer
   const loadResumable = useCallback(() => {
     harnessApi.resumable()
-      .then(r => { if (mounted.current) setResumable(r); })
+      .then(r => { if (mounted.current) setResumable(held => keepSame(held, r)); })
       .catch(() => {});
   }, []);
   useEffect(() => { if (active && status) loadResumable(); }, [active, status, newAgentOpen, loadResumable]);
+  // Back in the window: the list and the earlier sessions are read again at once, and render only if they changed
+  useEffect(() => {
+    if (!active || !status) return;
+    const again = () => { void refresh(); loadResumable(); };
+    window.addEventListener('focus', again);
+    return () => window.removeEventListener('focus', again);
+  }, [active, status, refresh, loadResumable]);
 
   usePluginVersion();
 

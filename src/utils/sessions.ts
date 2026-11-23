@@ -37,6 +37,8 @@ export const sessionApi = {
   stats: (provider: string, id: string) => invoke<Session>('session_stats', { provider, id }),
   detail: (provider: string, id: string) => invoke<Session>('session_details', { provider, id }),
   snapshot: () => invoke<Snapshot>('sessions_snapshot'),
+  /** The same scan for a holder of a snapshot: none when what it shows has the stamp held (MCR-141) */
+  snapshotSince: (stamp: string) => invoke<{ stamp: string; snapshot: Snapshot | null }>('sessions_snapshot_since', { stamp: stamp || null }),
   /** The same scan, answered with the named sessions only (`provider:id` keys) */
   pick: (keys: string[]) => invoke<Session[]>('sessions_pick', { keys }),
 };

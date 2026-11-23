@@ -10,7 +10,7 @@ import { controlsIn, dragsWindow } from '../utils/dragRegion.testing';
 import type { TitleBar } from '../utils/windowChrome';
 const chrome = vi.hoisted(() => ({ bar: 'native' as TitleBar }));
 vi.mock('../utils/windowChrome', async importOriginal => ({ ...await importOriginal<object>(), useTitleBar: () => chrome.bar }));
-vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
+vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), snapshotSince: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // The Live view connects to the runner; these tests are about History.
@@ -19,9 +19,26 @@ const session: Session = { id:'a',provider:'codex',parentId:null,name:'root',cwd
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve,0)); }); };
 const button = (text: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.trim().toLowerCase() === text) || [...host.querySelectorAll('button')].find(b => b.textContent?.toLowerCase().includes(text))!;
-beforeEach(() => { vi.resetAllMocks(); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session); });
+beforeEach(() => { vi.resetAllMocks(); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
+  // The stamped read answers with what `snapshot` gives, each time as changed
+  let stamps = 0; vi.mocked(sessionApi.snapshotSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() })); });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 describe('Sessions workspace', () => {
+  it('takes the index again only when its content changed, and says which stamp it holds (MCR-141)', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const full = await sessionApi.snapshot();
+      vi.mocked(sessionApi.snapshotSince).mockReset()
+        .mockResolvedValueOnce({ stamp: 'a', snapshot: full })
+        .mockResolvedValue({ stamp: 'a', snapshot: null });
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+      expect(host.textContent).toContain('Fix CORE-123');
+      await act(async () => { vi.advanceTimersByTime(5000); }); await flush();
+      // The second read names the stamp held; an answer without a snapshot keeps what is shown
+      expect(vi.mocked(sessionApi.snapshotSince).mock.calls.map(c => c[0])).toEqual(['', 'a']);
+      expect(host.textContent).toContain('Fix CORE-123');
+    } finally { vi.useRealTimers(); }
+  });
   it('opens on the Live view until Journal is chosen, and remembers the choice', async () => {
     localStorage.removeItem('agent-mcr.sessions.view');
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();

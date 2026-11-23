@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import TerminalPane from './TerminalPane';
+import TerminalPane, { canvasRenderer } from './TerminalPane';
 import { harnessApi } from '../utils/harness';
 
 type Link = { range: { start: { x: number; y: number }; end: { x: number; y: number } }; text: string; activate: (e: MouseEvent, text: string) => void };
@@ -47,6 +47,13 @@ vi.mock('@xterm/xterm', () => ({
 }));
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit() {} } }));
 vi.mock('@xterm/addon-unicode11', () => ({ Unicode11Addon: class {} }));
+// The WebGL renderer: `fail` makes the next one throw at load, as without WebGL
+const webgl = vi.hoisted(() => ({ made: 0, disposed: 0, fail: false, lose: [] as (() => void)[] }));
+vi.mock('@xterm/addon-webgl', () => ({ WebglAddon: class {
+  constructor() { if (webgl.fail) throw new Error('no WebGL'); webgl.made++; }
+  onContextLoss(f: () => void) { webgl.lose.push(f); return { dispose() {} }; }
+  dispose() { webgl.disposed++; }
+} }));
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { attach: vi.fn(() => new Promise(() => {})), detach: vi.fn(), resize: vi.fn(() => Promise.resolve()), input: vi.fn(), saveImage: vi.fn() } }));
 
@@ -220,5 +227,33 @@ describe('a terminal is the view of one shown session (MCR-139)', () => {
     expect(vi.mocked(harnessApi.attach).mock.calls.map(c => c[0])).toEqual(['t1', 't1']);
     expect(streams).toHaveLength(2);
     vi.mocked(harnessApi.attach).mockImplementation(() => new Promise(() => {}));
+  });
+});
+
+describe('the terminal draws on a canvas (MCR-139)', () => {
+  it('loads the WebGL renderer into the shown terminal and lets it go with the terminal', async () => {
+    Object.assign(webgl, { made: 0, disposed: 0, fail: false, lose: [] });
+    await act(async () => root.render(<TerminalPane id="t1" active/>)); await frame();
+    expect([webgl.made, webgl.disposed]).toEqual([1, 0]);
+    await act(async () => root.render(<div/>));
+    expect([webgl.made, webgl.disposed]).toEqual([1, 1]);
+  });
+
+  it('goes back to the DOM renderer when the context is lost, or when there is no WebGL', () => {
+    Object.assign(webgl, { made: 0, disposed: 0, fail: false, lose: [] });
+    const loaded: unknown[] = [];
+    const t = { loadAddon: (a: unknown) => loaded.push(a) } as unknown as Parameters<typeof canvasRenderer>[0];
+    const canvas = canvasRenderer(t);
+    expect([canvas.on, loaded.length]).toEqual([true, 1]);
+    webgl.lose.forEach(f => f());
+    expect([canvas.on, webgl.disposed]).toEqual([false, 1]);
+    // Disposing again after the loss is a no-op
+    canvas.dispose();
+    expect(webgl.disposed).toBe(1);
+    webgl.fail = true;
+    const none = canvasRenderer(t);
+    expect([none.on, loaded.length]).toEqual([false, 1]);
+    none.dispose();
+    webgl.fail = false;
   });
 });

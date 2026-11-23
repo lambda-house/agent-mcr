@@ -563,6 +563,23 @@ describe('Live workspace', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('reads the list and the earlier sessions again when the window gets focus, and renders nothing when they are the same (MCR-139)', async () => {
+    vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running }]));
+    vi.mocked(harnessApi.resumable).mockImplementation(() => Promise.resolve([{ agent: 'codex', id: 'old-1', cwd: '/work/repo', modified: 5 }]));
+    // Every answer a fresh object with the same content, as from the service
+    const base = await harnessApi.status();
+    vi.mocked(harnessApi.status).mockImplementation(() => Promise.resolve(JSON.parse(JSON.stringify(base))));
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    await act(async () => row('Fixing tests').click()); await flush();
+    const [lists, earlier, statuses, rendered] = [vi.mocked(harnessApi.list).mock.calls.length, vi.mocked(harnessApi.resumable).mock.calls.length, vi.mocked(harnessApi.status).mock.calls.length, renders.length];
+    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush(); await flush();
+    expect(vi.mocked(harnessApi.status).mock.calls.length).toBe(statuses + 1);
+    expect(vi.mocked(harnessApi.list).mock.calls.length).toBeGreaterThan(lists);
+    expect(vi.mocked(harnessApi.resumable).mock.calls.length).toBeGreaterThan(earlier);
+    expect(renders.length).toBe(rendered);
+  });
+
   it('drops a session the person quit from its own terminal', async () => {
     vi.mocked(harnessApi.forget).mockResolvedValue();
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();

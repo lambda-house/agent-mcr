@@ -16,7 +16,6 @@ import SessionMemoryBrowser from './SessionMemoryBrowser';
 import LiveWorkspace from './LiveWorkspace';
 import BoardView from './BoardView';
 import SlackView from './SlackView';
-import { keepSame } from '../utils/keepSame';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
 function savedView(): string {
@@ -60,10 +59,11 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const [role, setRole] = useState('all'); const [activeSince, setActiveSince] = useState(''); const [inactiveSince, setInactiveSince] = useState(''); const [inactiveMinutes, setInactiveMinutes] = useState(''); const [activeMinutes, setActiveMinutes] = useState('');
   const [filter, setFilter] = useState('all');
   const [tab, setTab] = useState('activity'); const [eventFilter, setEventFilter] = useState('all');
-  const inflight = useRef(false); const mounted = useRef(true); const contextVersion = useRef(0);
+  const inflight = useRef(false); const mounted = useRef(true); const contextVersion = useRef(0); const held = useRef('');
   const refresh = useCallback(async () => {
     if (inflight.current) return; inflight.current = true; setBusy(true);
-    try { const result = await sessionApi.snapshot(); if (mounted.current) { setData(held => keepSame(held, result)); setError(''); setSelected(s => s || (result.sessions[0] ? sessionKey(result.sessions[0]) : '')); } }
+    // Only a snapshot whose content changed comes across: the index of every session, megabytes, every five seconds otherwise (MCR-141)
+    try { const answer = await sessionApi.snapshotSince(held.current); const result = answer.snapshot; if (mounted.current) { if (result) { held.current = answer.stamp; setData(result); setSelected(s => s || (result.sessions[0] ? sessionKey(result.sessions[0]) : '')); } setError(''); } }
     catch(e) { if(mounted.current) setError(err(e)); }
     finally { inflight.current = false; if(mounted.current) setBusy(false); }
   }, []);
@@ -189,7 +189,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         {tab === 'usage' && <><h3>Recorded usage</h3><p className="sc-note">Lifetime of this session. Cached and cache-write input are included in input; reasoning is included in output. Token counts are not a monetary bill. Missing telemetry is shown as unknown.</p>{!chosen.usageKnown ? <p>No usage reported in this transcript.</p> : <><div className="sc-usage-grid">{Object.entries(chosen.usage).map(([k,v]) => <Metric key={k} label={k.replace('cacheWrite','cache write')} value={v.toLocaleString()} hint="tokens"/>)}</div><h3>By model</h3><table><thead><tr><th>Model</th><th>Input</th><th>Cached</th><th>Output</th></tr></thead><tbody>{Object.entries(chosen.models).map(([m,u]) => <tr key={m}><td>{m || 'Unattributed'}</td><td>{compact(u.input)}</td><td>{compact(u.cached)}</td><td>{compact(u.output)}</td></tr>)}</tbody></table></>}<h3>Tools used</h3>{Object.entries(chosen.tools).sort((a,b) => b[1]-a[1]).map(([tool,count]) => <div className="sc-tool-row" key={tool}><code>{tool}</code><span>{count}</span></div>)}<details className="sc-provenance"><summary>Source & accounting provenance</summary><p>{chosen.source}</p><p>Started {date(chosen.started)} · updated {date(chosen.updated)}</p><p>{chosen.provider === 'codex' ? 'Unique response usage records for this thread; older transcripts fall back to cumulative usage differences.' : 'Unique message IDs; repeated usage fragments are counted by positive increments.'}</p><p>Skipped malformed records: {chosen.malformedLines}</p></details></>}
         {tab === 'linked work' && <><h3>Ticket mentions</h3><p className="sc-note">Keys found in messages and tool activity. A mention is evidence of a reference, not an assignment.</p><div className="sc-ticket-list">{chosen.tickets.map(key => <code key={key}>{key}</code>)}</div>{!chosen.tickets.length && <p>No ticket mentions found.</p>}<h3>Memory tools observed</h3>{chosen.memoryRefs.length ? chosen.memoryRefs.map(r => <code className="sc-memory-ref" key={r}>{r}</code>) : <p className="sc-note">No named memory calls observed. Calls through shell wrappers may not be identifiable.</p>}</>}
         </div></> : <div className="sc-empty"><Bot size={32}/><h2>Select a session</h2><p>Inspect its activity, agents and linked work.</p></div>}</main></div>
-      <footer className="sc-footer"><span title={data.cachePath || 'No persistent cache'}><i className="sc-local-dot"/> {data.cachePath ? 'SQLite index' : 'In-memory index'} · {data.restoredFiles || 0} restored · {data.pendingFiles ? `${data.pendingFiles} files still indexing · totals partial` : 'history indexed'} · {compact(data.bytesRead || 0)} bytes read this scan · {data.errors.length} warnings</span><button onClick={async () => { try { await sessionApi.disable(); setEnabled(false); setData(empty); } catch(e) {setError(err(e));} }}>Revoke session access</button></footer>
+      <footer className="sc-footer"><span title={data.cachePath || 'No persistent cache'}><i className="sc-local-dot"/> {data.cachePath ? 'SQLite index' : 'In-memory index'} · {data.restoredFiles || 0} restored · {data.pendingFiles ? `${data.pendingFiles} files still indexing · totals partial` : 'history indexed'} · {compact(data.bytesRead || 0)} bytes read this scan · {data.errors.length} warnings</span><button onClick={async () => { try { await sessionApi.disable(); setEnabled(false); setData(empty); held.current = ''; } catch(e) {setError(err(e));} }}>Revoke session access</button></footer>
       {data.errors.length > 0 && <details className="sc-errors"><summary>Index warnings</summary>{data.errors.map((e,i) => <p key={i}>{e}</p>)}</details>}
     </>}</>}</section>;
 }

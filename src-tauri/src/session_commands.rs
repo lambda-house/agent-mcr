@@ -90,6 +90,56 @@ pub async fn sessions_snapshot(
     .await
     .map_err(|e| e.to_string())?
 }
+/// What the Journal asks every few seconds: the snapshot, or nothing when its
+/// content has the stamp the Journal already holds (MCR-141). The whole
+/// snapshot was 2.9 MB of JSON on the owner's Mac, parsed by the web view
+/// every five seconds while the Journal was shown, almost always unchanged.
+#[derive(serde::Serialize)]
+pub struct SnapshotSince {
+    pub stamp: String,
+    pub snapshot: Option<sessions::Snapshot>,
+}
+
+/// A digest of what a snapshot shows, without the scan's own figures (the
+/// time it ran, the bytes it read), which change at every scan.
+pub fn stamp(snapshot: &sessions::Snapshot) -> String {
+    use sha2::{Digest, Sha256};
+    let shown = serde_json::to_vec(&(&snapshot.sessions, &snapshot.errors, snapshot.pending_files, snapshot.scanned_files, &snapshot.cache_path, &snapshot.current_directory)).unwrap_or_default();
+    Sha256::digest(&shown).iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The snapshot to send for a holder of `held`: none when nothing it shows changed.
+pub fn since(snapshot: sessions::Snapshot, held: Option<&str>) -> SnapshotSince {
+    let stamp = stamp(&snapshot);
+    let snapshot = (held != Some(stamp.as_str())).then_some(snapshot);
+    SnapshotSince { stamp, snapshot }
+}
+
+/// `sessions_snapshot` for a reader that holds one: the same scan, answered
+/// with the stamp alone when nothing changed.
+#[tauri::command]
+pub async fn sessions_snapshot_since(
+    stamp: Option<String>,
+    access: State<'_, AccessState>,
+    state: State<'_, SessionState>,
+) -> Result<SnapshotSince, String> {
+    allowed(&access)?;
+    let index = state.index.clone();
+    let home = dirs::home_dir().ok_or("Home directory unavailable")?;
+    let cache = crate::get_config_dir()
+        .map_err(|e| e.message)?
+        .join("sessions/index.sqlite");
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut i = index
+            .lock()
+            .map_err(|_| "Index lock poisoned".to_string())?;
+        i.open_cache(&cache)?;
+        Ok(since(i.scan(&home, None), stamp.as_deref()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Most sessions one `sessions_pick` call names: the Live list's hosted ones.
 pub const MAX_PICKED: usize = 200;
 
@@ -364,6 +414,28 @@ mod picked_tests {
         s.provider = provider.into();
         s.id = id.into();
         s
+    }
+
+    #[test]
+    fn a_snapshot_is_sent_again_only_when_what_it_shows_changed() {
+        use super::since;
+        let snapshot = |sessions: Vec<Session>, indexed_at: u64, bytes_read: u64| crate::sessions::Snapshot {
+            sessions, errors: Vec::new(), scanned_files: 2, indexed_at, pending_files: 0, cache_path: None, restored_files: 0, bytes_read, current_directory: "/home/w".into(),
+        };
+        let first = since(snapshot(vec![session("claude", "a")], 1, 10), None);
+        assert!(first.snapshot.is_some());
+        // Another scan, nothing new: the scan's own figures do not count
+        let again = since(snapshot(vec![session("claude", "a")], 2, 99), Some(&first.stamp));
+        assert_eq!(again.stamp, first.stamp);
+        assert!(again.snapshot.is_none());
+        // A changed session is sent
+        let mut changed = session("claude", "a");
+        changed.title = "new title".into();
+        let next = since(snapshot(vec![changed], 3, 10), Some(&first.stamp));
+        assert_ne!(next.stamp, first.stamp);
+        assert!(next.snapshot.is_some());
+        // A holder of an unknown stamp gets it all
+        assert!(since(snapshot(vec![session("claude", "a")], 4, 10), Some("old")).snapshot.is_some());
     }
 
     #[test]

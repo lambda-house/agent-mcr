@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal, type IDecoration, type IMarker } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
 import { isPaletteKey, PLATFORM } from '../utils/platform';
@@ -30,6 +31,23 @@ function theme(element: HTMLElement) {
     cursor: v('--sc-accent', '#91d6b3'),
     selectionBackground: v('--sc-card', '#1c252c'),
   };
+}
+
+/**
+ * Loads the WebGL renderer into an opened terminal, and drops it for the DOM
+ * renderer when the context is lost. Never fails: without WebGL the terminal
+ * keeps the DOM renderer it opened with.
+ */
+export function canvasRenderer(t: Terminal): { readonly on: boolean; dispose: () => void } {
+  let addon: WebglAddon | null = null;
+  const drop = () => { const a = addon; addon = null; try { a?.dispose(); } catch { /* already gone */ } };
+  try {
+    const a = new WebglAddon();
+    a.onContextLoss(drop);
+    t.loadAddon(a);
+    addon = a;
+  } catch { addon = null; }
+  return { get on() { return addon !== null; }, dispose: drop };
 }
 
 /**
@@ -102,6 +120,13 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     t.loadAddon(new Unicode11Addon());
     t.unicode.activeVersion = '11';
     t.open(element);
+    // Drawn on a canvas, not as DOM rows (MCR-139). The DOM renderer builds the
+    // changed rows anew on every frame, and an agent at work repaints dozens of
+    // rows many times a second: elements, styles and their wrappers, garbage
+    // that only the web view's full collections free. Only the panes on screen
+    // have a terminal, so a handful of WebGL contexts at most. If the context
+    // cannot be had or is lost, the terminal goes back to the DOM renderer
+    const canvas = canvasRenderer(t);
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
     // On Windows and Linux Ctrl+Shift+C copies the selection, as in other terminals, and is never the agent's
@@ -311,6 +336,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose(); rendered.dispose(); switched.dispose(); reflowed.dispose();
       pointers.current = () => {};
       if (view !== null) void harnessApi.detach(view);
+      canvas.dispose();
       t.dispose();
       term.current = null; fit.current = null; resend.current = () => {};
     };
