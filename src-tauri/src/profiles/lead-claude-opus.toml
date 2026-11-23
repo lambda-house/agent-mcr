@@ -1,11 +1,15 @@
 # A lead below the root Supervisor: runs one track with its own executors
 # through the mcr task tools (owner's decision 16697 B). Like an implementer
 # that has executors; never the root Supervisor.
+# It delivers its track (MCR-136, owner's decision of 2026-11-23): it pushes
+# and merges a commit an independent validator approved, under the delivery
+# contract of its role guide, so merge and push are not owner words for it.
+# Force pushes are denied, best-effort (M2): the boundary is branch protection.
 id = "lead@claude-opus"
-version = 1
+version = 2
 role = "lead"
 adapter = "claude"
-summary = "Leads one track below the Supervisor with its own executors; never merges"
+summary = "Leads one track below the Supervisor with its own executors; delivers what an independent validator approved"
 
 [inference]
 model = "opus"
@@ -13,9 +17,10 @@ effort = "high"
 
 [permissions]
 mode = "acceptEdits"
+push = "delivery"
 
 [tools]
-deny = ["Bash(git push:*)", "Bash(gh pr merge:*)"]
+deny = ["Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)"]
 
 [context]
 skills = ["main-line", "discovered-work", "close-out"]
