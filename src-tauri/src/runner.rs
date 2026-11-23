@@ -706,6 +706,8 @@ impl Runner {
             let (from, skip) = replay_from(out.total, out.ring.len(), since);
             (view, from, out.ring.iter().skip(skip).copied().collect())
         };
+        // However this view ends, a failed handshake included, its sender leaves the session (review 17086)
+        let _leave = Leave { session: &session, view };
         writeln!(stream, "{}", json!({"ok": true, "from": from}))?;
         stream.write_all(&scrollback)?;
 
@@ -744,7 +746,6 @@ impl Runner {
                 Err(_) => break,
             }
         }
-        lock(&session.output).views.retain(|(v, _)| *v != view);
         stream.shutdown(std::net::Shutdown::Both)
     }
 
@@ -916,6 +917,18 @@ pub fn open_stream_reply(socket: &Path, req: Value) -> Result<(BufReader<Stream>
         return Err(e.to_string());
     }
     Ok((reader, stream, reply))
+}
+
+/// Takes a view's sender out of its session when the view ends, on any path.
+struct Leave<'a> {
+    session: &'a Session,
+    view: u64,
+}
+
+impl Drop for Leave<'_> {
+    fn drop(&mut self) {
+        lock(&self.session.output).views.retain(|(v, _)| *v != self.view);
+    }
 }
 
 /// Where a new view's replay starts: the offset of its first byte in all the
@@ -1551,6 +1564,23 @@ mod tests {
             assert_eq!(lock(&session.output).views.len(), 0, "the view's sender stays in the session");
         }
         runner.control(&json!({"op": "signal", "id": "q1", "signal": "KILL"})).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_view_whose_handshake_fails_leaves_no_sender_behind() {
+        let runner = Arc::new(Runner::default());
+        runner.control(&json!({"op": "spawn", "id": "h1", "argv": ["/bin/sh", "-c", "read line"], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
+        let session = runner.get("h1").unwrap();
+        for _ in 0..3 {
+            let (server, client) = Stream::pair().unwrap();
+            // The client is gone before the runner answers: the reply cannot be written
+            server.shutdown(std::net::Shutdown::Write).unwrap();
+            drop(client);
+            assert!(runner.attach("h1", None, server).is_err());
+            assert_eq!(lock(&session.output).views.len(), 0, "a sender stays in the session");
+        }
+        runner.control(&json!({"op": "signal", "id": "h1", "signal": "KILL"})).unwrap();
     }
 
     #[cfg(unix)]

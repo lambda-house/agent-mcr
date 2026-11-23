@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal, type IDecoration, type IMarker } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
-import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
 import { isPaletteKey, PLATFORM } from '../utils/platform';
@@ -35,13 +34,9 @@ function theme(element: HTMLElement) {
 }
 
 /** Hidden terminals kept with what they showed (MCR-139); see utils/terminalKeep.ts */
-type Live = { term: Terminal; fit: FitAddon; serial: SerializeAddon };
-export const keep = new TerminalKeep<Live>(
-  MAX_KEPT,
-  // Beyond MAX_KEPT a hidden terminal is kept as its serialized contents (review 17084)
-  ({ term, serial }) => { try { return { text: serial.serialize(), cols: term.cols, rows: term.rows }; } catch { return null; } },
-  ({ term }) => term.dispose(),
-);
+export const keep = new TerminalKeep<{ term: Terminal; fit: FitAddon }>(MAX_KEPT, ({ term }) => term.dispose());
+/** Sessions a pane shows now: a terminal let go while its session is shown again is not kept */
+const mountedIds = new Set<string>();
 
 /**
  * One hosted terminal. Mounting attaches a view (the runner replays its
@@ -102,9 +97,10 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     // A session shown a moment ago comes back with the terminal it had: every
     // line it showed, and only what it missed from the runner (MCR-139)
     const kept = keep.take(id);
-    let t: Terminal, f: FitAddon, serial: SerializeAddon;
-    if (kept?.term) {
-      ({ term: t, fit: f, serial } = kept.term);
+    mountedIds.add(id);
+    let t: Terminal, f: FitAddon;
+    if (kept) {
+      ({ term: t, fit: f } = kept.term);
       if (t.element) element.appendChild(t.element);
     } else {
       t = new Terminal({
@@ -120,14 +116,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       t.loadAddon(f);
       t.loadAddon(new Unicode11Addon());
       t.unicode.activeVersion = '11';
-      serial = new SerializeAddon();
-      t.loadAddon(serial);
       t.open(element);
-      // A compacted one: its contents as they were, at the size they were written for, before what it missed
-      if (kept?.text !== undefined) {
-        if (kept.cols && kept.rows) t.resize(kept.cols, kept.rows);
-        t.write(kept.text);
-      }
     }
     // The DOM renderer, on purpose (MCR-139): xterm's WebGL renderer measured
     // far heavier in this web view, 1.1 GB against 0.2 GB idle under the same
@@ -364,7 +353,14 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       if (view !== null) void harnessApi.detach(view);
       // Kept, not disposed: shown again it takes only what it missed
       t.element?.remove();
-      keep.put(id, { term: { term: t, fit: f, serial }, offset });
+      mountedIds.delete(id);
+      // Kept once xterm has parsed every byte given to it: a kept terminal then
+      // holds exactly what its offset says, and a reset on the next show (the
+      // runner no longer holds that offset) leaves no older byte to be parsed
+      // after it (review 17086). Shown again before that, the session gets a new
+      // terminal and this one goes
+      const kept = { term: { term: t, fit: f }, offset };
+      t.write(new Uint8Array(0), () => { if (mountedIds.has(id)) t.dispose(); else keep.put(id, kept); });
       term.current = null; fit.current = null; resend.current = () => {};
     };
   }, [id]);

@@ -43,7 +43,7 @@ vi.mock('@xterm/xterm', () => ({
     constructor() { screen.written[this.made] = []; screen.resets[this.made] = 0; }
     loadAddon(addon: { activate?: (t: unknown) => void }) { addon.activate?.(this); }
     open() {} paste() {} dispose() {} refresh() {}
-    write(data: Uint8Array | string) { screen.written[this.made].push(typeof data === 'string' ? data : new TextDecoder().decode(data)); }
+    write(data: Uint8Array | string, parsed?: () => void) { const text = typeof data === 'string' ? data : new TextDecoder().decode(data); if (text) screen.written[this.made].push(text); parsed?.(); }
     reset() { screen.resets[this.made]++; screen.written[this.made] = []; }
     resize(cols: number, rows: number) { this.cols = cols; this.rows = rows; }
     attachCustomKeyEventHandler() {}
@@ -59,12 +59,6 @@ vi.mock('@xterm/addon-fit', () => ({ FitAddon: class {
   fit() { if (this.t && screen.fitted) Object.assign(this.t, screen.fitted); }
 } }));
 vi.mock('@xterm/addon-unicode11', () => ({ Unicode11Addon: class {} }));
-// The serializer gives what its terminal was written, as one text
-vi.mock('@xterm/addon-serialize', () => ({ SerializeAddon: class {
-  t: { made: number } | null = null;
-  activate(t: { made: number }) { this.t = t; }
-  serialize() { return this.t ? screen.written[this.t.made].join('') : ''; }
-} }));
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { attach: vi.fn(() => new Promise(() => {})), detach: vi.fn(), resize: vi.fn(() => Promise.resolve()), input: vi.fn(), saveImage: vi.fn() } }));
 
@@ -304,26 +298,17 @@ describe('a terminal is the view of one shown session (MCR-139)', () => {
     expect(views[3].since).toBeNull();
   });
 
-  it('loses no line of a terminal pushed out of the keep: it comes back from its text and catches up (review 17084)', async () => {
-    runner(); screen.fitted = { cols: 132, rows: 40 };
+  it('keeps no more than MAX_KEPT hidden terminals; one pushed out comes back with the runner replay (review 17086)', async () => {
+    runner(); screen.fitted = { cols: 80, rows: 24 };
     const before = screen.made;
-    await act(async () => root.render(<TerminalPane id="a" active/>)); await frame();
-    act(() => { views[0].on.start(5_000_000); views[0].on.data(bytes('line beyond the ring\r\n')); });
-    await act(async () => root.render(<div/>));
-    // Four other sessions shown and hidden: 'a' is the least recently hidden of five
-    for (const id of ['b', 'c', 'd', 'e']) {
+    for (const id of ['a', 'b', 'c', 'd', 'e']) {
       await act(async () => root.render(<TerminalPane id={id} active/>)); await frame();
       await act(async () => root.render(<div/>));
     }
-    expect(keep.live).toEqual(['b', 'c', 'd', 'e']);
-    // Shown again: a new terminal with what 'a' showed, at the size it had, asking from where 'a' was
+    expect(keep.ids).toEqual(['b', 'c', 'd', 'e']);
+    // 'a' was dropped: showing it makes a new terminal that asks for everything
     await act(async () => root.render(<TerminalPane id="a" active/>)); await frame();
-    const back = screen.made - 1;
-    expect(back).toBe(before + 5);
-    const asked = views[views.length - 1];
-    expect(asked.since).toBe(5_000_022);
-    act(() => { asked.on.start(5_000_022); asked.on.data(bytes('missed\r\n')); });
-    expect(screen.written[back]).toEqual(['line beyond the ring\r\n', 'missed\r\n']);
-    expect(screen.resets[back]).toBe(0);
+    expect(screen.made).toBe(before + 6);
+    expect(views[views.length - 1].since).toBeNull();
   });
 });
