@@ -1,12 +1,12 @@
 import { createMenuStore, type Command as WorkbenchCommand, type MenuItem as WorkbenchMenuItem, type Submenu as WorkbenchSubmenu } from '@lambda-house/workbench';
 import { useMemo } from 'react';
-import {
-  activeTabOf, allTabs, canNavigateBack, canNavigateForward, exportActiveDocument, focusedGroupOf, requestSaveAll, saveActiveDocument,
-  type ReaderState,
-} from '@lambda-house/reader';
+import { focusedGroupOf, readerCommands, type ReaderState } from '@lambda-house/reader';
+import { journalCommands } from '@lambda-house/journal';
+import { layoutCommands, zoomCommands } from '@lambda-house/workbench';
 import { useStore, panelShown, type AppState } from '../store';
 import { useReader } from '../reader';
 import { reader } from '../readerHost';
+import { journal } from '../journal';
 import { liveNav } from './liveNav';
 import { terminalTask, TASK_SHORTCUT } from './terminalTask';
 import { PALETTE_SHORTCUT, PLATFORM } from './platform';
@@ -46,95 +46,49 @@ export interface MenuActions {
   reopenClosedTab: () => void;
 }
 
-/** Single-line selected text, to seed find/search (undefined keeps the old query). */
-function getSelectedText(): string | undefined {
-  const text = window.getSelection()?.toString().trim();
-  return text && !text.includes('\n') && text.length <= 200 ? text : undefined;
-}
-
-/** The focused document group's: its shown tab, whether it has one, whether it has several. */
-const activeTab = (s: CommandContext) => activeTabOf(focusedGroupOf(s.reader));
-const hasDocument = (s: CommandContext) => activeTab(s) !== null;
-const hasSeveralTabs = (s: CommandContext) => focusedGroupOf(s.reader).tabs.length > 1;
-
-/** The main menu, top to bottom. */
+/** The main menu, top to bottom: Agent MCR's commands, the reader's, the journal's and the workbench's. */
 export function buildMenu(actions: MenuActions): MenuItem[] {
   const state = useStore.getState;
   const documents = useReader.getState;
   const setTheme = (theme: AppState['theme']) => {
     if (state().theme !== theme) state().toggleTheme();
   };
+  /** Commands that act on what the Documents surface shows: they wait while Sessions is shown. */
+  const onDocuments = (command: Command): Command => ({ ...command, surface: 'documents' });
+  const doc = readerCommands(reader);
+  const journalCmd = journalCommands(journal);
+  const [splitPaneRight, splitPaneDown, closePane, focusNext, focusPrevious, resetLayout] = layoutCommands();
+  // Zoom acts on the focused pane; before any pane had the focus, on the document
+  const [zoomIn, zoomOut, resetZoom] = zoomCommands({
+    get: () => focusedGroupOf(documents()).zoom,
+    step: (direction) => (direction === 0 ? documents().resetZoom() : direction > 0 ? documents().zoomIn() : documents().zoomOut()),
+  });
 
   return [
-    {
-      id: 'file.save',
-      label: 'Save File',
-      shortcut: { mod: true, key: 's' },
-      enabled: (s) => activeTab(s)?.isDirty === true,
-      run: () => { saveActiveDocument(reader); },
-    },
+    onDocuments(doc.save),
     {
       label: 'Export As',
-      items: [
-        {
-          id: 'file.exportMarkdown',
-          label: 'Markdown…',
-          enabled: hasDocument,
-          run: () => { exportActiveDocument(reader, 'markdown'); },
-        },
-        {
-          id: 'file.exportHtml',
-          label: 'HTML…',
-          enabled: hasDocument,
-          run: () => { exportActiveDocument(reader, 'html'); },
-        },
-      ],
+      items: [onDocuments(doc.exportMarkdown), onDocuments(doc.exportHtml)],
     },
-    {
-      id: 'file.saveAll',
-      label: 'Save All…',
-      shortcut: { mod: true, shift: true, key: 's' },
-      enabled: (s) => allTabs(s.reader).some((t) => t.isDirty),
-      run: () => requestSaveAll(reader),
-    },
+    doc.saveAll,
     'separator',
     {
       label: 'View',
       items: [
-        {
+        onDocuments({
           id: 'view.filePanel',
           label: 'Agent Documents',
           shortcut: { mod: true, key: 'b' },
           checked: (s) => panelShown(s, 'agent-docs'),
           run: () => state().togglePanel('agent-docs'),
-        },
-        {
-          id: 'view.splitRight',
-          label: 'Split Document Right',
-          shortcut: { mod: true, key: '\\' },
-          run: () => { documents().splitGroup(undefined, 'row'); },
-        },
-        {
-          id: 'view.splitDown',
-          label: 'Split Document Down',
-          run: () => { documents().splitGroup(undefined, 'col'); },
-        },
-        {
-          id: 'view.closeGroup',
-          label: 'Close Document Group',
-          enabled: (s) => Object.keys(s.reader.groups).length > 1,
-          run: () => {
-            const result = documents().closeGroup(documents().focusedGroup);
-            if (!result.success && result.error) alert(result.error);
-          },
-        },
-        {
+        }),
+        onDocuments({
           id: 'view.toc',
           label: 'Table of Contents',
           shortcut: { mod: true, shift: true, key: 'o' },
           checked: (s) => panelShown(s, 'contents'),
           run: () => state().toggleTocVisible(),
-        },
+        }),
         {
           id: 'view.pinStatusBar',
           label: 'Pin Status Bar',
@@ -146,26 +100,18 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
           },
         },
         'separator',
-        {
-          id: 'view.zoomIn',
-          label: 'Zoom In',
-          shortcut: { mod: true, key: '+' },
-          aliases: [{ mod: true, key: '=' }],
-          run: () => documents().zoomIn(),
-        },
-        {
-          id: 'view.zoomOut',
-          label: 'Zoom Out',
-          shortcut: { mod: true, key: '-' },
-          run: () => documents().zoomOut(),
-        },
-        {
-          id: 'view.resetZoom',
-          label: 'Reset Zoom',
-          shortcut: { mod: true, key: '0' },
-          enabled: (s) => focusedGroupOf(s.reader).zoom !== 100,
-          run: () => documents().resetZoom(),
-        },
+        onDocuments(doc.splitRight),
+        onDocuments(doc.splitDown),
+        splitPaneRight,
+        splitPaneDown,
+        closePane,
+        focusNext,
+        focusPrevious,
+        resetLayout,
+        'separator',
+        zoomIn,
+        zoomOut,
+        resetZoom,
         'separator',
         {
           id: 'view.darkTheme',
@@ -184,13 +130,7 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
     {
       label: 'Edit',
       items: [
-        {
-          id: 'edit.editDocument',
-          label: 'Edit Document',
-          shortcut: { mod: true, key: 'e' },
-          checked: (s) => s.reader.editMode,
-          run: () => documents().toggleEditMode(),
-        },
+        onDocuments(doc.editDocument),
         // MCR-125 v0: the passage selected in the terminal that last had the keyboard,
         // with the operator's instruction, as a task text on the clipboard
         {
@@ -215,80 +155,43 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
           enabled: (s) => s.paletteHosted,
           run: () => { if (state().paletteHosted) state().setPaletteOpen(true); },
         },
-        {
-          id: 'search.find',
-          label: 'Find in Document…',
-          shortcut: { mod: true, key: 'f' },
-          enabled: hasDocument,
-          run: () => documents().openFind(getSelectedText()),
-        },
+        onDocuments(doc.find),
       ],
     },
     {
       label: 'Tabs',
       items: [
-        {
-          id: 'tabs.next',
-          label: 'Next Tab',
-          shortcut: { ctrl: true, key: 'Tab' },
-          enabled: hasSeveralTabs,
-          run: () => documents().activateNextTab(),
-        },
-        {
-          id: 'tabs.previous',
-          label: 'Previous Tab',
-          shortcut: { ctrl: true, shift: true, key: 'Tab' },
-          enabled: hasSeveralTabs,
-          run: () => documents().activatePrevTab(),
-        },
+        onDocuments(doc.nextTab),
+        onDocuments(doc.previousTab),
         // Through the Live view's history while it is shown, the document tabs' otherwise (MCR-108).
         // One command per key: the first command that matches a key is the one that runs
         {
-          id: 'tabs.back',
-          label: 'Back',
-          shortcut: { alt: true, key: 'ArrowLeft' },
+          ...doc.back,
           aliases: PLATFORM === 'macos' ? [{ mod: true, key: '[' }] : [],
-          enabled: (s) => liveNav.current ? liveNav.current.canBack() : canNavigateBack(focusedGroupOf(s.reader)),
-          run: () => { if (liveNav.current) liveNav.current.back(); else documents().navigateBack(); },
+          enabled: (s) => liveNav.current ? liveNav.current.canBack() : doc.back.enabled?.(s) !== false,
+          run: () => { if (liveNav.current) liveNav.current.back(); else doc.back.run(); },
         },
         {
-          id: 'tabs.forward',
-          label: 'Forward',
-          shortcut: { alt: true, key: 'ArrowRight' },
+          ...doc.forward,
           aliases: PLATFORM === 'macos' ? [{ mod: true, key: ']' }] : [],
-          enabled: (s) => liveNav.current ? liveNav.current.canForward() : canNavigateForward(focusedGroupOf(s.reader)),
-          run: () => { if (liveNav.current) liveNav.current.forward(); else documents().navigateForward(); },
+          enabled: (s) => liveNav.current ? liveNav.current.canForward() : doc.forward.enabled?.(s) !== false,
+          run: () => { if (liveNav.current) liveNav.current.forward(); else doc.forward.run(); },
         },
         'separator',
-        {
-          id: 'tabs.close',
-          label: 'Close Tab',
-          shortcut: { mod: true, key: 'w' },
-          enabled: hasDocument,
-          run: () => {
-            const tabId = focusedGroupOf(documents()).activeTabId;
-            if (tabId) documents().closeDocument(tabId);
-          },
-        },
-        {
-          id: 'tabs.closeAll',
-          // Unsaved ones are kept
-          label: 'Close All Tabs',
-          shortcut: { mod: true, shift: true, key: 'w' },
-          enabled: (s) => focusedGroupOf(s.reader).tabs.length > 0,
-          run: () => {
-            const result = documents().closeAllTabs();
-            if (!result.success && result.error) alert(result.error);
-          },
-        },
-        {
+        onDocuments(doc.closeTab),
+        onDocuments(doc.closeAllTabs),
+        onDocuments({
           id: 'tabs.reopen',
           label: 'Reopen Closed Tab',
           shortcut: { mod: true, shift: true, key: 't' },
           enabled: (s) => s.reader.recentlyClosed.length > 0,
           run: actions.reopenClosedTab,
-        },
+        }),
       ],
+    },
+    {
+      label: 'Journal',
+      items: [{ ...journalCmd.refresh, surface: 'sessions' }, { ...journalCmd.newList, surface: 'sessions' }],
     },
     'separator',
     {

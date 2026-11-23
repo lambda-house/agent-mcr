@@ -1,4 +1,5 @@
-import React, { useEffect, useCallback, useMemo, useState } from 'react';
+import React, { useEffect, useCallback, useMemo } from 'react';
+import { defaultDocumentsLayout } from './store/documentsLayout';
 import { useStore, panelShown, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH, type ZoomPanel } from './store';
 import { useReader } from './reader';
 import { openPath, reader } from './readerHost';
@@ -76,7 +77,10 @@ const NO_DOCUMENT = (
 );
 
 const App: React.FC = () => {
-  const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath);
+  // The shown surface is the store's: commands of the other one wait
+  const surface = useStore((s) => s.surface);
+  const setSurface = useStore((s) => s.setSurface);
+  const sessionsVisible = surface === 'sessions';
   // Subscribe field by field so that high frequency updates (scroll offsets,
   // active heading) do not re-render the whole application.
   const documentsLayoutRoot = useStore((s) => s.documentsLayout);
@@ -245,7 +249,7 @@ const App: React.FC = () => {
         e.preventDefault();
       }
       
-      const command = commandForKey(commands, e);
+      const command = commandForKey(commands, e, useStore.getState().surface);
       if (command) {
         e.preventDefault();
         command.run();
@@ -321,6 +325,7 @@ const App: React.FC = () => {
 
   const documentsLayout = useMemo<Layout>(() => ({ version: 1, root: documentsLayoutRoot }), [documentsLayoutRoot]);
   const applyDocumentsLayout = useCallback((next: Layout) => setDocumentsLayout(next.root), [setDocumentsLayout]);
+  const resetDocumentsLayout = useCallback(() => setDocumentsLayout(defaultDocumentsLayout({ withAgentDocs: !documentWindowPath })), [setDocumentsLayout]);
 
   const documentPanes = useMemo<Record<string, PaneType>>(() => {
     const zoomOf = (panel: ZoomPanel) => ({
@@ -359,7 +364,7 @@ const App: React.FC = () => {
           />
 
           <div className="main-content">
-            <LayoutView layout={documentsLayout} onChange={applyDocumentsLayout} paneTypes={documentPanes} />
+            <LayoutView layout={documentsLayout} onChange={applyDocumentsLayout} paneTypes={documentPanes} onReset={resetDocumentsLayout} />
           </div>
 
           <StatusBar />
@@ -377,9 +382,9 @@ const App: React.FC = () => {
     <div className="app-container">
       <Shell
         surfaces={surfaces}
-        active={sessionsVisible ? 'sessions' : 'documents'}
-        onActivate={(surface) => setSessionsVisible(surface === 'sessions')}
-        menu={<MainMenu items={menu} useCommandContext={useCommandContext} onOpen={flushEditorChanges} buttonClassName="toolbar-button" />}
+        active={surface}
+        onActivate={setSurface}
+        menu={<MainMenu items={menu} useCommandContext={useCommandContext} onOpen={flushEditorChanges} buttonClassName="toolbar-button" surface={surface} />}
         end={<ToolbarEnd />}
       />
       <SettingsModal />

@@ -59,6 +59,10 @@ export interface AppState {
   // Appearance
   theme: ColorTheme;
 
+  /** The shown surface of the window ('documents', 'sessions'): commands of another one wait. Not persisted. */
+  surface: string;
+  setSurface: (surface: string) => void;
+
   // Modal state
   settingsOpen: boolean;
   /** The command palette is showing. Not persisted. */
@@ -132,6 +136,7 @@ export const useStore = create<AppState>()(
       
       // Initial State - UI
       documentsLayout: defaultDocumentsLayout({ withAgentDocs: !documentWindowPath }),
+      surface: documentWindowPath ? 'documents' : 'sessions',
       panelZoom: DEFAULT_PANEL_ZOOM,
       statusBarVisible: false,
       statusBarPinned: false,
@@ -179,6 +184,7 @@ export const useStore = create<AppState>()(
       setStatusBarPinned: (pinned) => set({ statusBarPinned: pinned }),
       
 
+      setSurface: (surface) => set({ surface }),
       setSettingsOpen: (open) => set({ settingsOpen: open }),
       setPaletteOpen: (open) => set({ paletteOpen: open }),
       setPaletteHosted: (hosted) => set({ paletteHosted: hosted }),

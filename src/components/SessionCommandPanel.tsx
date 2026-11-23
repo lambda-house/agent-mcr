@@ -227,7 +227,7 @@ export default function SessionCommandPanel({
     }
 
     // The app's own commands, as its menu offers them now
-    return [...next, ...commandItems(menu, commandContext(), query)];
+    return [...next, ...commandItems(menu, commandContext(), query, 'Commands', commandContext().surface)];
   }, [open, enabled, scopedSessions, liveByKey, quickFilter, query, topTabs, menu, onSelectSession, onOpenLive, onNavigateView, onOpenSettings, onRefresh, onEnableAccess]);
 
   const filters = (
