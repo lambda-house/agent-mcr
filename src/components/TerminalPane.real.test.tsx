@@ -17,13 +17,14 @@ vi.mock('@xterm/xterm', async () => {
     element?: HTMLElement;
     textarea?: HTMLTextAreaElement;
     constructor(options: ConstructorParameters<typeof Real>[0]) { super({ ...options, allowProposedApi: true }); made.terms.push(this); }
-    open(parent: HTMLElement) { this.element = document.createElement('div'); parent.appendChild(this.element); }
+    // A textarea that takes the keyboard, as xterm's does
+    open(parent: HTMLElement) { this.element = document.createElement('div'); this.textarea = document.createElement('textarea'); this.element.appendChild(this.textarea); parent.appendChild(this.element); }
     onKey() { return { dispose() {} }; }
     registerLinkProvider() { return { dispose() {} }; }
     registerDecoration() { return undefined; }
     onRender() { return { dispose() {} }; }
     attachCustomKeyEventHandler() {}
-    focus() {}
+    focus() { this.textarea?.focus(); }
     refresh() {}
     hasSelection() { return false; }
     getSelection() { return ''; }
@@ -127,6 +128,23 @@ describe('a pane on a real terminal (review 17086)', () => {
     await answer('new line\r\n', 5_000_000);
     // Not "ew line": no unfinished sequence of the old terminal eats the replay's first bytes
     expect(lines(last())).toEqual(['new line']);
+  });
+
+  it('gives the keyboard to the new terminal when it replaces one that had it (review 17090)', async () => {
+    await show('a');
+    act(() => { views[0].on.start(0); views[0].on.data(bytes('old line\r\n')); });
+    await hide();
+    await parsed();
+    await show('a');
+    // Shown again, the kept terminal has the keyboard
+    const kept = last();
+    expect(document.activeElement).toBe((kept as unknown as { textarea: HTMLElement }).textarea);
+    // The runner cannot go on from its offset: a new terminal replaces it, and the person can type on
+    await answer('new line\r\n', 5_000_000);
+    await frame();
+    const now = last();
+    expect(now).not.toBe(kept);
+    expect(document.activeElement).toBe((now as unknown as { textarea: HTMLElement }).textarea);
   });
 
   it('does not keep the terminal of a session that left the list while its last bytes were being parsed (review 17088)', async () => {

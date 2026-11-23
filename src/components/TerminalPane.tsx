@@ -75,6 +75,8 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
   const [ended, setEnded] = useState(false);
   // A kept terminal the runner could not go on with is let go, and the pane mounts a new one (review 17088)
   const [fresh, setFresh] = useState(0);
+  // The terminal let go had the keyboard: the new one takes it (review 17090)
+  const refocus = useRef(false);
   const [notice, setNotice] = useState('');
   // Copy as task (MCR-125 v0): the right-click menu on a selection, and the dialog with its passage
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -119,6 +121,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       t.loadAddon(new Unicode11Addon());
       t.unicode.activeVersion = '11';
       t.open(element);
+      if (refocus.current) { refocus.current = false; requestAnimationFrame(() => { if (term.current === t) t.focus(); }); }
     }
     // The DOM renderer, on purpose (MCR-139): xterm's WebGL renderer measured
     // far heavier in this web view, 1.1 GB against 0.2 GB idle under the same
@@ -274,7 +277,12 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
         // and reused: a reset leaves xterm's parser inside any sequence the last
         // bytes left unfinished, and the replay's first bytes were read as its
         // end ("ew line", review 17088). A new terminal takes the replay instead
-        if (kept && (from === null || from !== kept.offset)) { discard = true; setFresh(n => n + 1); return; }
+        if (kept && (from === null || from !== kept.offset)) {
+          discard = true;
+          refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
+          setFresh(n => n + 1);
+          return;
+        }
         offset = from;
       },
       data: bytes => {
