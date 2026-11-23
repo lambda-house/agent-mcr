@@ -1,25 +1,28 @@
 import React, { useEffect, useCallback, useMemo, useState } from 'react';
-import { useStore, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH, type Heading, type RestoredDocument } from './store';
+import { useStore, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH } from './store';
+import { useReader } from './reader';
+import { openPath, reader } from './readerHost';
+import {
+  CloseDocumentDialog, DocumentPanel, MAIN_GROUP, ReaderProvider, SaveAllDialog, allTabs, type RestoredDocument,
+} from '@lambda-house/reader';
+import { EmptyState } from '@lambda-house/ui';
+import { FileQuestion } from 'lucide-react';
 import { LayoutView, MainMenu, Shell, findLeaf, isPx, type Layout, type LayoutNode, type PaneType, type ShellSurface, type Size } from '@lambda-house/workbench';
 import { Activity, FileText } from 'lucide-react';
 import {
   isTauri,
   readFile,
   onMenuCommand,
-  openExternal,
-  followLocalLink,
   onAgentFilesChanged,
 } from './utils/tauri';
-import { appMenu, buildMenu, menuCommands, commandForKey } from './utils/commands';
-import { getFileName, resolveLinkPath } from '@lambda-house/reader';
+import { appMenu, buildMenu, commandContext, menuCommands, commandForKey, useCommandContext } from './utils/commands';
+import { getFileName } from '@lambda-house/reader';
 import Toolbar, { ToolbarEnd } from './components/Toolbar';
 import { flushEditorChanges } from '@lambda-house/reader';
 import AgentPanel from './components/AgentPanel';
-import DocumentPanel from './components/DocumentPanel';
 import TocSidebar from './components/TocSidebar';
 import StatusBar from './components/StatusBar';
 import SettingsModal from './components/SettingsModal';
-import SaveAllDialog from './components/SaveAllDialog';
 import { agentFilesWatched, refreshAgentWorkspace } from './utils/agent';
 import SessionWorkspace from './components/SessionWorkspace';
 import { documentWindowPath } from './utils/documentWindow';
@@ -53,7 +56,7 @@ function errorText(error: unknown): string {
 async function reloadChangedDocuments(names: string[]): Promise<void> {
   if (names.length === 0) return;
   const changed = new Set(names);
-  const { documents, reloadDocument } = useStore.getState();
+  const { documents, reloadDocument } = useReader.getState();
   await Promise.all(Object.values(documents)
     .filter((doc) => !doc.isDirty && changed.has(getFileName(doc.path)))
     .map(async (doc) => {
@@ -65,6 +68,13 @@ async function reloadChangedDocuments(names: string[]): Promise<void> {
     }));
 }
 
+/** An empty document group: how to open a document here. */
+const NO_DOCUMENT = (
+  <EmptyState size="lg" icon={<FileQuestion size={64} />} title="No Document Open">
+    Select a document from the list on the left
+  </EmptyState>
+);
+
 const App: React.FC = () => {
   const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath);
   // Subscribe field by field so that high frequency updates (scroll offsets,
@@ -72,23 +82,22 @@ const App: React.FC = () => {
   const panelWidth = useStore((s) => s.panelWidth);
   const tocWidth = useStore((s) => s.tocWidth);
   const tocVisible = useStore((s) => s.tocVisible);
-  const hasAgentTabs = useStore((s) => s.tabs.some((t) => s.agentEntries.some((e) => e.path === t.path)));
+  const agentEntries = useStore((s) => s.agentEntries);
+  const hasAgentTabs = useReader((s) => allTabs(s).some((t) => agentEntries.some((e) => e.path === t.path)));
 
   const setPanelWidth = useStore((s) => s.setPanelWidth);
   const setTocWidth = useStore((s) => s.setTocWidth);
   const toggleTocVisible = useStore((s) => s.toggleTocVisible);
-  const activateTabByIndex = useStore((s) => s.activateTabByIndex);
-  const navigateBack = useStore((s) => s.navigateBack);
-  const navigateForward = useStore((s) => s.navigateForward);
-  const zoomIn = useStore((s) => s.zoomIn);
-  const zoomOut = useStore((s) => s.zoomOut);
+  const activateTabByIndex = useReader((s) => s.activateTabByIndex);
+  const navigateBack = useReader((s) => s.navigateBack);
+  const navigateForward = useReader((s) => s.navigateForward);
+  const zoomIn = useReader((s) => s.zoomIn);
+  const zoomOut = useReader((s) => s.zoomOut);
   const zoomPanel = useStore((s) => s.zoomPanel);
-  const reopenClosedTab = useStore((s) => s.reopenClosedTab);
-  const openDocument = useStore((s) => s.openDocument);
-  const restoreSession = useStore((s) => s.restoreSession);
-  const sessionRestored = useStore((s) => s.sessionRestored);
+  const reopenClosedTab = useReader((s) => s.reopenClosedTab);
+  const restoreSession = useReader((s) => s.restoreSession);
+  const sessionRestored = useReader((s) => s.sessionRestored);
 
-  const [headings, setHeadings] = useState<Heading[]>([]);
   // A memory reader window shows its one document and no list
   const filePanelVisible = useStore((s) => s.filePanelVisible) && !documentWindowPath;
   const setFilePanelVisible = useStore((s) => s.setFilePanelVisible);
@@ -101,19 +110,21 @@ const App: React.FC = () => {
     let cancelled = false;
 
     const restore = async () => {
-      const persistedTabs = useStore.getState().tabs;
+      const persistedTabs = allTabs(useReader.getState());
 
       if (documentWindowPath || persistedTabs.length === 0 || !isTauri()) {
         restoreSession([]);
         return;
       }
 
+      // A file open in two groups is read once
+      const paths = [...new Set(persistedTabs.map((tab) => tab.path))];
       const results = await Promise.all(
-        persistedTabs.map(async (tab): Promise<RestoredDocument | null> => {
+        paths.map(async (path): Promise<RestoredDocument | null> => {
           try {
-            return { path: tab.path, content: await readFile(tab.path) };
+            return { path, content: await readFile(path) };
           } catch (error) {
-            console.warn(`Dropping restored tab (cannot read ${tab.path}):`, error);
+            console.warn(`Dropping restored tab (cannot read ${path}):`, error);
             return null;
           }
         })
@@ -161,82 +172,18 @@ const App: React.FC = () => {
     };
   }, [documentsShown, filePanelVisible, hasAgentTabs]);
 
-  // Open a document by path (links, reopened tabs, the memory reader window)
-  const openPath = useCallback(async (path: string, options?: { preview?: boolean }) => {
-    const content = await readFile(path);
-    const result = openDocument(path, content, options);
-
-    if (!result.success) {
-      throw new Error(result.error || 'Failed to open document');
-    }
-  }, [openDocument]);
-
   // A native memory window opens only its requested document, independently of
   // the main window's launch queue and saved tabs.
   useEffect(() => {
     if (!documentWindowPath || !sessionRestored) return;
     void openPath(documentWindowPath).catch(error => alert(`Could not open memory:\n${errorText(error)}`));
     const refresh = () => {
-      const names = Object.values(useStore.getState().documents).map(doc => getFileName(doc.path));
+      const names = Object.values(useReader.getState().documents).map(doc => getFileName(doc.path));
       void reloadChangedDocuments(names);
     };
     window.addEventListener('focus', refresh);
     return () => window.removeEventListener('focus', refresh);
-  }, [sessionRestored, openPath]);
-
-  // Links in the document. The window itself never navigates (the backend
-  // blocks it): anchors scroll, web/mail links open in the default browser,
-  // links to local files open in a tab (or are revealed if not viewable),
-  // after a native confirmation when they're outside what the user opened.
-  useEffect(() => {
-    const handleClick = async (e: MouseEvent) => {
-      if (e.defaultPrevented || e.button !== 0) return;
-      const link = (e.target as HTMLElement).closest?.('.document-panel .markdown-body a[href]');
-      if (!link) return;
-      const href = link.getAttribute('href') ?? '';
-      e.preventDefault();
-
-      if (href.startsWith('#')) {
-        let id = href.slice(1);
-        try {
-          id = decodeURIComponent(id);
-        } catch {
-          // Malformed escape: use the id as written
-        }
-        link.closest('.markdown-body')?.querySelector(`[id="${CSS.escape(id)}"]`)?.scrollIntoView({ behavior: 'smooth' });
-        return;
-      }
-
-      try {
-        if (/^(https?|mailto):/i.test(href)) {
-          await openExternal(href);
-          return;
-        }
-        if (/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^file:/i.test(href) && !/^[A-Za-z]:[\\/]/.test(href)) {
-          return; // other schemes (javascript:, data:, ...) are ignored
-        }
-
-        const { tabs, activeTabId } = useStore.getState();
-        const documentPath = tabs.find((tab) => tab.id === activeTabId)?.path;
-        if (!documentPath) return;
-        const path = resolveLinkPath(href, documentPath);
-        if ((await followLocalLink(path)) === 'open') {
-          await openPath(path);
-        }
-      } catch (error) {
-        console.error('Failed to open link:', href, error);
-        alert(`Could not open ${href}:\n${errorText(error)}`);
-      }
-    };
-
-    document.addEventListener('click', handleClick);
-    return () => document.removeEventListener('click', handleClick);
-  }, [openPath]);
-
-  // Handle headings change from document
-  const handleHeadingsChange = useCallback((newHeadings: Heading[]) => {
-    setHeadings(newHeadings);
-  }, []);
+  }, [sessionRestored]);
 
   // Handle TOC toggle
   const handleToggleToc = useCallback(() => {
@@ -277,7 +224,7 @@ const App: React.FC = () => {
     let unlisten: (() => void) | undefined;
     onMenuCommand((id) => {
       const command = menuCommands(menu).find((item) => item.id === id);
-      if (command && (!command.enabled || command.enabled(useStore.getState()))) command.run();
+      if (command && (!command.enabled || command.enabled(commandContext()))) command.run();
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -338,7 +285,7 @@ const App: React.FC = () => {
       .then(({ getCurrentWindow }) => {
         const appWindow = getCurrentWindow();
         return appWindow.onCloseRequested(async (event) => {
-          const dirty = useStore.getState().tabs.filter((t) => t.isDirty);
+          const dirty = allTabs(useReader.getState()).filter((t) => t.isDirty);
           if (dirty.length === 0) return;
           event.preventDefault();
           const names = dirty.map((t) => t.title).join(', ');
@@ -389,12 +336,14 @@ const App: React.FC = () => {
         ?.closest?.('[data-zoom-panel]')
         ?.getAttribute('data-zoom-panel');
 
+      // A document group under the cursor zooms itself; anywhere else, the focused one
+      const group = (e.target as Element | null)?.closest?.('.document-panel[data-group]')?.getAttribute('data-group') ?? undefined;
       if (panel === 'files' || panel === 'toc') {
         zoomPanel(panel, direction);
       } else if (direction > 0) {
-        zoomIn();
+        zoomIn(group);
       } else {
-        zoomOut();
+        zoomOut(group);
       }
     };
     
@@ -442,12 +391,12 @@ const App: React.FC = () => {
       type: 'agent-docs', label: 'agent documents', collapsible: true, min: { w: PANEL_MIN_WIDTH }, max: { w: PANEL_MAX_WIDTH },
       render: () => <AgentPanel width={panelWidth} />,
     },
-    documents: { type: 'documents', label: 'document', min: { w: 200 }, render: () => <DocumentPanel onHeadingsChange={handleHeadingsChange} /> },
+    documents: { type: 'documents', label: 'document', min: { w: 200 }, render: () => <DocumentPanel group={MAIN_GROUP} empty={NO_DOCUMENT} /> },
     contents: {
       type: 'contents', label: 'table of contents', collapsible: true, min: { w: TOC_MIN_WIDTH }, max: { w: TOC_MAX_WIDTH },
-      render: () => <TocSidebar headings={headings} width={tocWidth} isVisible={tocVisible} onToggle={handleToggleToc} />,
+      render: () => <TocSidebar width={tocWidth} isVisible={tocVisible} onToggle={handleToggleToc} />,
     },
-  }), [panelWidth, tocWidth, tocVisible, headings, handleHeadingsChange, handleToggleToc]);
+  }), [panelWidth, tocWidth, tocVisible, handleToggleToc]);
 
   // The window's surfaces under one top bar (the workbench Shell). Documents is mounted only while shown;
   // Sessions stays mounted once opened. A memory window has Documents only.
@@ -476,17 +425,20 @@ const App: React.FC = () => {
   ];
 
   return (
+    <ReaderProvider reader={reader}>
     <div className="app-container">
       <Shell
         surfaces={surfaces}
         active={sessionsVisible ? 'sessions' : 'documents'}
         onActivate={(surface) => setSessionsVisible(surface === 'sessions')}
-        menu={<MainMenu items={menu} useCommandContext={useStore} onOpen={flushEditorChanges} buttonClassName="toolbar-button" />}
+        menu={<MainMenu items={menu} useCommandContext={useCommandContext} onOpen={flushEditorChanges} buttonClassName="toolbar-button" />}
         end={<ToolbarEnd />}
       />
       <SettingsModal />
       <SaveAllDialog />
+      <CloseDocumentDialog />
     </div>
+    </ReaderProvider>
   );
 };
 

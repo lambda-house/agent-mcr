@@ -17,6 +17,7 @@ import SessionAgentAccess from './SessionAgentAccess';
 import HarnessSettingsSection from './HarnessSettingsSection';
 import MemoryConnection from './MemoryConnection';
 import '../styles/settings-modal.css';
+import { useReader } from '../reader';
 
 type SettingsCategory =
   | 'general'
@@ -100,8 +101,9 @@ function PluginsSettingsSection() {
 const SettingsModal: React.FC = () => {
   const settingsOpen = useStore((s) => s.settingsOpen);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
-  const smoothScroll = useStore((s) => s.smoothScroll);
-  const setSmoothScroll = useStore((s) => s.setSmoothScroll);
+  const smoothScroll = useReader((s) => s.settings.smoothScroll);
+  const setReaderSettings = useReader((s) => s.setSettings);
+  const setSmoothScroll = (value: boolean) => setReaderSettings({ smoothScroll: value });
   const [appVersion, setAppVersion] = useState<string | null>(null);
   usePluginVersion();
   const pluginSettingsTabs = pluginRegistry.getSettingsTabs();

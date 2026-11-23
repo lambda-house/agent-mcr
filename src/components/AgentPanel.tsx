@@ -21,6 +21,8 @@ import {
 import { shortPath } from '../utils/harness';
 import PanelZoomBadge from './PanelZoomBadge';
 import { useSmoothWheelScroll } from '@lambda-house/ui';
+import { useReader } from '../reader';
+import { activeTabOf, focusedGroupOf } from '@lambda-house/reader';
 
 // ============================================================
 // Agent documents: instructions, rules, memory, plans and skills of coding
@@ -35,8 +37,8 @@ const AgentItem: React.FC<{ entry: AgentEntry; active: boolean; showGroup?: bool
   active,
   showGroup,
 }) => {
-  const openDocument = useStore((s) => s.openDocument);
-  const reloadDocument = useStore((s) => s.reloadDocument);
+  const openDocument = useReader((s) => s.openDocument);
+  const reloadDocument = useReader((s) => s.reloadDocument);
 
   // Single click opens the preview tab, double-click a permanent tab
   const open = useCallback(async (preview: boolean) => {
@@ -87,9 +89,9 @@ const AgentPanel: React.FC<{ width: number }> = ({ width }) => {
   const entries = useStore((s) => s.agentEntries);
   const sessionFolders = useStore((s) => s.agentFolders);
   const setAgentEntries = useStore((s) => s.setAgentEntries);
-  const activePath = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.path ?? null);
+  const activePath = useReader((s) => activeTabOf(focusedGroupOf(s))?.path ?? null);
   const zoom = useStore((s) => s.panelZoom.files);
-  const smoothScroll = useStore((s) => s.smoothScroll);
+  const smoothScroll = useReader((s) => s.settings.smoothScroll);
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState('');

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { useStore } from '../store';
-import { buildMenu, commandForKey, menuCommands } from './commands';
+import { buildMenu, commandContext, commandForKey, menuCommands } from './commands';
 
 // The native menu (src-tauri/src/main.rs) has its own list of items; the ones
 // Rust does not handle itself reach the frontend as "menu-command" events and
@@ -41,11 +41,11 @@ describe('the command panel', () => {
 
   it('opens only while Sessions hosts it', () => {
     useStore.setState({ paletteHosted: false, paletteOpen: false });
-    expect(palette.enabled?.(useStore.getState())).toBe(false);
+    expect(palette.enabled?.(commandContext())).toBe(false);
     palette.run();
     expect(useStore.getState().paletteOpen).toBe(false);
     useStore.setState({ paletteHosted: true });
-    expect(palette.enabled?.(useStore.getState())).toBe(true);
+    expect(palette.enabled?.(commandContext())).toBe(true);
     palette.run();
     expect(useStore.getState().paletteOpen).toBe(true);
   });

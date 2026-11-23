@@ -8,8 +8,7 @@ import { cacheState, compact, contextWindow, formatSessionTitle, matchesSession,
 import { formatAge } from '../utils/agent';
 import { hostedState, liveSessionLabel, runningFor, shortPath, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { TopTabPlugin } from '../plugins/sdk';
-import { useStore } from '../store';
-import { appMenu } from '../utils/commands';
+import { appMenu, commandContext } from '../utils/commands';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
 import { EarlierRow, HostedRow, rowIdle, useHostedByConversation } from './SessionRow';
@@ -228,7 +227,7 @@ export default function SessionCommandPanel({
     }
 
     // The app's own commands, as its menu offers them now
-    return [...next, ...commandItems(menu, useStore.getState(), query)];
+    return [...next, ...commandItems(menu, commandContext(), query)];
   }, [open, enabled, scopedSessions, liveByKey, quickFilter, query, topTabs, menu, onSelectSession, onOpenLive, onNavigateView, onOpenSettings, onRefresh, onEnableAccess]);
 
   const filters = (
