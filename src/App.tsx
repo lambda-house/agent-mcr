@@ -11,9 +11,9 @@ import {
   onAgentFilesChanged,
 } from './utils/tauri';
 import { appMenu, buildMenu, menuCommands, commandForKey } from './utils/commands';
-import { getFileName, resolveLinkPath } from './utils/files';
+import { getFileName, resolveLinkPath } from '@lambda-house/reader';
 import Toolbar, { ToolbarEnd } from './components/Toolbar';
-import { flushEditorChanges } from './utils/editorRegistry';
+import { flushEditorChanges } from '@lambda-house/reader';
 import AgentPanel from './components/AgentPanel';
 import DocumentPanel from './components/DocumentPanel';
 import TocSidebar from './components/TocSidebar';

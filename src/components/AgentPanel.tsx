@@ -20,7 +20,7 @@ import {
 } from '../utils/agent';
 import { shortPath } from '../utils/harness';
 import PanelZoomBadge from './PanelZoomBadge';
-import { useSmoothWheelScroll } from '../hooks/useSmoothWheelScroll';
+import { useSmoothWheelScroll } from '@lambda-house/ui';
 
 // ============================================================
 // Agent documents: instructions, rules, memory, plans and skills of coding

@@ -37,26 +37,27 @@ Frontend unit tests are Vitest files next to the code (`src/utils/*.test.ts`; DO
   - `LiveWorkspace.tsx` - Live: its own two-way pane tree (`utils/paneLayout.ts`: split, close, presets) is drawn by `LayoutView` (a split's ratio as two fractions; a handle's drag comes back as the ratio). A session's pane is a kept-alive pane: its terminal is mounted once and moved between panes, never remounted; an opened session in no pane waits hidden in the layout's parking. The pane's root has no `key` (a changing key would remount the terminal)
   - `MainMenu` (from `@lambda-house/workbench`) - Toolbar menu (top left): every command, grouped, with its shortcut
   - `SessionCommandPanel.tsx` - The command panel: the workbench `Palette` with sessions (Live rows under their folders, quick filters, preview), views, actions and the app's commands. It opens through the command `app.commandPalette` (Ctrl+Shift+P, ⇧⌘P; ⌘S is Save), set in the store's `paletteOpen`; the `command-panel` plugin hosts it in Sessions only, and `paletteHosted` keeps the command disabled over Documents. `TerminalPane` lets the key through (`isPaletteKey`)
-  - `DocumentPanel.tsx` - Center markdown renderer with ErrorBoundary. Scroll positions per document are anchored to the block at the top of the view (`utils/scrollAnchor.ts`), so late Mermaid output doesn't move the restored text
+  - `DocumentPanel.tsx` - Center markdown renderer with ErrorBoundary. Scroll positions per document are anchored to the block at the top of the view (`scrollAnchor.ts` in `@lambda-house/reader`), so late Mermaid output doesn't move the restored text
   - `TabBar.tsx` - Tab strip: preview tab, context menu, back/forward, overflow scrolling
   - `TocSidebar.tsx` - Right sidebar table of contents
   - `AgentPanel.tsx` - The left panel of Documents: agent documents by session folder, then the agents' own
-  - `FindBar.tsx` - Ctrl+F find in document (CSS Custom Highlight API; highlights are changed in place, WebKitGTK doesn't repaint replaced ones). A jump and the scroll restore both use `utils/scrollHold.ts` to keep their offset while late output changes the layout
-  - `Editor.tsx` - CodeMirror 6 source editor (Ctrl+E), lazy-loaded; per-document state lives in `utils/editorRegistry.ts`, saving in `utils/save.ts`
+  - `FindBar.tsx` - Ctrl+F find in document (CSS Custom Highlight API; highlights are changed in place, WebKitGTK doesn't repaint replaced ones). A jump and the scroll restore both use `holdScroll` (`@lambda-house/reader`) to keep their offset while late output changes the layout
+  - `Editor.tsx` - CodeMirror 6 source editor (Ctrl+E), lazy-loaded; per-document state lives in `editorRegistry.ts` (`@lambda-house/reader`), saving in `utils/save.ts`
   - `Toolbar.tsx` - The Documents tools in the top bar, put there with `ShellTools` (panels, edit, export, zoom, contents); `ToolbarEnd` is settings and theme, on every surface. `SessionWorkspace` puts the Live/Journal/Board/Slack switch and the summary there the same way (`.sc-bar` gives them the cockpit's type, since they render outside `.session-cockpit`); outside a Shell, as in tests, `ShellTools` renders in place
   - Shared controls come from `@lambda-house/ui` (`packages/ui`; the app's own `src/ui` is gone): `Button`, `ConfirmDialog` (buttons in the platform's order, `cancelIsDefault` for questions like opening an agent's link; `SaveAllDialog.tsx`, the cockpit and Live use it), `Dialog` (`size="lg"` for the new-agent form), `SplitHandle` (separators: drag to resize, drag to the edge or double-click to hide/show, arrows step), `Segmented` (the Live/Journal/Board/Slack switch; the Shell's surface switch uses it too), `Tabs`, `Menu` (tab, row and terminal menus; it renders in place), `PaneFrame` (agent documents, Contents), `EmptyState`, `Kbd`, `Badge`, `Notice`, `SettingRow`, `DescList`, `StatusDot`, `ScrollArea`. `TaskCopyDialog` keeps its own frame (its keys belong to the text field); `MainMenu` still draws its own menu
   - `StatusBar.tsx` - Bottom status bar (auto-hides)
 
-- **Hooks** (`src/hooks/`): `useSmoothWheelScroll` - velocity-based wheel scrolling shared by the document, file panel and TOC
+- **Smooth scrolling**: `useSmoothWheelScroll` (`@lambda-house/ui`) - velocity-based wheel scrolling shared by the document, the agent documents and the TOC
 
 - **Commands** (`src/utils/commands.ts`): `buildMenu` is the one list of commands (label, shortcut, `enabled`/`checked`, `run`; the types and `commandForKey`/`formatShortcut` are `@lambda-house/workbench`'s, typed with `AppState`). The menu renders it, the command panel lists it (through `appMenu`, set in `App.tsx`; `palette: false` keeps a command out), the native menu's events run it by id (`utils/nativeMenu.test.ts` fails if an item in `main.rs` has no command) and the key handler in `App.tsx` matches key presses against it, so a new command or shortcut goes there, not into either of them. `run` must be safe when `enabled` is false (shortcuts don't check it)
 
-- **Markdown Processing** (`src/utils/markdown.ts`):
+- **Markdown Processing** (`packages/reader/src/markdown.ts`, imported from `@lambda-house/reader`, like the file kinds, `resolveLinkPath`, find's `search.ts`, scroll anchoring and the editor registry; changes go into mdviewer-mj first):
   - markdown-it with `html: false` (raw HTML is escaped; every custom renderer rule must escape what it emits with `escapeHtml`)
   - Shiki for syntax highlighting (15+ languages)
   - Mermaid for diagrams with unique ID generation per render
   - HeadingIdGenerator for automatic anchor links
-  - `renderFile` dispatches by type (`getFileKind` in `utils/files.ts`): markdown, fb2 (converted via `utils/fb2.ts`), code (one highlighted fence), plain text
+  - `renderFile` dispatches by type (`getFileKind` in the reader's `files.ts`): markdown, fb2 (converted via `fb2.ts`), code (one highlighted fence), plain text
+  - Local images get their URL from `setImageUrl`, which `main.tsx` points at `convertFileSrc(path, 'localfile')`. Mermaid's `secure` list keeps diagrams from setting `themeCSS`/fonts (a `url()` there would fetch without the "Load images" consent)
   - Block elements carry `data-line` (0-based source line, frontmatter included) to map search results to the rendered DOM
 
 ### Backend (src-tauri/)
