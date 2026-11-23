@@ -12,8 +12,8 @@ import { Badge, Button, Kbd, Notice, SettingRow } from '@lambda-house/ui';
 import { useStore } from '../store';
 import { getAppVersion } from '../utils/tauri';
 import { pluginRegistry, usePluginVersion } from '../plugins';
-import SessionMemoryBrowser from './SessionMemoryBrowser';
-import SessionAgentAccess from './SessionAgentAccess';
+import { AgentAccess, JournalProvider, MemoryBrowser } from '@lambda-house/journal';
+import { journal } from '../journal';
 import HarnessSettingsSection from './HarnessSettingsSection';
 import MemoryConnection from './MemoryConnection';
 import '../styles/settings-modal.css';
@@ -258,7 +258,7 @@ const SettingsModal: React.FC = () => {
                   <p className="settings-section-description">Inspect TEOB memories across recorded workspaces.</p>
                 </div>
                 <div className="session-cockpit settings-embedded-host">
-                  <SessionMemoryBrowser />
+                  <JournalProvider journal={journal}><MemoryBrowser /></JournalProvider>
                 </div>
               </div>
             )}
@@ -269,13 +269,15 @@ const SettingsModal: React.FC = () => {
                   <h3>Agent access</h3>
                 </div>
                 <div className="settings-embedded-host">
-                  <SessionAgentAccess
-                    embedded
-                    directory=""
-                    inspect={() => {
-                      setSettingsOpen(false);
-                    }}
-                  />
+                  <JournalProvider journal={journal}>
+                    <AgentAccess
+                      embedded
+                      directory=""
+                      inspect={() => {
+                        setSettingsOpen(false);
+                      }}
+                    />
+                  </JournalProvider>
                 </div>
               </div>
             )}
