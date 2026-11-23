@@ -16,7 +16,7 @@ When pulling or moving to a newer version of `agent-mcr`, only these core files 
 1. **`src/components/SessionWorkspace.tsx`**
    - Subscribes via `usePluginVersion()` and renders `pluginRegistry.getTopTabs()` in `.hs-view-switch`.
 2. **`src/components/LiveWorkspace.tsx`** (+ **`src/styles/harness.css`**)
-   - Hosts the multi-pane split tree (`PaneNode` from `utils/paneLayout.ts`).
+   - Hosts the multi-pane split tree (`PaneNode` from `utils/paneLayout.ts`), drawn by the workbench `LayoutView` (`@lambda-house/workbench`); session panes are kept alive there.
    - Calls `pluginRegistry.getSidebarSections()`, `getPaneType()`, `getEmptyActions()`, `getSessionEnrichers()`, `getOverride('live:*')`, and `emitEvent(...)`.
 3. **`src-tauri/src/agents.rs` & `src-tauri/src/harness.rs`** (optional Rust backend enrichment)
    - `transcript_summary` (`title`, `role`, `tags` on `Resumable`) and `antigravity` harness support.

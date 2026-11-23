@@ -716,3 +716,34 @@ describe('Live workspace', () => {
     expect(host.querySelector('.hs-dir')).not.toBeNull();
   });
 });
+
+describe('panes on the workbench layout', () => {
+  it('keeps terminals mounted while panes are split, closed and laid out again', async () => {
+    const shell: Hosted = { ...ended, id: 's1', started: 3, exit: null };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const shown = () => [...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'));
+    await act(async () => row('Fixing tests').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    await act(async () => button('Two columns').click()); await flush();
+    expect(shown()).toEqual(['s1', 'r1']);
+    const before = mounts.length;
+
+    // Split the first pane: an empty pane below it, both terminals where they were
+    await act(async () => (host.querySelector('button[aria-label="Split down"]') as HTMLButtonElement).click()); await flush();
+    expect(host.querySelector('.hs-pane-title--empty')).not.toBeNull();
+    expect(shown()).toEqual(['s1', 'r1']);
+    // Close the empty pane, then one pane and two columns again
+    await act(async () => (host.querySelector('.hs-pane-title--empty button[aria-label="Close pane"]') as HTMLButtonElement).click()); await flush();
+    expect(host.querySelector('.hs-pane-title--empty')).toBeNull();
+    await act(async () => button('Single pane').click()); await flush();
+    expect(shown()).toHaveLength(1);
+    // The other terminal waits, mounted and hidden
+    expect(host.querySelectorAll('[data-terminal]')).toHaveLength(2);
+    await act(async () => button('Two columns').click()); await flush();
+    expect(shown()).toHaveLength(2);
+
+    expect(mounts.length).toBe(before);
+  });
+});

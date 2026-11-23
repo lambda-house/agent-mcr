@@ -1,8 +1,8 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
 import { Button, ConfirmDialog, Dialog, Menu } from '@lambda-house/ui';
+import { LayoutView, isPx, type Layout, type LayoutNode } from '@lambda-house/workbench';
 import TerminalPane from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
@@ -15,7 +15,7 @@ import { useStore } from '../store';
 import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
 import { liveNav } from '../utils/liveNav';
 import { PLATFORM } from '../utils/platform';
-import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
+import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneLeaf, type PaneNode } from '../utils/paneLayout';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
@@ -53,14 +53,30 @@ function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-acti
   </span>;
 }
 
-function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot: (id: string, el: HTMLElement | null) => void }) {
-  const ref = useCallback((el: HTMLElement | null) => registerSlot(sessionId, el), [sessionId, registerSlot]);
-  return <div className="hs-pane-slot" ref={ref}/>;
+/** Smallest pane in Live, px. */
+const PANE_MIN = { w: 240, h: 120 };
+
+/** Live's two-way pane tree as the workbench draws it: a split's ratio becomes two fractions. */
+function drawPaneTree(node: PaneNode): LayoutNode {
+  if (node.kind === 'leaf') {
+    const item = node.item;
+    return {
+      kind: 'leaf',
+      id: node.id,
+      pane: item ? { type: item.kind === 'session' ? 'session' : 'custom', key: item.kind === 'session' ? `session:${item.id}` : `custom:${item.type}:${item.key}`, state: item } : null,
+    };
+  }
+  return { kind: 'split', id: node.id, dir: node.dir, children: [drawPaneTree(node.a), drawPaneTree(node.b)], sizes: [{ fr: node.ratio }, { fr: 1 - node.ratio }] };
 }
 
-function HiddenPaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot: (id: string, el: HTMLElement | null) => void }) {
-  const ref = useCallback((el: HTMLElement | null) => registerSlot(sessionId, el), [sessionId, registerSlot]);
-  return <div className="hs-pane" hidden ref={ref}/>;
+/** The ratio of every two-child split of a drawn tree, to write a handle's drag back. */
+function splitRatios(node: LayoutNode, out = new Map<string, number>()): Map<string, number> {
+  if (node.kind === 'split') {
+    const [a, b] = node.sizes;
+    if (node.children.length === 2 && a && b && !isPx(a) && !isPx(b) && a.fr + b.fr > 0) out.set(node.id, a.fr / (a.fr + b.fr));
+    node.children.forEach(child => splitRatios(child, out));
+  }
+  return out;
 }
 
 /**
@@ -98,10 +114,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const [focusedPane, setFocusedPane] = useState('p1');
   const paneSeq = useRef(2);
   const splitSeq = useRef(1);
-  const [slotEls, setSlotEls] = useState<Record<string, HTMLElement | null>>({});
-  const registerSlot = useCallback((key: string, el: HTMLElement | null) => {
-    setSlotEls(prev => prev[key] === el ? prev : { ...prev, [key]: el });
-  }, []);
   const [profile, setProfile] = useState('claude');
   const [cwd, setCwd] = useState('');
   const [starting, setStarting] = useState(false);
@@ -348,26 +360,12 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     },
     reportError: (msg: string) => setError(msg),
   }), [active, hosted, opened, selected, layout, focusedPane, openItem, assignPaneItem, clearItemFromLayout, splitPane, closePane, applyPreset]);
-  const startDividerDrag = (splitId: string, dir: 'row' | 'col', e: React.MouseEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    const container = e.currentTarget.parentElement;
-    if (!container) return;
-    const rect = container.getBoundingClientRect();
-    const onMove = (ev: MouseEvent) => {
-      const ratio = dir === 'row'
-        ? (ev.clientX - rect.left) / Math.max(1, rect.width)
-        : (ev.clientY - rect.top) / Math.max(1, rect.height);
-      setLayout(prev => setSplitRatio(prev, splitId, ratio));
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = '';
-    };
-    document.body.style.cursor = dir === 'row' ? 'col-resize' : 'row-resize';
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-  };
+  // The pane tree, drawn by the workbench's LayoutView; a handle's drag comes back as the split's ratio.
+  // Live keeps its own two-way tree and its operations (split, close, presets).
+  const drawn = useMemo<Layout>(() => ({ version: 1, root: drawPaneTree(layout) }), [layout]);
+  const applyDrawn = useCallback((next: Layout) => {
+    setLayout(prev => [...splitRatios(next.root)].reduce((tree, [id, ratio]) => setSplitRatio(tree, id, ratio), prev));
+  }, []);
   useEffect(() => { if (focus?.id) select(focus.id); }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
   const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
@@ -805,16 +803,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         const bgOpened = opened.filter(id => !visibleSessions.has(id) && hosted.some(h => h.id === id));
         const emptyActions = pluginRegistry.getEmptyActions();
         const emptyPaneOverride = pluginRegistry.getOverride('live:empty-pane');
-        const renderNode = (node: PaneNode): React.ReactNode => {
-          if (node.kind === 'split') {
-            return (
-              <div key={node.id} className={`hs-split hs-split--${node.dir}`}>
-                <div className="hs-split-child" style={{ flex: node.ratio }}>{renderNode(node.a)}</div>
-                <div className="hs-divider" role="separator" aria-orientation={node.dir === 'row' ? 'vertical' : 'horizontal'} onMouseDown={e => startDividerDrag(node.id, node.dir, e)}/>
-                <div className="hs-split-child" style={{ flex: 1 - node.ratio }}>{renderNode(node.b)}</div>
-              </div>
-            );
-          }
+        // A leaf's pane: a session (header, cockpit, terminal, usage), a plugin's pane, or the empty pane.
+        // A session's pane is kept alive by the layout; one opened but in no pane waits parked and hidden.
+        const renderPane = (node: PaneLeaf, parked = false, visible = true): React.ReactNode => {
           const sessItem = node.item?.kind === 'session' ? node.item : null;
           const h = sessItem ? hosted.find(x => x.id === sessItem.id) : undefined;
           const pluginKind = node.item ? (node.item.kind === 'custom' ? node.item.type : node.item.kind) : '';
@@ -935,7 +926,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
           );
 
           return (
-            <div key={node.id} className={`hs-pane${multiPane && isFocused ? ' focused' : ''}`} onMouseDown={() => focusPane(node.id, node.item)}>
+            // No key: a kept-alive pane moves between leaves (and in from the parking); a key that changed would remount its terminal
+            <div className={`hs-pane${multiPane && isFocused ? ' focused' : ''}`} hidden={parked} onMouseDown={parked ? undefined : () => focusPane(node.id, node.item)}>
               {h ? (() => {
                 const defaultHeader = () => (
                   <header className="hs-pane-title">
@@ -952,14 +944,14 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                 );
                 return (
                   <>
-                    {sessionHeaderOverride
+                    {!parked && (sessionHeaderOverride
                       ? sessionHeaderOverride({ session: h, leafId: node.id, multiPane, isFocused, statsOpen: stats, toggleStats, controller, defaultRender: defaultHeader })
-                      : defaultHeader()}
+                      : defaultHeader())}
                     {/* The cockpit sits over the Supervisor's own terminal and nowhere else (MCR-96) */}
-                    {!h.exit && isSupervisor(h) && <CockpitPanel active={active} hosted={hosted} label={sessionLabel} onSession={follow}/>}
+                    {!parked && !h.exit && isSupervisor(h) && <CockpitPanel active={active} hosted={hosted} label={sessionLabel} onSession={follow}/>}
                     <div className="hs-pane-body">
-                      <PaneSlot sessionId={h.id} registerSlot={registerSlot}/>
-                      {stats && isFocused && <SessionStats session={h} active={active}/>}
+                      {opened.includes(h.id) && <TerminalPane key={h.id} id={h.id} name={sessionLabel(h)} active={active && visible} onQuit={() => { closing.current.add(h.id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === h.id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === h.id ? null : l)}/>}
+                      {!parked && stats && isFocused && <SessionStats session={h} active={active}/>}
                     </div>
                   </>
                 );
@@ -995,18 +987,26 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                 </div>
               );
             })()}
-            {leaves.length === 1 && !leaves[0].item
-              ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
-              : <div className="hs-layout-root">{renderNode(layout)}</div>}
-            {bgOpened.map(id => <HiddenPaneSlot key={`bg:${id}`} sessionId={id} registerSlot={registerSlot}/>)}
-            {opened.map(id => {
-              const h = hosted.find(x => x.id === id);
-              if (!h) return null;
-              const el = slotEls[id];
-              if (!el) return null;
-              const isVisible = visibleSessions.has(id);
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active && isVisible} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
-            })}
+            <LayoutView
+              className="hs-layout-root"
+              layout={drawn}
+              onChange={applyDrawn}
+              focusedLeaf={focusedPane}
+              paneTypes={{
+                session: {
+                  type: 'session', label: 'session pane', keepAlive: true, min: PANE_MIN,
+                  render: ({ pane, leaf, visible }) => renderPane({ kind: 'leaf', id: leaf?.id ?? `bg:${pane.key}`, item: pane.state as PaneItem }, !leaf, visible),
+                },
+                custom: {
+                  type: 'custom', label: 'pane', min: PANE_MIN,
+                  render: ({ pane, leaf }) => renderPane({ kind: 'leaf', id: leaf?.id ?? '', item: pane.state as PaneItem }),
+                },
+              }}
+              renderEmpty={(leaf) => leaves.length === 1
+                ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
+                : renderPane({ kind: 'leaf', id: leaf.id, item: null })}
+              retain={bgOpened.map(id => ({ type: 'session', key: `session:${id}`, state: { kind: 'session', id } }))}
+            />
           </>
         );
       })()}

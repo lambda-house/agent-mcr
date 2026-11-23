@@ -1,6 +1,6 @@
 import React, { useEffect, useCallback, useMemo, useState } from 'react';
-import { useStore, PANEL_MIN_WIDTH, TOC_MIN_WIDTH, type Heading, type RestoredDocument } from './store';
-import { Splitter } from '@lambda-house/ui';
+import { useStore, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH, type Heading, type RestoredDocument } from './store';
+import { LayoutView, findLeaf, isPx, type Layout, type LayoutNode, type PaneType, type Size } from '@lambda-house/workbench';
 import {
   isTauri,
   readFile,
@@ -401,6 +401,53 @@ const App: React.FC = () => {
     return () => window.removeEventListener('wheel', handleWheel);
   }, [zoomIn, zoomOut, zoomPanel]);
 
+  // ============================================================
+  // Documents: the agent documents, the document and the contents on the
+  // workbench layout, drawn from the store's widths and flags; what the
+  // handles change goes back through the same setters. A memory window has
+  // the left panel only while it is shown, as before.
+  // ============================================================
+
+  const documentsLayout = useMemo<Layout>(() => {
+    const children: LayoutNode[] = [
+      { kind: 'leaf', id: 'main', pane: { type: 'documents', key: 'main' } },
+      { kind: 'leaf', id: 'right', pane: { type: 'contents', key: 'contents' }, collapsed: !tocVisible },
+    ];
+    const sizes: Size[] = [{ fr: 1 }, { px: tocWidth }];
+    if (!documentWindowPath || filePanelVisible) {
+      children.unshift({ kind: 'leaf', id: 'left', pane: { type: 'agent-docs', key: 'left' }, collapsed: !filePanelVisible });
+      sizes.unshift({ px: panelWidth });
+    }
+    return { version: 1, root: { kind: 'split', id: 'documents', dir: 'row', children, sizes } };
+  }, [filePanelVisible, tocVisible, panelWidth, tocWidth]);
+
+  const applyDocumentsLayout = useCallback((next: Layout) => {
+    const split = next.root.kind === 'split' ? next.root : null;
+    const width = (id: string) => {
+      const size = split?.sizes[split.children.findIndex((child) => child.id === id)];
+      return size && isPx(size) ? size.px : undefined;
+    };
+    const left = findLeaf(next.root, 'left');
+    const right = findLeaf(next.root, 'right');
+    if (left && !left.collapsed !== filePanelVisible) setFilePanelVisible(!left.collapsed);
+    if (right && !right.collapsed !== tocVisible) setTocVisible(!right.collapsed);
+    const leftWidth = width('left'), rightWidth = width('right');
+    if (leftWidth !== undefined && leftWidth !== panelWidth) setPanelWidth(leftWidth);
+    if (rightWidth !== undefined && rightWidth !== tocWidth) setTocWidth(rightWidth);
+  }, [filePanelVisible, tocVisible, panelWidth, tocWidth, setFilePanelVisible, setTocVisible, setPanelWidth, setTocWidth]);
+
+  const documentPanes = useMemo<Record<string, PaneType>>(() => ({
+    'agent-docs': {
+      type: 'agent-docs', label: 'agent documents', collapsible: true, min: { w: PANEL_MIN_WIDTH }, max: { w: PANEL_MAX_WIDTH },
+      render: () => <AgentPanel width={panelWidth} />,
+    },
+    documents: { type: 'documents', label: 'document', min: { w: 200 }, render: () => <DocumentPanel onHeadingsChange={handleHeadingsChange} /> },
+    contents: {
+      type: 'contents', label: 'table of contents', collapsible: true, min: { w: TOC_MIN_WIDTH }, max: { w: TOC_MAX_WIDTH },
+      render: () => <TocSidebar headings={headings} width={tocWidth} isVisible={tocVisible} onToggle={handleToggleToc} />,
+    },
+  }), [panelWidth, tocWidth, tocVisible, headings, handleHeadingsChange, handleToggleToc]);
+
   return (
     <div className="app-container">
       <div className="workspace-surface" hidden={!sessionsVisible}>
@@ -415,38 +462,7 @@ const App: React.FC = () => {
       />
 
       <div className="main-content">
-        {filePanelVisible && <AgentPanel width={panelWidth} />}
-
-        {!documentWindowPath && <Splitter
-          side="left"
-          width={panelWidth}
-          minWidth={PANEL_MIN_WIDTH}
-          visible={filePanelVisible}
-          onWidthChange={setPanelWidth}
-          onVisibleChange={setFilePanelVisible}
-          label="agent documents"
-        />}
-
-        <DocumentPanel onHeadingsChange={handleHeadingsChange} />
-
-        <Splitter
-          side="right"
-          width={tocWidth}
-          minWidth={TOC_MIN_WIDTH}
-          visible={tocVisible}
-          onWidthChange={setTocWidth}
-          onVisibleChange={setTocVisible}
-          label="table of contents"
-        />
-
-        {tocVisible && (
-          <TocSidebar
-            headings={headings}
-            width={tocWidth}
-            isVisible={tocVisible}
-            onToggle={handleToggleToc}
-          />
-        )}
+        <LayoutView layout={documentsLayout} onChange={applyDocumentsLayout} paneTypes={documentPanes} />
       </div>
 
       <StatusBar />
