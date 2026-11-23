@@ -40,28 +40,36 @@ pub const OWNER_WORDS: [&str; 6] = ["merge", "push", "build", "release", "spend"
 pub const DELIVERY_WORDS: [&str; 2] = ["merge", "push"];
 
 /// What a delivering profile on an adapter with tool lists must deny
-/// (MCR-136): no force push, no mirror or prune, no deletion of main.
-/// Claude Code's `*` matches any text, spaces included, anywhere in a rule;
-/// whether one in the middle matches nothing is not documented, so a form
-/// that may come right after `push` has a rule of its own. Best-effort, as
-/// every deny rule (M2): `git -C <dir> push`, `git -c ... push`, an alias, a
-/// script, bundled short flags (`-uf`) and a ref update through `gh api` are
-/// not caught. The boundary that holds is the protection of main
-pub const FORCE_PUSH_DENIES: [&str; 11] = [
-    // --force, --force-with-lease and --force-if-includes, before or after the remote
-    "Bash(git push*--force*)",
+/// (MCR-136): force pushes, a mirror push and deleting main. Claude Code's
+/// `*` matches any text, spaces included, and a rule matches text, not
+/// words, so every rule starts its flag at a word: a space before it, or
+/// right after `push` (a rule `x * y` never matches `x y`). A branch name
+/// never starts with `-`, and a leading `+` always forces, so these match
+/// no ordinary branch push. Fewer safe rules over exhaustive ones (review
+/// 17009): a false deny of a normal push is worse than a missed exotic
+/// form, and the boundary that holds is the protection of main. Not caught:
+/// `git -C <dir> push`, `git -c ... push`, an alias, a script, bundled short
+/// flags (`-uf`), `--prune`, deleting main with `--delete`/`-d` before the
+/// remote or after another ref, `:main` without a remote,
+/// `:refs/heads/main`, and a ref update through `gh api`
+pub const FORCE_PUSH_DENIES: [&str; 14] = [
+    // --force, --force-with-lease, --force-if-includes; -f
+    "Bash(git push --force*)",
+    "Bash(git push * --force*)",
     "Bash(git push -f*)",
-    "Bash(git push* -f*)",
+    "Bash(git push * -f*)",
     // A forced refspec: +ref, +src:dst
     "Bash(git push +*)",
-    "Bash(git push* +*)",
-    "Bash(git push*--mirror*)",
-    "Bash(git push*--prune*)",
-    // Deleting main; `HEAD:main`, a plain push to main, is not a deletion
-    "Bash(git push*--delete*main)",
-    "Bash(git push* -d*main)",
-    "Bash(git push* :main)",
-    "Bash(git push* :refs/heads/main)",
+    "Bash(git push * +*)",
+    "Bash(git push --mirror*)",
+    "Bash(git push * --mirror*)",
+    // Deleting main, last or followed by another ref; `HEAD:main` is a plain push
+    "Bash(git push * :main)",
+    "Bash(git push * :main *)",
+    "Bash(git push * --delete main)",
+    "Bash(git push * --delete main *)",
+    "Bash(git push * -d main)",
+    "Bash(git push * -d main *)",
 ];
 
 /// What an executor below a delivering lead is denied where its adapter takes
@@ -354,6 +362,11 @@ pub struct ProfileRef {
     /// lowered to it again, whether or not it was lowered at the start
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ceiling: Option<Box<ProfileRef>>,
+    /// Lowered only because it runs below a session other than the root
+    /// Supervisor, which takes delivery out (MCR-136, `below`): a refresh
+    /// does that again rather than refuse for want of a ceiling
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub undelivered: bool,
 }
 
 /// `Tracked.agent_profile` as stored: anything this build cannot read as a
@@ -712,7 +725,7 @@ pub fn check(p: &AgentProfile, origin: Origin) -> Result<(), String> {
         // No force push where the adapter can be told so (best-effort, M2)
         if can.tools {
             if let Some(missing) = FORCE_PUSH_DENIES.iter().find(|r| !p.tools.deny.iter().any(|d| d == *r)) {
-                return Err(format!("tools.deny: a delivering lead denies force pushes, mirror, prune and deleting main; {missing:?} is missing (MCR-136)"));
+                return Err(format!("tools.deny: a delivering lead denies force pushes, a mirror push and deleting main; {missing:?} is missing (MCR-136)"));
             }
         }
     }
@@ -847,15 +860,17 @@ pub struct Launchable {
     pub lowered: bool,
     /// The creator's profile it is started under, if any
     pub ceiling: Option<ProfileRef>,
+    /// Lowered by `below` alone (MCR-136)
+    pub undelivered: bool,
 }
 
 impl Launchable {
     fn of(e: &Entry) -> Self {
-        Launchable { profile: e.profile.clone(), text: e.text.clone(), digest: e.digest.clone(), lowered: false, ceiling: None }
+        Launchable { profile: e.profile.clone(), text: e.text.clone(), digest: e.digest.clone(), lowered: false, ceiling: None, undelivered: false }
     }
     /// What the session records (`Tracked.agent_profile`)
     pub fn reference(&self) -> ProfileRef {
-        ProfileRef { id: self.profile.id.clone(), version: self.profile.version, role: self.profile.role.as_str().into(), digest: self.digest.clone(), lowered: self.lowered, words: self.profile.contract.owner_words.clone(), ceiling: self.ceiling.clone().map(Box::new) }
+        ProfileRef { id: self.profile.id.clone(), version: self.profile.version, role: self.profile.role.as_str().into(), digest: self.digest.clone(), lowered: self.lowered, words: self.profile.contract.owner_words.clone(), ceiling: self.ceiling.clone().map(Box::new), undelivered: self.undelivered }
     }
 }
 
@@ -932,7 +947,7 @@ pub fn pinned(config_dir: &Path, r: &ProfileRef) -> Result<Launchable, String> {
     if profile.id != r.id || profile.version != r.version {
         return Err(missing());
     }
-    Ok(Launchable { profile, text, digest: r.digest.clone(), lowered: r.lowered, ceiling: r.ceiling.as_deref().cloned() })
+    Ok(Launchable { profile, text, digest: r.digest.clone(), lowered: r.lowered, ceiling: r.ceiling.as_deref().cloned(), undelivered: r.undelivered })
 }
 
 /// Drop pinned versions that no session in `keep` (digests) names and that
@@ -981,7 +996,7 @@ pub fn bare(adapter_id: &str) -> Option<Launchable> {
     };
     let text = toml::to_string(&p).ok()?;
     let profile = parse(&text, Origin::Builtin).ok()?;
-    Some(Launchable { profile, digest: digest(text.as_bytes()), text, lowered: false, ceiling: None })
+    Some(Launchable { profile, digest: digest(text.as_bytes()), text, lowered: false, ceiling: None, undelivered: false })
 }
 
 /// The order of the ceiling (16639 9.2): plan and read-only lowest, then
@@ -1094,7 +1109,7 @@ pub fn lower_of(asked: &Launchable, caller: &AgentProfile) -> Result<(Launchable
     let body = toml::to_string(&p).map_err(|e| e.to_string())?;
     let text = format!("# {} v{} lowered to the ceiling of {} v{} (MCR-126 L6)\n{body}", p.id, p.version, caller.id, caller.version);
     let checked = parse(&text, Origin::Operator).map_err(|e| format!("The lowered profile is refused: {e}"))?;
-    Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true, ceiling: asked.ceiling.clone() }, notes))
+    Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true, ceiling: asked.ceiling.clone(), undelivered: false }, notes))
 }
 
 /// Takes delivery out of a profile that runs below a session (MCR-136): push
@@ -1129,7 +1144,7 @@ pub fn below(l: Launchable, works_for_root_or_nobody: bool) -> Result<(Launchabl
     let body = toml::to_string(&p).map_err(|e| e.to_string())?;
     let text = format!("# {} v{} as an executor, without delivery (MCR-136)\n{body}", p.id, p.version);
     let checked = parse(&text, Origin::Operator).map_err(|e| format!("The profile without delivery is refused: {e}"))?;
-    Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true, ceiling: l.ceiling }, notes))
+    Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true, ceiling: l.ceiling, undelivered: !l.lowered || l.undelivered }, notes))
 }
 
 /// The role guide every profile session gets (16639 section 6, as amended
@@ -1165,7 +1180,7 @@ You lead one track below the Supervisor, with executors of your own.
 - Direct them with `task_assign`, follow them with `task_wait` or your inbox, keep your track in the cockpit true, and report status after each round.
 - Give validation to an independent session: never to the lineage that did the work.
 - If your profile delivers (`push: delivery` in `whoami`, and merge and push are not in your `ownerWords`), you are in charge of your track's delivery. Merge only a commit that has all of these: an independent validator's APPROVE on that exact commit (the other lineage); green CI on the merge result; a hand-in comment on the issue.
-- Never force-push, and never rewrite main. Your deny rules catch the usual forms (`--force` and its kin, `-f`, `+ref`, `--mirror`, `--prune`, deleting main) and not `git -C <dir> push`, `git -c ... push`, an alias, a script, bundled short flags such as `-uf` or a ref update through `gh api`; never use those to get around them. Main's protection is the guard.
+- Never force-push, and never rewrite main. Your deny rules catch the usual forms (`--force` and its kin, `-f`, `+ref`, `--mirror`, and deleting main as `:main`, `--delete main` or `-d main` after the remote) and not `git -C <dir> push`, `git -c ... push`, an alias, a script, bundled short flags such as `-uf`, `--prune`, other orders of deleting main, or a ref update through `gh api`; never use those to get around them. Main's protection is the guard.
 - Comment the merge on the issue: commit, CI run, validator comment.
 - Rebuilds, restarts and deploys are still the owner's words. Ask for them as a need.
 - If your profile does not deliver (`push: none`), merge and push stay the owner's words: never merge.
@@ -1239,6 +1254,8 @@ pub fn refreshed(config_dir: &Path, r: &ProfileRef) -> Result<Launchable, String
             l.ceiling = Some(c.clone());
             Ok(l)
         }
+        // Lowered below a session only for delivery: the same again (MCR-136)
+        None if r.undelivered => Ok(below(now, false)?.0),
         // Lowered without a recorded ceiling: the profile as it is now could be wider
         None if r.lowered => Err("This session's profile was lowered to a ceiling that is not recorded: restart it without refresh_profile".into()),
         None => Ok(now),
@@ -1604,10 +1621,12 @@ mod tests {
         go(&inner.chars().collect::<Vec<_>>(), &command.chars().collect::<Vec<_>>(), mid_empty)
     }
 
-    /// MCR-136 review 17005 P3: the lead's denies catch the forms of a force
-    /// push, a mirror or prune push and deleting main, with the remote before
-    /// or after the flag, and leave a lead's ordinary pushes alone. This is
-    /// the documented rule syntax, not a run of Claude Code
+    /// MCR-136 reviews 17005 P3 and 17009: the lead's denies catch the forms
+    /// of a force push, a mirror push and deleting main, with the remote
+    /// before or after the flag and main last or followed by another ref, and
+    /// leave a lead's ordinary pushes alone, also of branches whose names hold
+    /// a flag's or main's letters. This is the documented rule syntax, not a
+    /// run of Claude Code
     #[test]
     fn the_force_push_denies_catch_the_forms_and_leave_ordinary_pushes() {
         let denied = |cmd: &str, mid_empty: bool| FORCE_PUSH_DENIES.iter().any(|r| bash_rule_matches(r, cmd, mid_empty));
@@ -1630,25 +1649,41 @@ mod tests {
                 "git push origin a +b",
                 "git push --mirror",
                 "git push origin --mirror",
-                "git push --prune origin",
-                "git push origin --prune refs/heads/*:refs/heads/*",
-                "git push origin --delete main",
-                "git push --delete origin main",
-                "git push origin -d main",
                 "git push origin :main",
-                "git push origin :refs/heads/main",
+                "git push origin :main other",
+                "git push origin --delete main",
+                "git push origin --delete main other",
+                "git push origin -d main",
+                "git push origin -d main other",
             ] {
                 assert!(denied(cmd, mid_empty), "{cmd} (mid_empty {mid_empty})");
             }
+            // Ordinary pushes, also of branches whose names hold a flag's or main's letters (review 17009)
             for cmd in [
                 "git push",
                 "git push origin HEAD:main",
                 "git push origin main",
+                "git push origin main other",
                 "git push -u origin mcr-136-leads-deliver",
                 "git push origin mcr-136-leads-deliver",
-                "git push origin --delete mcr-136-leads-deliver",
                 "git push --follow-tags origin main",
                 "git push origin feature-fix",
+                "git push origin feature--force-fix",
+                "git push origin fix-f",
+                "git push origin my-f-branch",
+                "git push origin force-push-docs",
+                "git push origin x--mirror",
+                "git push origin mirror-sync",
+                "git push origin prune-old",
+                "git push origin c++fix",
+                "git push origin domain",
+                "git push origin main-old",
+                "git push origin HEAD:main-next",
+                "git push origin --delete domain",
+                "git push origin --delete main-old",
+                "git push origin --delete feature--force-fix",
+                "git push origin -d mcr-136-leads-deliver",
+                "git push origin :main-old",
                 "git pull --force",
             ] {
                 assert!(!denied(cmd, mid_empty), "{cmd} (mid_empty {mid_empty})");
@@ -1681,6 +1716,35 @@ mod tests {
         // A profile that does not deliver is left as it is
         let implementer = choose(dir, "implementer@claude-opus").unwrap();
         assert_eq!(below(implementer.clone(), false).unwrap(), (implementer, Vec::new()));
+    }
+
+    /// MCR-136 review 17009 P2: a lead lowered by `below` alone (no ceiling)
+    /// is refreshed by lowering the profile as it is now the same way, not
+    /// refused; one lowered to a ceiling that is not recorded still is
+    #[test]
+    fn a_lead_lowered_below_a_session_is_refreshed_the_same_way() {
+        let dir = temp("mcr-undelivered-");
+        let (low, _) = below(choose(&dir, "lead@claude-opus").unwrap(), false).unwrap();
+        pin(&dir, &low).unwrap();
+        let r = low.reference();
+        assert!(r.lowered && r.undelivered && r.ceiling.is_none());
+        // Recorded, read back from the pin, and kept by an older record's default
+        assert_eq!(pinned(&dir, &r).unwrap(), low);
+        let back: ProfileRef = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert!(back.undelivered);
+        let again = refreshed(&dir, &r).unwrap();
+        assert!(!again.profile.delivers() && again.lowered && again.reference().undelivered);
+        assert!(NO_DELIVERY_DENIES.iter().all(|d| again.profile.tools.deny.contains(&d.to_string())));
+        assert_eq!(again.profile.version, 2);
+        // Without the mark it is refused as before: that lowering could have been anything
+        assert!(refreshed(&dir, &ProfileRef { undelivered: false, ..r.clone() }).unwrap_err().contains("not recorded"));
+        // A record of an older build has no mark
+        let old: ProfileRef = serde_json::from_value(json!({"id": "lead@claude-opus", "version": 1, "role": "lead", "digest": "d", "lowered": true})).unwrap();
+        assert!(!old.undelivered);
+        // The mark survives a second lowering at a restart (below is a no-op then)
+        let (same, notes) = below(again.clone(), false).unwrap();
+        assert!(notes.is_empty() && same.undelivered);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// MCR-136: an executor never delivers. Delivery is lowered to none, and

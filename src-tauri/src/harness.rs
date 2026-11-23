@@ -7160,6 +7160,8 @@ mod tests {
         let spawned: Arc<Mutex<Vec<Value>>> = Arc::default();
         let seen = spawned.clone();
         let folder = cwd.clone();
+        // A session hung up for a restart has ended at the runner's next answer
+        let hung_up: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
         let server = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
@@ -7174,6 +7176,10 @@ mod tests {
                         json!({})
                     }
                     "write" | "forget" => json!({}),
+                    "signal" => {
+                        hung_up.lock().unwrap().insert(req["id"].as_str().unwrap().to_string());
+                        json!({})
+                    }
                     "snapshot" => json!({"data": ""}),
                     "list" => {
                         let mut sessions = vec![
@@ -7182,7 +7188,14 @@ mod tests {
                             // Ended already, so a restart starts it again without a hangup
                             json!({"id": "old", "cwd": folder, "exit": 0, "meta": {"profile": "claude"}}),
                         ];
-                        sessions.extend(seen.lock().unwrap().iter().map(|r| json!({"id": r["id"], "cwd": r["cwd"], "meta": r["meta"]})));
+                        let gone = hung_up.lock().unwrap().clone();
+                        sessions.extend(seen.lock().unwrap().iter().map(|r| {
+                            let mut s = json!({"id": r["id"], "cwd": r["cwd"], "meta": r["meta"]});
+                            if gone.contains(r["id"].as_str().unwrap()) {
+                                s["exit"] = json!(0);
+                            }
+                            s
+                        }));
                         json!({ "sessions": sessions })
                     }
                     other => panic!("unexpected runner call {other}"),
@@ -7214,6 +7227,16 @@ mod tests {
             assert!(record(out["id"].as_str().unwrap()).lowered);
             assert!(out["lowered"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("never delivers")), "{out}");
         }
+        // Review 17009 P2: the very session, started under a creator without a
+        // profile, is refreshed by lowering the profile again, never refused
+        let first = spawned.lock().unwrap()[0]["id"].as_str().unwrap().to_string();
+        assert!(record(&first).undelivered && record(&first).ceiling.is_none());
+        let out = h.tool("session_restart", &json!({"session": first, "refresh_profile": true, "force": true})).unwrap();
+        let refreshed = out["id"].as_str().unwrap().to_string();
+        assert_ne!(refreshed, first);
+        no_push(&launched(&refreshed));
+        assert!(record(&refreshed).undelivered);
+        assert_eq!(lock(&h.store).sessions[&refreshed].supervisor.as_deref(), Some("bare"));
         // ... and the push and merge denies reach the Claude lead's command line
         let line = spawned.lock().unwrap()[0]["argv"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect::<Vec<_>>().join(" ");
         assert!(line.contains("'Bash(git push:*)'") && line.contains("'Bash(gh pr merge:*)'"), "{line}");
