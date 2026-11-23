@@ -155,6 +155,18 @@ describe('executors in a folder below their supervisor (MCR-133)', () => {
     expect(shape(all)).toEqual([`${lead}: lead:0 x:1[x] helper:2[helper] solo:0`]);
   });
 
+  it('does not hide a section as gone for a gone worktree listed in it', () => {
+    const ended = (h: Hosted): Hosted => ({ ...h, exit: { code: 0, signal: null, at: 9 } });
+    const sections = directorySections([ended(session('lead', '/a')), { ...ended(session('x', '/a/w', 'lead')), cwdGone: true }],
+      [past('own', '/a'), { ...past('wt', '/a/v'), gone: true }], []);
+    const { shown, hidden } = folderVisibility(sections, DEFAULT_LIVE_LIST);
+    expect(shown.map(d => d.path)).toEqual(['/a']);
+    expect(hidden).toEqual([]);
+    // Its own folder gone still hides it
+    const gone = directorySections([{ ...ended(session('lead', '/a')), cwdGone: true }], [], []);
+    expect(folderVisibility(gone, DEFAULT_LIVE_LIST).hidden.map(h => [h.section.path, h.reason])).toEqual([['/a', 'gone']]);
+  });
+
   it('keeps an executor outside its supervisor\'s folder where it was, naming its supervisor', () => {
     const all = [session('lead', lead), session('far', '/u/work/infra', 'lead')];
     expect(shape(all)).toEqual(['/u/work/infra: far:0', `${lead}: lead:0`]);

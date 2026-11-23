@@ -870,7 +870,8 @@ export function folderVisibility(sections: DirSection[], prefs: LiveListPrefs): 
       if (prefs.hiddenFolders.includes(d.path)) return 'hidden';
       // Added by the person, or shown again by them: the automatic rule is theirs to overrule
       if (prefs.hideNoise && !d.pinned && !prefs.shownFolders.includes(d.path)) {
-        if (d.sessions.some(h => h.cwdGone) || d.earlier.some(r => r.gone)) return 'gone';
+        // Only what lies in the folder itself: a gone worktree listed here (MCR-133) says nothing of this folder
+        if (d.sessions.some(h => h.cwdGone && h.cwd === d.path) || d.earlier.some(r => r.gone && r.cwd === d.path)) return 'gone';
         if (temporaryFolder(d.path)) return 'temporary';
       }
       if (!d.pinned && !d.sessions.length && !earlier.length && section.hiddenEarlier) return 'sessions hidden';
