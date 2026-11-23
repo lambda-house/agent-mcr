@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "macos-window-chrome",
+  "description": "macOS only (MCR-138): the main window has an overlay title bar, so its top row is a drag region, which moves the window through start_dragging. Double-click zoom (internal_toggle_maximize) is in core:default.",
+  "platforms": ["macOS"],
+  "windows": ["main"],
+  "permissions": [
+    "core:window:allow-start-dragging"
+  ]
+}

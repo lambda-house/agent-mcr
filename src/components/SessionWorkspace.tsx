@@ -8,6 +8,7 @@ import { pluginRegistry, usePluginVersion } from '../plugins';
 import '../styles/sessions.css';
 import SessionTree from './SessionTree';
 import WorkspaceSwitch from './WorkspaceSwitch';
+import { NO_DRAG, topRowProps, useTitleBar } from '../utils/windowChrome';
 import SessionResults from './SessionResults';
 import { useHostedByConversation } from './SessionRow';
 import { harnessApi, slackApi } from '../utils/harness';
@@ -35,6 +36,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const globalOverlays = pluginRegistry.getGlobalOverlays();
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [view, setViewState] = useState<string>(savedView);
+  const titleBar = useTitleBar();
   const [focus, setFocus] = useState<{ id: string; at: number }>();
   const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
   const activePluginTab = topTabs.find(t => t.id === view);
@@ -105,7 +107,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   };
   const recentDirectories = useMemo(() => [...new Set([...data.sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [data.sessions]);
   return <section className="session-cockpit">
-    <header className="sc-topbar">
+    <header className="sc-topbar" {...topRowProps(titleBar)}>
       <WorkspaceSwitch active="sessions" onChange={workspace => { if (workspace === 'documents') onClose(); }}/>
       <nav className="hs-view-switch" aria-label="Sessions view">
         <button type="button" aria-current={view === 'live' ? 'page' : undefined} onClick={() => setView('live')}><Terminal size={13}/> Live</button>
@@ -123,7 +125,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
       </div>
       {enabled && <details className="sc-summary">
         <summary><span className="sc-summary-working">{working} working</span><span> · {filtered.length.toLocaleString()} sessions</span><ChevronRight size={12}/></summary>
-        <div className="sc-summary-popover">
+        <div className="sc-summary-popover" {...NO_DRAG}>
           <Metric label="Observed working" value={String(working)} hint="Recent transcript activity; not process liveness"/>
           <Metric label="Sessions & agents" value={filtered.length.toLocaleString()} hint={`${filtered.filter(s => origin(s)==='human').length} human · ${filtered.filter(s => origin(s)==='subagent').length} subagents`}/>
           <Metric label="Recorded tokens" value={compact(totalTokens(usage))} hint={`${compact(usage.input)} input · ${compact(usage.output)} output · lifetime usage of matching sessions`}/>

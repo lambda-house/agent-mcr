@@ -1371,6 +1371,30 @@ mod tests {
         canonicalize(&dir).unwrap()
     }
 
+    /// MCR-138: tauri.macos.conf.json replaces the window list of tauri.conf.json
+    /// (a JSON merge patch replaces arrays whole), so its window must be the same
+    /// one plus the overlay title bar, and nothing else may differ.
+    #[test]
+    fn the_macos_window_is_the_main_window_with_an_overlay_title_bar() {
+        let window = |text: &str| -> serde_json::Map<String, serde_json::Value> {
+            let config: serde_json::Value = serde_json::from_str(text).unwrap();
+            let windows = config["app"]["windows"].as_array().unwrap();
+            assert_eq!(windows.len(), 1);
+            windows[0].as_object().unwrap().clone()
+        };
+        let main = window(include_str!("../tauri.conf.json"));
+        let mut mac = window(include_str!("../tauri.macos.conf.json"));
+        assert!(!main.contains_key("titleBarStyle") && !main.contains_key("hiddenTitle"));
+        assert_eq!(mac.remove("titleBarStyle"), Some(serde_json::json!("Overlay")));
+        assert_eq!(mac.remove("hiddenTitle"), Some(serde_json::json!(true)));
+        // The lights stay inside the 80 px the top row leaves them (utils/windowChrome.ts)
+        let lights = mac.remove("trafficLightPosition").unwrap();
+        assert!(lights["x"].as_f64().unwrap() + 3.0 * 20.0 <= 80.0);
+        // trafficLightPosition needs the system's decorations
+        assert_eq!(mac.get("decorations"), Some(&serde_json::json!(true)));
+        assert_eq!(mac, main);
+    }
+
     #[test]
     fn percent_decode_handles_trailing_escape_and_non_ascii() {
         assert_eq!(percent_decode("a%41"), "aA");

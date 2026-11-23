@@ -63,6 +63,8 @@
   
   /* Dimensions */
   --toolbar-height: 32px;
+  /* The top row under macOS's overlay title bar (MCR-138); tauri.macos.conf.json centres the traffic lights in it */
+  --titlebar-height: 38px;
   --tab-bar-height: 30px;
   --status-bar-height: 28px;
   --panel-min-width: 200px;
@@ -296,6 +298,12 @@ a:hover {
   gap: 4px;
   user-select: none;
   -webkit-app-region: drag;
+}
+
+/* The window's top row on macOS: the traffic lights are drawn over it (utils/windowChrome.ts) */
+.toolbar[data-titlebar] {
+  height: var(--titlebar-height);
+  min-height: var(--titlebar-height);
 }
 
 .toolbar-group {

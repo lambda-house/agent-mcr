@@ -75,7 +75,15 @@ echo stopped > "$config/background.state"
 if [ "${1:-start}" != "open" ]; then
   [ -d "$repo/node_modules" ] || { echo "Run npm install in $repo first"; exit 1; }
   (cd "$repo" && npm run build >/dev/null)
-  (cd "$repo/src-tauri" && TAURI_CONFIG='{"identifier":"cc.lambdahouse.agent-mcr.demo","productName":"Agent MCR demo","app":{"windows":[{"title":"COCKPIT DEMO - separate home, not your live app","width":1400,"height":900,"minWidth":1024,"minHeight":768,"resizable":true}]}}' cargo build)
+  # TAURI_CONFIG replaces the window list whole, so the demo's window is the
+  # app's own (with the macOS title bar of tauri.macos.conf.json) under another title
+  window_config="$(cd "$repo/src-tauri" && node -e '
+    const fs = require("fs");
+    const file = fs.existsSync("tauri.macos.conf.json") && process.platform === "darwin" ? "tauri.macos.conf.json" : "tauri.conf.json";
+    const w = JSON.parse(fs.readFileSync(file, "utf8")).app.windows[0];
+    process.stdout.write(JSON.stringify({ ...w, title: "COCKPIT DEMO - separate home, not your live app" }));
+  ')"
+  (cd "$repo/src-tauri" && TAURI_CONFIG="{\"identifier\":\"cc.lambdahouse.agent-mcr.demo\",\"productName\":\"Agent MCR demo\",\"app\":{\"windows\":[$window_config]}}" cargo build)
   mkdir -p "$demo/bin" "$config"
   # A copy, so a later build does not replace the program the demo's runner, service and window are
   if ! cmp -s "$repo/src-tauri/target/debug/agent-mcr" "$bin"; then
