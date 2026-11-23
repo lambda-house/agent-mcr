@@ -1,14 +1,14 @@
 import { homePath } from '../utils/paths';
 import { Button, Segmented, Tabs } from '@lambda-house/ui';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronRight, ClipboardList, History, MessageSquare, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
+import { Bot, ChevronRight, ClipboardList, History, MessageSquare, Play, Search, Shield, Terminal, X, Zap } from 'lucide-react';
 import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { useStore } from '../store';
 import { pluginRegistry, usePluginVersion } from '../plugins';
 import '../styles/sessions.css';
 import SessionTree from './SessionTree';
-import WorkspaceSwitch from './WorkspaceSwitch';
+import { ShellTools } from '@lambda-house/workbench';
 import SessionResults from './SessionResults';
 import { useHostedByConversation } from './SessionRow';
 import { harnessApi, slackApi } from '../utils/harness';
@@ -29,7 +29,7 @@ const date = (s: string) => s ? new Date(s).toLocaleString() : 'Unknown';
 function Metric({ label, value, hint }: { label: string; value: string; hint: string }) {
   return <div className="sc-metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>;
 }
-export default function SessionWorkspace({ onClose, active = true }: { onClose: () => void; active?: boolean }) {
+export default function SessionWorkspace({ active = true }: { active?: boolean }) {
   usePluginVersion();
   const topTabs = pluginRegistry.getTopTabs();
   const globalOverlays = pluginRegistry.getGlobalOverlays();
@@ -105,8 +105,8 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   };
   const recentDirectories = useMemo(() => [...new Set([...data.sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [data.sessions]);
   return <section className="session-cockpit">
-    <header className="sc-topbar">
-      <WorkspaceSwitch active="sessions" onChange={workspace => { if (workspace === 'documents') onClose(); }}/>
+    {/* The view switch and the summary are in the window's top bar, outside the cockpit; .sc-bar gives them the cockpit's type */}
+    <ShellTools>
       <Segmented label="Sessions view" value={view} onChange={setView} options={[
         { value: 'live', label: 'Live', icon: <Terminal size={13}/> },
         ...topTabs.map(t => ({ value: t.id, label: t.label, icon: t.icon, title: t.title })),
@@ -115,9 +115,8 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         { value: 'slack', icon: <MessageSquare size={13}/>, title: 'Slack: what is listened to, what sessions may post, and posts that wait for your approval',
           label: <>Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</> },
       ]}/>
-      <div className="sc-top-actions">
-        <Button variant="ghost" size="sm" icon={<Settings size={14}/>} onClick={() => useStore.getState().setSettingsOpen(true)} aria-label="Settings" title="Settings"/>
-      </div>
+    </ShellTools>
+    <ShellTools side="end"><div className="sc-bar">
       {enabled && <details className="sc-summary">
         <summary><span className="sc-summary-working">{working} working</span><span> · {filtered.length.toLocaleString()} sessions</span><ChevronRight size={12}/></summary>
         <div className="sc-summary-popover">
@@ -128,7 +127,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
           {data.pendingFiles > 0 && <p>History is still indexing; totals are partial.</p>}
         </div>
       </details>}
-    </header>
+    </div></ShellTools>
     <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
     {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
     {/* Only while Sessions is shown: an overlay may listen for keys (the command panel's Cmd+S), and over Documents those are the editor's */}

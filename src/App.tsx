@@ -1,6 +1,7 @@
 import React, { useEffect, useCallback, useMemo, useState } from 'react';
 import { useStore, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH, type Heading, type RestoredDocument } from './store';
-import { LayoutView, findLeaf, isPx, type Layout, type LayoutNode, type PaneType, type Size } from '@lambda-house/workbench';
+import { LayoutView, MainMenu, Shell, findLeaf, isPx, type Layout, type LayoutNode, type PaneType, type ShellSurface, type Size } from '@lambda-house/workbench';
+import { Activity, FileText } from 'lucide-react';
 import {
   isTauri,
   readFile,
@@ -11,7 +12,8 @@ import {
 } from './utils/tauri';
 import { appMenu, buildMenu, menuCommands, commandForKey } from './utils/commands';
 import { getFileName, resolveLinkPath } from './utils/files';
-import Toolbar from './components/Toolbar';
+import Toolbar, { ToolbarEnd } from './components/Toolbar';
+import { flushEditorChanges } from './utils/editorRegistry';
 import AgentPanel from './components/AgentPanel';
 import DocumentPanel from './components/DocumentPanel';
 import TocSidebar from './components/TocSidebar';
@@ -65,7 +67,6 @@ async function reloadChangedDocuments(names: string[]): Promise<void> {
 
 const App: React.FC = () => {
   const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath);
-  const [sessionsMounted, setSessionsMounted] = useState(sessionsVisible);
   // Subscribe field by field so that high frequency updates (scroll offsets,
   // active heading) do not re-render the whole application.
   const panelWidth = useStore((s) => s.panelWidth);
@@ -448,25 +449,41 @@ const App: React.FC = () => {
     },
   }), [panelWidth, tocWidth, tocVisible, headings, handleHeadingsChange, handleToggleToc]);
 
+  // The window's surfaces under one top bar (the workbench Shell). Documents is mounted only while shown;
+  // Sessions stays mounted once opened. A memory window has Documents only.
+  const surfaces: ShellSurface[] = [
+    {
+      id: 'documents', label: 'Documents', icon: <FileText size={13} />, keepMounted: false,
+      render: () => (
+        <>
+          <Toolbar
+            filePanelVisible={filePanelVisible}
+            onToggleFilePanel={documentWindowPath ? undefined : handleToggleFilePanel}
+          />
+
+          <div className="main-content">
+            <LayoutView layout={documentsLayout} onChange={applyDocumentsLayout} paneTypes={documentPanes} />
+          </div>
+
+          <StatusBar />
+        </>
+      ),
+    },
+    ...(documentWindowPath ? [] : [{
+      id: 'sessions', label: 'Sessions', icon: <Activity size={13} />,
+      render: () => <SessionWorkspace active={sessionsVisible} />,
+    }]),
+  ];
+
   return (
     <div className="app-container">
-      <div className="workspace-surface" hidden={!sessionsVisible}>
-        {sessionsMounted && <SessionWorkspace active={sessionsVisible} onClose={() => setSessionsVisible(false)} />}
-      </div>
-      {!sessionsVisible && <div className="workspace-surface">
-      <Toolbar
-        menu={menu}
-        onOpenSessions={documentWindowPath ? undefined : () => { setSessionsMounted(true); setSessionsVisible(true); }}
-        filePanelVisible={filePanelVisible}
-        onToggleFilePanel={documentWindowPath ? undefined : handleToggleFilePanel}
+      <Shell
+        surfaces={surfaces}
+        active={sessionsVisible ? 'sessions' : 'documents'}
+        onActivate={(surface) => setSessionsVisible(surface === 'sessions')}
+        menu={<MainMenu items={menu} useCommandContext={useStore} onOpen={flushEditorChanges} buttonClassName="toolbar-button" />}
+        end={<ToolbarEnd />}
       />
-
-      <div className="main-content">
-        <LayoutView layout={documentsLayout} onChange={applyDocumentsLayout} paneTypes={documentPanes} />
-      </div>
-
-      <StatusBar />
-      </div>}
       <SettingsModal />
       <SaveAllDialog />
     </div>

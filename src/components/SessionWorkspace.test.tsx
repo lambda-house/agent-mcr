@@ -20,7 +20,7 @@ afterEach(async () => { await act(async () => root.unmount()); host.remove(); })
 describe('Sessions workspace', () => {
   it('opens on the Live view until Journal is chosen, and remembers the choice', async () => {
     localStorage.removeItem('agent-mcr.sessions.view');
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+    await act(async () => root.render(<SessionWorkspace />)); await flush();
     expect(host.textContent).toContain('Open supervisor');
     expect(host.textContent).not.toContain('Fix CORE-123');
     await act(async () => button('journal').click()); await flush();
@@ -28,13 +28,13 @@ describe('Sessions workspace', () => {
     expect(localStorage.getItem('agent-mcr.sessions.view')).toBe('history');
   });
   it('renders actual session details as text and loads linked work only on request', async () => {
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+    await act(async () => root.render(<SessionWorkspace />)); await flush();
     expect(host.textContent).toContain('Fix CORE-123');expect(host.textContent).toContain('<script>untrusted()</script>');expect(host.querySelector('script')).toBeNull();
     await act(async () => button('linked work').click());expect(host.textContent).toContain('CORE-123');
     expect(host.querySelector('.sc-ticket-list button')).toBeNull();
   });
   it('draws a found session as the Live list does: an earlier one as mark, title and age', async () => {
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+    await act(async () => root.render(<SessionWorkspace />)); await flush();
     const row = host.querySelector('.ss-results .sc-session')!;
     expect(row.classList.contains('hs-item') && row.classList.contains('hs-resume')).toBe(true);
     expect(row.querySelector('strong')?.textContent?.trim()).toBe('Fix CORE-123');
@@ -50,7 +50,7 @@ describe('Sessions workspace', () => {
     const hosted: Hosted = { id: 'h1', pid: 42, argv: ['codex'], cwd: '/work/demo', started: 1, cols: 120, rows: 32, title: '', lastOutput: 1, exit: null, unread: 1,
       meta: { label: 'Codex', profile: 'codex', name: 'Parser fixer' }, harness: { profile: 'codex', state: 'waiting', agentSession: 'a', attention: { kind: 'permission', text: 'Approve the command?' } } as Hosted['harness'] };
     vi.mocked(harnessApi.list).mockResolvedValue([hosted]);
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush(); await flush();
+    await act(async () => root.render(<SessionWorkspace />)); await flush(); await flush();
     const row = host.querySelector('.ss-results .sc-session')!;
     expect(row.classList.contains('hs-resume')).toBe(false);
     expect(row.querySelector('.hs-dot.waiting')).not.toBeNull();
@@ -68,22 +68,22 @@ describe('Sessions workspace', () => {
     pluginRegistry.register(createPlugin({ id: 'test-overlay', name: 'Test overlay', setup(api) { api.registerGlobalOverlay({ id: 'test-overlay', render: () => <Overlay key="test-overlay"/> }); } }));
     const cmdS = () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true }));
     try {
-      await act(async () => root.render(<SessionWorkspace active={false} onClose={() => {}}/>)); await flush();
+      await act(async () => root.render(<SessionWorkspace active={false} />)); await flush();
       expect(host.querySelector('[data-overlay]')).toBeNull();
       await act(async () => { cmdS(); });
       expect(onKey).not.toHaveBeenCalled();
       // The built-in command panel is one of them: Cmd+S over Documents is Save, not the palette
       expect(document.querySelector('.cmd-panel, [role="dialog"]')).toBeNull();
-      await act(async () => root.render(<SessionWorkspace active onClose={() => {}}/>)); await flush();
+      await act(async () => root.render(<SessionWorkspace active />)); await flush();
       expect(host.querySelector('[data-overlay]')).not.toBeNull();
       await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' })); });
       expect(onKey).toHaveBeenCalledTimes(1);
-      await act(async () => root.render(<SessionWorkspace active={false} onClose={() => {}}/>)); await flush();
+      await act(async () => root.render(<SessionWorkspace active={false} />)); await flush();
       expect(host.querySelector('[data-overlay]')).toBeNull();
     } finally { pluginRegistry.unregister('test-overlay'); }
   });
   it('does not read transcripts before access is enabled', async () => {
     vi.mocked(sessionApi.access).mockResolvedValue(false);
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>));await flush();expect(host.textContent).toContain('Enable session access');expect(sessionApi.snapshot).not.toHaveBeenCalled();
+    await act(async () => root.render(<SessionWorkspace />));await flush();expect(host.textContent).toContain('Enable session access');expect(sessionApi.snapshot).not.toHaveBeenCalled();
   });
 });

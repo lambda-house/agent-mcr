@@ -1,8 +1,7 @@
-import { useEffect, useState } from 'react';
+import { usePlugins } from '@lambda-house/workbench';
 import { pluginRegistry } from './sdk';
 
+/** Re-renders when plugins come, go or are turned on or off. */
 export function usePluginVersion(): number {
-  const [ver, setVer] = useState(0);
-  useEffect(() => pluginRegistry.subscribe(() => setVer(v => v + 1)), []);
-  return ver;
+  return usePlugins(pluginRegistry.workbench);
 }
