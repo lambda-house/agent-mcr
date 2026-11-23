@@ -40,9 +40,29 @@ pub const OWNER_WORDS: [&str; 6] = ["merge", "push", "build", "release", "spend"
 pub const DELIVERY_WORDS: [&str; 2] = ["merge", "push"];
 
 /// What a delivering profile on an adapter with tool lists must deny
-/// (MCR-136): no force push. Best-effort, as every deny rule (M2); the
-/// boundary that holds is branch protection
-pub const FORCE_PUSH_DENIES: [&str; 3] = ["Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)"];
+/// (MCR-136): no force push, no mirror or prune, no deletion of main.
+/// Claude Code's `*` matches any text, spaces included, anywhere in a rule;
+/// whether one in the middle matches nothing is not documented, so a form
+/// that may come right after `push` has a rule of its own. Best-effort, as
+/// every deny rule (M2): `git -C <dir> push`, `git -c ... push`, an alias, a
+/// script, bundled short flags (`-uf`) and a ref update through `gh api` are
+/// not caught. The boundary that holds is the protection of main
+pub const FORCE_PUSH_DENIES: [&str; 11] = [
+    // --force, --force-with-lease and --force-if-includes, before or after the remote
+    "Bash(git push*--force*)",
+    "Bash(git push -f*)",
+    "Bash(git push* -f*)",
+    // A forced refspec: +ref, +src:dst
+    "Bash(git push +*)",
+    "Bash(git push* +*)",
+    "Bash(git push*--mirror*)",
+    "Bash(git push*--prune*)",
+    // Deleting main; `HEAD:main`, a plain push to main, is not a deletion
+    "Bash(git push*--delete*main)",
+    "Bash(git push* -d*main)",
+    "Bash(git push* :main)",
+    "Bash(git push* :refs/heads/main)",
+];
 
 /// What an executor below a delivering lead is denied where its adapter takes
 /// tool lists: delivery is the lead's and is never handed down (MCR-136)
@@ -292,10 +312,15 @@ pub struct AgentProfile {
 }
 
 impl AgentProfile {
+    /// Pushes and merges its own track's work (MCR-136)
+    pub fn delivers(&self) -> bool {
+        self.permissions.push == Push::Delivery
+    }
+
     /// The core words and the ones this profile adds; a delivering lead
     /// holds merge and push itself (MCR-136)
     pub fn owner_words(&self) -> Vec<String> {
-        let delivers = self.permissions.push == Push::Delivery;
+        let delivers = self.delivers();
         let mut words: Vec<String> = OWNER_WORDS.iter().filter(|w| !(delivers && DELIVERY_WORDS.contains(w))).map(|w| w.to_string()).collect();
         for w in &self.contract.owner_words {
             if !words.contains(w) {
@@ -687,7 +712,7 @@ pub fn check(p: &AgentProfile, origin: Origin) -> Result<(), String> {
         // No force push where the adapter can be told so (best-effort, M2)
         if can.tools {
             if let Some(missing) = FORCE_PUSH_DENIES.iter().find(|r| !p.tools.deny.iter().any(|d| d == *r)) {
-                return Err(format!("tools.deny: a delivering lead denies force pushes; {missing:?} is missing (MCR-136)"));
+                return Err(format!("tools.deny: a delivering lead denies force pushes, mirror, prune and deleting main; {missing:?} is missing (MCR-136)"));
             }
         }
     }
@@ -1005,9 +1030,8 @@ pub fn lower_of(asked: &Launchable, caller: &AgentProfile) -> Result<(Launchable
     }
     // Delivery is the lead's own and never handed down (MCR-136); below a
     // creator that does not push, nothing pushes
-    if p.permissions.push == Push::Delivery {
-        notes.push("permissions.push delivery is lowered to none: an executor never delivers, its lead does".into());
-        p.permissions.push = Push::None;
+    if p.delivers() {
+        undeliver(&mut p, &mut notes);
     } else if caller.permissions.push != Push::FeatureBranches && p.permissions.push != Push::None {
         notes.push(if caller.permissions.push == Push::Delivery { "permissions.push is lowered to none: below a lead, only the lead pushes".into() } else { "permissions.push is lowered to none, as yours".into() });
         p.permissions.push = Push::None;
@@ -1073,6 +1097,41 @@ pub fn lower_of(asked: &Launchable, caller: &AgentProfile) -> Result<(Launchable
     Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true, ceiling: asked.ceiling.clone() }, notes))
 }
 
+/// Takes delivery out of a profile that runs below a session (MCR-136): push
+/// none, and the push and merge denies back where its adapter takes tool lists
+fn undeliver(p: &mut AgentProfile, notes: &mut Vec<String>) {
+    if !p.delivers() {
+        return;
+    }
+    p.permissions.push = Push::None;
+    notes.push("permissions.push delivery is lowered to none: an executor never delivers, its lead does".into());
+    if crate::agents::adapter(&p.adapter).expresses().tools {
+        let missing: Vec<String> = NO_DELIVERY_DENIES.iter().filter(|r| !p.tools.deny.iter().any(|d| d == *r)).map(|r| r.to_string()).collect();
+        if !missing.is_empty() {
+            notes.push(format!("tools.deny gets {} back: below a lead, only the lead pushes and merges", missing.join(", ")));
+            p.tools.deny.extend(missing);
+        }
+    }
+}
+
+/// A profile started below any session but the root Supervisor (MCR-136):
+/// an executor never delivers, whoever creates it, with a profile or without
+/// one, and at a restart or a refresh as well. `works_for_root_or_nobody`:
+/// the session it will work for is the root Supervisor, or there is none;
+/// only then does a lead keep its delivery
+pub fn below(l: Launchable, works_for_root_or_nobody: bool) -> Result<(Launchable, Vec<String>), String> {
+    if works_for_root_or_nobody || !l.profile.delivers() {
+        return Ok((l, Vec::new()));
+    }
+    let mut p = l.profile.clone();
+    let mut notes = Vec::new();
+    undeliver(&mut p, &mut notes);
+    let body = toml::to_string(&p).map_err(|e| e.to_string())?;
+    let text = format!("# {} v{} as an executor, without delivery (MCR-136)\n{body}", p.id, p.version);
+    let checked = parse(&text, Origin::Operator).map_err(|e| format!("The profile without delivery is refused: {e}"))?;
+    Ok((Launchable { profile: checked, digest: digest(text.as_bytes()), text, lowered: true, ceiling: l.ceiling }, notes))
+}
+
 /// The role guide every profile session gets (16639 section 6, as amended
 /// by 16647): the third part of the `guide` tool and the Claude skill
 /// `agent-mcr:role`. Asked, not enforced (class A): what the harness holds is
@@ -1106,7 +1165,7 @@ You lead one track below the Supervisor, with executors of your own.
 - Direct them with `task_assign`, follow them with `task_wait` or your inbox, keep your track in the cockpit true, and report status after each round.
 - Give validation to an independent session: never to the lineage that did the work.
 - If your profile delivers (`push: delivery` in `whoami`, and merge and push are not in your `ownerWords`), you are in charge of your track's delivery. Merge only a commit that has all of these: an independent validator's APPROVE on that exact commit (the other lineage); green CI on the merge result; a hand-in comment on the issue.
-- Never force-push, and never rewrite main.
+- Never force-push, and never rewrite main. Your deny rules catch the usual forms (`--force` and its kin, `-f`, `+ref`, `--mirror`, `--prune`, deleting main) and not `git -C <dir> push`, `git -c ... push`, an alias, a script, bundled short flags such as `-uf` or a ref update through `gh api`; never use those to get around them. Main's protection is the guard.
 - Comment the merge on the issue: commit, CI run, validator comment.
 - Rebuilds, restarts and deploys are still the owner's words. Ask for them as a need.
 - If your profile does not deliver (`push: none`), merge and push stay the owner's words: never merge.
@@ -1525,6 +1584,103 @@ mod tests {
             assert!(lead.contains(clause), "{clause}");
         }
         assert!(role_part("implementer").contains("never merge"));
+    }
+
+    /// A Bash rule as Claude Code documents it: `*` matches any text, spaces
+    /// included; a trailing one may match nothing. Whether one in the middle
+    /// may is not documented, so both readings are checked (`mid_empty`)
+    fn bash_rule_matches(rule: &str, command: &str, mid_empty: bool) -> bool {
+        fn go(p: &[char], c: &[char], mid_empty: bool) -> bool {
+            match p.split_first() {
+                None => c.is_empty(),
+                Some(('*', rest)) => {
+                    let min = if rest.is_empty() || mid_empty { 0 } else { 1 };
+                    (min..=c.len()).any(|i| go(rest, &c[i..], mid_empty))
+                }
+                Some((x, rest)) => c.first() == Some(x) && go(rest, &c[1..], mid_empty),
+            }
+        }
+        let inner = rule.strip_prefix("Bash(").and_then(|r| r.strip_suffix(')')).unwrap();
+        go(&inner.chars().collect::<Vec<_>>(), &command.chars().collect::<Vec<_>>(), mid_empty)
+    }
+
+    /// MCR-136 review 17005 P3: the lead's denies catch the forms of a force
+    /// push, a mirror or prune push and deleting main, with the remote before
+    /// or after the flag, and leave a lead's ordinary pushes alone. This is
+    /// the documented rule syntax, not a run of Claude Code
+    #[test]
+    fn the_force_push_denies_catch_the_forms_and_leave_ordinary_pushes() {
+        let denied = |cmd: &str, mid_empty: bool| FORCE_PUSH_DENIES.iter().any(|r| bash_rule_matches(r, cmd, mid_empty));
+        for mid_empty in [false, true] {
+            for cmd in [
+                "git push --force",
+                "git push --force origin main",
+                "git push origin --force",
+                "git push origin main --force",
+                "git push --force-with-lease origin x",
+                "git push origin x --force-with-lease=x:abc",
+                "git push origin --force-if-includes --force-with-lease x",
+                "git push -f",
+                "git push -f origin main",
+                "git push origin -f",
+                "git push origin main -f",
+                "git push origin +main",
+                "git push origin +HEAD:main",
+                "git push +main",
+                "git push origin a +b",
+                "git push --mirror",
+                "git push origin --mirror",
+                "git push --prune origin",
+                "git push origin --prune refs/heads/*:refs/heads/*",
+                "git push origin --delete main",
+                "git push --delete origin main",
+                "git push origin -d main",
+                "git push origin :main",
+                "git push origin :refs/heads/main",
+            ] {
+                assert!(denied(cmd, mid_empty), "{cmd} (mid_empty {mid_empty})");
+            }
+            for cmd in [
+                "git push",
+                "git push origin HEAD:main",
+                "git push origin main",
+                "git push -u origin mcr-136-leads-deliver",
+                "git push origin mcr-136-leads-deliver",
+                "git push origin --delete mcr-136-leads-deliver",
+                "git push --follow-tags origin main",
+                "git push origin feature-fix",
+                "git pull --force",
+            ] {
+                assert!(!denied(cmd, mid_empty), "{cmd} (mid_empty {mid_empty})");
+            }
+        }
+        // The matcher itself, on the documented examples
+        assert!(bash_rule_matches("Bash(git * main)", "git push origin main", false));
+        assert!(!bash_rule_matches("Bash(git log * main)", "git log main", false));
+        assert!(bash_rule_matches("Bash(ls*)", "lsof", false) && !bash_rule_matches("Bash(ls *)", "lsof", false));
+        // Every rule is one the profile check takes
+        assert!(FORCE_PUSH_DENIES.iter().all(|r| tool_rule(r)));
+    }
+
+    /// MCR-136 review 17005 P1: `below` takes delivery out of a profile that
+    /// runs below any session but the root Supervisor, and only there
+    #[test]
+    fn a_lead_below_a_session_does_not_deliver() {
+        let dir = Path::new("/nonexistent-config-dir");
+        let lead = choose(dir, "lead@claude-opus").unwrap();
+        let (kept, notes) = below(lead.clone(), true).unwrap();
+        assert!(kept == lead && notes.is_empty());
+        let (low, notes) = below(lead.clone(), false).unwrap();
+        assert!(low.lowered && !low.profile.delivers() && notes.iter().any(|n| n.contains("never delivers")), "{notes:?}");
+        assert!(NO_DELIVERY_DENIES.iter().chain(FORCE_PUSH_DENIES.iter()).all(|r| low.profile.tools.deny.contains(&r.to_string())));
+        assert!(OWNER_WORDS.iter().all(|w| low.profile.owner_words().contains(&w.to_string())));
+        assert_eq!(parse(&low.text, Origin::Operator).unwrap(), low.profile);
+        assert_eq!(low.digest, digest(low.text.as_bytes()));
+        let (low, _) = below(choose(dir, "lead@codex").unwrap(), false).unwrap();
+        assert!(!low.profile.delivers() && low.profile.tools.deny.is_empty());
+        // A profile that does not deliver is left as it is
+        let implementer = choose(dir, "implementer@claude-opus").unwrap();
+        assert_eq!(below(implementer.clone(), false).unwrap(), (implementer, Vec::new()));
     }
 
     /// MCR-136: an executor never delivers. Delivery is lowered to none, and

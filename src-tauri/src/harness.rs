@@ -2942,6 +2942,20 @@ impl Harness {
             Some(r) if refresh => Some(crate::profiles::refreshed(&self.dir, &r)?),
             Some(r) => Some(crate::profiles::pinned(&self.dir, &r)?),
         };
+        // It goes on working for the session it works for: below any but the
+        // root Supervisor, or as an executor a session created, it does not
+        // deliver, whatever its pin or the profile now say (MCR-136)
+        let launch = match launch {
+            Some(l) => {
+                let (above, creator) = lock(&self.store).sessions.get(id).map(|t| (t.supervisor.clone(), t.created_by.clone())).unwrap_or_default();
+                // The root by its record, also while it is not running
+                let all = self.sessions()?;
+                let root = |up: &String| all.iter().any(|s| s["id"] == up.as_str() && s["meta"]["role"] == "supervisor");
+                let free = [above, creator].iter().flatten().all(root);
+                Some(crate::profiles::below(l, free)?.0)
+            }
+            None => None,
+        };
         let profile = old["harness"]["profile"].as_str().unwrap_or("").to_string();
         crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
         if !adapter(&profile).is_agent() {
@@ -3063,7 +3077,7 @@ impl Harness {
             None => None,
         };
         let asked = req["profile"].as_str().unwrap_or("");
-        let chosen = match pinned {
+        let mut chosen = match pinned {
             Some(l) => Some(l),
             None if crate::profiles::is_profile_id(asked) => Some(crate::profiles::choose(&self.dir, asked)?),
             None => None,
@@ -3104,6 +3118,10 @@ impl Harness {
             let live = sessions.iter().find(|s| s["exit"].is_null() && s["id"] == up.as_str()).ok_or_else(|| format!("No running session {up} to work for"))?;
             if !adapter(live["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
                 return Err("Only an agent session can have executors".into());
+            }
+            // Below any session but the root Supervisor, a lead does not deliver (MCR-136)
+            if let Some(c) = chosen.take() {
+                chosen = Some(crate::profiles::below(c, live["meta"]["role"] == "supervisor")?.0);
             }
             let store = lock(&self.store);
             if store.chain(up).len() + 1 > MAX_DEPTH {
@@ -3613,6 +3631,13 @@ impl Harness {
             let above = live(up).ok_or_else(|| format!("No running session {up}"))?;
             if !adapter(above["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
                 return Err("Only an agent session can have executors".into());
+            }
+            // A delivering lead works for the root Supervisor or for nobody (MCR-136);
+            // a pin that cannot be read counts as delivering when it was a lead's
+            let recorded = lock(&self.store).sessions.get(child).and_then(|t| t.agent_profile.clone());
+            let delivers = recorded.is_some_and(|r| crate::profiles::pinned(&self.dir, &r).map(|l| l.profile.delivers()).unwrap_or(r.role == "lead"));
+            if delivers && above["meta"]["role"] != "supervisor" {
+                return Err("Refused: that session is a lead that delivers, and an executor never delivers. Put it under the Supervisor, or start the work below that session as a new executor".into());
             }
         }
         let before = lock(&self.store).sessions.get(child).and_then(|t| t.supervisor.clone());
@@ -4371,7 +4396,13 @@ impl Harness {
                         // A bare request that the ceiling leaves as it was stays a bare launch
                         if notes.is_empty() && !crate::profiles::is_profile_id(&profile) { (None, notes) } else { (Some(l), notes) }
                     }
-                    (a, _) => (a, Vec::new()),
+                    // A creator without a profile has no ceiling to lower to, but an
+                    // executor never delivers unless it works for the root (MCR-136)
+                    (Some(a), None) => {
+                        let (l, notes) = crate::profiles::below(a, mine["meta"]["role"] == "supervisor")?;
+                        (Some(l), notes)
+                    }
+                    (None, _) => (None, Vec::new()),
                 };
                 if let Some(task) = args["task"].as_str() {
                     plain_prompt(task)?;
@@ -7107,6 +7138,123 @@ mod tests {
         // A lowered one whose creator is gone is not refreshed to the wider profile
         h.update(|s| s.sessions.get_mut("lost").unwrap().agent_profile = Some(crate::profiles::ProfileRef { lowered: true, ..recorded.clone() }));
         assert!(h.tool("session_restart", &json!({"session": "lost", "refresh_profile": true})).unwrap_err().contains("not recorded"));
+
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// MCR-136 review 17005 P1: an executor never delivers, whoever starts it.
+    /// A creator without a profile, the Supervisor's session_create for
+    /// another session, a bind and a restart all keep delivery for a lead
+    /// that works for the root Supervisor or for nobody, and give it to no
+    /// one else; below a lead, a Claude executor keeps the push and merge denies.
+    #[test]
+    #[cfg(unix)]
+    fn an_executor_never_delivers_whoever_starts_it() {
+        let dir = socket_test_dir("mcr-136-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dunce::canonicalize(&dir).unwrap().display().to_string();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let spawned: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = spawned.clone();
+        let folder = cwd.clone();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "spawn" => {
+                        seen.lock().unwrap().push(req.clone());
+                        json!({})
+                    }
+                    "write" | "forget" => json!({}),
+                    "snapshot" => json!({"data": ""}),
+                    "list" => {
+                        let mut sessions = vec![
+                            json!({"id": "root", "cwd": folder, "meta": {"profile": "claude", "role": "supervisor"}}),
+                            json!({"id": "bare", "cwd": folder, "meta": {"profile": "claude"}}),
+                            // Ended already, so a restart starts it again without a hangup
+                            json!({"id": "old", "cwd": folder, "exit": 0, "meta": {"profile": "claude"}}),
+                        ];
+                        sessions.extend(seen.lock().unwrap().iter().map(|r| json!({"id": r["id"], "cwd": r["cwd"], "meta": r["meta"]})));
+                        json!({ "sessions": sessions })
+                    }
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            for id in ["root", "bare"] {
+                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), ..Tracked::default() });
+            }
+        });
+        let record = |id: &str| lock(&h.store).sessions[id].agent_profile.clone().unwrap();
+        let launched = |id: &str| crate::profiles::pinned(&dir, &record(id)).unwrap().profile;
+        let no_push = |p: &crate::profiles::AgentProfile| {
+            assert!(!p.delivers(), "{}: {:?}", p.id, p.permissions.push);
+            if p.adapter == "claude" {
+                for rule in crate::profiles::NO_DELIVERY_DENIES {
+                    assert!(p.tools.deny.iter().any(|d| d == rule), "{}: {rule} in {:?}", p.id, p.tools.deny);
+                }
+            }
+        };
+
+        // A creator without a profile: both leads start without delivery, and the result says so
+        for lead in ["lead@claude-opus", "lead@codex"] {
+            let out = h.agent_tool("bare", "executor_create", &json!({"profile": lead})).unwrap();
+            no_push(&launched(out["id"].as_str().unwrap()));
+            assert!(record(out["id"].as_str().unwrap()).lowered);
+            assert!(out["lowered"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("never delivers")), "{out}");
+        }
+        // ... and the push and merge denies reach the Claude lead's command line
+        let line = spawned.lock().unwrap()[0]["argv"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect::<Vec<_>>().join(" ");
+        assert!(line.contains("'Bash(git push:*)'") && line.contains("'Bash(gh pr merge:*)'"), "{line}");
+        // The root Supervisor's own executor is a lead that delivers
+        let out = h.agent_tool("root", "executor_create", &json!({"profile": "lead@claude-opus"})).unwrap();
+        let delivering = out["id"].as_str().unwrap().to_string();
+        assert!(launched(&delivering).delivers() && !record(&delivering).lowered);
+
+        // session_create for another session: below a non-root session no delivery, below the root or nobody it keeps it
+        let out = h.tool("session_create", &json!({"profile": "lead@claude-opus", "cwd": cwd, "supervisor": "bare"})).unwrap();
+        no_push(&launched(out["id"].as_str().unwrap()));
+        let out = h.tool("session_create", &json!({"profile": "lead@codex", "cwd": cwd, "supervisor": "root"})).unwrap();
+        assert!(launched(out["id"].as_str().unwrap()).delivers());
+        let out = h.tool("session_create", &json!({"profile": "lead@claude-opus", "cwd": cwd})).unwrap();
+        let independent = out["id"].as_str().unwrap().to_string();
+        assert!(launched(&independent).delivers());
+
+        // A delivering lead is never bound below another session; below the root it may be
+        assert!(h.bind(&independent, Some("bare")).unwrap_err().contains("never delivers"));
+        assert!(lock(&h.store).sessions[&independent].supervisor.is_none());
+        h.bind(&independent, Some("root")).unwrap();
+        assert_eq!(lock(&h.store).sessions[&independent].supervisor.as_deref(), Some("root"));
+
+        // A restart below a non-root session drops delivery, also for a pin that has it, with refresh or without
+        let lead = crate::profiles::choose(&dir, "lead@claude-opus").unwrap();
+        crate::profiles::pin(&dir, &lead).unwrap();
+        for refresh in [false, true] {
+            h.update(|s| {
+                s.sessions.insert("old".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), supervisor: Some("bare".into()), agent_profile: Some(lead.reference()), ..Tracked::default() });
+            });
+            let out = h.tool("session_restart", &json!({"session": "old", "refresh_profile": refresh})).unwrap();
+            let new = out["id"].as_str().unwrap();
+            no_push(&launched(new));
+            assert_eq!(lock(&h.store).sessions[new].supervisor.as_deref(), Some("bare"));
+        }
+        // ... and keeps it for a lead that works for the root
+        h.update(|s| {
+            s.sessions.insert("old".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), supervisor: Some("root".into()), agent_profile: Some(lead.reference()), ..Tracked::default() });
+        });
+        let out = h.tool("session_restart", &json!({"session": "old"})).unwrap();
+        assert!(launched(out["id"].as_str().unwrap()).delivers());
 
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
