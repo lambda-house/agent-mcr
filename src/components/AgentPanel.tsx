@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, CheckCheck, ChevronDown, ChevronRight, EyeOff, Folder, RefreshCw, Search } from 'lucide-react';
-import { Button, PaneFrame } from '@lambda-house/ui';
+import { Button } from '@lambda-house/ui';
+import { Pane } from '@lambda-house/workbench';
 import clsx from 'clsx';
 import { useStore } from '../store';
 import {
@@ -19,7 +20,6 @@ import {
   refreshAgentWorkspace,
 } from '../utils/agent';
 import { shortPath } from '../utils/harness';
-import PanelZoomBadge from './PanelZoomBadge';
 import { useSmoothWheelScroll } from '@lambda-house/ui';
 import { useReader } from '../reader';
 import { activeTabOf, focusedGroupOf } from '@lambda-house/reader';
@@ -85,7 +85,7 @@ const AgentItem: React.FC<{ entry: AgentEntry; active: boolean; showGroup?: bool
 /** Session folders shown open before the person chooses. */
 const OPEN_FOLDERS = 4;
 
-const AgentPanel: React.FC<{ width: number }> = ({ width }) => {
+const AgentPanel: React.FC = () => {
   const entries = useStore((s) => s.agentEntries);
   const sessionFolders = useStore((s) => s.agentFolders);
   const setAgentEntries = useStore((s) => s.setAgentEntries);
@@ -196,14 +196,11 @@ const AgentPanel: React.FC<{ width: number }> = ({ width }) => {
   };
 
   return (
-    <PaneFrame
+    <Pane
       as="aside"
       className="file-panel"
-      style={{ width }}
-      data-zoom-panel="files"
       title="Agent documents"
       tools={<>
-        <PanelZoomBadge panel="files" />
         {enabled && <>
           <Button variant="ghost" size="xs" icon={<CheckCheck size={16} />} onClick={handleMarkAllRead} title="Mark everything as read" aria-label="Mark everything as read" disabled={!entries.some((e) => e.unread)} />
           <Button variant="ghost" size="xs" icon={<RefreshCw size={16} />} onClick={refresh} title="Refresh" aria-label="Refresh" disabled={loading} busy={loading} />
@@ -258,7 +255,7 @@ const AgentPanel: React.FC<{ width: number }> = ({ width }) => {
           </nav>
         </>
       )}
-    </PaneFrame>
+    </Pane>
   );
 };
 

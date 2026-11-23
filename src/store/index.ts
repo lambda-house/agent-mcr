@@ -6,6 +6,10 @@ import type { ColorTheme } from '@lambda-house/reader';
 import type { AgentEntry } from '../utils/tauri';
 import { DEFAULT_LIVE_LIST, type LiveListPrefs } from '../utils/harness';
 import { documentWindowPath, documentWindowStorage } from '../utils/documentWindow';
+import type { LayoutNode } from '@lambda-house/workbench';
+import { defaultDocumentsLayout, documentsLayoutFrom, hidePane, isDocumentsLayout, isPaneShown, showPane, togglePane, type DocumentsPane } from './documentsLayout';
+
+export { PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH, type DocumentsPane } from './documentsLayout';
 
 // ============================================================
 // Constants
@@ -20,10 +24,6 @@ const REMOVED_KEYS = [
   'searchScope', 'workspaces', 'activeWorkspace', 'checkUpdatesOnStart',
 ];
 
-export const PANEL_MIN_WIDTH = 200;
-export const PANEL_MAX_WIDTH = 400;
-export const TOC_MIN_WIDTH = 180;
-export const TOC_MAX_WIDTH = 320;
 
 /** Side panels that zoom on their own (Ctrl + wheel over the panel). */
 export type ZoomPanel = 'files' | 'toc';
@@ -47,10 +47,8 @@ export type { Heading } from '@lambda-house/reader';
 export interface AppState {
   
   // UI State
-  panelWidth: number;
-  filePanelVisible: boolean;
-  tocWidth: number;
-  tocVisible: boolean;
+  /** The Documents view: agent documents, document groups, contents, as a workbench layout (documentsLayout.ts). */
+  documentsLayout: LayoutNode;
   /** Zoom of the file panel and the TOC, independent of the document zoom. */
   panelZoom: Record<ZoomPanel, number>;
   statusBarVisible: boolean;
@@ -77,9 +75,12 @@ export interface AppState {
 
   
   // Actions - UI
-  setPanelWidth: (width: number) => void;
+  /** The Documents layout after a resize or a pane menu; ignored unless Agent MCR can draw it. */
+  setDocumentsLayout: (layout: LayoutNode) => void;
+  showPanel: (panel: DocumentsPane) => void;
+  hidePanel: (panel: DocumentsPane) => void;
+  togglePanel: (panel: DocumentsPane) => void;
   setFilePanelVisible: (visible: boolean) => void;
-  setTocWidth: (width: number) => void;
   setTocVisible: (visible: boolean) => void;
   toggleTocVisible: () => void;
   /** Step a panel's zoom in (1) or out (-1), or reset it to 100% (0). */
@@ -124,16 +125,13 @@ export function normalizeLiveList(stored: unknown): LiveListPrefs {
 
 export const useStore = create<AppState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       // Initial State - Files
       
       // Initial State - Documents
       
       // Initial State - UI
-      panelWidth: 280,
-      filePanelVisible: true,
-      tocWidth: 220,
-      tocVisible: true,
+      documentsLayout: defaultDocumentsLayout({ withAgentDocs: !documentWindowPath }),
       panelZoom: DEFAULT_PANEL_ZOOM,
       statusBarVisible: false,
       statusBarPinned: false,
@@ -155,19 +153,15 @@ export const useStore = create<AppState>()(
       // Actions - UI
       // ============================================================
       
-      setPanelWidth: (width) => set({ 
-        panelWidth: Math.round(Math.max(PANEL_MIN_WIDTH, Math.min(PANEL_MAX_WIDTH, width))) 
-      }),
-
-      setFilePanelVisible: (visible) => set({ filePanelVisible: visible }),
-      
-      setTocWidth: (width) => set({ 
-        tocWidth: Math.round(Math.max(TOC_MIN_WIDTH, Math.min(TOC_MAX_WIDTH, width))) 
-      }),
-      
-      setTocVisible: (visible) => set({ tocVisible: visible }),
-      
-      toggleTocVisible: () => set((state) => ({ tocVisible: !state.tocVisible })),
+      setDocumentsLayout: (layout) => {
+        if (layout !== get().documentsLayout && isDocumentsLayout(layout)) set({ documentsLayout: layout });
+      },
+      showPanel: (panel) => set((state) => ({ documentsLayout: showPane(state.documentsLayout, panel) })),
+      hidePanel: (panel) => set((state) => ({ documentsLayout: hidePane(state.documentsLayout, panel) })),
+      togglePanel: (panel) => set((state) => ({ documentsLayout: togglePane(state.documentsLayout, panel) })),
+      setFilePanelVisible: (visible) => (visible ? get().showPanel('agent-docs') : get().hidePanel('agent-docs')),
+      setTocVisible: (visible) => (visible ? get().showPanel('contents') : get().hidePanel('contents')),
+      toggleTocVisible: () => get().togglePanel('contents'),
       
 
       zoomPanel: (panel, direction) => set((state) => {
@@ -207,14 +201,11 @@ export const useStore = create<AppState>()(
     }),
     {
       name: 'mdviewer-storage',
-      version: 6,
+      version: 7,
       storage: createJSONStorage(() => documentWindowPath ? documentWindowStorage(localStorage) : localStorage),
       partialize: (state) => ({
         // Only persist these fields
-        panelWidth: state.panelWidth,
-        filePanelVisible: state.filePanelVisible,
-        tocWidth: state.tocWidth,
-        tocVisible: state.tocVisible,
+        documentsLayout: state.documentsLayout,
         panelZoom: state.panelZoom,
         statusBarPinned: state.statusBarPinned,
         liveList: state.liveList,
@@ -235,6 +226,11 @@ export const useStore = create<AppState>()(
         if (version < 5) {
           for (const key of REMOVED_KEYS) delete (persisted as Record<string, unknown>)[key];
         }
+        // v7: the side panels' widths and visibility are the Documents layout
+        if (version < 7) {
+          persisted.documentsLayout = documentsLayoutFrom(persisted, !documentWindowPath);
+          for (const key of ['panelWidth', 'filePanelVisible', 'tocWidth', 'tocVisible']) delete persisted[key];
+        }
         return persisted;
       },
       merge: (persistedState, currentState) => {
@@ -243,6 +239,7 @@ export const useStore = create<AppState>()(
         return {
           ...currentState,
           ...persisted,
+          documentsLayout: isDocumentsLayout(persisted.documentsLayout) ? persisted.documentsLayout : currentState.documentsLayout,
           panelZoom: { ...DEFAULT_PANEL_ZOOM, ...persisted.panelZoom },
           liveList: normalizeLiveList(persisted.liveList),
         };
@@ -256,5 +253,8 @@ useReader.getState().setTheme(useStore.getState().theme);
 useStore.subscribe((state, prev) => {
   if (state.theme !== prev.theme) useReader.getState().setTheme(state.theme);
 });
+
+/** Whether a panel of the Documents view shows. */
+export const panelShown = (state: Pick<AppState, 'documentsLayout'>, panel: DocumentsPane): boolean => isPaneShown(state.documentsLayout, panel);
 
 export default useStore;

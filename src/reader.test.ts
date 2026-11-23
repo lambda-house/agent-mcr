@@ -37,9 +37,10 @@ describe('the reader takes over the old saved tabs', () => {
     expect(reader.settings.languageAliases).toEqual({ sc: 'scala' });
     expect(reader.theme).toBe('light');
     // The app keeps its own part, and saves it without the reader's
-    expect(useStore.getState().tocWidth).toBe(250);
+    // and its panels are the Documents layout now, with the width it had
+    expect(JSON.stringify(useStore.getState().documentsLayout)).toContain('{"px":250}');
     const app = JSON.parse(localStorage.getItem('mdviewer-storage') as string);
-    expect(app.version).toBe(6);
+    expect(app.version).toBe(7);
     expect([app.state.tabs, app.state.zoom, app.state.smoothScroll]).toEqual([undefined, undefined, undefined]);
     expect(JSON.parse(localStorage.getItem('mdviewer-reader') as string).state.groups.main.tabs).toHaveLength(2);
   };

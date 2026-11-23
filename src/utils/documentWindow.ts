@@ -1,19 +1,31 @@
+import { closeLeaf, findPaneOfType, type LayoutNode } from '@lambda-house/workbench';
+import { defaultDocumentsLayout, documentsLayoutFrom, isDocumentsLayout } from '../store/documentsLayout';
+
 export const documentWindowPath = typeof window === 'undefined'
   ? null : new URLSearchParams(window.location.search).get('memoryDocument');
 
-/** Inherit display preferences, but never share tabs or write the main workspace. */
+/**
+ * Inherit display preferences (the theme, the contents panel), but never
+ * share tabs or write the main workspace. A memory window has no agent documents.
+ */
 export function documentWindowStorage(source: Pick<Storage, 'getItem'>) {
   return {
     getItem: () => {
-      let preferences: Record<string, unknown> = {};
+      let theme: unknown;
+      let documentsLayout: LayoutNode | null = null;
       try {
-        const saved = JSON.parse(source.getItem('mdviewer-storage') || '{}').state || {};
-        preferences = Object.fromEntries([
-          'theme', 'tocWidth', 'tocVisible',
-        ].filter(key => key in saved).map(key => [key, saved[key]]));
-      } catch { /* Use the reader defaults if the saved preferences are invalid. */ }
-      return JSON.stringify({ version: 6, state: {
-        ...preferences, filePanelVisible: false,
+        const saved = JSON.parse(source.getItem('mdviewer-storage') || '{}');
+        const state = saved.state || {};
+        theme = state.theme;
+        const layout = (saved.version ?? 0) < 7 ? documentsLayoutFrom(state, false) : state.documentsLayout;
+        if (isDocumentsLayout(layout)) {
+          const agentDocs = findPaneOfType(layout, 'agent-docs');
+          documentsLayout = agentDocs ? closeLeaf(layout, agentDocs.id) : layout;
+        }
+      } catch { /* Use the defaults if the saved preferences are invalid. */ }
+      return JSON.stringify({ version: 7, state: {
+        ...(theme ? { theme } : {}),
+        documentsLayout: documentsLayout ?? defaultDocumentsLayout({ withAgentDocs: false }),
       } });
     },
     setItem: () => {},

@@ -4,7 +4,7 @@ import {
   activeTabOf, allTabs, canNavigateBack, canNavigateForward, exportActiveDocument, focusedGroupOf, requestSaveAll, saveActiveDocument,
   type ReaderState,
 } from '@lambda-house/reader';
-import { useStore, type AppState } from '../store';
+import { useStore, panelShown, type AppState } from '../store';
 import { useReader } from '../reader';
 import { reader } from '../readerHost';
 import { liveNav } from './liveNav';
@@ -105,8 +105,8 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
           id: 'view.filePanel',
           label: 'Agent Documents',
           shortcut: { mod: true, key: 'b' },
-          checked: (s) => s.filePanelVisible,
-          run: () => state().setFilePanelVisible(!state().filePanelVisible),
+          checked: (s) => panelShown(s, 'agent-docs'),
+          run: () => state().togglePanel('agent-docs'),
         },
         {
           id: 'view.splitRight',
@@ -132,7 +132,7 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
           id: 'view.toc',
           label: 'Table of Contents',
           shortcut: { mod: true, shift: true, key: 'o' },
-          checked: (s) => s.tocVisible,
+          checked: (s) => panelShown(s, 'contents'),
           run: () => state().toggleTocVisible(),
         },
         {

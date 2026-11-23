@@ -10,7 +10,7 @@ import {
   Sun,
   Settings,
 } from 'lucide-react';
-import { useStore } from '../store';
+import { useStore, panelShown } from '../store';
 import { useReader } from '../reader';
 import { reader } from '../readerHost';
 import { MIN_ZOOM, MAX_ZOOM, activeTabOf, exportActiveDocument, focusedGroupOf } from '@lambda-house/reader';
@@ -99,7 +99,7 @@ const Toolbar: React.FC<ToolbarProps> = ({
   filePanelVisible,
   onToggleFilePanel,
 }) => {
-  const tocVisible = useStore((s) => s.tocVisible);
+  const tocVisible = useStore((s) => panelShown(s, 'contents'));
   const toggleTocVisible = useStore((s) => s.toggleTocVisible);
   const activeTab = useReader((s) => activeTabOf(focusedGroupOf(s)));
   const editMode = useReader((s) => s.editMode);

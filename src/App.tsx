@@ -1,5 +1,5 @@
 import React, { useEffect, useCallback, useMemo, useState } from 'react';
-import { useStore, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH } from './store';
+import { useStore, panelShown, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, TOC_MAX_WIDTH, type ZoomPanel } from './store';
 import { useReader } from './reader';
 import { openPath, reader } from './readerHost';
 import {
@@ -7,7 +7,7 @@ import {
 } from '@lambda-house/reader';
 import { EmptyState } from '@lambda-house/ui';
 import { FileQuestion } from 'lucide-react';
-import { LayoutView, MainMenu, Shell, findLeaf, isPx, type Layout, type LayoutNode, type PaneType, type ShellSurface, type Size } from '@lambda-house/workbench';
+import { LayoutView, MainMenu, Shell, type Layout, type PaneType, type ShellSurface } from '@lambda-house/workbench';
 import { Activity, FileText } from 'lucide-react';
 import {
   isTauri,
@@ -79,29 +79,21 @@ const App: React.FC = () => {
   const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath);
   // Subscribe field by field so that high frequency updates (scroll offsets,
   // active heading) do not re-render the whole application.
-  const panelWidth = useStore((s) => s.panelWidth);
-  const tocWidth = useStore((s) => s.tocWidth);
-  const tocVisible = useStore((s) => s.tocVisible);
+  const documentsLayoutRoot = useStore((s) => s.documentsLayout);
+  const setDocumentsLayout = useStore((s) => s.setDocumentsLayout);
   const agentEntries = useStore((s) => s.agentEntries);
   const hasAgentTabs = useReader((s) => allTabs(s).some((t) => agentEntries.some((e) => e.path === t.path)));
 
-  const setPanelWidth = useStore((s) => s.setPanelWidth);
-  const setTocWidth = useStore((s) => s.setTocWidth);
   const toggleTocVisible = useStore((s) => s.toggleTocVisible);
   const activateTabByIndex = useReader((s) => s.activateTabByIndex);
   const navigateBack = useReader((s) => s.navigateBack);
   const navigateForward = useReader((s) => s.navigateForward);
-  const zoomIn = useReader((s) => s.zoomIn);
-  const zoomOut = useReader((s) => s.zoomOut);
-  const zoomPanel = useStore((s) => s.zoomPanel);
   const reopenClosedTab = useReader((s) => s.reopenClosedTab);
   const restoreSession = useReader((s) => s.restoreSession);
   const sessionRestored = useReader((s) => s.sessionRestored);
 
   // A memory reader window shows its one document and no list
-  const filePanelVisible = useStore((s) => s.filePanelVisible) && !documentWindowPath;
-  const setFilePanelVisible = useStore((s) => s.setFilePanelVisible);
-  const setTocVisible = useStore((s) => s.setTocVisible);
+  const filePanelVisible = panelShown({ documentsLayout: documentsLayoutRoot }, 'agent-docs') && !documentWindowPath;
   const documentsShown = !sessionsVisible;
 
   // Restore the previous session: the persisted tabs only carry paths, so the
@@ -190,9 +182,7 @@ const App: React.FC = () => {
     toggleTocVisible();
   }, [toggleTocVisible]);
 
-  const handleToggleFilePanel = useCallback(() => {
-    setFilePanelVisible(!useStore.getState().filePanelVisible);
-  }, [setFilePanelVisible]);
+  const handleToggleFilePanel = useCallback(() => useStore.getState().togglePanel('agent-docs'), []);
 
   // Reopen closed tab
   const handleReopenClosedTab = useCallback(async () => {
@@ -321,82 +311,40 @@ const App: React.FC = () => {
     return () => window.removeEventListener('mouseup', handleMouseUp);
   }, [navigateBack, navigateForward]);
 
-  // Ctrl+Scroll for zoom
+  // Ctrl+wheel zooms the pane under the pointer: the workbench's LayoutView does it (each pane type's zoom)
+
   // ============================================================
-  
-  // Zooms whatever is under the cursor: the file panel and the TOC have their
-  // own zoom, everywhere else it is the document zoom.
-  useEffect(() => {
-    const handleWheel = (e: WheelEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.deltaY === 0) return;
-      e.preventDefault();
+  // Documents: the agent documents, the document groups and the contents,
+  // on the workbench layout the store keeps (store/documentsLayout.ts). Its
+  // handles and pane menus change it there. A memory window has no agent documents.
+  // ============================================================
 
-      const direction = e.deltaY < 0 ? 1 : -1;
-      const panel = (e.target as Element | null)
-        ?.closest?.('[data-zoom-panel]')
-        ?.getAttribute('data-zoom-panel');
+  const documentsLayout = useMemo<Layout>(() => ({ version: 1, root: documentsLayoutRoot }), [documentsLayoutRoot]);
+  const applyDocumentsLayout = useCallback((next: Layout) => setDocumentsLayout(next.root), [setDocumentsLayout]);
 
-      // A document group under the cursor zooms itself; anywhere else, the focused one
-      const group = (e.target as Element | null)?.closest?.('.document-panel[data-group]')?.getAttribute('data-group') ?? undefined;
-      if (panel === 'files' || panel === 'toc') {
-        zoomPanel(panel, direction);
-      } else if (direction > 0) {
-        zoomIn(group);
-      } else {
-        zoomOut(group);
-      }
+  const documentPanes = useMemo<Record<string, PaneType>>(() => {
+    const zoomOf = (panel: ZoomPanel) => ({
+      get: () => useStore.getState().panelZoom[panel],
+      step: (_: unknown, direction: 1 | -1 | 0) => useStore.getState().zoomPanel(panel, direction),
+      subscribe: useStore.subscribe,
+    });
+    return {
+      'agent-docs': {
+        type: 'agent-docs', label: 'agent documents', title: 'Agent documents', singleton: true, collapsible: true,
+        min: { w: PANEL_MIN_WIDTH }, max: { w: PANEL_MAX_WIDTH }, zoom: zoomOf('files'),
+        render: () => <AgentPanel />,
+      },
+      documents: {
+        type: 'documents', label: 'document', title: 'Documents', singleton: true, closable: false, keepAlive: true, min: { w: 200 },
+        render: () => <DocumentGroups empty={NO_DOCUMENT} />,
+      },
+      contents: {
+        type: 'contents', label: 'table of contents', title: 'Contents', singleton: true, collapsible: true,
+        min: { w: TOC_MIN_WIDTH }, max: { w: TOC_MAX_WIDTH }, zoom: zoomOf('toc'),
+        render: () => <TocSidebar onToggle={handleToggleToc} />,
+      },
     };
-    
-    window.addEventListener('wheel', handleWheel, { passive: false });
-    return () => window.removeEventListener('wheel', handleWheel);
-  }, [zoomIn, zoomOut, zoomPanel]);
-
-  // ============================================================
-  // Documents: the agent documents, the document and the contents on the
-  // workbench layout, drawn from the store's widths and flags; what the
-  // handles change goes back through the same setters. A memory window has
-  // the left panel only while it is shown, as before.
-  // ============================================================
-
-  const documentsLayout = useMemo<Layout>(() => {
-    const children: LayoutNode[] = [
-      { kind: 'leaf', id: 'main', pane: { type: 'documents', key: 'main' } },
-      { kind: 'leaf', id: 'right', pane: { type: 'contents', key: 'contents' }, collapsed: !tocVisible },
-    ];
-    const sizes: Size[] = [{ fr: 1 }, { px: tocWidth }];
-    if (!documentWindowPath || filePanelVisible) {
-      children.unshift({ kind: 'leaf', id: 'left', pane: { type: 'agent-docs', key: 'left' }, collapsed: !filePanelVisible });
-      sizes.unshift({ px: panelWidth });
-    }
-    return { version: 1, root: { kind: 'split', id: 'documents', dir: 'row', children, sizes } };
-  }, [filePanelVisible, tocVisible, panelWidth, tocWidth]);
-
-  const applyDocumentsLayout = useCallback((next: Layout) => {
-    const split = next.root.kind === 'split' ? next.root : null;
-    const width = (id: string) => {
-      const size = split?.sizes[split.children.findIndex((child) => child.id === id)];
-      return size && isPx(size) ? size.px : undefined;
-    };
-    const left = findLeaf(next.root, 'left');
-    const right = findLeaf(next.root, 'right');
-    if (left && !left.collapsed !== filePanelVisible) setFilePanelVisible(!left.collapsed);
-    if (right && !right.collapsed !== tocVisible) setTocVisible(!right.collapsed);
-    const leftWidth = width('left'), rightWidth = width('right');
-    if (leftWidth !== undefined && leftWidth !== panelWidth) setPanelWidth(leftWidth);
-    if (rightWidth !== undefined && rightWidth !== tocWidth) setTocWidth(rightWidth);
-  }, [filePanelVisible, tocVisible, panelWidth, tocWidth, setFilePanelVisible, setTocVisible, setPanelWidth, setTocWidth]);
-
-  const documentPanes = useMemo<Record<string, PaneType>>(() => ({
-    'agent-docs': {
-      type: 'agent-docs', label: 'agent documents', collapsible: true, min: { w: PANEL_MIN_WIDTH }, max: { w: PANEL_MAX_WIDTH },
-      render: () => <AgentPanel width={panelWidth} />,
-    },
-    documents: { type: 'documents', label: 'document', min: { w: 200 }, render: () => <DocumentGroups empty={NO_DOCUMENT} /> },
-    contents: {
-      type: 'contents', label: 'table of contents', collapsible: true, min: { w: TOC_MIN_WIDTH }, max: { w: TOC_MAX_WIDTH },
-      render: () => <TocSidebar width={tocWidth} isVisible={tocVisible} onToggle={handleToggleToc} />,
-    },
-  }), [panelWidth, tocWidth, tocVisible, handleToggleToc]);
+  }, [handleToggleToc]);
 
   // The window's surfaces under one top bar (the workbench Shell). Documents is mounted only while shown;
   // Sessions stays mounted once opened. A memory window has Documents only.
