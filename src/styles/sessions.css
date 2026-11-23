@@ -63,8 +63,11 @@
 .sc-event .sc-message summary { font:12px/1.5 Inter,system-ui,sans-serif; color:var(--sc-text); }
 .sc-event .sc-message[open] p { margin-top:6px; }
 .sc-footer > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* The window's top row on macOS: the traffic lights are drawn over it (utils/windowChrome.ts); one line, as a title bar */
+.sc-topbar[data-titlebar] { height:var(--titlebar-height); min-height:var(--titlebar-height); padding-top:0; padding-bottom:0; user-select:none; }
 @media (max-width:1050px) {
   .sc-topbar { gap:6px; flex-wrap:wrap; }
+  .sc-topbar[data-titlebar] { flex-wrap:nowrap; }
   .sc-summary { margin-left:auto; }
   .sc-filters select { max-width:150px; }
   .sc-activity-count { display:block; margin:3px 0 0; }

@@ -16,6 +16,7 @@ import type { MenuItem } from '../utils/commands';
 import clsx from 'clsx';
 import MainMenu from './MainMenu';
 import WorkspaceSwitch from './WorkspaceSwitch';
+import { NO_DRAG, topRowProps, useTitleBar } from '../utils/windowChrome';
 
 // ============================================================
 // Zoom Control Component
@@ -43,6 +44,7 @@ const ZoomControl: React.FC = () => {
 
   return (
     <div
+      {...NO_DRAG}
       className={clsx('zoom-control', isExpanded ? 'expanded' : 'collapsed')}
       onMouseEnter={() => setIsExpanded(true)}
       onMouseLeave={() => setIsExpanded(false)}
@@ -110,6 +112,7 @@ const Toolbar: React.FC<ToolbarProps> = ({
   const toggleEditMode = useStore((s) => s.toggleEditMode);
   const toggleTheme = useStore((s) => s.toggleTheme);
   const [isExporting, setIsExporting] = useState(false);
+  const titleBar = useTitleBar();
 
   const handleToggleToc = useCallback(() => {
     toggleTocVisible();
@@ -130,7 +133,7 @@ const Toolbar: React.FC<ToolbarProps> = ({
   }, []);
 
   return (
-    <header className="toolbar">
+    <header className="toolbar" {...topRowProps(titleBar)}>
       {/* Left Section */}
       <div className="toolbar-group">
         {onOpenSessions && <WorkspaceSwitch active="documents" onChange={workspace => { if (workspace === 'sessions') onOpenSessions(); }} />}

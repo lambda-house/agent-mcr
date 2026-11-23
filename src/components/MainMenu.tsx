@@ -4,6 +4,7 @@ import clsx from 'clsx';
 import { useStore } from '../store';
 import { formatShortcut, isSubmenu, type Command, type MenuItem } from '../utils/commands';
 import { flushEditorChanges } from '../utils/editorRegistry';
+import { NO_DRAG } from '../utils/windowChrome';
 
 /**
  * How long an open submenu stays when the pointer moves to another row (ms):
@@ -271,7 +272,7 @@ const MainMenu: React.FC<MainMenuProps> = ({ items }) => {
   }, [open, close]);
 
   return (
-    <div className="main-menu" ref={rootRef}>
+    <div className="main-menu" ref={rootRef} {...NO_DRAG}>
       <button
         className={clsx('toolbar-button', open && 'active')}
         // Opening the menu with the mouse leaves the focus where it is

@@ -6,6 +6,10 @@ import SessionWorkspace from './SessionWorkspace';
 import { sessionApi, type Session } from '../utils/sessions';
 import { harnessApi, type Hosted } from '../utils/harness';
 import { createPlugin, pluginRegistry } from '../plugins';
+import { controlsIn, dragsWindow } from '../utils/dragRegion.testing';
+import type { TitleBar } from '../utils/windowChrome';
+const chrome = vi.hoisted(() => ({ bar: 'native' as TitleBar }));
+vi.mock('../utils/windowChrome', async importOriginal => ({ ...await importOriginal<object>(), useTitleBar: () => chrome.bar }));
 vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
@@ -85,5 +89,30 @@ describe('Sessions workspace', () => {
   it('does not read transcripts before access is enabled', async () => {
     vi.mocked(sessionApi.access).mockResolvedValue(false);
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>));await flush();expect(host.textContent).toContain('Enable session access');expect(sessionApi.snapshot).not.toHaveBeenCalled();
+  });
+  it('is the window top row on macOS: the empty space drags, every tab and button clicks, no inset in full screen', async () => {
+    try {
+      chrome.bar = 'overlay';
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+      const row = host.querySelector('.sc-topbar') as HTMLElement;
+      expect(row.getAttribute('data-tauri-drag-region')).toBe('deep');
+      expect(row.style.paddingLeft).toBe('80px');
+      expect(dragsWindow(row)).toBe(true);
+      expect(dragsWindow(row.querySelector('.hs-view-switch')!)).toBe(true);
+      const tabs = ['documents', 'sessions', 'live', 'journal', 'board', 'slack', 'settings'];
+      for (const tab of tabs) expect(dragsWindow(button(tab)), tab).toBe(false);
+      const controls = controlsIn(row);
+      expect(controls.length).toBeGreaterThanOrEqual(tabs.length);
+      for (const c of controls) for (const el of [c, ...c.querySelectorAll('*')]) expect(dragsWindow(el), el.outerHTML.slice(0, 80)).toBe(false);
+      chrome.bar = 'fullscreen';
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}} active={false}/>)); await flush();
+      expect(row.getAttribute('data-tauri-drag-region')).toBeNull();
+      expect(row.style.paddingLeft).toBe('');
+      expect(dragsWindow(row)).toBe(false);
+      chrome.bar = 'native';
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+      expect(row.hasAttribute('data-titlebar')).toBe(false);
+      expect(row.hasAttribute('data-tauri-drag-region')).toBe(false);
+    } finally { chrome.bar = 'native'; }
   });
 });
