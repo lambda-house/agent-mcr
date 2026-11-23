@@ -43,8 +43,9 @@ vi.mock('@xterm/xterm', () => ({
     constructor() { screen.written[this.made] = []; screen.resets[this.made] = 0; }
     loadAddon(addon: { activate?: (t: unknown) => void }) { addon.activate?.(this); }
     open() {} paste() {} dispose() {} refresh() {}
-    write(data: Uint8Array) { screen.written[this.made].push(new TextDecoder().decode(data)); }
+    write(data: Uint8Array | string) { screen.written[this.made].push(typeof data === 'string' ? data : new TextDecoder().decode(data)); }
     reset() { screen.resets[this.made]++; screen.written[this.made] = []; }
+    resize(cols: number, rows: number) { this.cols = cols; this.rows = rows; }
     attachCustomKeyEventHandler() {}
     focus() { screen.focused++; }
     onKey() { return { dispose() {} }; } onData() { return { dispose() {} }; } onResize(f: (size: { cols: number; rows: number }) => void) { screen.resized.push(f); return { dispose() {} }; }
@@ -58,6 +59,12 @@ vi.mock('@xterm/addon-fit', () => ({ FitAddon: class {
   fit() { if (this.t && screen.fitted) Object.assign(this.t, screen.fitted); }
 } }));
 vi.mock('@xterm/addon-unicode11', () => ({ Unicode11Addon: class {} }));
+// The serializer gives what its terminal was written, as one text
+vi.mock('@xterm/addon-serialize', () => ({ SerializeAddon: class {
+  t: { made: number } | null = null;
+  activate(t: { made: number }) { this.t = t; }
+  serialize() { return this.t ? screen.written[this.t.made].join('') : ''; }
+} }));
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { attach: vi.fn(() => new Promise(() => {})), detach: vi.fn(), resize: vi.fn(() => Promise.resolve()), input: vi.fn(), saveImage: vi.fn() } }));
 
@@ -256,6 +263,27 @@ describe('a terminal is the view of one shown session (MCR-139)', () => {
     expect(sizes().length).toBe(told);
   });
 
+  it('drops frames of a view that arrive after it was let go: no byte twice, no reset of a kept terminal (review 17084)', async () => {
+    runner(); screen.fitted = { cols: 120, rows: 30 };
+    const before = screen.made;
+    await show();
+    act(() => { views[0].on.start(0); views[0].on.data(bytes('seen\r\n')); });
+    await hide();
+    // The old view's frames were on their way: they reach the kept terminal after the hide
+    act(() => { views[0].on.data(bytes('late\r\n')); views[0].on.start(0); });
+    expect(screen.written[before]).toEqual(['seen\r\n']);
+    expect(screen.resets[before]).toBe(0);
+    // Shown again: asked from where it really was, and the runner sends what it missed, once
+    await show();
+    expect(views[1].since).toBe(6);
+    act(() => { views[1].on.start(6); views[1].on.data(bytes('late\r\n')); });
+    // More late frames of the first view, now that the second one runs: dropped too
+    act(() => { views[0].on.data(bytes('late\r\n')); views[0].on.start(0); views[0].on.data(new Uint8Array(0)); });
+    expect(screen.written[before]).toEqual(['seen\r\n', 'late\r\n']);
+    expect(screen.resets[before]).toBe(0);
+    expect(host.querySelector('.hs-terminal-notice')).toBeNull();
+  });
+
   it('starts over with what the runner holds when it cannot go on from the offset, or does not say where it starts', async () => {
     runner(); screen.fitted = { cols: 100, rows: 30 };
     const before = screen.made;
@@ -276,17 +304,26 @@ describe('a terminal is the view of one shown session (MCR-139)', () => {
     expect(views[3].since).toBeNull();
   });
 
-  it('keeps no more than MAX_KEPT hidden terminals, dropping the least recently hidden', async () => {
-    runner(); screen.fitted = { cols: 80, rows: 24 };
+  it('loses no line of a terminal pushed out of the keep: it comes back from its text and catches up (review 17084)', async () => {
+    runner(); screen.fitted = { cols: 132, rows: 40 };
     const before = screen.made;
-    for (const id of ['a', 'b', 'c', 'd', 'e']) {
+    await act(async () => root.render(<TerminalPane id="a" active/>)); await frame();
+    act(() => { views[0].on.start(5_000_000); views[0].on.data(bytes('line beyond the ring\r\n')); });
+    await act(async () => root.render(<div/>));
+    // Four other sessions shown and hidden: 'a' is the least recently hidden of five
+    for (const id of ['b', 'c', 'd', 'e']) {
       await act(async () => root.render(<TerminalPane id={id} active/>)); await frame();
       await act(async () => root.render(<div/>));
     }
-    expect(keep.ids).toEqual(['b', 'c', 'd', 'e']);
-    // 'a' was dropped: showing it makes a new terminal that asks for everything
+    expect(keep.live).toEqual(['b', 'c', 'd', 'e']);
+    // Shown again: a new terminal with what 'a' showed, at the size it had, asking from where 'a' was
     await act(async () => root.render(<TerminalPane id="a" active/>)); await frame();
-    expect(screen.made).toBe(before + 6);
-    expect(views[views.length - 1].since).toBeNull();
+    const back = screen.made - 1;
+    expect(back).toBe(before + 5);
+    const asked = views[views.length - 1];
+    expect(asked.since).toBe(5_000_022);
+    act(() => { asked.on.start(5_000_022); asked.on.data(bytes('missed\r\n')); });
+    expect(screen.written[back]).toEqual(['line beyond the ring\r\n', 'missed\r\n']);
+    expect(screen.resets[back]).toBe(0);
   });
 });

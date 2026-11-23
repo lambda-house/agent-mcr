@@ -38,6 +38,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const PROTOCOL: u32 = 1;
 const SCROLLBACK: usize = 4 * 1024 * 1024;
+/// How often a view with nothing to send looks whether its client went away.
+const VIEW_LOOK: Duration = Duration::from_millis(250);
 /// Output chunks queued per attached view before the view is dropped.
 const VIEW_QUEUE: usize = 2048;
 /// Exit when nothing runs and nobody is connected for this long.
@@ -243,7 +245,9 @@ struct Output {
     ring: VecDeque<u8>,
     /// All the output so far, in bytes: the ring ends at this offset
     total: u64,
-    views: Vec<SyncSender<Arc<[u8]>>>,
+    /// Attached views, each by a number of its own so that one that ends can leave at once
+    views: Vec<(u64, SyncSender<Arc<[u8]>>)>,
+    next_view: u64,
     scanner: Scanner,
     last_bell: u64,
     /// A program status query is passed on at most once a second
@@ -449,6 +453,7 @@ impl Runner {
                 ring: VecDeque::new(),
                 total: 0,
                 views: Vec::new(),
+                next_view: 0,
                 scanner: Scanner::default(),
                 last_bell: 0,
                 last_query: 0,
@@ -499,7 +504,7 @@ impl Runner {
                 out.total += n as u64;
                 let excess = out.ring.len().saturating_sub(SCROLLBACK);
                 out.ring.drain(..excess);
-                out.views.retain(|v| v.try_send(chunk.clone()).is_ok());
+                out.views.retain(|(_, v)| v.try_send(chunk.clone()).is_ok());
                 has_views = !out.views.is_empty();
                 out.scanner.feed(&chunk, &mut signals);
                 let now = now_ms();
@@ -691,19 +696,26 @@ impl Runner {
             Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
         };
         let (tx, rx) = sync_channel::<Arc<[u8]>>(VIEW_QUEUE);
-        let (from, scrollback): (u64, Vec<u8>) = {
+        let (view, from, scrollback): (u64, u64, Vec<u8>) = {
             let mut out = lock(&session.output);
+            out.next_view += 1;
+            let view = out.next_view;
             if !out.closed {
-                out.views.push(tx);
+                out.views.push((view, tx));
             }
             let (from, skip) = replay_from(out.total, out.ring.len(), since);
-            (from, out.ring.iter().skip(skip).copied().collect())
+            (view, from, out.ring.iter().skip(skip).copied().collect())
         };
         writeln!(stream, "{}", json!({"ok": true, "from": from}))?;
         stream.write_all(&scrollback)?;
 
         let mut input = stream.try_clone()?;
         let typing = session.clone();
+        // The client went away: on a quiet session no output would ever wake the
+        // loop below to find that out, and each detached view kept a thread and
+        // a socket here for as long as the agent said nothing (MCR-139)
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let left = gone.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = input.read(&mut buf) {
@@ -718,13 +730,21 @@ impl Runner {
                     break;
                 }
             }
+            left.store(true, Ordering::SeqCst);
             let _ = input.shutdown(std::net::Shutdown::Both);
         });
-        for chunk in rx {
-            if stream.write_all(&chunk).is_err() {
-                break;
+        loop {
+            match rx.recv_timeout(VIEW_LOOK) {
+                Ok(chunk) => {
+                    if stream.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !gone.load(Ordering::SeqCst) => {}
+                Err(_) => break,
             }
         }
+        lock(&session.output).views.retain(|(v, _)| *v != view);
         stream.shutdown(std::net::Shutdown::Both)
     }
 
@@ -1502,6 +1522,35 @@ mod tests {
         assert_eq!(replay_from(500, 100, Some(399)), (400, 0));
         assert_eq!(replay_from(500, 100, Some(501)), (400, 0));
         assert_eq!(replay_from(500, 100, Some(450)), (450, 50));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_view_whose_client_went_away_ends_on_a_quiet_session() {
+        let runner = Arc::new(Runner::default());
+        runner.control(&json!({"op": "spawn", "id": "q1", "argv": ["/bin/sh", "-c", "read line"], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
+        let session = runner.get("q1").unwrap();
+        for _ in 0..3 {
+            let (server, client) = Stream::pair().unwrap();
+            let (done, ended) = std::sync::mpsc::channel();
+            let r = runner.clone();
+            std::thread::spawn(move || {
+                let _ = r.attach("q1", None, server);
+                let _ = done.send(());
+            });
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("\"ok\""), "{line}");
+            assert_eq!(lock(&session.output).views.len(), 1);
+            // The app detaches; the agent prints nothing
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(reader);
+            drop(client);
+            assert!(ended.recv_timeout(Duration::from_secs(3)).is_ok(), "the view's thread stays while the session is quiet");
+            assert_eq!(lock(&session.output).views.len(), 0, "the view's sender stays in the session");
+        }
+        runner.control(&json!({"op": "signal", "id": "q1", "signal": "KILL"})).unwrap();
     }
 
     #[cfg(unix)]

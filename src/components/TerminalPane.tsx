@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal, type IDecoration, type IMarker } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
 import { isPaletteKey, PLATFORM } from '../utils/platform';
@@ -34,7 +35,13 @@ function theme(element: HTMLElement) {
 }
 
 /** Hidden terminals kept with what they showed (MCR-139); see utils/terminalKeep.ts */
-export const keep = new TerminalKeep<{ term: Terminal; fit: FitAddon }>(MAX_KEPT, ({ term }) => term.dispose());
+type Live = { term: Terminal; fit: FitAddon; serial: SerializeAddon };
+export const keep = new TerminalKeep<Live>(
+  MAX_KEPT,
+  // Beyond MAX_KEPT a hidden terminal is kept as its serialized contents (review 17084)
+  ({ term, serial }) => { try { return { text: serial.serialize(), cols: term.cols, rows: term.rows }; } catch { return null; } },
+  ({ term }) => term.dispose(),
+);
 
 /**
  * One hosted terminal. Mounting attaches a view (the runner replays its
@@ -95,9 +102,9 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     // A session shown a moment ago comes back with the terminal it had: every
     // line it showed, and only what it missed from the runner (MCR-139)
     const kept = keep.take(id);
-    let t: Terminal, f: FitAddon;
-    if (kept) {
-      ({ term: t, fit: f } = kept.term);
+    let t: Terminal, f: FitAddon, serial: SerializeAddon;
+    if (kept?.term) {
+      ({ term: t, fit: f, serial } = kept.term);
       if (t.element) element.appendChild(t.element);
     } else {
       t = new Terminal({
@@ -113,7 +120,14 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       t.loadAddon(f);
       t.loadAddon(new Unicode11Addon());
       t.unicode.activeVersion = '11';
+      serial = new SerializeAddon();
+      t.loadAddon(serial);
       t.open(element);
+      // A compacted one: its contents as they were, at the size they were written for, before what it missed
+      if (kept?.text !== undefined) {
+        if (kept.cols && kept.rows) t.resize(kept.cols, kept.rows);
+        t.write(kept.text);
+      }
     }
     // The DOM renderer, on purpose (MCR-139): xterm's WebGL renderer measured
     // far heavier in this web view, 1.1 GB against 0.2 GB idle under the same
@@ -255,8 +269,13 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     const keyed = t.onKey(() => { lastKey = Date.now(); });
     // Where the terminal is in the session's output: the offset of the next byte it has not seen
     let offset: number | null = kept?.offset ?? null;
+    // Frames of this view that arrive after it was let go (they were on their
+    // way: detaching is asynchronous) are dropped. The terminal may be kept or
+    // shown again by then, and the offset kept says it never saw them: the next
+    // view gets them from the runner, once. A late start must not reset it
     harnessApi.attach(id, kept ? offset : null, {
       start: from => {
+        if (disposed) return;
         // The runner could not start where this terminal left off (it holds no
         // more, or it is a runner that does not say): the terminal starts over
         // with what the runner holds, as a new one would
@@ -264,6 +283,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
         offset = from;
       },
       data: bytes => {
+        if (disposed) return;
         if (bytes.length === 0) {
           setEnded(true);
           if (Date.now() - lastKey < QUIT_WINDOW_MS) quit.current?.();
@@ -344,7 +364,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       if (view !== null) void harnessApi.detach(view);
       // Kept, not disposed: shown again it takes only what it missed
       t.element?.remove();
-      keep.put(id, { term: { term: t, fit: f }, offset });
+      keep.put(id, { term: { term: t, fit: f, serial }, offset });
       term.current = null; fit.current = null; resend.current = () => {};
     };
   }, [id]);
