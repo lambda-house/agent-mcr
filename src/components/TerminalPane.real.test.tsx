@@ -45,6 +45,19 @@ const show = async (id: string) => { await act(async () => root.render(<Terminal
 const hide = async () => { await act(async () => root.render(<div/>)); };
 const lines = (t: Headless) => { const b = t.buffer.active; const out: string[] = []; for (let y = 0; y < b.length; y++) { const l = b.getLine(y)?.translateToString(true) ?? ''; if (l) out.push(l); } return out; };
 const last = () => made.terms[made.terms.length - 1] as Headless;
+/**
+ * The runner's answer to the pane's latest view: it starts at `from` and sends
+ * `text`. A pane that lets its terminal go on that answer opens a new view,
+ * which the runner answers the same way.
+ */
+const answer = async (text: string, from: number) => {
+  const first = views[views.length - 1];
+  await act(async () => { first.on.start(from); first.on.data(bytes(text)); });
+  await frame();
+  const now = views[views.length - 1];
+  if (now !== first) await act(async () => { now.on.start(from); now.on.data(bytes(text)); });
+  await parsed();
+};
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -91,18 +104,43 @@ describe('a pane on a real terminal (review 17086)', () => {
     expect(lines(last())).toEqual(['new line']);
   });
 
-  it('leaves no older byte after a reset, when the runner cannot go on from where a kept terminal was', async () => {
+  it('leaves no older byte when the runner cannot go on from where a kept terminal was', async () => {
     await show('a');
     act(() => { views[0].on.start(0); views[0].on.data(bytes('old line\r\n')); });
     await hide();
     await parsed();
     await show('a');
-    const asked = views[views.length - 1];
-    expect(asked.since).toBe(10);
-    // The runner holds no more from offset 10: it starts its scrollback further on
-    act(() => { asked.on.start(5_000_000); asked.on.data(bytes('new line\r\n')); });
-    await parsed();
+    expect(views[views.length - 1].since).toBe(10);
+    // The runner holds nothing from offset 10: it starts its scrollback further on
+    await answer('new line\r\n', 5_000_000);
     expect(lines(last())).toEqual(['new line']);
+  });
+
+  it('shows a replay whole after a kept terminal stopped inside an escape sequence (review 17088)', async () => {
+    await show('a');
+    // The last bytes the pane had leave xterm's parser inside a colour sequence
+    act(() => { views[0].on.start(0); views[0].on.data(bytes('x\x1b[3')); });
+    await hide();
+    await parsed();
+    await show('a');
+    // The runner can no longer go on from there: what it holds starts further on
+    await answer('new line\r\n', 5_000_000);
+    // Not "ew line": no unfinished sequence of the old terminal eats the replay's first bytes
+    expect(lines(last())).toEqual(['new line']);
+  });
+
+  it('does not keep the terminal of a session that left the list while its last bytes were being parsed (review 17088)', async () => {
+    // Its own session id: the keep remembers for good which sessions left the list
+    keep.retain(new Set(['left']));
+    await show('left');
+    // Enough output that xterm is still parsing it, in slices, when the pane is let go
+    const lots = bytes('queued line of an agent at work\r\n'.repeat(60_000));
+    act(() => { views[0].on.start(0); views[0].on.data(lots); });
+    // Hidden with its bytes still queued; the list lets the session go before xterm has parsed them
+    await act(async () => { root.render(<div/>); });
+    keep.retain(new Set());
+    await parsed();
+    expect(keep.ids).toEqual([]);
   });
 
   it('shows every line once when it is shown again before what it had was parsed', async () => {

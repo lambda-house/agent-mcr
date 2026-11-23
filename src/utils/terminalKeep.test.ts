@@ -42,4 +42,18 @@ describe('kept terminals (MCR-139)', () => {
     expect(dropped).toEqual(['A1']);
     expect(keep.take('a')?.term).toBe('A2');
   });
+
+  it('never takes back a session that left the list, also when its terminal is put after that (review 17088)', () => {
+    const dropped: string[] = [];
+    const keep = new TerminalKeep<string>(4, t => dropped.push(t));
+    keep.retain(new Set(['a', 'b']));
+    keep.retain(new Set(['b']));
+    // The terminal of 'a' finished parsing only now
+    keep.put('a', { term: 'A', offset: 1 });
+    expect(keep.ids).toEqual([]);
+    expect(dropped).toEqual(['A']);
+    // A session that was never in a list (started since) is kept
+    keep.put('c', { term: 'C', offset: 1 });
+    expect(keep.ids).toEqual(['c']);
+  });
 });

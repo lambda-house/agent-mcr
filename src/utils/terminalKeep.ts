@@ -25,6 +25,9 @@ export const MAX_KEPT = 4;
 
 export class TerminalKeep<T> {
   private kept = new Map<string, Kept<T>>();
+  /** The sessions of the last list, and those that were in a list and left it: never kept again */
+  private listed = new Set<string>();
+  private gone = new Set<string>();
 
   constructor(private max: number, private drop: (term: T) => void) {}
 
@@ -35,8 +38,14 @@ export class TerminalKeep<T> {
     return k;
   }
 
-  /** Keep a hidden terminal; the least recently hidden beyond `max` is dropped */
+  /**
+   * Keep a hidden terminal; the least recently hidden beyond `max` is dropped.
+   * One of a session that left the list is dropped at once: a terminal is put
+   * when xterm has parsed its last bytes, which can be after the list let the
+   * session go (review 17088).
+   */
   put(id: string, kept: Kept<T>) {
+    if (this.gone.has(id)) { this.drop(kept.term); return; }
     const old = this.kept.get(id);
     if (old && old.term !== kept.term) this.drop(old.term);
     this.kept.delete(id);
@@ -48,8 +57,10 @@ export class TerminalKeep<T> {
     }
   }
 
-  /** Drop the kept terminals of sessions that are not in `ids` */
+  /** Drop the kept terminals of sessions that are not in `ids`, the list now */
   retain(ids: Set<string>) {
+    for (const id of this.listed) if (!ids.has(id)) this.gone.add(id);
+    this.listed = new Set(ids);
     for (const [id, k] of [...this.kept]) if (!ids.has(id)) { this.kept.delete(id); this.drop(k.term); }
   }
 

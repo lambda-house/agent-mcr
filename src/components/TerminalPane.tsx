@@ -73,6 +73,8 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
   const fit = useRef<FitAddon | null>(null);
   const resend = useRef<() => void>(() => {});
   const [ended, setEnded] = useState(false);
+  // A kept terminal the runner could not go on with is let go, and the pane mounts a new one (review 17088)
+  const [fresh, setFresh] = useState(0);
   const [notice, setNotice] = useState('');
   // Copy as task (MCR-125 v0): the right-click menu on a selection, and the dialog with its passage
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -258,21 +260,25 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     const keyed = t.onKey(() => { lastKey = Date.now(); });
     // Where the terminal is in the session's output: the offset of the next byte it has not seen
     let offset: number | null = kept?.offset ?? null;
+    // This terminal is not to be kept or used again: the runner could not go on where it left off
+    let discard = false;
     // Frames of this view that arrive after it was let go (they were on their
     // way: detaching is asynchronous) are dropped. The terminal may be kept or
     // shown again by then, and the offset kept says it never saw them: the next
     // view gets them from the runner, once. A late start must not reset it
     harnessApi.attach(id, kept ? offset : null, {
       start: from => {
-        if (disposed) return;
+        if (disposed || discard) return;
         // The runner could not start where this terminal left off (it holds no
-        // more, or it is a runner that does not say): the terminal starts over
-        // with what the runner holds, as a new one would
-        if (kept && (from === null || from !== kept.offset)) t.reset();
+        // more, or it is a runner that does not say). The terminal is not reset
+        // and reused: a reset leaves xterm's parser inside any sequence the last
+        // bytes left unfinished, and the replay's first bytes were read as its
+        // end ("ew line", review 17088). A new terminal takes the replay instead
+        if (kept && (from === null || from !== kept.offset)) { discard = true; setFresh(n => n + 1); return; }
         offset = from;
       },
       data: bytes => {
-        if (disposed) return;
+        if (disposed || discard) return;
         if (bytes.length === 0) {
           setEnded(true);
           if (Date.now() - lastKey < QUIT_WINDOW_MS) quit.current?.();
@@ -354,16 +360,17 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       // Kept, not disposed: shown again it takes only what it missed
       t.element?.remove();
       mountedIds.delete(id);
-      // Kept once xterm has parsed every byte given to it: a kept terminal then
-      // holds exactly what its offset says, and a reset on the next show (the
-      // runner no longer holds that offset) leaves no older byte to be parsed
-      // after it (review 17086). Shown again before that, the session gets a new
-      // terminal and this one goes
-      const kept = { term: { term: t, fit: f }, offset };
-      t.write(new Uint8Array(0), () => { if (mountedIds.has(id)) t.dispose(); else keep.put(id, kept); });
+      // Kept once xterm has parsed every byte given to it, so that a kept
+      // terminal holds exactly what its offset says (review 17086). Shown again
+      // before that, the session gets a new terminal and this one goes
+      if (discard) { t.dispose(); } else {
+        const kept = { term: { term: t, fit: f }, offset };
+        // A session removed from the list meanwhile is not taken back (`put` refuses it, review 17088)
+        t.write(new Uint8Array(0), () => { if (mountedIds.has(id)) t.dispose(); else keep.put(id, kept); });
+      }
       term.current = null; fit.current = null; resend.current = () => {};
     };
-  }, [id]);
+  }, [id, fresh]);
 
   // A session that started or ended changes which pointers are links
   useEffect(() => { pointers.current(); }, [isSession]);

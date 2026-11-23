@@ -278,24 +278,31 @@ describe('a terminal is the view of one shown session (MCR-139)', () => {
     expect(host.querySelector('.hs-terminal-notice')).toBeNull();
   });
 
-  it('starts over with what the runner holds when it cannot go on from the offset, or does not say where it starts', async () => {
+  it('starts over in a new terminal when the runner cannot go on from the offset, or does not say where it starts (review 17088)', async () => {
     runner(); screen.fitted = { cols: 100, rows: 30 };
     const before = screen.made;
     await show();
     act(() => { views[0].on.start(0); views[0].on.data(bytes('old\r\n')); });
     await hide(); await show();
-    // The runner holds 4 MiB and no longer has offset 5: it sends its scrollback from 7000
-    act(() => { views[1].on.start(7000); views[1].on.data(bytes('held\r\n')); });
-    expect(screen.resets[before]).toBe(1);
-    expect(screen.written[before]).toEqual(['held\r\n']);
+    // The runner holds 4 MiB and no longer has offset 5: the kept terminal is let go, never reset and reused
+    await act(async () => { views[1].on.start(7000); views[1].on.data(bytes('held\r\n')); }); await frame();
+    expect(screen.resets[before]).toBe(0);
+    expect(screen.written[before]).toEqual(['old\r\n']);
+    // A new terminal asks for everything and takes it
+    expect(screen.made).toBe(before + 2);
+    expect(views[2].since).toBeNull();
+    act(() => { views[2].on.start(7000); views[2].on.data(bytes('held\r\n')); });
+    expect(screen.written[before + 1]).toEqual(['held\r\n']);
     await hide(); await show();
-    expect(views[2].since).toBe(7006);
-    // A runner before MCR-139 does not say: start over, and next time ask for everything
-    act(() => { views[2].on.start(null); views[2].on.data(bytes('all\r\n')); });
-    expect(screen.resets[before]).toBe(2);
-    expect(screen.written[before]).toEqual(['all\r\n']);
+    expect(views[3].since).toBe(7006);
+    // A runner before MCR-139 does not say: a new terminal again, and next time ask for everything
+    await act(async () => { views[3].on.start(null); }); await frame();
+    expect(screen.made).toBe(before + 3);
+    expect(views[4].since).toBeNull();
+    act(() => { views[4].on.start(null); views[4].on.data(bytes('all\r\n')); });
+    expect(screen.written[before + 2]).toEqual(['all\r\n']);
     await hide(); await show();
-    expect(views[3].since).toBeNull();
+    expect(views[5].since).toBeNull();
   });
 
   it('keeps no more than MAX_KEPT hidden terminals; one pushed out comes back with the runner replay (review 17086)', async () => {
