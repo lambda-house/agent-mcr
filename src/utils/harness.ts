@@ -740,15 +740,16 @@ export function executorsBelow(id: string, all: Hosted[]): Set<string> {
 
 export interface DirSection { path: string; sessions: Hosted[]; earlier: Resumable[]; pinned: boolean; latest: number }
 
+/** A path with one separator, none at the end but the root's. */
+const normPath = (x: string) => x.replace(/\\/g, '/').replace(/(?<=[^/:])\/+$/, '');
+
 /**
  * The rest of `path` below `folder` with `/` between its parts, or '' when it
  * is not inside it (the same folder is not inside). Told by whole folder
  * names: `/a/teob-ai` is not inside `/a/teob`.
  */
 export function pathBelow(path: string, folder: string): string {
-  // One separator, none at the end but the root's
-  const norm = (x: string) => x.replace(/\\/g, '/').replace(/(?<=[^/:])\/+$/, '');
-  const p = norm(path), f = norm(folder);
+  const p = normPath(path), f = normPath(folder);
   const base = f.endsWith('/') ? f : `${f}/`;
   return f && p !== f && p.startsWith(base) ? p.slice(base.length).replace(/^\/+/, '') : '';
 }
@@ -775,12 +776,14 @@ export function subfolderTag(sectionPath: string, cwd: string): { tag: string; p
 export function sectionFolders(sessions: Hosted[]): Map<string, string> {
   const byId = new Map(sessions.map(h => [h.id, h]));
   const out = new Map<string, string>();
+  // In its supervisor's folder or below it: it goes where its supervisor is listed
+  const within = (path: string, folder: string) => normPath(path) === normPath(folder) || !!pathBelow(path, folder);
   const home = (h: Hosted, seen: Set<string>): string => {
     const known = out.get(h.id);
     if (known !== undefined) return known;
     const up = byId.get(h.harness?.supervisor || '');
     // A circle of relations keeps every session in its own folder
-    const folder = up && !isSupervisor(up) && !seen.has(up.id) && pathBelow(h.cwd, up.cwd) ? home(up, new Set(seen).add(h.id)) : h.cwd;
+    const folder = up && !isSupervisor(up) && !seen.has(up.id) && within(h.cwd, up.cwd) ? home(up, new Set(seen).add(h.id)) : h.cwd;
     out.set(h.id, folder);
     return folder;
   };

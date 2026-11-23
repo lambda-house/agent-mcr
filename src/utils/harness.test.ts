@@ -155,6 +155,11 @@ describe('executors in a folder below their supervisor (MCR-133)', () => {
     expect(shape(all)).toEqual([`${lead}: lead:0 x:1[x] helper:2[helper] solo:0`]);
   });
 
+  it('keeps an executor in its supervisor\'s own folder with it when that supervisor moves up', () => {
+    const all = [session('lead', '/a'), session('worker', '/a/w', 'lead'), session('helper', '/a/w', 'worker'), session('mate', '/a/w/x', 'helper')];
+    expect(shape(all)).toEqual(['/a: lead:0 worker:1[w] helper:2[w] mate:3[x]']);
+  });
+
   it('does not hide a section as gone for a gone worktree listed in it', () => {
     const ended = (h: Hosted): Hosted => ({ ...h, exit: { code: 0, signal: null, at: 9 } });
     const sections = directorySections([ended(session('lead', '/a')), { ...ended(session('x', '/a/w', 'lead')), cwdGone: true }],
