@@ -4,11 +4,12 @@ import { useStore, panelShown, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, 
 import { useReader } from './reader';
 import { openPath, reader } from './readerHost';
 import {
-  CloseDocumentDialog, DocumentGroups, ReaderProvider, SaveAllDialog, allTabs, type RestoredDocument,
+  CloseDocumentDialog, DocumentGroups, ReaderProvider, SaveAllDialog, allTabs, readerSettingsTab, type RestoredDocument,
 } from '@lambda-house/reader';
 import { EmptyState } from '@lambda-house/ui';
 import { FileQuestion } from 'lucide-react';
-import { LayoutView, MainMenu, Shell, type Layout, type PaneType, type ShellSurface } from '@lambda-house/workbench';
+import { LayoutView, MainMenu, SettingsDialog, Shell, appearanceTab, pluginsTab, shortcutsTab, type Layout, type PaneType, type SettingsTab, type ShellSurface } from '@lambda-house/workbench';
+import { journalSettingsTabs } from '@lambda-house/journal';
 import { Activity, FileText } from 'lucide-react';
 import {
   isTauri,
@@ -22,7 +23,10 @@ import Toolbar, { ToolbarEnd } from './components/Toolbar';
 import { flushEditorChanges } from '@lambda-house/reader';
 import AgentPanel from './components/AgentPanel';
 import TocSidebar from './components/TocSidebar';
-import SettingsModal from './components/SettingsModal';
+import { appSettingsTabs } from './components/SettingsTabs';
+import MemoryConnection from './components/MemoryConnection';
+import { journal } from './journal';
+import { pluginRegistry, usePluginVersion } from './plugins';
 import { agentFilesWatched, refreshAgentWorkspace } from './utils/agent';
 import SessionWorkspace from './components/SessionWorkspace';
 import { documentWindowPath } from './utils/documentWindow';
@@ -79,6 +83,9 @@ const App: React.FC = () => {
   // The shown surface is the store's: commands of the other one wait
   const surface = useStore((s) => s.surface);
   const statusBarPinned = useStore((s) => s.statusBarPinned);
+  const settingsOpen = useStore((s) => s.settingsOpen);
+  const theme = useStore((s) => s.theme);
+  const closeSettings = useCallback(() => useStore.getState().setSettingsOpen(false), []);
   const setStatusBarPinned = useStore((s) => s.setStatusBarPinned);
   const setSurface = useStore((s) => s.setSurface);
   const sessionsVisible = surface === 'sessions';
@@ -211,6 +218,17 @@ const App: React.FC = () => {
 
   // The command palette lists the same commands
   useEffect(() => appMenu.set(menu), [menu]);
+
+  // One Settings dialog: the workbench's tabs, the reader's, the journal's and Agent MCR's
+  usePluginVersion();
+  const settingsTabs: SettingsTab[] = [
+    appearanceTab({ theme, setTheme: (next) => { if (useStore.getState().theme !== next) useStore.getState().toggleTheme(); } }),
+    shortcutsTab(() => appMenu.get()),
+    pluginsTab(pluginRegistry.workbench, <>Plugins are auto-discovered from <code>src/plugins/*/index.ts(x)</code>.</>),
+    readerSettingsTab(),
+    ...journalSettingsTabs(journal, { memories: <MemoryConnection /> }),
+    ...appSettingsTabs(),
+  ];
 
   // The system menu uses the same commands as the toolbar menu.
   useEffect(() => {
@@ -388,7 +406,7 @@ const App: React.FC = () => {
         menu={<MainMenu items={menu} useCommandContext={useCommandContext} onOpen={flushEditorChanges} buttonClassName="toolbar-button" surface={surface} />}
         end={<ToolbarEnd />}
       />
-      <SettingsModal />
+      <SettingsDialog open={settingsOpen} onClose={closeSettings} tabs={settingsTabs} />
       <SaveAllDialog />
       <CloseDocumentDialog />
     </div>
