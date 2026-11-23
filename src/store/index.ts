@@ -51,7 +51,6 @@ export interface AppState {
   documentsLayout: LayoutNode;
   /** Zoom of the file panel and the TOC, independent of the document zoom. */
   panelZoom: Record<ZoomPanel, number>;
-  statusBarVisible: boolean;
   statusBarPinned: boolean;
   /** What the Live list shows of folders and past sessions (MCR-107) */
   liveList: LiveListPrefs;
@@ -89,7 +88,6 @@ export interface AppState {
   toggleTocVisible: () => void;
   /** Step a panel's zoom in (1) or out (-1), or reset it to 100% (0). */
   zoomPanel: (panel: ZoomPanel, direction: 1 | -1 | 0) => void;
-  setStatusBarVisible: (visible: boolean) => void;
   setStatusBarPinned: (pinned: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
@@ -138,7 +136,6 @@ export const useStore = create<AppState>()(
       documentsLayout: defaultDocumentsLayout({ withAgentDocs: !documentWindowPath }),
       surface: documentWindowPath ? 'documents' : 'sessions',
       panelZoom: DEFAULT_PANEL_ZOOM,
-      statusBarVisible: false,
       statusBarPinned: false,
       liveList: DEFAULT_LIVE_LIST,
 
@@ -176,10 +173,6 @@ export const useStore = create<AppState>()(
           : clampPanelZoom(direction > 0 ? current * ZOOM_STEP : current / ZOOM_STEP);
         return next === current ? state : { panelZoom: { ...state.panelZoom, [panel]: next } };
       }),
-      
-      setStatusBarVisible: (visible) => set((state) => (
-        state.statusBarVisible === visible ? state : { statusBarVisible: visible }
-      )),
       
       setStatusBarPinned: (pinned) => set({ statusBarPinned: pinned }),
       
