@@ -1560,7 +1560,8 @@ mod tests {
             client.shutdown(std::net::Shutdown::Both).unwrap();
             drop(reader);
             drop(client);
-            assert!(ended.recv_timeout(Duration::from_secs(3)).is_ok(), "the view's thread stays while the session is quiet");
+            // It looks every VIEW_LOOK: four of them are plenty, and far less than any output would take on a quiet session
+            assert!(ended.recv_timeout(VIEW_LOOK * 4).is_ok(), "the view's thread stays while the session is quiet");
             assert_eq!(lock(&session.output).views.len(), 0, "the view's sender stays in the session");
         }
         runner.control(&json!({"op": "signal", "id": "q1", "signal": "KILL"})).unwrap();
