@@ -26,7 +26,7 @@ describe('Sessions workspace', () => {
     await act(async () => root.render(<SessionWorkspace />)); await flush();
     expect(host.textContent).toContain('Open supervisor');
     // The journal stays mounted under Live (its snapshot names Live's sessions), hidden
-    const journalView = () => host.querySelector('.hs-journal-wrap') as HTMLElement;
+    const journalView = () => host.querySelector('[data-view="history"]') as HTMLElement;
     expect(journalView().hidden).toBe(true);
     await act(async () => button('journal').click()); await flush();
     expect(journalView().hidden).toBe(false);

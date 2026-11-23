@@ -1,8 +1,6 @@
 /* The journal's own styles are in @lambda-house/journal/journal.css. These fit
-   Agent MCR into it: the Journal view's wrapper, and the Live list's rows
-   (JournalRow in SessionRow.tsx, harness.css) inside the journal's tree. */
-.hs-journal-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-.hs-journal-wrap[hidden] { display: none; }
+   the Live list's rows (JournalRow in SessionRow.tsx, harness.css) into the
+   journal's tree. */
 .session-cockpit .sc-tree-row .sc-session.hs-item { display: flex; align-items: flex-start; gap: 8px; min-width: 0; padding: 5px 8px; text-align: left; }
 .session-cockpit .sc-tree-row .sc-session.hs-resume { align-items: center; padding: 2px 6px; }
 .sc-session.selected .hs-item-text strong { font-weight: 600; }

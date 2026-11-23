@@ -2,7 +2,6 @@
 
 /* Nothing in the Live view may spill into the scrolling Sessions area: a scroll bar that comes and goes there changes the terminal's size, which refits it, which brings the bar back */
 .hs-live-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; overflow: hidden; background: var(--canvas); }
-.hs-live-wrap[hidden] { display: none; }
 .hs-live { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: clamp(256px, 23%, 310px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); background: var(--canvas); }
 
 .hs-list { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; padding: 10px 8px 8px 10px; background: var(--canvas); gap: 6px; }

@@ -1,4 +1,3 @@
-import { Segmented } from '@lambda-house/ui';
 import { useEffect, useMemo, useState } from 'react';
 import { ClipboardList, History, MessageSquare, Terminal } from 'lucide-react';
 import { useStore as useZustand } from 'zustand';
@@ -9,7 +8,7 @@ import { journal } from '../journal';
 import { pluginRegistry, usePluginVersion } from '../plugins';
 import '@lambda-house/journal/journal.css';
 import '../styles/sessions.css';
-import { ShellTools } from '@lambda-house/workbench';
+import { ShellViews, type ShellView } from '@lambda-house/workbench';
 import { HostedByConversation, JournalRow, useHostedByConversation } from './SessionRow';
 import { harnessApi, slackApi } from '../utils/harness';
 import LiveWorkspace from './LiveWorkspace';
@@ -33,7 +32,6 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
   const [view, setViewState] = useState<string>(savedView);
   const [focus, setFocus] = useState<{ id: string; at: number }>();
   const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
-  const activePluginTab = topTabs.find(t => t.id === view);
   // Posts that wait for the person's approval: shown on the Slack tab from every view
   const [slackWaiting, setSlackWaiting] = useState(0);
   useEffect(() => {
@@ -61,20 +59,24 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
   const live = useHostedByConversation(active && view === 'history' && !!enabled, 5000);
   const searchFolder = (path: string) => { setDirectory(path); setView('history'); };
   const recentDirectories = useMemo(() => [...new Set([...sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [sessions]);
+  const views: ShellView[] = [
+    { id: 'live', label: 'Live', icon: <Terminal size={13}/>, keepMounted: 'always',
+      render: () => <div className="hs-live-wrap"><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div> },
+    ...topTabs.map((t): ShellView => ({ id: t.id, label: t.label, icon: t.icon, title: t.title, render: () => t.render({ active }) })),
+    // Always mounted: its snapshot names Live's sessions and feeds the palette
+    { id: 'history', label: 'Journal', icon: <History size={13}/>, title: 'Find an earlier session: by text, folder, agent or time', keepMounted: 'always',
+      render: () => <HostedByConversation.Provider value={live}>
+        <JournalProvider journal={withResume} row={JournalRow}><JournalView active={active}/></JournalProvider>
+      </HostedByConversation.Provider> },
+    { id: 'board', label: 'Board', icon: <ClipboardList size={13}/>, title: 'What sessions reported to you, and the notes they left for each other',
+      render: () => <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/> },
+    { id: 'slack', icon: <MessageSquare size={13}/>, title: 'Slack: what is listened to, what sessions may post, and posts that wait for your approval',
+      label: <>Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</>,
+      render: () => <SlackView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }} onWaiting={setSlackWaiting}/> },
+  ];
   return <section className="session-cockpit">
-    {/* The view switch is in the window's top bar; the journal puts its summary there too */}
-    <ShellTools>
-      <Segmented label="Sessions view" value={view} onChange={setView} options={[
-        { value: 'live', label: 'Live', icon: <Terminal size={13}/> },
-        ...topTabs.map(t => ({ value: t.id, label: t.label, icon: t.icon, title: t.title })),
-        { value: 'history', label: 'Journal', icon: <History size={13}/>, title: 'Find an earlier session: by text, folder, agent or time' },
-        { value: 'board', label: 'Board', icon: <ClipboardList size={13}/>, title: 'What sessions reported to you, and the notes they left for each other' },
-        { value: 'slack', icon: <MessageSquare size={13}/>, title: 'Slack: what is listened to, what sessions may post, and posts that wait for your approval',
-          label: <>Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</> },
-      ]}/>
-    </ShellTools>
-    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
-    {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
+    {/* The view switch goes into the window's top bar, and each view's tools while it is shown */}
+    <ShellViews label="Sessions view" views={views} value={view} onChange={setView}/>
     {/* Only while Sessions is shown: an overlay may listen for keys (the command panel's Cmd+S), and over Documents those are the editor's */}
     {active && globalOverlays.map(o => o.render({
       enabled,
@@ -89,14 +91,5 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
       onEnableAccess: async () => { try { store.getState().setEnabled(await journal.host.enable()); } catch (e) { store.getState().setError(errorText(e)); } },
       topTabs,
     }))}
-    {view === 'slack' && <SlackView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }} onWaiting={setSlackWaiting}/>}
-    {view === 'board' && <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/>}
-    <div className="hs-journal-wrap" hidden={view !== 'history'}>
-      <HostedByConversation.Provider value={live}>
-        <JournalProvider journal={withResume} row={JournalRow}>
-          <JournalView active={active}/>
-        </JournalProvider>
-      </HostedByConversation.Provider>
-    </div>
   </section>;
 }
