@@ -528,6 +528,10 @@
 .hs-rel { display: inline-flex; align-items: center; gap: 2px; margin: 0 3px 0 0; font-size: 10px; font-weight: 600; vertical-align: -1px; }
 .hs-rel.executor { color: var(--sc-muted); }
 .hs-rel.supervisor { margin: 0 0 0 5px; padding: 0 4px; border-radius: 7px; color: var(--sc-accent); background: color-mix(in srgb, var(--sc-accent) 14%, transparent); }
+/* An executor or earlier conversation listed in a section above its own folder (MCR-133): the last folder of the rest of its path */
+.hs-rel.subdir { display: inline-block; max-width: min(100%, 26ch); margin: 1px 0 0; padding: 0 4px; overflow: hidden; border: 1px solid var(--sc-border); border-radius: 7px; color: var(--sc-muted); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; vertical-align: 0; }
+.hs-resume:has(> .hs-subdir-line) { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; row-gap: 0; }
+.hs-resume > .hs-subdir-line { grid-column: 1 / -1; padding-left: 18px; }
 .hs-list li.is-supervisor > .hs-item strong { font-weight: 600; }
 .hs-under { color: var(--sc-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hs-bind { flex: 0 0 100%; display: flex; gap: 5px; padding: 2px 6px 6px 22px; box-sizing: border-box; }

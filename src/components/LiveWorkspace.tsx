@@ -10,7 +10,7 @@ import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou, ProgramLine } from './SessionRow';
-import { agentProfileTitle, canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { agentProfileTitle, canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, subfolderTag, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { useStore } from '../store';
 import ConfirmDialog from './ConfirmDialog';
 import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
@@ -523,7 +523,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     };
   };
   const supervisorSummary = supervisor ? sessionSummary(supervisor, Date.now()) : null;
-  const row = ({ session: h, depth, executors, elsewhere }: RelationRow) => {
+  /** `section`: the folder of the section the row is listed in, for the tag of an executor in a folder below it (MCR-133) */
+  const row = ({ session: h, depth, executors, elsewhere }: RelationRow, section = h.cwd) => {
+    const sub = subfolderTag(section, h.cwd);
     const state = hostedState(h);
     const role = executors ? 'is-supervisor' : '';
     const works = h.harness?.supervisor ? 'is-executor' : '';
@@ -545,7 +547,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         <HostedRow hosted={h} label={label} session={indexedSession(h, metrics)} detail={detail}
           before={works && <span className="hs-rel executor" title={`Executor of ${names.get(h.harness?.supervisor ?? '') ?? 'a session'}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
           after={executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
-          under={elsewhere && <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>}/>
+          // Its folder below the section's on a line of its own: in the name it would be the first thing the ellipsis cuts (MCR-133)
+          under={elsewhere ? <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>
+            : sub && <small className="hs-under"><span className="hs-rel subdir" title={`Works in ${sub.path}`}>{sub.tag}</span></small>}/>
       </button>
       <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
       {binding === h.id && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
@@ -741,18 +745,19 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
               {!d.sessions.some(h => !h.exit) && <button type="button" className="hs-dir-start" title={`Hide ${name}: it goes to Hidden folders at the end of the list. Nothing is deleted`} aria-label={`Hide folder ${d.path}`} onClick={() => hideFolder(d.path)}><EyeOff size={12}/></button>}
             </header>
-            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(row)}</ul>}
+            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(r => row(r, d.path))}</ul>}
             {d.earlier.length > 0 && <div className="hs-earlier">
               <button type="button" className="hs-earlier-toggle" aria-expanded={open} onClick={() => setEarlierOpen(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>
                 {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<History size={11}/> Earlier · {d.earlier.length} · last {formatAge(d.earlier[0].modified)}
               </button>
               {open && <ul aria-label={`Earlier sessions in ${d.path}`}>
-                {d.earlier.slice(0, 12).map(r => <li key={r.id} className="hs-earlier-row">
-                  <button type="button" className="hs-item hs-resume" disabled={!status || starting} title={`Continue this ${r.agent === 'claude' ? 'Claude' : 'Codex'} session here${maybeOpenElsewhere(r, Date.now()) ? '. It changed minutes ago: close it in its other terminal first' : ''}\n${r.id}`} onClick={() => void start(undefined, r.cwd, r.id)}>
+                {d.earlier.slice(0, 12).map(r => { const sub = subfolderTag(d.path, r.cwd); return <li key={r.id} className="hs-earlier-row">
+                  <button type="button" className="hs-item hs-resume" disabled={!status || starting} title={`Continue this ${r.agent === 'claude' ? 'Claude' : 'Codex'} session ${sub ? `in ${r.cwd}` : 'here'}${maybeOpenElsewhere(r, Date.now()) ? '. It changed minutes ago: close it in its other terminal first' : ''}\n${r.id}`} onClick={() => void start(undefined, r.cwd, r.id)}>
                     <EarlierRow agent={r.agent} title={titles[r.id] || r.title || `${r.agent === 'claude' ? 'Claude' : 'Codex'} session`} modified={r.modified} note={maybeOpenElsewhere(r, Date.now()) ? ' · open elsewhere?' : ''}/>
+                    {sub && <small className="hs-subdir-line"><span className="hs-rel subdir" title={`In ${sub.path}`}>{sub.tag}</span></small>}
                   </button>
                   <button type="button" className="hs-dir-start hs-earlier-hide" title="Hide this session from the list. Its conversation stays on disk and can still be found by search" aria-label={`Hide session ${titles[r.id] || r.title || r.id}`} onClick={() => hideSession(r.id)}><EyeOff size={11}/></button>
-                </li>)}
+                </li>; })}
                 {d.earlier.length > 12 && <li className="hs-earlier-more">{d.earlier.length - 12} older: use search</li>}
                 {d.hiddenEarlier > 0 && <li className="hs-earlier-more"><button type="button" className="hs-earlier-unhide" onClick={() => showFolder(d.path, 'sessions hidden', sessionsOf(d.path))}>{d.hiddenEarlier} hidden · show them</button></li>}
               </ul>}

@@ -740,10 +740,66 @@ export function executorsBelow(id: string, all: Hosted[]): Set<string> {
 
 export interface DirSection { path: string; sessions: Hosted[]; earlier: Resumable[]; pinned: boolean; latest: number }
 
+/** A path with one separator, none at the end but the root's. */
+const normPath = (x: string) => x.replace(/\\/g, '/').replace(/(?<=[^/:])\/+$/, '');
+
+/**
+ * The rest of `path` below `folder` with `/` between its parts, or '' when it
+ * is not inside it (the same folder is not inside). Told by whole folder
+ * names: `/a/teob-ai` is not inside `/a/teob`.
+ */
+export function pathBelow(path: string, folder: string): string {
+  const p = normPath(path), f = normPath(folder);
+  const base = f.endsWith('/') ? f : `${f}/`;
+  return f && p !== f && p.startsWith(base) ? p.slice(base.length).replace(/^\/+/, '') : '';
+}
+
+/**
+ * The tag of a row listed in a section above its own folder (MCR-133): the last
+ * folder of the rest of its path, and the whole path for the tooltip. Null when
+ * the row is in the section's own folder.
+ */
+export function subfolderTag(sectionPath: string, cwd: string): { tag: string; path: string } | null {
+  const rest = pathBelow(cwd, sectionPath);
+  if (!rest) return null;
+  const parts = rest.split('/').filter(Boolean);
+  return { tag: parts[parts.length - 1] ?? rest, path: cwd };
+}
+
+/**
+ * The folder whose section lists each session (MCR-133). A session that works
+ * for another one and whose folder lies inside that one's folder (an executor
+ * in a worktree below its lead) is listed in its supervisor's section, at any
+ * depth; every other session in its own folder. The root Supervisor's
+ * executors are never moved: it has no section.
+ */
+export function sectionFolders(sessions: Hosted[]): Map<string, string> {
+  const byId = new Map(sessions.map(h => [h.id, h]));
+  const out = new Map<string, string>();
+  // In its supervisor's folder or below it: it goes where its supervisor is listed
+  const within = (path: string, folder: string) => normPath(path) === normPath(folder) || !!pathBelow(path, folder);
+  const home = (h: Hosted, seen: Set<string>): string => {
+    const known = out.get(h.id);
+    if (known !== undefined) return known;
+    const up = byId.get(h.harness?.supervisor || '');
+    // A circle of relations keeps every session in its own folder
+    const folder = up && !isSupervisor(up) && !seen.has(up.id) && within(h.cwd, up.cwd) ? home(up, new Set(seen).add(h.id)) : h.cwd;
+    out.set(h.id, folder);
+    return folder;
+  };
+  sessions.forEach(h => home(h, new Set([h.id])));
+  return out;
+}
+
 /**
  * The Live list by folder, in an order that does not move while work goes on:
  * folders with at least one running session first, then the rest, each group
  * sorted by path. A session that starts waiting changes its row, not its place.
+ * An executor inside its supervisor's folder is listed in that one's section
+ * (`sectionFolders`), and an earlier conversation from a folder inside a
+ * section that lists sessions or was added by the person goes to the nearest
+ * such section: a worktree gets a section only for a session that is not such
+ * an executor (MCR-133).
  */
 export function directorySections(sessions: Hosted[], resumable: Resumable[], pinned: string[]): DirSection[] {
   const by = new Map<string, DirSection>();
@@ -753,8 +809,13 @@ export function directorySections(sessions: Hosted[], resumable: Resumable[], pi
     return section;
   };
   pinned.forEach(at);
-  for (const h of sessions) { const d = at(h.cwd); d.sessions.push(h); d.latest = Math.max(d.latest, h.started); }
-  for (const r of resumable) { const d = at(r.cwd); d.earlier.push(r); d.latest = Math.max(d.latest, r.modified); }
+  const folders = sectionFolders(sessions);
+  for (const h of sessions) { const d = at(folders.get(h.id) ?? h.cwd); d.sessions.push(h); d.latest = Math.max(d.latest, h.started); }
+  // Only a section that something else lists takes in the history of the folders below it, the nearest first:
+  // a folder with nothing but history never gathers another's
+  const listed = [...by.keys()].sort((a, b) => b.length - a.length);
+  const into = (cwd: string) => by.has(cwd) ? cwd : listed.find(path => pathBelow(cwd, path)) ?? cwd;
+  for (const r of resumable) { const d = at(into(r.cwd)); d.earlier.push(r); d.latest = Math.max(d.latest, r.modified); }
   const active = (d: DirSection) => d.sessions.some(h => !h.exit);
   return [...by.values()].map(d => ({ ...d, earlier: [...d.earlier].sort((a, b) => b.modified - a.modified) }))
     .sort((a, b) => Number(active(b)) - Number(active(a)) || a.path.localeCompare(b.path, undefined, { sensitivity: 'base' }));
@@ -812,7 +873,8 @@ export function folderVisibility(sections: DirSection[], prefs: LiveListPrefs): 
       if (prefs.hiddenFolders.includes(d.path)) return 'hidden';
       // Added by the person, or shown again by them: the automatic rule is theirs to overrule
       if (prefs.hideNoise && !d.pinned && !prefs.shownFolders.includes(d.path)) {
-        if (d.sessions.some(h => h.cwdGone) || d.earlier.some(r => r.gone)) return 'gone';
+        // Only what lies in the folder itself: a gone worktree listed here (MCR-133) says nothing of this folder
+        if (d.sessions.some(h => h.cwdGone && h.cwd === d.path) || d.earlier.some(r => r.gone && r.cwd === d.path)) return 'gone';
         if (temporaryFolder(d.path)) return 'temporary';
       }
       if (!d.pinned && !d.sessions.length && !earlier.length && section.hiddenEarlier) return 'sessions hidden';
