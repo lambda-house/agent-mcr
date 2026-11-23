@@ -18,6 +18,8 @@ import BoardView from './BoardView';
 import SlackView from './SlackView';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
+/** How often the snapshot of the index is read while Live is shown: it names earlier sessions there, nothing more */
+export const LIVE_SNAPSHOT_MS = 60_000;
 function savedView(): string {
   try { return localStorage.getItem(VIEW_KEY) || 'live'; } catch { return 'live'; }
 }
@@ -68,7 +70,9 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     finally { inflight.current = false; if(mounted.current) setBusy(false); }
   }, []);
   useEffect(() => { mounted.current = true; if (!isTauri()) { setEnabled(false); return; } sessionApi.access().then(setEnabled).catch(e => setError(err(e))); return () => { mounted.current = false; }; }, []);
-  useEffect(() => { if (!enabled || !active) return; void refresh(); const timer = setInterval(() => { if (!document.hidden) void refresh(); }, 5000); return () => clearInterval(timer); }, [enabled, active, refresh]);
+  // On Live the snapshot only names earlier sessions (the hosted ones come with their figures): read it seldom there (MCR-139)
+  const every = view === 'live' ? LIVE_SNAPSHOT_MS : 5000;
+  useEffect(() => { if (!enabled || !active) return; void refresh(); const timer = setInterval(() => { if (!document.hidden) void refresh(); }, every); return () => clearInterval(timer); }, [enabled, active, refresh, every]);
   useEffect(() => {
     if (!enabled || !active || !data.pendingFiles) return;
     const timer = setTimeout(() => { if (!document.hidden) void refresh(); }, 150);

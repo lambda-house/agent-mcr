@@ -143,11 +143,9 @@ pub async fn sessions_snapshot_since(
 /// Most sessions one `sessions_pick` call names: the Live list's hosted ones.
 pub const MAX_PICKED: usize = 200;
 
-/// The sessions named by `provider:id` keys, in the index's order. Unknown keys
-/// are left out.
-pub fn picked(sessions: Vec<sessions::Session>, keys: &[String]) -> Vec<sessions::Session> {
-    let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
-    sessions.into_iter().filter(|s| wanted.contains(format!("{}:{}", s.provider, s.id).as_str())).collect()
+/// Whether a session is one of the `provider:id` keys.
+pub fn named(keys: &std::collections::HashSet<String>) -> impl Fn(&sessions::Session) -> bool + '_ {
+    move |s| keys.contains(&format!("{}:{}", s.provider, s.id))
 }
 
 /// The same scan as `sessions_snapshot`, answered with the named sessions only
@@ -177,7 +175,9 @@ pub async fn sessions_pick(
             .lock()
             .map_err(|_| "Index lock poisoned".to_string())?;
         i.open_cache(&cache)?;
-        Ok(picked(i.scan(&home, None).sessions, &keys))
+        // Only the named sessions are summarised; the scan still brings the whole index up to date
+        let keys: std::collections::HashSet<String> = keys.into_iter().collect();
+        Ok(i.scan_where(&home, None, named(&keys)).sessions)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -406,7 +406,7 @@ mod memory_window_tests {
 
 #[cfg(test)]
 mod picked_tests {
-    use super::picked;
+    use super::named;
     use crate::sessions::Session;
 
     fn session(provider: &str, id: &str) -> Session {
@@ -440,10 +440,10 @@ mod picked_tests {
 
     #[test]
     fn picks_only_the_named_sessions_by_provider_and_id() {
-        let all = vec![session("claude", "a"), session("codex", "a"), session("claude", "b"), session("claude", "c")];
-        let keys = vec!["claude:a".to_string(), "claude:c".into(), "codex:zz".into()];
-        let got: Vec<String> = picked(all, &keys).iter().map(|s| format!("{}:{}", s.provider, s.id)).collect();
+        let all = [session("claude", "a"), session("codex", "a"), session("claude", "b"), session("claude", "c")];
+        let keys: std::collections::HashSet<String> = ["claude:a", "claude:c", "codex:zz"].map(String::from).into();
+        let got: Vec<String> = all.iter().filter(|s| named(&keys)(s)).map(|s| format!("{}:{}", s.provider, s.id)).collect();
         assert_eq!(got, vec!["claude:a", "claude:c"]);
-        assert!(picked(vec![session("claude", "a")], &[]).is_empty());
+        assert!(!named(&std::collections::HashSet::new())(&session("claude", "a")));
     }
 }

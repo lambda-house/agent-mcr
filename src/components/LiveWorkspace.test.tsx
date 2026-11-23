@@ -22,9 +22,11 @@ const focused: string[] = [];
 const mounts: string[] = [];
 // Every render of a terminal stand-in: a list poll that changed nothing renders none (MCR-139)
 const renders: string[] = [];
+// The keep of hidden terminals (MCR-139): what the view tells it to retain
+const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); } }));
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
-  return { default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
+  return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
     renders.push(id);
     useEffect(() => { mounts.push(id); }, [id]);
     useEffect(() => { givenIsSession.push(isSession); }, [isSession]);
@@ -578,6 +580,34 @@ describe('Live workspace', () => {
     expect(vi.mocked(harnessApi.list).mock.calls.length).toBeGreaterThan(lists);
     expect(vi.mocked(harnessApi.resumable).mock.calls.length).toBeGreaterThan(earlier);
     expect(renders.length).toBe(rendered);
+  });
+
+  it('takes the terminals away while the Live view itself is hidden, and gives them back when it is shown (MCR-139)', async () => {
+    const shell: Hosted = { ...running, id: 's1', title: '', meta: { label: 'Shell', profile: 'shell' } };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const terminals = () => [...host.querySelectorAll('[data-terminal]')].map(t => t.getAttribute('data-terminal'));
+    await act(async () => row('Fixing tests').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    await act(async () => button('Two columns').click()); await flush();
+    expect(terminals().sort()).toEqual(['r1', 's1']);
+    const before = mounts.length;
+    // Another view of the Sessions workspace, or another workspace: no terminal streams
+    await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
+    expect(terminals()).toEqual([]);
+    // Back: the same panes, each with its terminal mounted again
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(terminals().sort()).toEqual(['r1', 's1']);
+    expect(mounts.length).toBe(before + 2);
+  });
+
+  it('lets kept terminals go with their sessions from the list, once the list has been read (MCR-139)', async () => {
+    kept.retained = [];
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(kept.retained[kept.retained.length - 1]).toEqual(['e1', 'r1']);
+    expect(kept.retained.every(ids => ids.length > 0)).toBe(true);
   });
 
   it('drops a session the person quit from its own terminal', async () => {

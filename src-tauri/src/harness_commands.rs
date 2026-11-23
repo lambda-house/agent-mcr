@@ -950,15 +950,21 @@ pub async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), Str
 /// bytes; an empty message means the stream ended. Returns the view handle
 /// used for input and detaching.
 #[tauri::command]
-pub async fn terminal_attach(id: String, output: Channel<InvokeResponseBody>, state: State<'_, HarnessState>) -> Result<u64, String> {
+pub async fn terminal_attach(id: String, since: Option<u64>, output: Channel<InvokeResponseBody>, state: State<'_, HarnessState>) -> Result<u64, String> {
     valid_id(&id)?;
     let view_id = id.clone();
-    let (mut reader, writer) = blocking(move || {
+    let (mut reader, writer, reply) = blocking(move || {
         let socket = socket()?;
         runner::ensure(&socket)?;
-        runner::open_stream(&socket, json!({"op": "attach", "id": id}))
+        let mut req = json!({"op": "attach", "id": id});
+        if let Some(since) = since {
+            req["since"] = json!(since);
+        }
+        runner::open_stream_reply(&socket, req)
     })
     .await?;
+    // Where the bytes start in all the session's output; a runner before MCR-139 does not say
+    let from = reply["from"].as_u64();
     let handle = state.next_view.fetch_add(1, Ordering::SeqCst) + 1;
     state.views.lock().map_err(|_| "View state unavailable")?.insert(handle, (writer, view_id));
     // One thread reads the runner, the other gathers what it read into frames for the web view
@@ -977,6 +983,10 @@ pub async fn terminal_attach(id: String, output: Channel<InvokeResponseBody>, st
         }
     });
     std::thread::spawn(move || {
+        // The first frame says where the bytes start, before any of them
+        if output.send(InvokeResponseBody::Raw(start_frame(from))).is_err() {
+            return;
+        }
         gather(&gathered, GATHER, |data| output.send(InvokeResponseBody::Raw(frame(data))).is_ok());
         // The end of the stream: a frame with nothing in it
         let _ = output.send(InvokeResponseBody::Raw(frame(&[])));
@@ -1006,6 +1016,19 @@ pub fn frame(data: &[u8]) -> Vec<u8> {
     if out.len() < FRAME_MIN {
         out.resize(FRAME_MIN, 0);
     }
+    out
+}
+
+/// The length that marks a start frame: it is followed by the offset (u64,
+/// little-endian) of the first byte the view gets, `u64::MAX` when unknown.
+pub const START: u32 = u32::MAX;
+
+/// The first frame of a view: where its bytes start in all the output.
+pub fn start_frame(from: Option<u64>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_MIN);
+    out.extend_from_slice(&START.to_le_bytes());
+    out.extend_from_slice(&from.unwrap_or(u64::MAX).to_le_bytes());
+    out.resize(FRAME_MIN, 0);
     out
 }
 
@@ -1158,6 +1181,17 @@ mod tests {
             assert!(f[4 + data.len()..].iter().all(|b| *b == 0));
         }
         assert_eq!(frame(&[7u8; 5000]).len(), 5004);
+    }
+
+    #[test]
+    fn a_start_frame_says_where_the_bytes_start_or_that_it_is_not_known() {
+        let f = start_frame(Some(4_294_967_301));
+        assert_eq!(f.len(), FRAME_MIN);
+        assert_eq!(u32::from_le_bytes(f[..4].try_into().unwrap()), START);
+        assert_eq!(u64::from_le_bytes(f[4..12].try_into().unwrap()), 4_294_967_301);
+        assert_eq!(u64::from_le_bytes(start_frame(None)[4..12].try_into().unwrap()), u64::MAX);
+        // No data frame can say START: a frame never holds 4 GiB
+        assert!(GATHER_BYTES < START as usize);
     }
 
     #[test]

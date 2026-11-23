@@ -8,6 +8,7 @@ import { isPaletteKey, PLATFORM } from '../utils/platform';
 import { excerptFromSelection } from '../utils/taskCopy';
 import { isCopyKey, isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
 import TaskCopyDialog from './TaskCopyDialog';
+import { MAX_KEPT, TerminalKeep } from '../utils/terminalKeep';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
 export const RESIZE_SETTLE_MS = 200;
@@ -31,6 +32,9 @@ function theme(element: HTMLElement) {
     selectionBackground: v('--sc-card', '#1c252c'),
   };
 }
+
+/** Hidden terminals kept with what they showed (MCR-139); see utils/terminalKeep.ts */
+export const keep = new TerminalKeep<{ term: Terminal; fit: FitAddon }>(MAX_KEPT, ({ term }) => term.dispose());
 
 /**
  * One hosted terminal. Mounting attaches a view (the runner replays its
@@ -88,20 +92,29 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
   useEffect(() => {
     const element = host.current;
     if (!element) return;
-    const t = new Terminal({
-      allowProposedApi: true,
-      cursorBlink: true,
-      fontFamily: '"SF Mono", Menlo, Monaco, monospace',
-      fontSize: 13,
-      scrollback: 10000,
-      macOptionIsMeta: true,
-      theme: theme(element),
-    });
-    const f = new FitAddon();
-    t.loadAddon(f);
-    t.loadAddon(new Unicode11Addon());
-    t.unicode.activeVersion = '11';
-    t.open(element);
+    // A session shown a moment ago comes back with the terminal it had: every
+    // line it showed, and only what it missed from the runner (MCR-139)
+    const kept = keep.take(id);
+    let t: Terminal, f: FitAddon;
+    if (kept) {
+      ({ term: t, fit: f } = kept.term);
+      if (t.element) element.appendChild(t.element);
+    } else {
+      t = new Terminal({
+        allowProposedApi: true,
+        cursorBlink: true,
+        fontFamily: '"SF Mono", Menlo, Monaco, monospace',
+        fontSize: 13,
+        scrollback: 10000,
+        macOptionIsMeta: true,
+        theme: theme(element),
+      });
+      f = new FitAddon();
+      t.loadAddon(f);
+      t.loadAddon(new Unicode11Addon());
+      t.unicode.activeVersion = '11';
+      t.open(element);
+    }
     // The DOM renderer, on purpose (MCR-139): xterm's WebGL renderer measured
     // far heavier in this web view, 1.1 GB against 0.2 GB idle under the same
     // load, mostly graphics memory a context and its glyph atlas keep, made
@@ -240,13 +253,25 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     // Key presses only: xterm's own replies to the agent's queries are not the person
     let lastKey = 0;
     const keyed = t.onKey(() => { lastKey = Date.now(); });
-    harnessApi.attach(id, bytes => {
-      if (bytes.length === 0) {
-        setEnded(true);
-        if (Date.now() - lastKey < QUIT_WINDOW_MS) quit.current?.();
-        return;
-      }
-      t.write(bytes);
+    // Where the terminal is in the session's output: the offset of the next byte it has not seen
+    let offset: number | null = kept?.offset ?? null;
+    harnessApi.attach(id, kept ? offset : null, {
+      start: from => {
+        // The runner could not start where this terminal left off (it holds no
+        // more, or it is a runner that does not say): the terminal starts over
+        // with what the runner holds, as a new one would
+        if (kept && (from === null || from !== kept.offset)) t.reset();
+        offset = from;
+      },
+      data: bytes => {
+        if (bytes.length === 0) {
+          setEnded(true);
+          if (Date.now() - lastKey < QUIT_WINDOW_MS) quit.current?.();
+          return;
+        }
+        t.write(bytes);
+        if (offset !== null) offset += bytes.length;
+      },
     }).then(handle => {
       if (disposed) { void harnessApi.detach(handle); return; }
       view = handle;
@@ -313,9 +338,13 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       t.textarea?.removeEventListener('focus', claim);
       if (terminalTask.current === mine) terminalTask.current = null;
       typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose(); rendered.dispose(); switched.dispose(); reflowed.dispose();
+      // The marks are this mount's: the next one marks the rows it draws
+      [...marks].forEach(unmark);
       pointers.current = () => {};
       if (view !== null) void harnessApi.detach(view);
-      t.dispose();
+      // Kept, not disposed: shown again it takes only what it missed
+      t.element?.remove();
+      keep.put(id, { term: { term: t, fit: f }, offset });
       term.current = null; fit.current = null; resend.current = () => {};
     };
   }, [id]);
@@ -327,7 +356,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     if (!active) return;
     // Shown again: fit, and tell the agent the size even when it did not change here
     // (the session may have been resized from elsewhere while this pane was hidden)
-    requestAnimationFrame(() => { try { fit.current?.fit(); } catch { /* hidden */ } resend.current(); term.current?.focus(); });
+    requestAnimationFrame(() => { try { fit.current?.fit(); } catch { /* hidden */ } resend.current(); term.current?.refresh(0, term.current.rows - 1); term.current?.focus(); });
   }, [active]);
 
   useEffect(() => {

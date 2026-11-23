@@ -24,6 +24,26 @@ beforeEach(() => { vi.resetAllMocks(); localStorage.setItem('agent-mcr.sessions.
   let stamps = 0; vi.mocked(sessionApi.snapshotSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() })); });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 describe('Sessions workspace', () => {
+  it('reads the snapshot every minute while Live is shown, and every five seconds in Journal (MCR-139)', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      localStorage.setItem('agent-mcr.sessions.view', 'live');
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+      const reads = () => vi.mocked(sessionApi.snapshotSince).mock.calls.length;
+      const first = reads();
+      await act(async () => { vi.advanceTimersByTime(55_000); }); await flush();
+      expect(reads()).toBe(first);
+      await act(async () => { vi.advanceTimersByTime(5_000); }); await flush();
+      expect(reads()).toBe(first + 1);
+      // Journal: read at once, then every five seconds
+      await act(async () => button('journal').click()); await flush();
+      const journal = reads();
+      expect(journal).toBe(first + 2);
+      await act(async () => { vi.advanceTimersByTime(5_000); }); await flush();
+      expect(reads()).toBe(journal + 1);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('takes the index again only when its content changed, and says which stamp it holds (MCR-141)', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {

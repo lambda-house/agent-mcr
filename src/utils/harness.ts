@@ -492,11 +492,16 @@ export const harnessApi = {
   signal: (id: string, signal: 'INT' | 'TERM' | 'HUP' | 'KILL') => invoke<void>('harness_signal', { id, signal }),
   forget: (id: string) => invoke<void>('harness_forget', { id }),
   resize: (id: string, cols: number, rows: number) => invoke<void>('terminal_resize', { id, cols, rows }),
-  /** Output arrives as raw bytes; an empty buffer means the stream ended. */
-  attach: (id: string, onData: (bytes: Uint8Array) => void) => {
+  /**
+   * A view of a session's output. `start` comes first, with the offset of the
+   * first byte in all the session's output (null: the runner does not say);
+   * with `since` the runner starts there when it still holds it. Then raw
+   * bytes; an empty buffer means the stream ended.
+   */
+  attach: (id: string, since: number | null, on: { start: (from: number | null) => void; data: (bytes: Uint8Array) => void }) => {
     const output = new Channel<ArrayBuffer>();
-    output.onmessage = data => onData(unframe(data));
-    return invoke<number>('terminal_attach', { id, output });
+    output.onmessage = data => { const from = frameStart(data); if (from !== undefined) on.start(from); else on.data(unframe(data)); };
+    return invoke<number>('terminal_attach', { id, since, output });
   },
   input: (view: number, data: string) => invoke<void>('terminal_input', { view, data }),
   detach: (view: number) => invoke<void>('terminal_detach', { view }),
@@ -508,7 +513,18 @@ export const harnessApi = {
  * a little-endian u32 length, the bytes, zeros up to 1024. Frames are never
  * shorter, so Tauri fetches them as bytes instead of sending them as source
  * text the web view compiles (MCR-139). Length 0 is the end of the stream.
+ * The first frame of a view says where its bytes start: the length u32::MAX,
+ * then that offset (u64; u64::MAX when the runner does not say).
  */
+export function frameStart(data: ArrayBuffer): number | null | undefined {
+  if (data.byteLength < 12) return undefined;
+  const view = new DataView(data);
+  if (view.getUint32(0, true) !== 0xffffffff) return undefined;
+  const from = view.getBigUint64(4, true);
+  return from > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(from);
+}
+
+/** The bytes of a data frame (see `frameStart` for the first frame of a view). */
 export function unframe(data: ArrayBuffer): Uint8Array {
   if (data.byteLength < 4) return new Uint8Array(0);
   const length = new DataView(data).getUint32(0, true);

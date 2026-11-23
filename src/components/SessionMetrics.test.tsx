@@ -73,7 +73,7 @@ it('does not overlap scans and clears values after access/read failure', async (
     expect(host.textContent).toBe('0');
   } finally { await act(async () => root.unmount()); vi.useRealTimers(); }
 });
-it('asks the index for the hosted conversations only, and for a new one as soon as it runs (MCR-139)', async () => {
+it('asks the index for the listed conversations only, ended ones included, and for a new one as soon as it runs (MCR-139)', async () => {
   vi.useFakeTimers();
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   const host = document.createElement('div'); const root = createRoot(host);
@@ -85,10 +85,11 @@ it('asks the index for the hosted conversations only, and for a new one as soon 
   vi.mocked(sessionApi.pick).mockReset().mockImplementation(keys => Promise.resolve(keys.includes('claude:s1') ? [session] : []));
   try {
     await act(async () => root.render(<Probe list={[shell, ended, hosted]}/>));
-    expect(vi.mocked(sessionApi.pick).mock.calls).toEqual([[['claude:s1']]]);
+    // An ended row keeps its figures (it stays in the list until removed); a shell has none
+    expect(vi.mocked(sessionApi.pick).mock.calls).toEqual([[['claude:s1', 'codex:old']]]);
     expect(host.textContent).toBe('claude:s1');
     await act(async () => root.render(<Probe list={[shell, ended, hosted, codex]}/>));
-    expect(vi.mocked(sessionApi.pick).mock.lastCall).toEqual([['claude:s1', 'codex:c1']]);
+    expect(vi.mocked(sessionApi.pick).mock.lastCall).toEqual([['claude:s1', 'codex:c1', 'codex:old']]);
     // Unchanged answers set nothing new; the whole index is never asked for
     await act(async () => vi.advanceTimersByTime(30_000));
     expect(sessionApi.snapshot).not.toHaveBeenCalled();

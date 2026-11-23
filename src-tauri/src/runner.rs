@@ -9,8 +9,13 @@
 //! - Control: one request line → one reply line, repeatedly. `hello`, `spawn`,
 //!   `list`, `resize`, `write`, `signal`, `forget`. A reply is the result object,
 //!   or `{"error": "..."}`.
-//! - `{"op":"attach","id":...}` → `{"ok":true}`, then the connection carries raw
-//!   bytes: the scrollback, then live output. Bytes the client sends are typed
+//! - `{"op":"attach","id":...}` → `{"ok":true,"from":N}`, then the connection carries raw
+//!   bytes: the scrollback, then live output. `from` is the offset of the first
+//!   byte sent in all the session's output so far. With `"since":N` the
+//!   scrollback starts at that offset when the runner still holds it, so a view
+//!   that keeps what it showed takes only what it missed (MCR-139); otherwise
+//!   it is the whole scrollback, and `from` says so. A runner before this
+//!   answers without `from`. Bytes the client sends are typed
 //!   into the terminal. A view that falls too far behind is disconnected and
 //!   reattaches (at most once per view; the child never waits for a viewer).
 //! - `{"op":"watch"}` → `{"ok":true}`, then one JSON event per line.
@@ -236,6 +241,8 @@ fn handle_dsr(
 
 struct Output {
     ring: VecDeque<u8>,
+    /// All the output so far, in bytes: the ring ends at this offset
+    total: u64,
     views: Vec<SyncSender<Arc<[u8]>>>,
     scanner: Scanner,
     last_bell: u64,
@@ -440,6 +447,7 @@ impl Runner {
             job: Mutex::new(job),
             output: Mutex::new(Output {
                 ring: VecDeque::new(),
+                total: 0,
                 views: Vec::new(),
                 scanner: Scanner::default(),
                 last_bell: 0,
@@ -488,6 +496,7 @@ impl Runner {
             {
                 let mut out = lock(&session.output);
                 out.ring.extend(chunk.iter());
+                out.total += n as u64;
                 let excess = out.ring.len().saturating_sub(SCROLLBACK);
                 out.ring.drain(..excess);
                 out.views.retain(|v| v.try_send(chunk.clone()).is_ok());
@@ -676,20 +685,21 @@ impl Runner {
         }
     }
 
-    fn attach(&self, id: &str, mut stream: Stream) -> std::io::Result<()> {
+    fn attach(&self, id: &str, since: Option<u64>, mut stream: Stream) -> std::io::Result<()> {
         let session = match self.get(id) {
             Ok(s) => s,
             Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
         };
         let (tx, rx) = sync_channel::<Arc<[u8]>>(VIEW_QUEUE);
-        let scrollback: Vec<u8> = {
+        let (from, scrollback): (u64, Vec<u8>) = {
             let mut out = lock(&session.output);
             if !out.closed {
                 out.views.push(tx);
             }
-            out.ring.iter().copied().collect()
+            let (from, skip) = replay_from(out.total, out.ring.len(), since);
+            (from, out.ring.iter().skip(skip).copied().collect())
         };
-        writeln!(stream, "{}", json!({"ok": true}))?;
+        writeln!(stream, "{}", json!({"ok": true, "from": from}))?;
         stream.write_all(&scrollback)?;
 
         let mut input = stream.try_clone()?;
@@ -779,7 +789,7 @@ impl Runner {
             }
             match req["op"].as_str() {
                 // Both turn the connection into a stream; nothing was read past the line
-                Some("attach") => return self.attach(req["id"].as_str().unwrap_or(""), writer),
+                Some("attach") => return self.attach(req["id"].as_str().unwrap_or(""), req["since"].as_u64(), writer),
                 Some("watch") => return self.watch(writer),
                 Some("snapshot") => return self.snapshot(req["id"].as_str().unwrap_or(""), writer),
                 _ => {
@@ -871,6 +881,11 @@ impl Client {
 /// Open a stream connection (`attach` or `watch`). Returns the reader, which
 /// may already hold stream bytes past the handshake, and a writer.
 pub fn open_stream(socket: &Path, req: Value) -> Result<(BufReader<Stream>, Stream), String> {
+    open_stream_reply(socket, req).map(|(reader, stream, _)| (reader, stream))
+}
+
+/// `open_stream`, with the runner's first reply (an attach says `from` there).
+pub fn open_stream_reply(socket: &Path, req: Value) -> Result<(BufReader<Stream>, Stream, Value), String> {
     let mut stream = Stream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
     writeln!(stream, "{req}").map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
@@ -880,7 +895,18 @@ pub fn open_stream(socket: &Path, req: Value) -> Result<(BufReader<Stream>, Stre
     if let Some(e) = reply["error"].as_str() {
         return Err(e.to_string());
     }
-    Ok((reader, stream))
+    Ok((reader, stream, reply))
+}
+
+/// Where a new view's replay starts: the offset of its first byte in all the
+/// output (`total` bytes, the last `held` of them in the ring), and how many
+/// ring bytes to skip. `since` is taken when the ring still holds it.
+pub fn replay_from(total: u64, held: usize, since: Option<u64>) -> (u64, usize) {
+    let start = total - held as u64;
+    match since {
+        Some(at) if at >= start && at <= total => (at, (at - start) as usize),
+        _ => (start, 0),
+    }
 }
 
 /// A session's scrollback bytes (what a new view would be replayed).
@@ -1464,6 +1490,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         control.call(json!({"op": "forget", "id": "p1"})).unwrap();
+    }
+
+    #[test]
+    fn a_replay_starts_where_the_view_left_off_while_the_ring_holds_it() {
+        // 100 bytes so far, all held: from where the view left off
+        assert_eq!(replay_from(100, 100, Some(60)), (60, 60));
+        assert_eq!(replay_from(100, 100, Some(100)), (100, 100));
+        // No offset, or one the ring no longer holds, or one from the future: everything held
+        assert_eq!(replay_from(100, 100, None), (0, 0));
+        assert_eq!(replay_from(500, 100, Some(399)), (400, 0));
+        assert_eq!(replay_from(500, 100, Some(501)), (400, 0));
+        assert_eq!(replay_from(500, 100, Some(450)), (450, 50));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_view_that_kept_its_bytes_is_sent_only_what_it_missed() {
+        let socket = temp_socket("since");
+        serve_in_background(&socket);
+        let mut control = Client::connect(&socket).unwrap();
+        control.call(json!({"op": "spawn", "id": "s1", "argv": ["/bin/sh", "-c", "printf 'one\\n'; read line; printf 'two\\n'; read line"], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
+        let (mut first, mut input, reply) = open_stream_reply(&socket, json!({"op": "attach", "id": "s1"})).unwrap();
+        assert_eq!(reply["from"], 0);
+        let shown = read_until(&mut first, "one");
+        // Nothing more comes until a line is typed: the view has every byte so far
+        std::thread::sleep(Duration::from_millis(200));
+        let had = shown.len() as u64;
+        drop(first);
+        input.write_all(b"x\n").unwrap();
+        drop(input);
+        // Shown again from where it left off: what it missed, and not "one" a second time
+        let (mut again, _w, reply) = open_stream_reply(&socket, json!({"op": "attach", "id": "s1", "since": had})).unwrap();
+        assert_eq!(reply["from"], had);
+        let missed = read_until(&mut again, "two");
+        assert!(!missed.contains("one"), "{missed:?}");
+        // An offset the runner cannot serve gets the whole scrollback, and says where it starts
+        let (mut whole, _w, reply) = open_stream_reply(&socket, json!({"op": "attach", "id": "s1", "since": had + 1_000_000})).unwrap();
+        assert_eq!(reply["from"], 0);
+        let all = read_until(&mut whole, "two");
+        assert!(all.contains("one"), "{all:?}");
+        control.call(json!({"op": "signal", "id": "s1", "signal": "KILL"})).unwrap();
     }
 
     #[cfg(unix)]

@@ -5,13 +5,14 @@ import { runningFor, type Hosted } from '../utils/harness';
 import { estimatedCost } from '../utils/sessionCost';
 import { keepSame } from '../utils/keepSame';
 
-/** The index keys of the hosted Claude and Codex conversations, in one order */
+/** The index keys of the listed Claude and Codex conversations, running or ended, in one order */
 export function hostedKeys(hosted: Hosted[]): string[] {
   const keys = new Set<string>();
   for (const h of hosted) {
     const provider = h.harness?.profile || h.meta.profile;
     const id = h.harness?.agentSession;
-    if (!h.exit && id && (provider === 'claude' || provider === 'codex')) keys.add(`${provider}:${id}`);
+    // Ended rows too: they stay in the list with their figures until they are removed
+    if (id && (provider === 'claude' || provider === 'codex')) keys.add(`${provider}:${id}`);
   }
   return [...keys].sort();
 }

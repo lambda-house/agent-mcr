@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@/ui';
-import TerminalPane from './TerminalPane';
+import TerminalPane, { keep } from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import CockpitPanel from './CockpitPanel';
@@ -22,6 +22,7 @@ import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
 import '../styles/harness.css';
 import { keepSame } from '../utils/keepSame';
+import { formatSessionTitle } from '../utils/sessions';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const PINNED_KEY = 'hs-dirs';
@@ -72,7 +73,7 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
  * Agent terminals hosted by the runner. They keep running when this view, the
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
  */
-export default function LiveWorkspace({ active, recentDirectories, titles = {}, onSearch, focus }: {
+export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = {}, onSearch, focus }: {
   active: boolean; recentDirectories: string[];
   /** A session to show, asked for from another view; `at` makes a repeated ask count */
   focus?: { id: string; at: number };
@@ -96,6 +97,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const [gate, setGate] = useState<'new' | 'stopped' | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
   const metrics = useSessionMetrics(active, hosted);
+  // The hosted conversations' titles come with their figures, every ten seconds; the index's (for earlier
+  // sessions) with the Sessions workspace's snapshot, which it reads seldom while Live is shown (MCR-139)
+  const titles = useMemo(() => ({ ...indexTitles, ...Object.fromEntries(Object.values(metrics).filter(s => !s.parentId).map(s => [s.id, formatSessionTitle(s)])) }), [indexTitles, metrics]);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState('');
   const [opened, setOpened] = useState<string[]>([]);
@@ -134,6 +138,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
   // Sessions the person closed: once they have ended they leave the list too
   const closing = useRef(new Set<string>());
+  // The service's list has been read since this view mounted: before that an empty list says nothing
+  const listRead = useRef(false);
   const mounted = useRef(true);
 
   // Nothing runs and nothing may be started: the list gives way to the question
@@ -155,7 +161,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     }).catch(e => { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); });
   }, [closed]);
   const refresh = useCallback(async () => {
-    try { const list = await harnessApi.list(); if (mounted.current) { setHosted(held => keepSame(held, list)); setError(''); } }
+    try { const list = await harnessApi.list(); if (mounted.current) { listRead.current = true; setHosted(held => keepSame(held, list)); setError(''); } }
     catch (e) { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); }
   }, [closed]);
 
@@ -281,6 +287,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // The same function while the same sessions run: a terminal looks at its links again when it changes (MCR-106)
   const liveIds = hosted.filter(h => !h.exit).map(h => h.id).join(' ');
   const isSession = useCallback((id: string) => liveIds.split(' ').includes(id), [liveIds]);
+  // A kept terminal goes with its session from the list (an ended session in the list keeps its own)
+  const listedIds = hosted.map(h => h.id).join(' ');
+  useEffect(() => { if (listRead.current) keep.retain(new Set(listedIds.split(' ').filter(Boolean))); }, [listedIds]);
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
   useEffect(() => {
@@ -1019,11 +1028,12 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
             {leaves.length === 1 && !leaves[0].item
               ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
               : <div className="hs-layout-root">{renderNode(layout)}</div>}
-            {/* A terminal only for a session a pane shows (MCR-139). A hidden one is
-                unmounted: its view detaches and its buffer goes, and showing it again
-                attaches anew, so the runner replays the scrollback it keeps. A terminal
-                kept for every session ever opened parsed all their output for good */}
-            {opened.filter(id => visibleSessions.has(id)).map(id => {
+            {/* A terminal only for a session a pane shows while the Live view is shown
+                (MCR-139). A hidden one detaches from the runner and goes to the keep
+                (TerminalPane's `keep`): shown again, it takes only what it missed. A
+                terminal kept attached for every session ever opened parsed all their
+                output for good, and one mounted hidden told the agent 80×24 */}
+            {opened.filter(id => active && visibleSessions.has(id)).map(id => {
               const h = hosted.find(x => x.id === id);
               if (!h) return null;
               const el = slotEls[id];
