@@ -15,6 +15,7 @@ import SessionMemoryBrowser from './SessionMemoryBrowser';
 import LiveWorkspace from './LiveWorkspace';
 import BoardView from './BoardView';
 import SlackView from './SlackView';
+import { keepSame } from '../utils/keepSame';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
 function savedView(): string {
@@ -60,7 +61,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const inflight = useRef(false); const mounted = useRef(true); const contextVersion = useRef(0);
   const refresh = useCallback(async () => {
     if (inflight.current) return; inflight.current = true; setBusy(true);
-    try { const result = await sessionApi.snapshot(); if (mounted.current) { setData(result); setError(''); setSelected(s => s || (result.sessions[0] ? sessionKey(result.sessions[0]) : '')); } }
+    try { const result = await sessionApi.snapshot(); if (mounted.current) { setData(held => keepSame(held, result)); setError(''); setSelected(s => s || (result.sessions[0] ? sessionKey(result.sessions[0]) : '')); } }
     catch(e) { if(mounted.current) setError(err(e)); }
     finally { inflight.current = false; if(mounted.current) setBusy(false); }
   }, []);

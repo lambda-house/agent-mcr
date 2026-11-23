@@ -37,6 +37,8 @@ export const sessionApi = {
   stats: (provider: string, id: string) => invoke<Session>('session_stats', { provider, id }),
   detail: (provider: string, id: string) => invoke<Session>('session_details', { provider, id }),
   snapshot: () => invoke<Snapshot>('sessions_snapshot'),
+  /** The same scan, answered with the named sessions only (`provider:id` keys) */
+  pick: (keys: string[]) => invoke<Session[]>('sessions_pick', { keys }),
 };
 export function sessionKey(s: Session): string { return `${s.provider}:${s.id}`; }
 export function totalTokens(u: Usage): number { return u.input + u.output; }

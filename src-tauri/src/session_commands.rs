@@ -90,6 +90,48 @@ pub async fn sessions_snapshot(
     .await
     .map_err(|e| e.to_string())?
 }
+/// Most sessions one `sessions_pick` call names: the Live list's hosted ones.
+pub const MAX_PICKED: usize = 200;
+
+/// The sessions named by `provider:id` keys, in the index's order. Unknown keys
+/// are left out.
+pub fn picked(sessions: Vec<sessions::Session>, keys: &[String]) -> Vec<sessions::Session> {
+    let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    sessions.into_iter().filter(|s| wanted.contains(format!("{}:{}", s.provider, s.id).as_str())).collect()
+}
+
+/// The same scan as `sessions_snapshot`, answered with the named sessions only
+/// (MCR-139). The Live list colours its few hosted rows by their prompt cache;
+/// the whole snapshot (1,221 sessions, 2.9 MB of JSON on the owner's Mac) sent
+/// every ten seconds for that was parsed and dropped by the web view each time.
+#[tauri::command]
+pub async fn sessions_pick(
+    keys: Vec<String>,
+    access: State<'_, AccessState>,
+    state: State<'_, SessionState>,
+) -> Result<Vec<sessions::Session>, String> {
+    allowed(&access)?;
+    if keys.len() > MAX_PICKED {
+        return Err(format!("At most {MAX_PICKED} sessions at a time"));
+    }
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = state.index.clone();
+    let home = dirs::home_dir().ok_or("Home directory unavailable")?;
+    let cache = crate::get_config_dir()
+        .map_err(|e| e.message)?
+        .join("sessions/index.sqlite");
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut i = index
+            .lock()
+            .map_err(|_| "Index lock poisoned".to_string())?;
+        i.open_cache(&cache)?;
+        Ok(picked(i.scan(&home, None).sessions, &keys))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 /// Usage, tools and context figures of one session, for the Live view's
 /// stats pane. Same grant as the Sessions workspace; no transcript text.
 #[tauri::command]
@@ -309,5 +351,27 @@ mod memory_window_tests {
         assert_eq!(url.path(), "/index.html");
         assert_eq!(url.fragment(), None);
         assert_eq!(url.query_pairs().collect::<Vec<_>>(), vec![("memoryDocument".into(), path.into())]);
+    }
+}
+
+#[cfg(test)]
+mod picked_tests {
+    use super::picked;
+    use crate::sessions::Session;
+
+    fn session(provider: &str, id: &str) -> Session {
+        let mut s = Session::default();
+        s.provider = provider.into();
+        s.id = id.into();
+        s
+    }
+
+    #[test]
+    fn picks_only_the_named_sessions_by_provider_and_id() {
+        let all = vec![session("claude", "a"), session("codex", "a"), session("claude", "b"), session("claude", "c")];
+        let keys = vec!["claude:a".to_string(), "claude:c".into(), "codex:zz".into()];
+        let got: Vec<String> = picked(all, &keys).iter().map(|s| format!("{}:{}", s.provider, s.id)).collect();
+        assert_eq!(got, vec!["claude:a", "claude:c"]);
+        assert!(picked(vec![session("claude", "a")], &[]).is_empty());
     }
 }

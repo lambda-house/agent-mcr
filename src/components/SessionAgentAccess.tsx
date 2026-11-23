@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Copy, Shield, X } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { sessionKey, shellQuote, type Session, type SessionEvent } from '../utils/sessions';
+import { keepSame } from '../utils/keepSame';
 interface Grant { enabled: boolean; directory: string; session: string; excerpts: boolean }
 interface Status { grant: Grant; socket: string | null; executable: string; error: string | null; clients: string[]; recentQueries: { at: string; client: string; tool: string; ok: boolean; elapsedMs: number; cohort?: unknown; session?: string }[] }
 export const analysisApi = {
@@ -18,8 +19,8 @@ export default function SessionAgentAccess({ close, directory, selected, inspect
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [evidence, setEvidence] = useState('');
-  const refresh = useCallback(async () => { try { setStatus(await analysisApi.status()); } catch (e) { setError(message(e)); } }, []);
-  useEffect(() => { void refresh(); const timer = setInterval(() => void refresh(), 3000); return () => clearInterval(timer); }, [refresh]);
+  const refresh = useCallback(async () => { try { const next = await analysisApi.status(); setStatus(held => keepSame(held, next)); } catch (e) { setError(message(e)); } }, []);
+  useEffect(() => { void refresh(); const timer = setInterval(() => { if (!document.hidden) void refresh(); }, 3000); return () => clearInterval(timer); }, [refresh]);
   const action = async (f: () => Promise<unknown>) => { setBusy(true); setError(''); try { await f(); await refresh(); } catch (e) { setError(message(e)); } finally { setBusy(false); } };
   const command = status ? `${shellQuote(status.executable)} --mcp` : '';
   const cohort = selected ? { session: sessionKey(selected) } : directory ? { directory } : {};

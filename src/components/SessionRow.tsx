@@ -5,6 +5,7 @@ import { SessionFigures } from './SessionMetrics';
 import { formatAge } from '../utils/agent';
 import { formatUntil, harnessApi, heldNote, hostedState, programHint, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
 import type { Session } from '../utils/sessions';
+import { keepSame } from '../utils/keepSame';
 
 /**
  * The two rows of the Live list. The list itself, the Journal's results and
@@ -100,8 +101,8 @@ export function useHostedByConversation(active: boolean, every = 0): Map<string,
     let live = true;
     const load = () => {
       Promise.resolve().then(() => harnessApi.list())
-        .then(list => { if (live) setHosted(Array.isArray(list) ? list : []); })
-        .catch(() => { if (live) setHosted([]); });
+        .then(list => { if (live) setHosted(held => keepSame(held, Array.isArray(list) ? list : [])); })
+        .catch(() => { if (live) setHosted(held => held.length ? [] : held); });
     };
     load();
     const timer = every ? setInterval(() => { if (!document.hidden) load(); }, every) : undefined;

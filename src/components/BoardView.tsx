@@ -4,6 +4,7 @@ import { formatUntil, harnessApi, openReports, reportGroups, shortPath, tildePat
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
+import { keepSame } from '../utils/keepSame';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const KIND = { needs_human: 'Needs you', done: 'Done', status: 'Status' } as const;
@@ -47,7 +48,7 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
   const refresh = useCallback(async () => {
     try {
       const [b, list] = await Promise.all([harnessApi.board(), harnessApi.list()]);
-      if (mounted.current) { setBoard(b); setHosted(list); setError(''); }
+      if (mounted.current) { setBoard(held => keepSame(held, b)); setHosted(held => keepSame(held, list)); setError(''); }
     } catch (e) { if (mounted.current) setError(err(e)); }
   }, []);
 

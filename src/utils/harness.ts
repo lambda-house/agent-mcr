@@ -495,13 +495,25 @@ export const harnessApi = {
   /** Output arrives as raw bytes; an empty buffer means the stream ended. */
   attach: (id: string, onData: (bytes: Uint8Array) => void) => {
     const output = new Channel<ArrayBuffer>();
-    output.onmessage = data => onData(new Uint8Array(data));
+    output.onmessage = data => onData(unframe(data));
     return invoke<number>('terminal_attach', { id, output });
   },
   input: (view: number, data: string) => invoke<void>('terminal_input', { view, data }),
   detach: (view: number) => invoke<void>('terminal_detach', { view }),
   saveImage: (id: string, bytes: ArrayBuffer) => invoke<string>('terminal_save_image', bytes, { headers: { session: id } }),
 };
+
+/**
+ * The bytes of one frame of terminal output (`frame` in harness_commands.rs):
+ * a little-endian u32 length, the bytes, zeros up to 1024. Frames are never
+ * shorter, so Tauri fetches them as bytes instead of sending them as source
+ * text the web view compiles (MCR-139). Length 0 is the end of the stream.
+ */
+export function unframe(data: ArrayBuffer): Uint8Array {
+  if (data.byteLength < 4) return new Uint8Array(0);
+  const length = new DataView(data).getUint32(0, true);
+  return new Uint8Array(data, 4, Math.min(length, data.byteLength - 4));
+}
 
 /** Escape a path the way Terminal does when a file is dropped on it. */
 export function shellQuote(path: string): string {

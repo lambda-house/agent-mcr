@@ -21,6 +21,7 @@ import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
 import '../styles/harness.css';
+import { keepSame } from '../utils/keepSame';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const PINNED_KEY = 'hs-dirs';
@@ -67,11 +68,6 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
   return <div className="hs-pane-slot" ref={ref}/>;
 }
 
-function HiddenPaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot: (id: string, el: HTMLElement | null) => void }) {
-  const ref = useCallback((el: HTMLElement | null) => registerSlot(sessionId, el), [sessionId, registerSlot]);
-  return <div className="hs-pane" hidden ref={ref}/>;
-}
-
 /**
  * Agent terminals hosted by the runner. They keep running when this view, the
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
@@ -86,7 +82,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   onSearch?: (directory: string) => void;
 }) {
   const sessionLabel = (h: Hosted) => liveSessionLabel(h, titles);
-  const metrics = useSessionMetrics(active);
   // Null: the default width, a share of the window
   const [listWidth, setListWidth] = useState<number | null>(storedWidth);
   const resizeList = (x: number | null, handle?: HTMLElement) => {
@@ -100,6 +95,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // The background processes are not allowed: never asked ('new'), or stopped by the person
   const [gate, setGate] = useState<'new' | 'stopped' | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
+  const metrics = useSessionMetrics(active, hosted);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState('');
   const [opened, setOpened] = useState<string[]>([]);
@@ -158,7 +154,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     }).catch(e => { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); });
   }, [closed]);
   const refresh = useCallback(async () => {
-    try { const list = await harnessApi.list(); if (mounted.current) { setHosted(list); setError(''); } }
+    try { const list = await harnessApi.list(); if (mounted.current) { setHosted(held => keepSame(held, list)); setError(''); } }
     catch (e) { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); }
   }, [closed]);
 
@@ -820,7 +816,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         const leaves = listLeaves(layout);
         const multiPane = leaves.length > 1;
         const visibleSessions = new Set(leaves.map(l => l.item?.kind === 'session' && l.item.id ? l.item.id : null).filter((x): x is string => !!x));
-        const bgOpened = opened.filter(id => !visibleSessions.has(id) && hosted.some(h => h.id === id));
         const emptyActions = pluginRegistry.getEmptyActions();
         const emptyPaneOverride = pluginRegistry.getOverride('live:empty-pane');
         const renderNode = (node: PaneNode): React.ReactNode => {
@@ -1016,14 +1011,16 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
             {leaves.length === 1 && !leaves[0].item
               ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
               : <div className="hs-layout-root">{renderNode(layout)}</div>}
-            {bgOpened.map(id => <HiddenPaneSlot key={`bg:${id}`} sessionId={id} registerSlot={registerSlot}/>)}
-            {opened.map(id => {
+            {/* A terminal only for a session a pane shows (MCR-139). A hidden one is
+                unmounted: its view detaches and its buffer goes, and showing it again
+                attaches anew, so the runner replays the scrollback it keeps. A terminal
+                kept for every session ever opened parsed all their output for good */}
+            {opened.filter(id => visibleSessions.has(id)).map(id => {
               const h = hosted.find(x => x.id === id);
               if (!h) return null;
               const el = slotEls[id];
               if (!el) return null;
-              const isVisible = visibleSessions.has(id);
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active && isVisible} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );

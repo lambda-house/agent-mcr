@@ -3,6 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TerminalPane from './TerminalPane';
+import { harnessApi } from '../utils/harness';
 
 type Link = { range: { start: { x: number; y: number }; end: { x: number; y: number } }; text: string; activate: (e: MouseEvent, text: string) => void };
 type Provider = { provideLinks: (y: number, done: (links: Link[] | undefined) => void) => void };
@@ -199,5 +200,25 @@ describe('session pointers in a terminal', () => {
     expect(screen.providers).toBe(1);
     await act(async () => root.render(<div/>));
     expect(screen.providers).toBe(0);
+  });
+});
+
+describe('a terminal is the view of one shown session (MCR-139)', () => {
+  it('detaches its view and lets the terminal go when it is unmounted, and attaches anew, from the scrollback, when mounted again', async () => {
+    let handle = 0;
+    const streams: ((bytes: Uint8Array) => void)[] = [];
+    vi.mocked(harnessApi.attach).mockImplementation((_id, onData) => { streams.push(onData); return Promise.resolve(++handle); });
+    vi.mocked(harnessApi.detach).mockClear();
+    await act(async () => root.render(<TerminalPane id="t1" active/>)); await frame();
+    expect(vi.mocked(harnessApi.attach).mock.calls.map(c => c[0])).toEqual(['t1']);
+    await act(async () => root.render(<div/>));
+    // The runner stops streaming to it: nothing keeps parsing a session nobody sees
+    expect(vi.mocked(harnessApi.detach).mock.calls).toEqual([[1]]);
+    expect(host.querySelector('.hs-terminal')).toBeNull();
+    // Shown again: a new view, which the runner starts with the scrollback it keeps
+    await act(async () => root.render(<TerminalPane id="t1" active/>)); await frame();
+    expect(vi.mocked(harnessApi.attach).mock.calls.map(c => c[0])).toEqual(['t1', 't1']);
+    expect(streams).toHaveLength(2);
+    vi.mocked(harnessApi.attach).mockImplementation(() => new Promise(() => {}));
   });
 });

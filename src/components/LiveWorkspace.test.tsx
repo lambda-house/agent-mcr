@@ -20,9 +20,12 @@ let linkTo = '';
 const givenIsSession: unknown[] = [];
 const focused: string[] = [];
 const mounts: string[] = [];
+// Every render of a terminal stand-in: a list poll that changed nothing renders none (MCR-139)
+const renders: string[] = [];
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
   return { default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
+    renders.push(id);
     useEffect(() => { mounts.push(id); }, [id]);
     useEffect(() => { givenIsSession.push(isSession); }, [isSession]);
     useEffect(() => { if (focusAt) { focused.push(id); onFocused?.(); } }, [focusAt]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -514,6 +517,50 @@ describe('Live workspace', () => {
     expect(pane('r1')).not.toBeNull();
     expect(mounts.filter(id => id === 'r1').length).toBe(before + 1);
     expect(focused).toEqual(['s1', 'r1']);
+  });
+
+  it('keeps a terminal only for a session a pane shows, and mounts it anew when it is shown again (MCR-139)', async () => {
+    const shell: Hosted = { ...running, id: 's1', title: '', meta: { label: 'Shell', profile: 'shell' } };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const terminals = () => [...host.querySelectorAll('[data-terminal]')].map(t => t.getAttribute('data-terminal'));
+    const mountsOf = (id: string) => mounts.filter(m => m === id).length;
+    const before = mountsOf('r1');
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(terminals()).toEqual(['r1']);
+    // Another session in the one pane: the first one's terminal is gone, not kept hidden and streaming
+    await act(async () => row('Shell').click()); await flush();
+    expect(terminals()).toEqual(['s1']);
+    expect(host.querySelector('[hidden] [data-terminal]')).toBeNull();
+    // Shown again: a new terminal, which attaches and gets the scrollback from the runner
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(terminals()).toEqual(['r1']);
+    expect(mountsOf('r1')).toBe(before + 2);
+    // Two panes show two sessions: both have their terminal
+    await act(async () => button('Two columns').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    expect(terminals().sort()).toEqual(['r1', 's1']);
+  });
+
+  it('sets no new list when a poll brings the same sessions, so the view does not render again (MCR-139)', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running }]));
+      await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+      const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+      await act(async () => row('Fixing tests').click()); await flush();
+      const rendered = renders.length;
+      const calls = vi.mocked(harnessApi.list).mock.calls.length;
+      // Same content, fresh objects, a few polls: nothing renders again
+      for (let i = 0; i < 3; i++) { await act(async () => { vi.advanceTimersByTime(2000); }); await flush(); }
+      expect(vi.mocked(harnessApi.list).mock.calls.length).toBeGreaterThan(calls);
+      expect(renders.length).toBe(rendered);
+      // A change does come through
+      vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running, title: 'Writing docs' }]));
+      await act(async () => { vi.advanceTimersByTime(2000); }); await flush();
+      expect(row('Writing docs')).toBeTruthy();
+    } finally { vi.useRealTimers(); }
   });
 
   it('drops a session the person quit from its own terminal', async () => {

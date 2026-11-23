@@ -6,6 +6,7 @@ import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
 import { ACTION_KIND, actionSource, ageTitle, clickable, harnessChips, harnessSaw, isOld, liveFacts, named, oneView, shownUrgency, staleMarks, stillAwaits, trackPublisher, trackStateShown, trackWaits, type Named, type NeedGroup } from '../utils/cockpit';
 import { harnessApi, type Cockpit, type CockpitAct, type CockpitAction, type CockpitLink, type CockpitTrack, type Hosted } from '../utils/harness';
+import { keepSame } from '../utils/keepSame';
 
 /**
  * The cockpit above the Supervisor's terminal (MCR-96): one view of tracks
@@ -310,7 +311,7 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
       // A read that hangs is said, never covered by the last good one: "nothing needs you" is a claim
       const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer from the harness service in ${READ_TIMEOUT_MS / 1000} s`)), READ_TIMEOUT_MS); });
       Promise.race([Promise.resolve().then(() => harnessApi.cockpit()), late])
-        .then(c => { if (live && n > shown) { shown = n; setCockpit(c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null); setError(''); } })
+        .then(c => { if (live && n > shown) { shown = n; const next = c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null; setCockpit(held => keepSame(held, next)); setError(''); } })
         .catch(e => { if (live && n > shown) { shown = n; setError(String(e instanceof Error ? e.message : e)); } })
         .finally(() => clearTimeout(timer));
     };

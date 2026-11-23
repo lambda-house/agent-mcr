@@ -961,21 +961,78 @@ pub async fn terminal_attach(id: String, output: Channel<InvokeResponseBody>, st
     .await?;
     let handle = state.next_view.fetch_add(1, Ordering::SeqCst) + 1;
     state.views.lock().map_err(|_| "View state unavailable")?.insert(handle, (writer, view_id));
+    // One thread reads the runner, the other gathers what it read into frames for the web view
+    let (chunks, gathered) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if output.send(InvokeResponseBody::Raw(buf[..n].to_vec())).is_err() {
+                    if chunks.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
             }
         }
-        let _ = output.send(InvokeResponseBody::Raw(Vec::new()));
+    });
+    std::thread::spawn(move || {
+        gather(&gathered, GATHER, |data| output.send(InvokeResponseBody::Raw(frame(data))).is_ok());
+        // The end of the stream: a frame with nothing in it
+        let _ = output.send(InvokeResponseBody::Raw(frame(&[])));
     });
     Ok(handle)
+}
+
+/// Output that arrives this soon after the first part of it goes to the web view with it.
+const GATHER: std::time::Duration = std::time::Duration::from_millis(6);
+/// The most one frame gathers.
+const GATHER_BYTES: usize = 256 * 1024;
+/// The least a frame takes. Tauri sends a channel message shorter than 1024
+/// bytes as JavaScript source text, a JSON array of its numbers that the web
+/// view parses and compiles; anything longer is fetched as bytes. An agent at
+/// work writes hundreds of small repaints a minute, and as source text each
+/// left garbage that only the web view's full collections free: 300 MB and
+/// more under load (MCR-139). A frame is never shorter, so terminal output
+/// never takes that way.
+pub const FRAME_MIN: usize = 1024;
+
+/// A frame for the web view: the length (u32, little-endian), the bytes, and
+/// zeros up to `FRAME_MIN`. Length 0 is the end of the stream.
+pub fn frame(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity((data.len() + 4).max(FRAME_MIN));
+    out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(data);
+    if out.len() < FRAME_MIN {
+        out.resize(FRAME_MIN, 0);
+    }
+    out
+}
+
+/// Hands on what arrives in `chunks`: each time the first chunk and whatever
+/// follows it within `window`, up to `GATHER_BYTES`, as one piece, in order.
+/// Ends when the chunks end or `send` says the view is gone.
+pub fn gather(chunks: &std::sync::mpsc::Receiver<Vec<u8>>, window: std::time::Duration, mut send: impl FnMut(&[u8]) -> bool) {
+    use std::sync::mpsc::RecvTimeoutError;
+    while let Ok(first) = chunks.recv() {
+        let mut data = first;
+        let until = std::time::Instant::now() + window;
+        let mut ended = false;
+        while data.len() < GATHER_BYTES {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            match chunks.recv_timeout(left) {
+                Ok(more) => data.extend_from_slice(&more),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if !send(&data) || ended {
+            return;
+        }
+    }
 }
 
 #[tauri::command]
@@ -1090,6 +1147,72 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_is_never_short_enough_to_go_as_source_text_and_says_its_length() {
+        for data in [&b""[..], b"x", &[7u8; 1019], &[7u8; 1020], &[7u8; 5000]] {
+            let f = frame(data);
+            assert!(f.len() >= FRAME_MIN, "{} bytes", data.len());
+            assert_eq!(u32::from_le_bytes(f[..4].try_into().unwrap()) as usize, data.len());
+            assert_eq!(&f[4..4 + data.len()], data);
+            assert!(f[4 + data.len()..].iter().all(|b| *b == 0));
+        }
+        assert_eq!(frame(&[7u8; 5000]).len(), 5004);
+    }
+
+    #[test]
+    fn output_is_gathered_in_order_and_handed_on_when_it_pauses_or_ends() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // What arrives together goes together, in order
+        for part in [&b"ab"[..], b"cd", b"ef"] {
+            tx.send(part.to_vec()).unwrap();
+        }
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            tx.send(b"later".to_vec()).unwrap();
+            // The stream ends
+        });
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        gather(&rx, std::time::Duration::from_millis(50), |d| {
+            sent.push(d.to_vec());
+            true
+        });
+        writer.join().unwrap();
+        assert_eq!(sent, vec![b"abcdef".to_vec(), b"later".to_vec()]);
+    }
+
+    #[test]
+    fn gathering_stops_when_the_view_is_gone() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        tx.send(b"one".to_vec()).unwrap();
+        let mut calls = 0;
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = tx.send(b"two".to_vec());
+            tx
+        });
+        gather(&rx, std::time::Duration::from_millis(10), |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(calls, 1);
+        drop(late.join());
+    }
+
+    #[test]
+    fn a_frame_gathers_no_more_than_its_limit() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        for _ in 0..5 {
+            tx.send(vec![1u8; GATHER_BYTES / 2]).unwrap();
+        }
+        drop(tx);
+        let mut sizes = Vec::new();
+        gather(&rx, std::time::Duration::from_secs(5), |d| {
+            sizes.push(d.len());
+            true
+        });
+        assert_eq!(sizes, vec![GATHER_BYTES, GATHER_BYTES, GATHER_BYTES / 2]);
+    }
 
     #[test]
     fn a_hold_the_service_ended_is_not_raised_again_by_the_next_key() {

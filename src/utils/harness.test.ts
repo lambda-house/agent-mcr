@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeLiveList } from '../store';
-import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report, directorySections, pathBelow, subfolderTag, type Resumable } from './harness';
+import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report, directorySections, pathBelow, subfolderTag, type Resumable, unframe } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
 
@@ -464,5 +464,20 @@ describe('agentProfileTitle', () => {
     expect(agentProfileTitle({ id: 'lead@codex', version: 2, role: 'lead', adapter: 'codex', summary: '', model: null, effort: 'high', mode: 'workspace-write' }))
       .toBe('lead@codex (v2; effort high, mode workspace-write)');
     expect(agentProfileTitle({ id: 'custom@pi', version: 1, role: 'custom', adapter: 'pi', summary: 'Pi' })).toBe('Pi (v1)');
+  });
+});
+
+describe('terminal output frames (MCR-139)', () => {
+  const frame = (bytes: number[], size = 1024) => { const b = new ArrayBuffer(Math.max(size, bytes.length + 4)); new DataView(b).setUint32(0, bytes.length, true); new Uint8Array(b).set(bytes, 4); return b; };
+  it('takes the bytes a frame says it holds and leaves the padding', () => {
+    expect([...unframe(frame([27, 91, 72, 104, 105]))]).toEqual([27, 91, 72, 104, 105]);
+    const big = Array.from({ length: 3000 }, (_, i) => i % 251);
+    expect([...unframe(frame(big))]).toEqual(big);
+  });
+  it('reads the end of the stream as nothing, and never past the frame', () => {
+    expect(unframe(frame([])).length).toBe(0);
+    expect(unframe(new ArrayBuffer(2)).length).toBe(0);
+    const lying = frame([1, 2, 3], 8); new DataView(lying).setUint32(0, 999, true);
+    expect([...unframe(lying)]).toEqual([1, 2, 3, 0]);
   });
 });

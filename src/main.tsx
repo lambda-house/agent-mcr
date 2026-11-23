@@ -13,6 +13,7 @@ import '@fontsource/jetbrains-mono/600.css';
 import './styles/index.css';
 import './styles/ui.css';
 import { pluginRegistry, usePluginVersion } from './plugins';
+import { watchWindowActivity } from './utils/motion';
 
 // Apply the persisted theme before the first paint (no dark flash in light
 // mode), and follow later changes
@@ -25,6 +26,8 @@ applyTheme(useStore.getState().theme);
 useStore.subscribe((state, prev) => {
   if (state.theme !== prev.theme) applyTheme(state.theme);
 });
+// Animations pause while the window is in the background (MCR-139)
+watchWindowActivity();
 
 function PluginAppRoot() {
   usePluginVersion();
