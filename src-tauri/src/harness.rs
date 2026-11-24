@@ -3274,6 +3274,14 @@ impl Harness {
                 .collect();
             crate::profiles::prune_pins(&self.dir, &keep, now_ms());
         }
+        let supervised = above.is_some() || replacing.is_some_and(|id| {
+            lock(&self.store).sessions.get(id).is_some_and(|t| t.supervisor.is_some())
+        });
+        if profile == "claude" && supervised {
+            // MCR-147: Claude's suggested next prompt can be submitted as a
+            // separate turn before the supervisor has assigned its next task.
+            spawn_env.insert("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(), "false".into());
+        }
         spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
         let id = runner::random_id()[..12].to_string();
         spawn_env.insert("AGENT_MCR_SESSION".into(), id.clone());
@@ -7257,9 +7265,33 @@ mod tests {
         let record = lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.clone().unwrap();
         assert!(record.lowered && record.id == "implementer@claude-opus");
         assert!(crate::profiles::pinned(&dir, &record).unwrap().profile.tools.deny.contains(&"Edit".to_string()));
+
+        // MCR-147: Claude recorded a suggestion acceptance before the assignment.
+        // Replay that acceptance with a simulated composer using the actual spawn
+        // environment, then feed it the writes from the real task_assign path.
+        let executor = out["id"].as_str().unwrap();
+        let setting = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION";
+        let mut prompts = Vec::new();
+        if lock(&spawned)[2]["env"][setting] != "false" {
+            prompts.push("INFRA-243 round 5");
+        }
+        h.update(|s| s.set_state(executor, "idle"));
+        *lock(&h.typed) = Some(Vec::new());
+        let text = "INFRA-243 round 5. Apply the validator's changes.\n\nKeep the full task together.";
+        h.agent_tool("lead", "task_assign", &json!({"session": executor, "text": text})).unwrap();
+        let writes = typed_so_far(&h);
+        let [(paste_to, paste), (enter_to, enter)] = writes.as_slice() else {
+            panic!("expected a paste and Enter, got {writes:?}");
+        };
+        assert_eq!((paste_to.as_str(), enter_to.as_str(), enter.as_str()), (executor, executor, "\r"));
+        prompts.push(paste.strip_prefix("\x1b[200~").unwrap().strip_suffix("\x1b[201~").unwrap());
+        assert_eq!(prompts, [text]);
+        assert!(lock(&spawned)[1]["env"][setting].is_null(), "independent Claude keeps its setting");
+
         // A bare Codex for it is lowered too: its sandbox drops to read-only
         let out = h.agent_tool("lead", "executor_create", &json!({"profile": "codex"})).unwrap();
         assert!(line(3).contains("'--sandbox' 'read-only' '--ask-for-approval' 'on-request'"), "{}", line(3));
+        assert!(lock(&spawned)[3]["env"][setting].is_null(), "Codex needs no Claude setting");
         let record = lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.clone().unwrap();
         assert_eq!(record.id, "custom@bare-codex");
         // Started under the lead's profile, which is recorded for a refresh (16771 M2)
