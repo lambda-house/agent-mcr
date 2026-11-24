@@ -4,7 +4,7 @@ import { useStore, panelShown, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, TOC_MIN_WIDTH, 
 import { useReader } from './reader';
 import { openPath, reader } from './readerHost';
 import {
-  CloseDocumentDialog, DocumentGroups, ReaderProvider, SaveAllDialog, allTabs, readerSettingsTab, type RestoredDocument,
+  CloseDocumentDialog, Contents, DocumentGroups, ReaderProvider, SaveAllDialog, allTabs, readerSettingsTab, type RestoredDocument,
 } from '@lambda-house/reader';
 import { EmptyState } from '@lambda-house/ui';
 import { FileQuestion } from 'lucide-react';
@@ -22,7 +22,6 @@ import { getFileName } from '@lambda-house/reader';
 import Toolbar, { ToolbarEnd } from './components/Toolbar';
 import { flushEditorChanges } from '@lambda-house/reader';
 import AgentPanel from './components/AgentPanel';
-import TocSidebar from './components/TocSidebar';
 import { appSettingsTabs } from './components/SettingsTabs';
 import MemoryConnection from './components/MemoryConnection';
 import { journal } from './journal';
@@ -365,7 +364,7 @@ const App: React.FC = () => {
       contents: {
         type: 'contents', label: 'table of contents', title: 'Contents', singleton: true, collapsible: true,
         min: { w: TOC_MIN_WIDTH }, max: { w: TOC_MAX_WIDTH }, zoom: zoomOf('toc'),
-        render: () => <TocSidebar onToggle={handleToggleToc} />,
+        render: () => <Contents onClose={handleToggleToc} />,
       },
     };
   }, [handleToggleToc]);

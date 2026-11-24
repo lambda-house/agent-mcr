@@ -1,4 +1,5 @@
 import { findPaneOfType, leaves, normalize, placePane, setCollapsed, type LayoutNode, type Leaf } from '@lambda-house/workbench';
+import { CONTENTS_MAX_WIDTH, CONTENTS_MIN_WIDTH, CONTENTS_WIDTH } from '@lambda-house/reader';
 
 // The Documents view as a workbench layout (shared UI spec §5.3–5.4): the
 // agent documents, the document groups, the contents. These pure functions
@@ -6,10 +7,11 @@ import { findPaneOfType, leaves, normalize, placePane, setCollapsed, type Layout
 
 export const PANEL_MIN_WIDTH = 200;
 export const PANEL_MAX_WIDTH = 400;
-export const TOC_MIN_WIDTH = 180;
-export const TOC_MAX_WIDTH = 320;
+/** The contents pane's sizes are the reader's. */
+export const TOC_MIN_WIDTH = CONTENTS_MIN_WIDTH;
+export const TOC_MAX_WIDTH = CONTENTS_MAX_WIDTH;
 export const PANEL_WIDTH = 280;
-export const TOC_WIDTH = 220;
+export const TOC_WIDTH = CONTENTS_WIDTH;
 
 export type DocumentsPane = 'agent-docs' | 'contents';
 
