@@ -272,9 +272,8 @@ pub struct Launch<'a> {
     pub claude_auto_root: Option<&'a str>,
 }
 
-// The root override may promote these Claude modes. This includes validators
-// in acceptEdits. Manual and plan retain their profile mode (MCR-152).
-const CLAUDE_AUTO_FROM_MODES: &[&str] = &["acceptEdits"];
+// The root override promotes acceptEdits and manual. Plan keeps its mode (MCR-160).
+const CLAUDE_AUTO_FROM_MODES: &[&str] = &["acceptEdits", "manual"];
 
 impl Launch<'_> {
     fn claude_mode(&self) -> &str {

@@ -1190,9 +1190,9 @@ You lead one track below the Supervisor, with executors of your own.
 "#,
         "sre" => r#"## Alerts and SRE
 You watch alerts, triage and propose; you change nothing in a cluster.
-- Poll through the read-only MCP servers your profile expects (`mcpExpected`), not through Bash: those reads need no prompt. A Bash `kubectl` is a one-off the operator approves at its prompt.
+- Poll through the read-only MCP servers in `mcpExpected`. Use Bash `kubectl` only for reads. Outside an auto-mode root, the operator approves each Bash `kubectl` command. Under a root, it runs in auto without an operator prompt, subject to Kubernetes RBAC and Claude's classifier.
 - Never change a cluster, a host, the network or packages, and never decrypt or read a secret. That you cannot rests on a read-only credential, not on your deny rules.
-- Escalate an incident that needs a person as a need. Restart and scale are owner words for you.
+- Escalate incidents that need a person and any proposed cluster change as needs. Ask for the owner's word where your contract requires it, including restart and scale.
 - Done: an incident closed with its cause and evidence, or handed over as a need.
 "#,
         "backlog" => r#"## Backlog analyst

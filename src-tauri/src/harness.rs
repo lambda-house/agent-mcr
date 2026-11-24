@@ -7300,14 +7300,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn auto_mode_trusts_a_lead_and_new_executor_before_spawn() {
+    fn auto_mode_trusts_promoted_claude_sessions_before_spawn() {
         let fixture = tempfile::Builder::new().prefix("mcr152-").tempdir_in("/tmp").unwrap();
         let dir = dunce::canonicalize(fixture.path()).unwrap();
         let home = dir.join("home");
         let work = home.join("work");
         let checkout = work.join("repo");
         let new_worktree = work.join("wt/new");
-        for cwd in [&checkout, &new_worktree, &home.join("elsewhere"), &home.join("workshop"), &work.join("validator")] {
+        let backlog_checkout = work.join("backlog");
+        let guarded_checkout = work.join("guarded");
+        for cwd in [
+            &checkout, &new_worktree, &backlog_checkout, &guarded_checkout,
+            &home.join("elsewhere"), &home.join("workshop"), &work.join("validator"),
+        ] {
             std::fs::create_dir_all(cwd).unwrap();
         }
         let config = home.join(".claude.json");
@@ -7350,17 +7355,19 @@ mod tests {
         let lead_id = lead["id"].as_str().unwrap();
         let executor = h.agent_tool(lead_id, "executor_create", &json!({"profile": "implementer@claude-opus", "cwd": new_worktree})).unwrap();
         let executor_id = executor["id"].as_str().unwrap();
-        for cwd in [home.join("elsewhere"), home.join("workshop")] {
-            let outside = h.tool("session_create", &json!({"profile": "backlog@claude-opus", "cwd": cwd})).unwrap();
+        for (profile, cwd) in [("sre@claude-sonnet", home.join("elsewhere")), ("backlog@claude-opus", home.join("workshop"))] {
+            let outside = h.tool("session_create", &json!({"profile": profile, "cwd": cwd})).unwrap();
             assert_eq!(outside["effectiveMode"], "manual (profile)");
         }
         let validator = h.agent_tool(lead_id, "executor_create", &json!({"profile": "validator@claude-opus", "cwd": work.join("validator")})).unwrap();
         let effective_auto = "auto (root ~/work)";
         assert_eq!(validator["effectiveMode"], effective_auto);
         let sre = h.tool("session_create", &json!({"profile": "sre@claude-sonnet", "cwd": checkout})).unwrap();
-        assert_eq!(sre["effectiveMode"], "manual (profile mode kept under root ~/work)");
+        assert_eq!(sre["effectiveMode"], effective_auto);
+        let backlog = h.tool("session_create", &json!({"profile": "backlog@claude-opus", "cwd": backlog_checkout})).unwrap();
+        assert_eq!(backlog["effectiveMode"], effective_auto);
         std::fs::write(dir.join("auto-mode.json"), br#"{"roots":["~"]}"#).unwrap();
-        let guarded = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": checkout})).unwrap();
+        let guarded = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": guarded_checkout})).unwrap();
         assert_eq!(guarded["effectiveMode"], "acceptEdits (profile, ignored auto-mode root \"~\" because it is the home folder or an ancestor)");
         assert_eq!(lead["effectiveMode"], effective_auto);
         assert_eq!(executor["effectiveMode"], effective_auto);
@@ -7373,8 +7380,8 @@ mod tests {
         assert_eq!(overview["sessions"][0]["executors"][0]["effectiveMode"], effective_auto);
 
         let spawned = lock(&spawned);
-        assert_eq!(spawned.len(), 7);
-        let modes = ["auto", "auto", "manual", "manual", "auto", "manual", "acceptEdits"];
+        let modes = ["auto", "auto", "manual", "manual", "auto", "auto", "auto", "acceptEdits"];
+        assert_eq!(spawned.len(), modes.len());
         for ((req, trusted), mode) in spawned.iter().zip(modes) {
             let line = req["argv"].as_array().unwrap().last().unwrap().as_str().unwrap();
             let expected_auto = mode == "auto";
