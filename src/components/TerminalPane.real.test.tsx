@@ -83,7 +83,7 @@ describe('Enter in a visible terminal with no attached input stream', () => {
     expect(harnessApi.input).toHaveBeenCalledExactlyOnceWith(17, '\r');
   });
 
-  it('drops Down Down Enter together while attaching', async () => {
+  it('drops Down Down Enter while attaching and sends the next Enter', async () => {
     let attached!: (handle: number) => void;
     vi.mocked(harnessApi.attach).mockImplementationOnce(() => new Promise(resolve => { attached = resolve; }));
     await show('opening');
@@ -94,6 +94,10 @@ describe('Enter in a visible terminal with no attached input stream', () => {
     });
     await act(async () => { attached(17); });
     expect(harnessApi.input).not.toHaveBeenCalled();
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('Terminal input was dropped');
+    await act(async () => { last().input('\r', true); });
+    expect(harnessApi.input).toHaveBeenCalledExactlyOnceWith(17, '\r');
+    expect(host.querySelector('[role="status"]')).toBeNull();
   });
 
   it('reaches the session when the input stream was detached', async () => {
@@ -104,7 +108,7 @@ describe('Enter in a visible terminal with no attached input stream', () => {
     expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\r'], [2, '\r']]);
   });
 
-  it('drops Enter when a preceding key failed on the detached stream', async () => {
+  it('drops Enter after a failed key and sends the retyped sequence', async () => {
     await show('detached');
     let lost!: (error: string) => void;
     vi.mocked(harnessApi.input).mockImplementationOnce(() => new Promise((_, reject) => { lost = reject; }));
@@ -114,6 +118,11 @@ describe('Enter in a visible terminal with no attached input stream', () => {
     });
     await act(async () => { lost('The terminal is detached'); });
     expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\x1b[B']]);
+    await act(async () => {
+      last().input('\x1b[B', true);
+      last().input('\r', true);
+    });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\x1b[B'], [2, '\x1b[B'], [2, '\r']]);
   });
 
   it('guards the replacement Enter when reconnect drops a queued key', async () => {
@@ -159,6 +168,21 @@ describe('Enter in a visible terminal with no attached input stream', () => {
     await act(async () => { attached(17); });
     expect(harnessApi.detach).toHaveBeenCalledWith(17);
     expect(harnessApi.input).not.toHaveBeenCalled();
+  });
+
+  it('cancels writes still queued when the pane detaches on hide', async () => {
+    await show('hidden');
+    let written!: () => void;
+    vi.mocked(harnessApi.input).mockImplementationOnce(() => new Promise(resolve => { written = resolve; }));
+    await act(async () => {
+      last().input('a', true);
+      last().input('b', true);
+      last().input('\r', true);
+    });
+    await hide();
+    await act(async () => { written(); });
+    expect(harnessApi.input).toHaveBeenCalledExactlyOnceWith(1, 'a');
+    expect(harnessApi.detach).toHaveBeenCalledWith(1);
   });
 });
 
@@ -283,6 +307,24 @@ describe('a pane on a real terminal (review 17086)', () => {
     // The runner holds nothing from offset 10: it starts its scrollback further on
     await answer('new line\r\n', 5_000_000);
     expect(lines(last())).toEqual(['new line']);
+  });
+
+  it('lets Enter through when a key in flight succeeds during replay replacement', async () => {
+    await show('a');
+    act(() => { views[0].on.start(0); views[0].on.data(bytes('old line\r\n')); });
+    await hide();
+    await parsed();
+    await show('a');
+    let written!: () => void;
+    vi.mocked(harnessApi.input).mockImplementationOnce(() => new Promise(resolve => { written = resolve; }));
+    await act(async () => { last().input('a', true); });
+    const kept = last();
+    await act(async () => { views[1].on.start(5_000_000); });
+    expect(last()).toBe(kept);
+    await act(async () => { written(); });
+    expect(last()).not.toBe(kept);
+    await act(async () => { last().input('\r', true); });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[2, 'a'], [2, '\r']]);
   });
 
   it('shows a replay whole after a kept terminal stopped inside an escape sequence (review 17088)', async () => {

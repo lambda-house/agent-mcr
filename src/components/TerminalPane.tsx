@@ -21,6 +21,7 @@ export const RESIZE_SETTLE_MS = 200;
 export const QUIT_WINDOW_MS = 10_000;
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
+const INPUT_DROPPED_NOTICE = 'Terminal input was dropped. Check the prompt and retype the lost keys.';
 
 /** Colours from the Sessions palette the pane sits in (light and dark). */
 function theme(element: HTMLElement) {
@@ -341,43 +342,59 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     // This terminal is not to be kept or used again: the runner could not go on where it left off
     let discard = false;
     let reconnecting = false;
-    let inputWrites = Promise.resolve();
-    let pendingKeys = 0;
+    let writingInput = false;
+    const inputQueue: { handle: number; data: string; retry: boolean }[] = [];
     const loseInput = () => {
       inputLost.current = true;
       pendingEnter.current = null;
     };
-    const sendInput = (handle: number, data: string, reconnect: boolean) => {
-      const enter = data === '\r';
-      if (!enter) pendingKeys++;
-      // A submit must wait for the preceding writes, including their errors.
-      inputWrites = inputWrites.then(async () => {
-        if (disposed || discard || reconnecting) return;
-        if (enter && inputLost.current) {
-          inputLost.current = false;
-          return;
-        }
-        try {
-          await harnessApi.input(handle, data);
-        } catch (error) {
-          if (disposed || discard) return;
-          const message = err(error);
-          if (!enter) loseInput();
-          if (reconnect && message.startsWith('The terminal is detached') && shown.current) {
-            reconnecting = true;
-            // The replacement will also drop any keys still in this queue.
-            if (pendingKeys) loseInput();
-            if (enter && !inputLost.current) pendingEnter.current = { id, retry: false };
-            else setNotice(message);
-            refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
-            setFresh(n => n + 1);
-          } else {
+    const dropInput = (data: string) => {
+      if (data === '\r') {
+        // This Enter belonged to the lost keys. The next one can submit again.
+        inputLost.current = false;
+      } else {
+        loseInput();
+        setNotice(INPUT_DROPPED_NOTICE);
+      }
+    };
+    const flushInput = async () => {
+      if (writingInput) return;
+      writingInput = true;
+      try {
+        // Process even dropped input in order so its Enter ends the sequence.
+        for (let next = inputQueue.shift(); next && !disposed; next = inputQueue.shift()) {
+          const { handle, data, retry } = next;
+          const enter = data === '\r';
+          if (discard || reconnecting || (enter && inputLost.current)) {
+            dropInput(data);
+            continue;
+          }
+          try {
+            await harnessApi.input(handle, data);
+            if (enter && !disposed) setNotice(n => n === INPUT_DROPPED_NOTICE ? '' : n);
+          } catch (error) {
+            if (disposed) return;
+            const message = err(error);
+            if (!enter) loseInput();
+            if (!discard && retry && message.startsWith('The terminal is detached') && shown.current) {
+              reconnecting = true;
+              refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
+              if (enter) {
+                pendingEnter.current = { id, retry: false };
+                continue;
+              }
+            }
             setNotice(message);
           }
         }
-      }).finally(() => {
-        if (!enter) pendingKeys--;
-      });
+      } finally {
+        writingInput = false;
+        if (!disposed && (discard || reconnecting)) setFresh(n => n + 1);
+      }
+    };
+    const sendInput = (handle: number, data: string, retry: boolean) => {
+      inputQueue.push({ handle, data, retry });
+      void flushInput();
     };
     view.listen({
       start: from => {
@@ -389,11 +406,11 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
         // terminal, including any frames that arrive before React replaces it.
         if (kept && (from === null || from !== kept.offset)) {
           discard = true;
-          if (pendingKeys) loseInput();
           refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
           view.pause();
           replacement.current = { id, view };
-          setFresh(n => n + 1);
+          // Account for the in-flight write before dropping the queued keys.
+          if (!writingInput) setFresh(n => n + 1);
           return;
         }
         offset = from;
@@ -425,12 +442,12 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
 
     const typed = t.onData(data => {
       if (disposed) return;
-      if (!discard && !reconnecting && view.handle !== null) sendInput(view.handle, data, true);
-      else if (shown.current) {
-        if (data !== '\r') loseInput();
-        else if (!discard && !reconnecting && !inputLost.current) {
+      if (view.handle !== null && ((!discard && !reconnecting) || (shown.current && writingInput))) {
+        sendInput(view.handle, data, true);
+      } else if (shown.current) {
+        if (data === '\r' && !discard && !reconnecting && !inputLost.current) {
           pendingEnter.current = { id, retry: true };
-        }
+        } else dropInput(data);
       }
     });
     const resized = t.onResize(({ cols, rows }) => { void sendSize(cols, rows); });
@@ -483,6 +500,8 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     observer.observe(element);
     return () => {
       disposed = true;
+      // A hidden pane gives up its handle. Drop bytes that have yet to be sent.
+      inputQueue.length = 0;
       clearTimeout(settle);
       observer.disconnect();
       element.removeEventListener('paste', onPaste, true);
