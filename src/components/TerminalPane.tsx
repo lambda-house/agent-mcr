@@ -134,6 +134,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   const replacement = useRef<{ id: string; view: TerminalView } | null>(null);
   // The terminal let go had the keyboard: the new one takes it (review 17090)
   const refocus = useRef(false);
+  const pendingEnter = useRef<{ id: string; retry: boolean } | null>(null);
   const [notice, setNotice] = useState('');
   // Copy as task (MCR-125 v0): the right-click menu on a selection, and the dialog with its passage
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -155,6 +156,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   const copyText = (text: string) => { harnessApi.copyText(text).catch(e => setNotice(err(e))); };
 
   useEffect(() => () => {
+    if (pendingEnter.current?.id === id) pendingEnter.current = null;
     if (replacement.current?.id === id) {
       replacement.current.view.dispose();
       replacement.current = null;
@@ -187,13 +189,13 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       t.unicode.activeVersion = '11';
       t.open(element);
       disableOutputScrollbarReveal(t);
-      if (refocus.current) {
-        refocus.current = false;
-        requestAnimationFrame(() => {
-          const focused = document.activeElement;
-          if (!document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) t.focus();
-        });
-      }
+    }
+    if (refocus.current) {
+      refocus.current = false;
+      requestAnimationFrame(() => {
+        const focused = document.activeElement;
+        if (shown.current && !document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) t.focus();
+      });
     }
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
@@ -335,6 +337,23 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     let offset: number | null = kept?.offset ?? null;
     // This terminal is not to be kept or used again: the runner could not go on where it left off
     let discard = false;
+    let reconnecting = false;
+    const sendInput = (handle: number, data: string, retryEnter: boolean) => {
+      void harnessApi.input(handle, data).catch(error => {
+        if (disposed || discard || reconnecting) return;
+        const message = err(error);
+        // A detached view did not write this one-byte Enter. Retry it once
+        // after a new attach, with the existing replay and focus handling.
+        if (retryEnter && data === '\r' && message.startsWith('The terminal is detached') && shown.current) {
+          reconnecting = true;
+          pendingEnter.current = { id, retry: false };
+          refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
+          setFresh(n => n + 1);
+          return;
+        }
+        setNotice(message);
+      });
+    };
     view.listen({
       start: from => {
         // The runner could not start where this terminal left off (it holds no
@@ -363,12 +382,26 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
         t.write(bytes);
         if (offset !== null) offset += bytes.length;
       },
-      ready: () => { void sendSize(t.cols, t.rows); },
-      error: e => setNotice(err(e)),
+      ready: () => {
+        const enter = pendingEnter.current;
+        if (enter?.id === id && view.handle !== null) {
+          pendingEnter.current = null;
+          if (shown.current) sendInput(view.handle, '\r', enter.retry);
+        }
+        void sendSize(t.cols, t.rows);
+      },
+      error: e => {
+        if (pendingEnter.current?.id === id) pendingEnter.current = null;
+        setNotice(err(e));
+      },
     });
     if (!transferred) view.open(id, offset);
 
-    const typed = t.onData(data => { if (view.handle !== null) harnessApi.input(view.handle, data).catch(e => setNotice(err(e))); });
+    const typed = t.onData(data => {
+      if (disposed || discard || reconnecting) return;
+      if (view.handle !== null) sendInput(view.handle, data, true);
+      else if (data === '\r' && shown.current) pendingEnter.current = { id, retry: true };
+    });
     const resized = t.onResize(({ cols, rows }) => { void sendSize(cols, rows); });
 
     const onPaste = (e: ClipboardEvent) => {

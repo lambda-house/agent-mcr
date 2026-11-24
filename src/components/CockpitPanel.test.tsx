@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 // Vitest hands CSS imports over empty: the stylesheet is read from disk
 const css = readFileSync(`${process.cwd()}/src/styles/harness.css`, 'utf8');
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { cockpit: vi.fn(), cockpitAct: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { cockpit: vi.fn(), cockpitAct: vi.fn(), clearDraft: vi.fn() } }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'a while ago' }));
 
 const session = (id: string, name: string, over: Partial<Hosted> = {}): Hosted => ({ id, pid: 1, argv: ['claude'], cwd: '/work', started: 1, cols: 80, rows: 24, title: '', lastOutput: 1, exit: null, meta: { label: 'Claude Code', profile: 'claude' }, harness: { name, named: true, profile: 'claude', state: 'working' } as Hosted['harness'], ...over });
@@ -384,6 +384,21 @@ it('can be collapsed, and stays so', async () => {
   expect(host.querySelector('.ck-body')).toBeNull();
 });
 
+it.each(['derived', 'merged'])('clears an empty-box hold from a %s row using its timestamp', async kind => {
+  const since = Date.now() - 60_000;
+  const action = kind === 'derived'
+    ? { id: 'held:r1', title: 'Unsent line', kind: 'held_line' as const, derived: 'held' as const, where: { session: 'r1' }, since }
+    : { ...doc.actions[0], where: { session: 'r1' }, live: { held: since } };
+  vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...doc, actions: [action] });
+  vi.mocked(harnessApi.clearDraft).mockResolvedValue(undefined);
+  await show();
+  const clear = [...host.querySelectorAll('button')].find(button => button.textContent === 'Clear hold for empty input');
+  expect(clear).toBeDefined();
+  await act(async () => { clear?.click(); });
+  expect(harnessApi.clearDraft).toHaveBeenCalledExactlyOnceWith('r1', since);
+  expect(harnessApi.cockpitAct).not.toHaveBeenCalled();
+});
+
 it('shows a session at a prompt with nothing published, at the first read, and drops it when the prompt is answered (MCR-118)', async () => {
   const empty: Cockpit = { schema: 1, version: 0, updated: 0, sessions: { r1: { name: 'Reviewer' } }, tracks: [], actions: [] };
   vi.mocked(harnessApi.cockpit).mockResolvedValue({ ...empty, actions: [{ id: 'prompt:r1', title: 'Reviewer asks for your answer in its terminal', kind: 'answer_prompt', derived: 'prompt', where: { session: 'r1' }, since: Date.now() }] });
@@ -418,8 +433,9 @@ it('shows how long an unsent line has stood, and an overdue human wait with what
   const wait = host.querySelector('[data-action="wait:w1"]')!;
   expect(wait.textContent).toContain('It registered: a go for the fault run');
   expect(wait.querySelector('.ck-kind')!.textContent).toBe('waits for you');
-  // Nothing on a derived row is a button: it only opens its session
-  expect([...host.querySelectorAll('.ck-action button')].filter(b => !b.classList.contains('ck-session'))).toEqual([]);
+  const controls = [...host.querySelectorAll('.ck-action button')].filter(b => !b.classList.contains('ck-session'));
+  expect(controls.map(button => button.textContent)).toEqual(['Clear hold for empty input']);
+  expect(held.contains(controls[0])).toBe(true);
 });
 
 it('merges what the harness knows into the published action for the same session: one row, its chips, the harness urgency (MCR-118)', async () => {

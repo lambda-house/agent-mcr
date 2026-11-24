@@ -65,11 +65,51 @@ beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   if (!('ResizeObserver' in globalThis)) Object.assign(globalThis, { ResizeObserver: class { observe() {} disconnect() {} } });
   keep.protect(new Set()); keep.retain(new Set()); made.terms = []; views = [];
+  vi.mocked(harnessApi.input).mockReset().mockResolvedValue(undefined);
   let handle = 0;
   vi.mocked(harnessApi.attach).mockImplementation((id, since, on) => { views.push({ id, since, on }); return Promise.resolve(++handle); });
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+describe('Enter in a visible terminal with no attached input stream', () => {
+  it('reaches the session during attach', async () => {
+    let attached!: (handle: number) => void;
+    vi.mocked(harnessApi.attach).mockImplementationOnce(() => new Promise(resolve => { attached = resolve; }));
+    await show('opening');
+    await act(async () => { last().input('\r', true); });
+    expect(harnessApi.input).not.toHaveBeenCalled();
+    await act(async () => { attached(17); });
+    expect(harnessApi.input).toHaveBeenCalledExactlyOnceWith(17, '\r');
+  });
+
+  it('reaches the session when the input stream was detached', async () => {
+    await show('detached');
+    vi.mocked(harnessApi.input).mockRejectedValueOnce('The terminal is detached');
+    await act(async () => { last().input('\r', true); });
+    expect(views.map(view => view.id)).toEqual(['detached', 'detached']);
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\r'], [2, '\r']]);
+  });
+
+  it('does not keep retrying Enter if the replacement stream is detached', async () => {
+    await show('detached');
+    vi.mocked(harnessApi.input).mockRejectedValue('The terminal is detached');
+    await act(async () => { last().input('\r', true); });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\r'], [2, '\r']]);
+    expect(host.querySelector('[role="status"]')?.textContent).toBe('The terminal is detached');
+  });
+
+  it('drops a pending Enter when the pane is hidden before it attaches', async () => {
+    let attached!: (handle: number) => void;
+    vi.mocked(harnessApi.attach).mockImplementationOnce(() => new Promise(resolve => { attached = resolve; }));
+    await show('opening');
+    await act(async () => { last().input('\r', true); });
+    await hide();
+    await act(async () => { attached(17); });
+    expect(harnessApi.detach).toHaveBeenCalledWith(17);
+    expect(harnessApi.input).not.toHaveBeenCalled();
+  });
+});
 
 it('keeps the selected terminal focused when a different pane mounts', async () => {
   const panes = (second: boolean) => <><TerminalPane id="selected" active focusOnMount/>{second && <TerminalPane id="another" active/>}</>;
