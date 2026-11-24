@@ -1180,6 +1180,8 @@ You lead one track below the Supervisor, with executors of your own.
 - Direct them with `task_assign`, follow them with `task_wait` or your inbox, keep your track in the cockpit true, and report status after each round.
 - Give validation to an independent session: never to the lineage that did the work.
 - If your profile delivers (`push: delivery` in `whoami`, and merge and push are not in your `ownerWords`), you are in charge of your track's delivery. Merge only a commit that has all of these: an independent validator's APPROVE on that exact commit (the other lineage); green CI on the merge result; a hand-in comment on the issue.
+- Always push as `git push origin <branch>` and verify that `origin` points to the track's GitHub repository. For the pre-approved Claude Code merge, check that the PR head is the approved commit immediately before running `gh pr merge --merge -- <PR>`. The final `--` ends option parsing. Use the normal approval flow for `--match-head-commit`, which lets GitHub enforce the expected head itself. Run each as a bare command from the worktree, with no chaining, pipes or `git -C`. Deny rules take precedence. Never merge with `--admin`.
+- Codex keeps its `on-request` approvals. Its command-prefix allows run outside the sandbox and apply through shared config layers. The harness's approval hook reports the prompt for the operator to decide (D6).
 - Never force-push, and never rewrite main. Your deny rules catch the usual forms (`--force` and its kin, `-f`, `+ref`, `--mirror`, and deleting main as `:main`, `--delete main` or `-d main` after the remote) and not `git -C <dir> push`, `git -c ... push`, an alias, a script, bundled short flags such as `-uf`, `--prune`, other orders of deleting main, or a ref update through `gh api`; never use those to get around them. Main's protection is the guard.
 - Comment the merge on the issue: commit, CI run, validator comment.
 - Rebuilds, restarts and deploys are still the owner's words. Ask for them as a need.
@@ -1603,9 +1605,9 @@ mod tests {
         assert!(role_part("implementer").contains("never merge"));
     }
 
-    /// A Bash rule as Claude Code documents it: `*` matches any text, spaces
-    /// included; a trailing one may match nothing. Whether one in the middle
-    /// may is not documented, so both readings are checked (`mid_empty`)
+    /// Model Claude Code's documented text match for one Bash command. A
+    /// trailing ` *` or `:*` on a literal prefix also matches the bare prefix.
+    /// Check both readings of whether an internal `*` can match no text.
     fn bash_rule_matches(rule: &str, command: &str, mid_empty: bool) -> bool {
         fn go(p: &[char], c: &[char], mid_empty: bool) -> bool {
             match p.split_first() {
@@ -1618,7 +1620,75 @@ mod tests {
             }
         }
         let inner = rule.strip_prefix("Bash(").and_then(|r| r.strip_suffix(')')).unwrap();
-        go(&inner.chars().collect::<Vec<_>>(), &command.chars().collect::<Vec<_>>(), mid_empty)
+        let legacy;
+        let pattern = if let Some(prefix) = inner.strip_suffix(":*") {
+            legacy = format!("{prefix} *");
+            legacy.as_str()
+        } else {
+            inner
+        };
+        if pattern.strip_suffix(" *").is_some_and(|prefix| !prefix.contains('*') && command == prefix) {
+            return true;
+        }
+        go(&pattern.chars().collect::<Vec<_>>(), &command.chars().collect::<Vec<_>>(), mid_empty)
+    }
+
+    #[test]
+    fn delivery_rules_match_only_the_intended_command_prefixes() {
+        use crate::agents::{windows_args, Launch};
+
+        let lead = choose(Path::new("/nonexistent-config-dir"), "lead@claude-opus").unwrap();
+        let words = windows_args(&Launch { profile: "claude", agent: Some(&lead.profile), settings: "/claude-hooks.json", ..Default::default() }).unwrap();
+        let rules = |flag| {
+            let start = words.iter().position(|word| word == flag).unwrap() + 1;
+            words[start..].iter().take_while(|word| !word.starts_with("--"))
+        };
+        for mid_empty in [false, true] {
+            let allowed = |cmd| rules("--allowedTools").any(|rule| bash_rule_matches(rule, cmd, mid_empty));
+            let denied = |cmd| rules("--disallowedTools").any(|rule| bash_rule_matches(rule, cmd, mid_empty));
+            for cmd in ["git push origin feature-branch", "gh pr merge --merge -- 6"] {
+                assert!(allowed(cmd) && !denied(cmd), "{cmd}");
+            }
+            for cmd in [
+                "git push ./repo HEAD:feature-branch",
+                "git push upstream feature-branch",
+                "git push origins feature-branch",
+                "git push -u origin feature-branch",
+                "gh pr merge 6 --merge --match-head-commit abc123",
+                "gh pr merge -dF notes.txt 6",
+                "gh pr merge 6 -mF notes.txt",
+                "gh pr merge -rF notes.txt 6",
+                "gh pr merge 6 -sF notes.txt",
+                "gh pr merge --merge -sF notes.txt -- 6",
+                "gh pr merge --merge '--body-file=notes.txt' -- 6",
+            ] {
+                assert!(!allowed(cmd), "{cmd}");
+            }
+            for cmd in [
+                "git push origin --force feature-branch",
+                "git push origin --mirror",
+                "git push origin --delete main",
+                "git push origin --receive-pack=receiver feature-branch",
+                "git push origin --ex=receiver feature-branch",
+            ] {
+                assert!(allowed(cmd) && denied(cmd), "{cmd}");
+            }
+            for cmd in [
+                "git push --receive-pack receiver origin feature-branch",
+                "git push origin feature-branch --exec=receiver",
+                "git push --e=receiver origin feature-branch",
+                "git push --rece receiver origin feature-branch",
+                "git push --repo=ext::transport feature-branch",
+                "gh pr merge --admin 6",
+                "gh pr merge 6 --admin",
+                "gh pr merge -F notes.txt 6",
+                "gh pr merge 6 -F notes.txt",
+                "gh pr merge --body-file notes.txt 6",
+                "gh pr merge 6 --body-file=notes.txt",
+            ] {
+                assert!(denied(cmd), "{cmd}");
+            }
+        }
     }
 
     /// MCR-136 reviews 17005 P3 and 17009: the lead's denies catch the forms
@@ -1693,6 +1763,8 @@ mod tests {
         assert!(bash_rule_matches("Bash(git * main)", "git push origin main", false));
         assert!(!bash_rule_matches("Bash(git log * main)", "git log main", false));
         assert!(bash_rule_matches("Bash(ls*)", "lsof", false) && !bash_rule_matches("Bash(ls *)", "lsof", false));
+        assert!(bash_rule_matches("Bash(ls *)", "ls", false));
+        assert!(bash_rule_matches("Bash(ls:*)", "ls -la", false) && !bash_rule_matches("Bash(ls:*)", "lsof", false));
         // Every rule is one the profile check takes
         assert!(FORCE_PUSH_DENIES.iter().all(|r| tool_rule(r)));
     }
