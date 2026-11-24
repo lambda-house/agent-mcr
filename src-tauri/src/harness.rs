@@ -3069,8 +3069,13 @@ impl Harness {
     }
 
     fn stop_for_restart(&self, id: &str) -> Result<(), String> {
+        let signal = |name| match self.runner(json!({"op": "signal", "id": id, "signal": name})) {
+            Ok(_) => Ok(()),
+            Err(_) if self.session(id).is_ok_and(|s| !s["exit"].is_null()) => Ok(()),
+            Err(reason) => Err(reason),
+        };
         // Both agents save their conversation as they go.
-        self.runner(json!({"op": "signal", "id": id, "signal": "HUP"}))?;
+        signal("HUP")?;
         let ended = |wait: Duration| {
             let until = Instant::now() + wait;
             loop {
@@ -3085,7 +3090,7 @@ impl Harness {
         };
         // Leave room in the ten-second control timeout for trust preparation.
         if !ended(Duration::from_secs(5)) {
-            self.runner(json!({"op": "signal", "id": id, "signal": "KILL"}))?;
+            signal("KILL")?;
             if !ended(Duration::from_secs(2)) {
                 return Err("The session did not end".into());
             }
@@ -7404,21 +7409,22 @@ mod tests {
         });
         let mut h = Harness::open(&dir);
         h.launch_home = Some(home.clone());
-        let old = h.create_as(&json!({"profile": "lead@claude-opus", "cwd": cwd}), false, None).unwrap();
+        let old = h.tool("session_create", &json!({"profile": "lead@claude-opus", "cwd": cwd})).unwrap();
         let id = old["id"].as_str().unwrap();
+        let restart = || h.tool("session_restart", &json!({"session": id, "force": true}));
         let settings = dir.join("auto-mode.json");
         let trust_lock = home.join(".claude.json.lock");
         std::fs::write(&settings, "{").unwrap();
-        assert!(h.restart(id, true, false).unwrap_err().contains("Invalid"));
+        assert!(restart().unwrap_err().contains("Invalid"));
         assert!(h.session(id).unwrap()["exit"].is_null());
 
         std::fs::write(&settings, br#"{"roots":["~/work"]}"#).unwrap();
         std::fs::create_dir(&trust_lock).unwrap();
-        assert!(h.restart(id, true, false).unwrap_err().contains("Claude config lock was busy"));
+        assert!(restart().unwrap_err().contains("Claude config lock was busy"));
         assert!(h.session(id).unwrap()["exit"].is_null());
         assert!(!lock(&h.store).restarting.contains(id));
 
-        let started = h.create_as(&json!({"profile": "implementer@claude-opus", "cwd": fresh}), false, None).unwrap();
+        let started = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": fresh})).unwrap();
         let effective = started["effectiveMode"].as_str().unwrap();
         assert!(effective.starts_with("auto (root ~/work, launched without recording Claude folder trust:"));
         assert!(effective.contains("Claude config lock was busy"));
@@ -7426,7 +7432,7 @@ mod tests {
         assert!(trust_lock.is_dir());
         std::fs::remove_dir(trust_lock).unwrap();
 
-        let replacement = h.restart(id, true, false).unwrap();
+        let replacement = restart().unwrap();
         assert_eq!(replacement["replaced"], id);
         assert_eq!(replacement["effectiveMode"], "auto (root ~/work)");
         assert_ne!(replacement["id"], id);
