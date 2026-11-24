@@ -8,8 +8,13 @@ import { pickDirectory } from '../utils/tauri';
 import { useStore } from '../store';
 import { DEFAULT_LIVE_LIST } from '../utils/harness';
 import { liveNav } from '../utils/liveNav';
+import { hostedDetail } from './SessionRow';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), storeNoticeSeen: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), listSince: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), storeNoticeSeen: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
+vi.mock('./SessionRow', async importOriginal => {
+  const original = await importOriginal<typeof import('./SessionRow')>();
+  return { ...original, hostedDetail: vi.fn(original.hostedDetail) };
+});
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // Terminals need a real canvas; the pane itself is exercised in the app
@@ -49,6 +54,11 @@ beforeEach(() => {
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
   vi.mocked(harnessApi.status).mockResolvedValue({ runner: { protocol: 1, pid: 7, version: '0.1.0', exe: '/x' }, profiles: [{ id: 'claude', label: 'Claude Code', command: 'claude', optional: false, canSupervise: true, taskTracking: true }, { id: 'codex', label: 'Codex', command: 'codex', optional: false, canSupervise: true, taskTracking: true }, { id: 'antigravity', label: 'Antigravity', command: 'agy --mode accept-edits', optional: true, canSupervise: true, taskTracking: false }, { id: 'pi', label: 'Pi', command: 'pi', optional: true, canSupervise: true, taskTracking: false }, { id: 'opencode', label: 'OpenCode', command: 'opencode', optional: true, canSupervise: true, taskTracking: false }, { id: 'shell', label: 'Terminal', command: '', optional: false, canSupervise: false, taskTracking: false }], supervisorProfile: 'claude', home: '/Users/me' });
   vi.mocked(harnessApi.list).mockResolvedValue([ended, running]);
+  vi.mocked(harnessApi.listSince).mockImplementation(async held => {
+    const sessions = (await harnessApi.list()).map(({ lastOutput: _, ...row }) => row);
+    const stamp = JSON.stringify(sessions);
+    return { stamp, sessions: stamp === held ? null : sessions };
+  });
   vi.mocked(harnessApi.resumable).mockResolvedValue([]);
   vi.mocked(harnessApi.ack).mockResolvedValue();
   // The list's choices live in the app's settings, shared by every test here
@@ -59,6 +69,18 @@ afterEach(async () => { await act(async () => root.unmount()); host.remove(); })
 
 const rows = () => [...host.querySelectorAll('.hs-dir > ul > li')];
 const folders = () => [...host.querySelectorAll('.hs-dir')];
+
+it('only renders the previous and next session rows when selection changes', async () => {
+  const third = { ...running, id: 'r3', title: 'Third session' };
+  vi.mocked(harnessApi.list).mockResolvedValue([ended, running, third]);
+  await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
+  const rowButton = (title: string) => rows().find(r => r.textContent?.includes(title))!.querySelector('button')!;
+  await act(async () => rowButton('Fixing tests').click());
+  vi.mocked(hostedDetail).mockClear();
+  await act(async () => rowButton('Third session').click());
+  expect(vi.mocked(hostedDetail).mock.calls.map(([session]) => session.id).sort()).toEqual(['r1', 'r3']);
+  expect(host.querySelector('.hs-dir li.selected')?.textContent).toContain('Third session');
+});
 
 describe('hiding folders and cleaning up (MCR-107)', () => {
   const label = (path: string) => `[aria-label="Folder ${path}"]`;
@@ -548,13 +570,14 @@ describe('Live workspace', () => {
   it('sets no new list when a poll brings the same sessions, so the view does not render again (MCR-139)', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {
-      vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running }]));
+      let lastOutput = 1;
+      vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running, lastOutput: ++lastOutput }]));
       await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
       const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
       await act(async () => row('Fixing tests').click()); await flush();
       const rendered = renders.length;
       const calls = vi.mocked(harnessApi.list).mock.calls.length;
-      // Same content, fresh objects, a few polls: nothing renders again
+      // New PTY traffic, same display data: the stamp is unchanged.
       for (let i = 0; i < 3; i++) { await act(async () => { vi.advanceTimersByTime(2000); }); await flush(); }
       expect(vi.mocked(harnessApi.list).mock.calls.length).toBeGreaterThan(calls);
       expect(renders.length).toBe(rendered);

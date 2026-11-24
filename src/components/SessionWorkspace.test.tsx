@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { act, useEffect } from 'react';
+import { act, Profiler, useEffect } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionWorkspace from './SessionWorkspace';
@@ -14,14 +14,16 @@ vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // The Live view connects to the runner; these tests are about History.
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(() => new Promise(() => {})), list: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(() => new Promise(() => {})), listSince: vi.fn() } }));
 const session: Session = { id:'a',provider:'codex',parentId:null,name:'root',cwd:'/work/demo',title:'Fix CORE-123',model:'model-a',effort:'high',started:'2026-01-01T00:00:00Z',updated:'2026-01-01T00:00:00Z',modified:Date.now(),status:'working',usage:{input:100,cached:70,cacheWrite:0,output:20,reasoning:5},usageKnown:true,models:{},tools:{shell:2},tickets:['CORE-123'],memoryRefs:[],events:[{seq:1,at:'2026-01-01T00:00:00Z',kind:'assistant',text:'<script>untrusted()</script>',tool:null}],eventCount:1,malformedLines:0,source:'/fake/session.jsonl',turnId:'turn'};
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve,0)); }); };
 const button = (text: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.trim().toLowerCase() === text) || [...host.querySelectorAll('button')].find(b => b.textContent?.toLowerCase().includes(text))!;
 beforeEach(() => { vi.resetAllMocks(); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
   // The stamped read answers with what `snapshot` gives, each time as changed
-  let stamps = 0; vi.mocked(sessionApi.snapshotSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() })); });
+  let stamps = 0; vi.mocked(sessionApi.snapshotSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() }));
+  vi.mocked(harnessApi.listSince).mockImplementation(async stamp => ({ stamp: 'live', sessions: stamp ? null : [] }));
+});
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 describe('Sessions workspace', () => {
   it('reads the snapshot every minute while Live is shown, and every five seconds in Journal (MCR-139)', async () => {
@@ -48,14 +50,20 @@ describe('Sessions workspace', () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {
       const full = await sessionApi.snapshot();
+      let finish!: (answer: { stamp: string; snapshot: null }) => void;
       vi.mocked(sessionApi.snapshotSince).mockReset()
         .mockResolvedValueOnce({ stamp: 'a', snapshot: full })
-        .mockResolvedValue({ stamp: 'a', snapshot: null });
-      await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+        .mockReturnValue(new Promise(resolve => { finish = resolve; }));
+      const commit = vi.fn();
+      await act(async () => root.render(<Profiler id="journal" onRender={commit}><SessionWorkspace onClose={() => {}}/></Profiler>)); await flush();
       expect(host.textContent).toContain('Fix CORE-123');
+      commit.mockClear();
       await act(async () => { vi.advanceTimersByTime(5000); }); await flush();
+      expect(commit).not.toHaveBeenCalled();
+      await act(async () => finish({ stamp: 'a', snapshot: null }));
       // The second read names the stamp held; an answer without a snapshot keeps what is shown
       expect(vi.mocked(sessionApi.snapshotSince).mock.calls.map(c => c[0])).toEqual(['', 'a']);
+      expect(vi.mocked(harnessApi.listSince).mock.calls.map(c => c[0])).toEqual(['', 'live']);
       expect(host.textContent).toContain('Fix CORE-123');
     } finally { vi.useRealTimers(); }
   });
@@ -90,7 +98,7 @@ describe('Sessions workspace', () => {
   it('draws a found session that runs now as its Live row', async () => {
     const hosted: Hosted = { id: 'h1', pid: 42, argv: ['codex'], cwd: '/work/demo', started: 1, cols: 120, rows: 32, title: '', lastOutput: 1, exit: null, unread: 1,
       meta: { label: 'Codex', profile: 'codex', name: 'Parser fixer' }, harness: { profile: 'codex', state: 'waiting', agentSession: 'a', attention: { kind: 'permission', text: 'Approve the command?' } } as Hosted['harness'] };
-    vi.mocked(harnessApi.list).mockResolvedValue([hosted]);
+    vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'live', sessions: [hosted] });
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush(); await flush();
     const row = host.querySelector('.ss-results .sc-session')!;
     expect(row.classList.contains('hs-resume')).toBe(false);

@@ -1,5 +1,5 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@/ui';
@@ -22,7 +22,7 @@ import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
 import '../styles/harness.css';
 import { keepSame } from '../utils/keepSame';
-import { formatSessionTitle } from '../utils/sessions';
+import { formatSessionTitle, type Session } from '../utils/sessions';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const PINNED_KEY = 'hs-dirs';
@@ -31,6 +31,10 @@ const START: [string, string][] = [['claude', 'Claude Code'], ['codex', 'Codex']
 const HISTORY_FOLDERS = 6;
 const BACK_KEYS = PLATFORM === 'macos' ? '⌘[' : 'Alt+Left';
 const FORWARD_KEYS = PLATFORM === 'macos' ? '⌘]' : 'Alt+Right';
+const isAgent = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');
+const EMPTY_TITLES: Record<string, string> = {};
+const rowUsesClock = (h: Hosted, session?: Session) =>
+  !h.exit && !!(h.shells?.length || h.subagents?.some(a => !a.finished) || session?.context?.cacheAt);
 
 const LIST_WIDTH_KEY = 'hs-list-width';
 /** The session list is never narrower than this, and leaves the terminal at least as much. */
@@ -42,7 +46,7 @@ const storedWidth = (): number | null => {
 interface Action { label: string; icon: React.ReactNode; run: () => void; title?: string }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
-function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean }) {
+function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false }: { label: string; actions: Action[] | (() => Action[]); icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean }) {
   const [at, setAt] = useState<{ top: number; right: number } | null>(null);
   const wrap = useRef<HTMLSpanElement>(null);
   useEffect(() => {
@@ -59,10 +63,105 @@ function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-acti
       setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
     }}>{icon ?? <MoreHorizontal size={14}/>}</button>
     {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }} onKeyDown={e => { if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return; e.preventDefault(); const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('button')); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); buttons[(index + (e.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus(); }}>
-      {actions.map(a => <button key={a.label} type="button" role="menuitem" title={a.title} onClick={() => { setAt(null); a.run(); }}>{a.icon} {a.label}</button>)}
+      {(typeof actions === 'function' ? actions() : actions).map(a => <button key={a.label} type="button" role="menuitem" title={a.title} onClick={() => {
+        setAt(null);
+        const current = typeof actions === 'function' ? actions().find(next => next.label === a.label) : a;
+        current?.run();
+      }}>{a.icon} {a.label}</button>)}
     </div>}
   </span>;
 }
+
+type RowHandlers = {
+  select: (id: string) => void;
+  reference: (h: Hosted) => string;
+  actions: (h: Hosted) => Action[];
+  connect: (id: string, supervisorId: string) => void;
+  cancelBinding: () => void;
+};
+
+interface LiveSessionRowProps {
+  h: Hosted;
+  depth: number;
+  executors: number;
+  section: string;
+  elsewhereCwd?: string;
+  elsewhereLabel: string;
+  home: string;
+  label: string;
+  selected: boolean;
+  copied: boolean;
+  peerNames: string;
+  supervisorName: string;
+  session?: Session;
+  /** A shared clock tick invalidates only rows with time-dependent indicators. */
+  clock: number;
+  choices: { here: [string, string][]; elsewhere: [string, string][] } | null;
+  handlers: RowHandlers;
+}
+
+/** Row props describe one session so a selection only changes the old and new rows. */
+const LiveSessionRow = memo(function LiveSessionRow({
+  h, depth, executors, section, elsewhereCwd, elsewhereLabel, home, label, selected, copied,
+  peerNames, supervisorName, session, choices, handlers,
+}: LiveSessionRowProps) {
+  const now = Date.now();
+  const choice = ([id, text]: [string, string]) => <option key={id} value={id}>{text}</option>;
+  const sub = subfolderTag(section, h.cwd);
+  const state = hostedState(h);
+  const role = executors ? 'is-supervisor' : '';
+  const works = h.harness?.supervisor ? 'is-executor' : '';
+  const detail = hostedDetail(h, copied ? 'reference copied' : '');
+  const subs = (h.subagents ?? []).filter(a => !a.finished);
+  const shells = h.exit ? [] : h.shells ?? [];
+  return <li key={h.id} style={depth ? { ['--level' as string]: Math.min(depth, 4) } : undefined} data-depth={depth || undefined}
+    className={[selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, session, now), role, works, depth ? 'hs-nested' : ''].filter(Boolean).join(' ')}>
+    <button className="hs-item" onClick={() => handlers.select(h.id)}
+      draggable={!h.exit} onDragStart={e => { e.dataTransfer.setData(SESSION_DRAG_TYPE, h.id); e.dataTransfer.setData('text/plain', handlers.reference(h)); e.dataTransfer.effectAllowed = 'copy'; }}
+      title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${peerNames}` : ''}${h.exit ? '' : '\nDrag into a terminal to point its agent at this session'}`}>
+      <HostedRow hosted={h} label={label} session={session} detail={detail}
+        before={works && <span className="hs-rel executor" title={`Executor of ${supervisorName}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
+        after={executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
+        // Its folder below the section's on a line of its own: in the name it would be the first thing the ellipsis cuts (MCR-133)
+      under={elsewhereCwd !== undefined ? <small className="hs-under" title={elsewhereCwd}>under {elsewhereLabel} · {shortPath(tildePath(elsewhereCwd, home))}</small>
+          : sub && <small className="hs-under"><span className="hs-rel subdir" title={`Works in ${sub.path}`}>{sub.tag}</span></small>}/>
+    </button>
+    <RowMenu label={`Actions for ${label}`} actions={() => handlers.actions(h)}/>
+    {choices !== null && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
+      <select aria-label="Supervisor" autoFocus defaultValue="" onChange={e => { if (e.target.value) handlers.connect(h.id, e.target.value); }}>
+        <option value="" disabled>{choices.here.length + choices.elsewhere.length ? 'Works for…' : 'No other agent session is running'}</option>
+        {/* Two groups stand in for a separator, which a native select does not draw in every WebKit; one group alone needs no heading */}
+        {choices.here.length > 0 && choices.elsewhere.length > 0
+          ? <><optgroup label="This folder">{choices.here.map(choice)}</optgroup><optgroup label="Other folders">{choices.elsewhere.map(choice)}</optgroup></>
+          : [...choices.here.map(choice), ...choices.elsewhere.map(choice)]}
+      </select>
+      <button type="button" onClick={() => handlers.cancelBinding()}>Cancel</button>
+    </form>}
+    {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
+      {shells.map(sh => {
+        const health = shellHealth(sh, now);
+        const quiet = health === 'quiet' ? runningFor(sh.quietSince ?? now, now) : '';
+        const why = health === 'stopped' ? 'Suspended: it is not running until it is continued.'
+          : health === 'quiet' ? `No processor use for ${quiet}: it may be waiting (the network, a lock, a sleep) or stuck.`
+          : 'Using the processor: alive.';
+        return <li key={sh.pid} className={health} title={`${sh.command}\npid ${sh.pid} · running for ${runningFor(sh.started, now)}${sh.cpu !== undefined ? ` · ${sh.cpu < 10 ? sh.cpu.toFixed(1) : Math.round(sh.cpu)}s of processor time` : ''}\n${why}`}>
+          <Terminal size={11} aria-label={`${health} shell`}/>
+          <span className="hs-item-text"><strong>{sh.command}</strong></span>
+          <small>{health === 'stopped' ? 'stopped · ' : quiet ? `quiet ${quiet} · ` : ''}{runningFor(sh.started, now)}</small>
+        </li>;
+      })}
+    </ul>}
+    {subs.length > 0 && <ul className="hs-subs" aria-label={`Subagents of ${label}`}>
+      {subs.map(a => {
+        const live = subagentActive(a, now);
+        return <li key={a.id} className={live ? 'active' : ''} title={[a.agentType, a.model, live ? 'active' : `quiet, last activity ${formatAge(a.lastActivity)}`, `started ${formatAge(a.started)}`].filter(Boolean).join(' · ')}>
+          <span className={`hs-dot ${live ? 'working' : ''}`} aria-label={live ? 'active' : 'quiet'}/>
+          <span className="hs-item-text"><strong>{a.description || `Subagent ${a.id.slice(0, 8)}`}</strong></span>
+        </li>;
+      })}
+    </ul>}
+  </li>;
+});
 
 function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot: (id: string, el: HTMLElement | null) => void }) {
   const ref = useCallback((el: HTMLElement | null) => registerSlot(sessionId, el), [sessionId, registerSlot]);
@@ -73,8 +172,9 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
  * Agent terminals hosted by the runner. They keep running when this view, the
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
  */
-export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = {}, onSearch, focus }: {
+export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = EMPTY_TITLES, sessionAccess = false, onSearch, focus }: {
   active: boolean; recentDirectories: string[];
+  sessionAccess?: boolean;
   /** A session to show, asked for from another view; `at` makes a repeated ask count */
   focus?: { id: string; at: number };
   /** Display titles by conversation id, when the Sessions index has them */
@@ -96,7 +196,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   // The background processes are not allowed: never asked ('new'), or stopped by the person
   const [gate, setGate] = useState<'new' | 'stopped' | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
-  const metrics = useSessionMetrics(active, hosted);
+  const metrics = useSessionMetrics(active, hosted, sessionAccess);
   // The hosted conversations' titles come with their figures, every ten seconds; the index's (for earlier
   // sessions) with the Sessions workspace's snapshot, which it reads seldom while Live is shown (MCR-139)
   const titles = useMemo(() => ({ ...indexTitles, ...Object.fromEntries(Object.values(metrics).filter(s => !s.parentId).map(s => [s.id, formatSessionTitle(s)])) }), [indexTitles, metrics]);
@@ -140,10 +240,15 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const closing = useRef(new Set<string>());
   // The service's list has been read since this view mounted: before that an empty list says nothing
   const listRead = useRef(false);
+  const listStamp = useRef('');
+  const listRequest = useRef(0);
+  const listShown = useRef(0);
   const mounted = useRef(true);
 
   // Nothing runs and nothing may be started: the list gives way to the question
   const closed = useCallback(() => {
+    listStamp.current = '';
+    listShown.current = ++listRequest.current;
     setStatus(null); setHosted([]); setOpened([]); setSelected(''); setError('');
     harnessApi.background().then(b => { if (mounted.current) setGate(b.consent === 'stopped' ? 'stopped' : 'new'); }).catch(() => { if (mounted.current) setGate('new'); });
   }, []);
@@ -160,9 +265,31 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       }
     }).catch(e => { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); });
   }, [closed]);
-  const refresh = useCallback(async () => {
-    try { const list = await harnessApi.list(); if (mounted.current) { listRead.current = true; setHosted(held => keepSame(held, list)); setError(''); } }
-    catch (e) { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); }
+  const refresh = useCallback(async function refreshList() {
+    const request = ++listRequest.current;
+    const stamp = listStamp.current;
+    try {
+      const answer = await harnessApi.listSince(stamp);
+      if (!mounted.current || request <= listShown.current) return;
+      listShown.current = request;
+      // An overlapping read replaced the base for this unchanged reply.
+      if (!answer.sessions && stamp !== listStamp.current) return refreshList();
+      listRead.current = true;
+      if (answer.sessions) {
+        listStamp.current = answer.stamp;
+        const next = answer.sessions;
+        setHosted(held => {
+          const byId = new Map(held.map(h => [h.id, h]));
+          const rows = next.map(h => keepSame(byId.get(h.id), h) ?? h);
+          return rows.length === held.length && rows.every((h, i) => h === held[i]) ? held : rows;
+        });
+      }
+      setError('');
+    } catch (e) {
+      if (!mounted.current || request <= listShown.current) return;
+      listShown.current = request;
+      if (notAllowed(e)) closed(); else setError(err(e));
+    }
   }, [closed]);
 
   useEffect(() => {
@@ -459,7 +586,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     finally { setStarting(false); }
   };
   const connect_to = (id: string, supervisorId: string | null) => { setBinding(''); act(async () => { await harnessApi.bind(id, supervisorId); }); };
-  const isAgent = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');
   const actions = (h: Hosted): Action[] => [
     // Any agent session can have executors; the Supervisor sees everything already
     ...(isAgent(h) && !isSupervisor(h) ? START.map(([profile, what]) => ({ label: `New executor (${what}) · Preview`, icon: <CornerDownRight size={13}/>, run: () => void startExecutor(h, profile) })) : []),
@@ -536,70 +662,58 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     };
   };
   const supervisorSummary = supervisor ? sessionSummary(supervisor, Date.now()) : null;
-  /** `section`: the folder of the section the row is listed in, for the tag of an executor in a folder below it (MCR-133) */
-  const row = ({ session: h, depth, executors, elsewhere }: RelationRow, section = h.cwd) => {
-    const sub = subfolderTag(section, h.cwd);
-    const state = hostedState(h);
-    const role = executors ? 'is-supervisor' : '';
-    const works = h.harness?.supervisor ? 'is-executor' : '';
-    // Sessions it could work for: live agents, not itself and not below it
-    const below = binding === h.id ? executorsBelow(h.id, hosted) : null;
-    const candidates = below ? hosted.filter(x => isAgent(x) && !isSupervisor(x) && x.id !== h.id && !below.has(x.id)) : [];
-    // Its own folder first, then the others; each by title
+  const latestRowHandlers = useRef<RowHandlers | null>(null);
+  useLayoutEffect(() => {
+    latestRowHandlers.current = {
+      select,
+      reference: h => sessionReference(h, titles),
+      actions,
+      connect: connect_to,
+      cancelBinding: () => setBinding(''),
+    };
+  });
+  // The row can skip a render while a menu action still sees the latest Live state.
+  const rowHandlers = useMemo<RowHandlers>(() => ({
+    select: id => latestRowHandlers.current!.select(id),
+    reference: h => latestRowHandlers.current!.reference(h),
+    actions: h => latestRowHandlers.current?.actions(h) ?? [],
+    connect: (id, supervisorId) => latestRowHandlers.current!.connect(id, supervisorId),
+    cancelBinding: () => latestRowHandlers.current!.cancelBinding(),
+  }), []);
+  const bindingChoices = useMemo(() => {
+    const h = binding && hosted.find(row => row.id === binding);
+    if (!h) return null;
+    const below = executorsBelow(h.id, hosted);
+    const candidates = hosted.filter(x => isAgent(x) && !isSupervisor(x) && x.id !== h.id && !below.has(x.id));
     const choices = supervisorChoices(h, candidates);
-    const choice = (x: Hosted, withFolder: boolean) => <option key={x.id} value={x.id}>{sessionLabel(x)}{withFolder ? ` · ${shortPath(tildePath(x.cwd, home))}` : ''}</option>;
-    const label = sessionLabel(h);
-    const detail = hostedDetail(h, referenced === h.id ? 'reference copied' : '');
-    const subs = (h.subagents ?? []).filter(a => !a.finished);
-    const shells = h.exit ? [] : h.shells ?? [];
-    return <li key={h.id} style={depth ? { ['--level' as string]: Math.min(depth, 4) } : undefined} data-depth={depth || undefined}
-      className={[h.id === selected ? 'selected' : '', needsYou(h) ? 'needs-you' : '', !needsYou(h) && (state === 'idle' || h.exit) && !shells.length ? 'idle' : '', cacheClass(h, metrics, Date.now()), role, works, depth ? 'hs-nested' : ''].filter(Boolean).join(' ')}>
-      <button className="hs-item" onClick={() => select(h.id)}
-        draggable={!h.exit} onDragStart={e => { e.dataTransfer.setData(SESSION_DRAG_TYPE, h.id); e.dataTransfer.setData('text/plain', sessionReference(h, titles)); e.dataTransfer.effectAllowed = 'copy'; }}
-        title={`${STATE_LABEL[state]} · pid ${h.pid ?? '?'}\n${h.argv.join(' ')}\n${h.cwd}${h.peers?.length ? `\nIn contact with: ${h.peers.map(id => names.get(id) ?? id).join(', ')}` : ''}${h.exit ? '' : '\nDrag into a terminal to point its agent at this session'}`}>
-        <HostedRow hosted={h} label={label} session={indexedSession(h, metrics)} detail={detail}
-          before={works && <span className="hs-rel executor" title={`Executor of ${names.get(h.harness?.supervisor ?? '') ?? 'a session'}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
-          after={executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
-          // Its folder below the section's on a line of its own: in the name it would be the first thing the ellipsis cuts (MCR-133)
-          under={elsewhere ? <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>
-            : sub && <small className="hs-under"><span className="hs-rel subdir" title={`Works in ${sub.path}`}>{sub.tag}</span></small>}/>
-      </button>
-      <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
-      {binding === h.id && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
-        <select aria-label="Supervisor" autoFocus defaultValue="" onChange={e => { if (e.target.value) connect_to(h.id, e.target.value); }}>
-          <option value="" disabled>{candidates.length ? 'Works for…' : 'No other agent session is running'}</option>
-          {/* Two groups stand in for a separator, which a native select does not draw in every WebKit; one group alone needs no heading */}
-          {choices.here.length > 0 && choices.elsewhere.length > 0
-            ? <><optgroup label="This folder">{choices.here.map(x => choice(x, false))}</optgroup><optgroup label="Other folders">{choices.elsewhere.map(x => choice(x, true))}</optgroup></>
-            : [...choices.here.map(x => choice(x, false)), ...choices.elsewhere.map(x => choice(x, true))]}
-        </select>
-        <button type="button" onClick={() => setBinding('')}>Cancel</button>
-      </form>}
-      {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
-        {shells.map(sh => {
-          const now = Date.now();
-          const health = shellHealth(sh, now);
-          const quiet = health === 'quiet' ? runningFor(sh.quietSince ?? now, now) : '';
-          const why = health === 'stopped' ? 'Suspended: it is not running until it is continued.'
-            : health === 'quiet' ? `No processor use for ${quiet}: it may be waiting (the network, a lock, a sleep) or stuck.`
-            : 'Using the processor: alive.';
-          return <li key={sh.pid} className={health} title={`${sh.command}\npid ${sh.pid} · running for ${runningFor(sh.started, now)}${sh.cpu !== undefined ? ` · ${sh.cpu < 10 ? sh.cpu.toFixed(1) : Math.round(sh.cpu)}s of processor time` : ''}\n${why}`}>
-            <Terminal size={11} aria-label={`${health} shell`}/>
-            <span className="hs-item-text"><strong>{sh.command}</strong></span>
-            <small>{health === 'stopped' ? 'stopped · ' : quiet ? `quiet ${quiet} · ` : ''}{runningFor(sh.started, now)}</small>
-          </li>;
-        })}
-      </ul>}
-      {subs.length > 0 && <ul className="hs-subs" aria-label={`Subagents of ${label}`}>
-        {subs.map(a => {
-          const live = subagentActive(a, Date.now());
-          return <li key={a.id} className={live ? 'active' : ''} title={[a.agentType, a.model, live ? 'active' : `quiet, last activity ${formatAge(a.lastActivity)}`, `started ${formatAge(a.started)}`].filter(Boolean).join(' · ')}>
-            <span className={`hs-dot ${live ? 'working' : ''}`} aria-label={live ? 'active' : 'quiet'}/>
-            <span className="hs-item-text"><strong>{a.description || `Subagent ${a.id.slice(0, 8)}`}</strong></span>
-          </li>;
-        })}
-      </ul>}
-    </li>;
+    return {
+      here: choices.here.map((x): [string, string] => [x.id, liveSessionLabel(x, titles)]),
+      elsewhere: choices.elsewhere.map((x): [string, string] => [
+        x.id, `${liveSessionLabel(x, titles)} · ${shortPath(tildePath(x.cwd, home))}`,
+      ]),
+    };
+  }, [binding, hosted, titles, home]);
+  const [rowClock, setRowClock] = useState(0);
+  const hasTimedRows = hosted.some(h => rowUsesClock(h, indexedSession(h, metrics)));
+  useEffect(() => {
+    if (!active || !hasTimedRows) return;
+    const tick = () => { if (!document.hidden) setRowClock(Date.now()); };
+    tick();
+    const timer = setInterval(tick, 30_000);
+    document.addEventListener('visibilitychange', tick);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', tick); };
+  }, [active, hasTimedRows]);
+
+  /** The section supplies the relative folder for an executor listed below its supervisor. */
+  const row = ({ session: h, depth, executors, elsewhere }: RelationRow, section = h.cwd) => {
+    const session = indexedSession(h, metrics);
+    return <LiveSessionRow key={h.id} h={h} depth={depth} executors={executors} section={section}
+      elsewhereCwd={elsewhere?.cwd} elsewhereLabel={elsewhere ? sessionLabel(elsewhere) : ''} home={home}
+      label={sessionLabel(h)} selected={h.id === selected} copied={h.id === referenced}
+      peerNames={h.peers?.map(id => names.get(id) ?? id).join(', ') ?? ''}
+      supervisorName={names.get(h.harness?.supervisor ?? '') ?? 'a session'}
+      session={session} clock={rowUsesClock(h, session) ? rowClock : 0}
+      choices={binding === h.id ? bindingChoices : null} handlers={rowHandlers}/>;
   };
 
   const sidebarOverride = pluginRegistry.getOverride('live:sidebar');

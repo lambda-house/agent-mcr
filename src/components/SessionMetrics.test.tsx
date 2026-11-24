@@ -41,17 +41,17 @@ it('shows bare figures and explains them in one tooltip', async () => {
     // The cache: time left while warm, "cold" after its lifetime, with what waking up costs
     await act(async () => root.render(<SessionMetrics hosted={hosted} data={unrecorded(180_000, { cacheTtl: 3600, cacheAt: Date.now() - 18 * 60_000 })}/>));
     expect(host.querySelector('.hs-metric-cache')?.textContent).toMatch(/^4[12]m$/);
-    expect(cacheClass(hosted, unrecorded(180_000, { cacheTtl: 3600, cacheAt: Date.now() - 18 * 60_000 }), Date.now())).toBe('cache-warm');
-    expect(cacheClass(hosted, unrecorded(180_000, { cacheTtl: 3600, cacheAt: Date.now() - 55 * 60_000 }), Date.now())).toBe('cache-warm cache-cooling');
+    expect(cacheClass(hosted, unrecorded(180_000, { cacheTtl: 3600, cacheAt: Date.now() - 18 * 60_000 })['claude:s1'], Date.now())).toBe('cache-warm');
+    expect(cacheClass(hosted, unrecorded(180_000, { cacheTtl: 3600, cacheAt: Date.now() - 55 * 60_000 })['claude:s1'], Date.now())).toBe('cache-warm cache-cooling');
     const cold = unrecorded(180_000, { cacheTtl: 300, cacheAt: Date.now() - 3600_000, coldWakeups: 2, coldTokens: 300_000 });
     await act(async () => root.render(<SessionMetrics hosted={hosted} data={cold}/>));
     expect(host.querySelector('.hs-metric-cache.cold')?.textContent).toBe('cold');
     expect(title()).toContain('Waking the session up writes about 180K tokens to the cache again');
     expect(title()).toContain('Cold wakeups so far: 2 · 300K tokens read uncached');
-    expect(cacheClass(hosted, cold, Date.now())).toBe('cache-cold');
+    expect(cacheClass(hosted, cold['claude:s1'], Date.now())).toBe('cache-cold');
     // At work it is being refreshed, whatever the index last saw; an ended one has no cache to keep
-    expect(cacheClass({ ...hosted, harness: { ...hosted.harness!, state: 'working' } }, cold, Date.now())).toBe('cache-warm');
-    expect(cacheClass({ ...hosted, exit: { code: 0, signal: null, at: 1 } }, cold, Date.now())).toBe('');
+    expect(cacheClass({ ...hosted, harness: { ...hosted.harness!, state: 'working' } }, cold['claude:s1'], Date.now())).toBe('cache-warm');
+    expect(cacheClass({ ...hosted, exit: { code: 0, signal: null, at: 1 } }, cold['claude:s1'], Date.now())).toBe('');
     await act(async () => root.render(<SessionMetrics hosted={hosted} data={{}}/>));
     expect(host.textContent).toBe('');
   } finally { await act(async () => root.unmount()); }
@@ -60,7 +60,7 @@ it('does not overlap scans and clears values after access/read failure', async (
   vi.useFakeTimers();
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   const host = document.createElement('div'); const root = createRoot(host);
-  function Probe() { const data = useSessionMetrics(true, [hosted]); return <span>{Object.keys(data).length}</span>; }
+  function Probe() { const data = useSessionMetrics(true, [hosted], true); return <span>{Object.keys(data).length}</span>; }
   let resolve!: (v: any) => void;
   vi.mocked(sessionApi.pick).mockImplementationOnce(() => new Promise(r => { resolve = r; })).mockRejectedValue(new Error('access revoked'));
   try {
@@ -73,6 +73,29 @@ it('does not overlap scans and clears values after access/read failure', async (
     expect(host.textContent).toBe('0');
   } finally { await act(async () => root.unmount()); vi.useRealTimers(); }
 });
+
+it('starts polling only after a grant and stops with figures cleared when revoked', async () => {
+  vi.useFakeTimers();
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  const host = document.createElement('div'); const root = createRoot(host);
+  function Probe({ access }: { access: boolean }) {
+    const data = useSessionMetrics(true, [hosted], access);
+    return <span>{Object.keys(data).length}</span>;
+  }
+  vi.mocked(sessionApi.pick).mockReset().mockResolvedValue([session]);
+  try {
+    await act(async () => root.render(<Probe access={false}/>));
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(sessionApi.pick).not.toHaveBeenCalled();
+    await act(async () => root.render(<Probe access/>));
+    expect(sessionApi.pick).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toBe('1');
+    await act(async () => root.render(<Probe access={false}/>));
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(sessionApi.pick).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toBe('0');
+  } finally { await act(async () => root.unmount()); vi.useRealTimers(); }
+});
 it('asks the index for the listed conversations only, ended ones included, and for a new one as soon as it runs (MCR-139)', async () => {
   vi.useFakeTimers();
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -80,7 +103,7 @@ it('asks the index for the listed conversations only, ended ones included, and f
   const shell = { meta: { profile: 'shell' }, harness: { agentSession: '' } } as unknown as Hosted;
   const ended = { meta: { profile: 'codex' }, harness: { agentSession: 'old' }, exit: { code: 0 } } as unknown as Hosted;
   const codex = { meta: { profile: 'codex' }, harness: { profile: 'codex', agentSession: 'c1' } } as unknown as Hosted;
-  function Probe({ list }: { list: Hosted[] }) { const data = useSessionMetrics(true, list); return <span>{Object.keys(data).join(',')}</span>; }
+  function Probe({ list }: { list: Hosted[] }) { const data = useSessionMetrics(true, list, true); return <span>{Object.keys(data).join(',')}</span>; }
   vi.mocked(sessionApi.snapshot).mockReset();
   vi.mocked(sessionApi.pick).mockReset().mockImplementation(keys => Promise.resolve(keys.includes('claude:s1') ? [session] : []));
   try {

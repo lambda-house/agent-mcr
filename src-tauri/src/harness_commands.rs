@@ -474,14 +474,33 @@ pub async fn harness_outside_supervisors(app: tauri::AppHandle, on: bool) -> Res
 #[tauri::command]
 pub async fn harness_list(state: State<'_, HarnessState>) -> Result<Value, String> {
     let drafts = state.drafts.clone();
-    blocking(move || {
-        let list = service(json!({"op": "sessions"}))?;
-        if let Ok(mut drafts) = drafts.lock() {
-            prune(&mut drafts, &list);
-        }
-        Ok(list)
-    })
-    .await
+    blocking(move || read_list(&drafts)).await
+}
+
+fn read_list(drafts: &Mutex<BTreeMap<String, Draft>>) -> Result<Value, String> {
+    let list = service(json!({"op": "sessions"}))?;
+    if let Ok(mut drafts) = drafts.lock() {
+        prune(&mut drafts, &list);
+    }
+    Ok(list)
+}
+
+#[tauri::command]
+pub async fn harness_list_since(stamp: Option<String>, state: State<'_, HarnessState>) -> Result<Value, String> {
+    let drafts = state.drafts.clone();
+    blocking(move || list_since(read_list(&drafts)?, stamp.as_deref())).await
+}
+
+fn list_since(mut list: Value, held: Option<&str>) -> Result<Value, String> {
+    use sha2::{Digest, Sha256};
+    let mut sessions = list["sessions"].take();
+    for row in sessions.as_array_mut().into_iter().flatten().filter_map(Value::as_object_mut) {
+        // Terminal traffic changes this timestamp without changing anything the Live view shows.
+        row.remove("lastOutput");
+    }
+    let bytes = serde_json::to_vec(&sessions).map_err(|e| e.to_string())?;
+    let stamp: String = Sha256::digest(bytes).iter().take(16).map(|b| format!("{b:02x}")).collect();
+    Ok(json!({ "sessions": (held != Some(stamp.as_str())).then_some(sessions), "stamp": stamp }))
 }
 
 /// The app's count of a line the service has since ended by itself
@@ -782,6 +801,17 @@ pub async fn memory_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
 #[tauri::command]
 pub async fn slack_status() -> Result<Value, String> {
     blocking(|| service(json!({"op": "slack"}))).await
+}
+
+#[tauri::command]
+pub async fn slack_waiting() -> Result<u64, String> {
+    blocking(|| {
+        let waiting = service(json!({"op": "slack", "waitingOnly": true}))?;
+        // An older service ignores the new field and returns the full status.
+        waiting.as_u64().or_else(|| waiting["counts"]["waiting"].as_u64())
+            .ok_or_else(|| "The harness returned no Slack approval count".into())
+    })
+    .await
 }
 
 /// Check the tokens with Slack, ask the person, then keep the tokens in the Keychain.
@@ -1170,6 +1200,17 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_list_sends_visible_changes_and_ignores_terminal_output() {
+        let list = |last, state| json!({"sessions": [{"id": "a", "lastOutput": last, "harness": {"state": state}}]});
+        let initial = list_since(list(1, "working"), None).unwrap();
+        let stamp = initial["stamp"].as_str();
+        assert_eq!(initial["sessions"], json!([{"id": "a", "harness": {"state": "working"}}]));
+        assert!(list_since(list(2, "working"), stamp).unwrap()["sessions"].is_null());
+        assert_eq!(list_since(list(3, "idle"), stamp).unwrap()["sessions"][0]["harness"]["state"], "idle");
+        assert_eq!(list_since(json!({"sessions": []}), stamp).unwrap()["sessions"], json!([]));
+    }
 
     #[test]
     fn a_frame_is_never_short_enough_to_go_as_source_text_and_says_its_length() {

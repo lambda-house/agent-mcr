@@ -104,8 +104,11 @@ pub struct SnapshotSince {
 /// time it ran, the bytes it read), which change at every scan.
 pub fn stamp(snapshot: &sessions::Snapshot) -> String {
     use sha2::{Digest, Sha256};
-    let shown = serde_json::to_vec(&(&snapshot.sessions, &snapshot.errors, snapshot.pending_files, snapshot.scanned_files, &snapshot.cache_path, &snapshot.current_directory)).unwrap_or_default();
-    Sha256::digest(&shown).iter().take(16).map(|b| format!("{b:02x}")).collect()
+    let shown = (&snapshot.sessions, &snapshot.errors, snapshot.pending_files, snapshot.scanned_files, &snapshot.cache_path, &snapshot.current_directory);
+    let mut digest = std::io::BufWriter::new(Sha256::new());
+    let result = serde_json::to_writer(&mut digest, &shown).and_then(|()|
+        digest.into_inner().map_err(|e| serde_json::Error::io(e.into_error())));
+    result.unwrap_or_default().finalize().iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 /// The snapshot to send for a holder of `held`: none when nothing it shows changed.
@@ -219,7 +222,7 @@ pub async fn session_details(
         index
             .lock()
             .map_err(|_| "Index lock poisoned".to_string())?
-            .detail(&provider, &id)
+            .detail(&provider, &id)?
             .ok_or_else(|| "Session no longer indexed".into())
     })
     .await
@@ -302,7 +305,7 @@ pub async fn session_memories(
                 index
                     .lock()
                     .map_err(|_| "Index lock poisoned")?
-                    .detail(&provider, &id)
+                    .summary_of(&provider, &id)
                     .ok_or("Session not indexed")?,
             )
         } else {
@@ -327,7 +330,7 @@ pub async fn read_session_memory(
     let home = dirs::home_dir().ok_or("Home directory unavailable")?;
     let opened_key = key.clone();
     let document = tauri::async_runtime::spawn_blocking(move|| {
-        let session=if let (Some(provider),Some(id))=(provider,id) {Some(index.lock().map_err(|_|"Index lock poisoned")?.detail(&provider,&id).ok_or("Session not indexed")?)}else{None};
+        let session=if let (Some(provider),Some(id))=(provider,id) {Some(index.lock().map_err(|_|"Index lock poisoned")?.summary_of(&provider,&id).ok_or("Session not indexed")?)}else{None};
         if key=="transcript-memory" {
             let s=session.ok_or("Select a session")?;
             let events=index.lock().map_err(|_|"Index lock poisoned")?.memory_events(&s.provider,&s.id)?;
