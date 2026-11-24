@@ -21,6 +21,7 @@ export const RESIZE_SETTLE_MS = 200;
 export const QUIT_WINDOW_MS = 10_000;
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
+const INPUT_DROPPED_NOTICE = 'Terminal input was dropped. Check the prompt and retype the lost keys.';
 
 /** Colours from the Sessions palette the pane sits in (light and dark). */
 function theme(element: HTMLElement) {
@@ -134,6 +135,9 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   const replacement = useRef<{ id: string; view: TerminalView } | null>(null);
   // The terminal let go had the keyboard: the new one takes it (review 17090)
   const refocus = useRef(false);
+  const pendingEnter = useRef<{ id: string; retry: boolean } | null>(null);
+  // Keep track across a view replacement: the next Enter may belong to lost keys.
+  const inputLost = useRef(false);
   const [notice, setNotice] = useState('');
   // Copy as task (MCR-125 v0): the right-click menu on a selection, and the dialog with its passage
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -155,6 +159,8 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   const copyText = (text: string) => { harnessApi.copyText(text).catch(e => setNotice(err(e))); };
 
   useEffect(() => () => {
+    if (pendingEnter.current?.id === id) pendingEnter.current = null;
+    inputLost.current = false;
     if (replacement.current?.id === id) {
       replacement.current.view.dispose();
       replacement.current = null;
@@ -187,13 +193,13 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       t.unicode.activeVersion = '11';
       t.open(element);
       disableOutputScrollbarReveal(t);
-      if (refocus.current) {
-        refocus.current = false;
-        requestAnimationFrame(() => {
-          const focused = document.activeElement;
-          if (!document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) t.focus();
-        });
-      }
+    }
+    if (refocus.current) {
+      refocus.current = false;
+      requestAnimationFrame(() => {
+        const focused = document.activeElement;
+        if (shown.current && !document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) t.focus();
+      });
     }
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
@@ -335,6 +341,61 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     let offset: number | null = kept?.offset ?? null;
     // This terminal is not to be kept or used again: the runner could not go on where it left off
     let discard = false;
+    let reconnecting = false;
+    let writingInput = false;
+    const inputQueue: { handle: number; data: string; retry: boolean }[] = [];
+    const loseInput = () => {
+      inputLost.current = true;
+      pendingEnter.current = null;
+    };
+    const dropInput = (data: string) => {
+      if (data === '\r') {
+        // This Enter belonged to the lost keys. The next one can submit again.
+        inputLost.current = false;
+      } else {
+        loseInput();
+        setNotice(INPUT_DROPPED_NOTICE);
+      }
+    };
+    const flushInput = async () => {
+      if (writingInput) return;
+      writingInput = true;
+      try {
+        // Process even dropped input in order so its Enter ends the sequence.
+        for (let next = inputQueue.shift(); next && !disposed; next = inputQueue.shift()) {
+          const { handle, data, retry } = next;
+          const enter = data === '\r';
+          if (discard || reconnecting || (enter && inputLost.current)) {
+            dropInput(data);
+            continue;
+          }
+          try {
+            await harnessApi.input(handle, data);
+            if (enter && !disposed) setNotice(n => n === INPUT_DROPPED_NOTICE ? '' : n);
+          } catch (error) {
+            if (disposed) return;
+            const message = err(error);
+            if (!enter) loseInput();
+            if (!discard && retry && message.startsWith('The terminal is detached') && shown.current) {
+              reconnecting = true;
+              refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
+              if (enter) {
+                pendingEnter.current = { id, retry: false };
+                continue;
+              }
+            }
+            setNotice(message);
+          }
+        }
+      } finally {
+        writingInput = false;
+        if (!disposed && (discard || reconnecting)) setFresh(n => n + 1);
+      }
+    };
+    const sendInput = (handle: number, data: string, retry: boolean) => {
+      inputQueue.push({ handle, data, retry });
+      void flushInput();
+    };
     view.listen({
       start: from => {
         // The runner could not start where this terminal left off (it holds no
@@ -348,7 +409,8 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
           refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
           view.pause();
           replacement.current = { id, view };
-          setFresh(n => n + 1);
+          // Account for the in-flight write before dropping the queued keys.
+          if (!writingInput) setFresh(n => n + 1);
           return;
         }
         offset = from;
@@ -363,12 +425,31 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
         t.write(bytes);
         if (offset !== null) offset += bytes.length;
       },
-      ready: () => { void sendSize(t.cols, t.rows); },
-      error: e => setNotice(err(e)),
+      ready: () => {
+        const enter = pendingEnter.current;
+        if (enter?.id === id && view.handle !== null) {
+          pendingEnter.current = null;
+          if (shown.current) sendInput(view.handle, '\r', enter.retry);
+        }
+        void sendSize(t.cols, t.rows);
+      },
+      error: e => {
+        if (pendingEnter.current?.id === id) pendingEnter.current = null;
+        setNotice(err(e));
+      },
     });
     if (!transferred) view.open(id, offset);
 
-    const typed = t.onData(data => { if (view.handle !== null) harnessApi.input(view.handle, data).catch(e => setNotice(err(e))); });
+    const typed = t.onData(data => {
+      if (disposed) return;
+      if (view.handle !== null && ((!discard && !reconnecting) || (shown.current && writingInput))) {
+        sendInput(view.handle, data, true);
+      } else if (shown.current) {
+        if (data === '\r' && !discard && !reconnecting && !inputLost.current) {
+          pendingEnter.current = { id, retry: true };
+        } else dropInput(data);
+      }
+    });
     const resized = t.onResize(({ cols, rows }) => { void sendSize(cols, rows); });
 
     const onPaste = (e: ClipboardEvent) => {
@@ -419,6 +500,8 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     observer.observe(element);
     return () => {
       disposed = true;
+      // A hidden pane gives up its handle. Drop bytes that have yet to be sent.
+      inputQueue.length = 0;
       clearTimeout(settle);
       observer.disconnect();
       element.removeEventListener('paste', onPaste, true);
