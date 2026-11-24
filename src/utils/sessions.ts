@@ -21,6 +21,29 @@ export interface Session {
   context?: ContextStats;
 }
 export interface Snapshot { sessions: Session[]; errors: string[]; scannedFiles: number; pendingFiles: number; indexedAt: number; cachePath?: string | null; restoredFiles?: number; bytesRead?: number; currentDirectory?: string }
+export interface JournalUpdate {
+  stamp: string;
+  snapshot: Snapshot | null;
+  /** Present for a delta. Each entry is the position of its supplied session in the new snapshot. */
+  positions?: number[];
+  removed?: string[];
+}
+
+export function applyJournalUpdate(current: Snapshot, { snapshot, positions, removed = [] }: JournalUpdate): Snapshot {
+  if (!snapshot) return current;
+  if (!positions) return snapshot;
+  if (!positions.length && !removed.length) return { ...snapshot, sessions: current.sessions };
+  const replaced = new Set([...removed, ...snapshot.sessions.map(s => s.source)]);
+  const retained = current.sessions.filter(s => !replaced.has(s.source));
+  let nextChanged = 0;
+  let nextRetained = 0;
+  // Unchanged rows keep their relative order. Fill around the changed rows at
+  // the positions supplied by the index, preserving that index's tie-breaks.
+  const sessions = Array.from({ length: retained.length + positions.length }, (_, i) =>
+    i === positions[nextChanged] ? snapshot.sessions[nextChanged++] : retained[nextRetained++]);
+  return { ...snapshot, sessions };
+}
+
 export interface MemoryItem { key: string; title: string; provider: string; scope: string; path: string; modified: number; description: string }
 export interface MemoryCatalog { entries: MemoryItem[]; notes: string[] }
 export interface MemoryDocument { title: string; content: string; provenance: string; note: string }
@@ -37,8 +60,7 @@ export const sessionApi = {
   stats: (provider: string, id: string) => invoke<Session>('session_stats', { provider, id }),
   detail: (provider: string, id: string) => invoke<Session>('session_details', { provider, id }),
   snapshot: () => invoke<Snapshot>('sessions_snapshot'),
-  /** The same scan for a holder of a snapshot: none when what it shows has the stamp held (MCR-141) */
-  snapshotSince: (stamp: string) => invoke<{ stamp: string; snapshot: Snapshot | null }>('sessions_snapshot_since', { stamp: stamp || null }),
+  journalSince: (stamp: string) => invoke<JournalUpdate>('sessions_journal_since', { stamp: stamp || null }),
   /** The same scan, answered with the named sessions only (`provider:id` keys) */
   pick: (keys: string[]) => invoke<Session[]>('sessions_pick', { keys }),
 };

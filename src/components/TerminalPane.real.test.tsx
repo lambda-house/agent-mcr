@@ -36,7 +36,7 @@ vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { activate() {} fit() {} di
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: {
   attach: vi.fn(), detach: vi.fn(), resize: vi.fn(() => Promise.resolve()), input: vi.fn(), saveImage: vi.fn(),
-  status: vi.fn(), list: vi.fn(), resumable: vi.fn(),
+  status: vi.fn(), listSince: vi.fn(), resumable: vi.fn(),
 } }));
 vi.mock('../utils/tauri', async importOriginal => ({ ...await importOriginal<object>(), isTauri: () => true }));
 
@@ -87,7 +87,7 @@ it('detaches zero-height and clipped panes, drops late frames, and reuses the xt
   const session: Hosted = { id: 'geometry', pid: 7, argv: [], cwd: '/work/repo', started: 1, cols: 80, rows: 24,
     title: 'Geometry test', lastOutput: 1, exit: null, meta: {} };
   vi.mocked(harnessApi.status).mockResolvedValue({ runner: { protocol: 1, pid: 8, version: 'test', exe: '/x' }, profiles: [], home: '/work' });
-  vi.mocked(harnessApi.list).mockResolvedValue([session]);
+  vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'geometry', sessions: [session] });
   vi.mocked(harnessApi.resumable).mockResolvedValue([]);
   vi.mocked(harnessApi.detach).mockClear();
   const rect = (height: number) => new DOMRect(0, 0, 640, height);

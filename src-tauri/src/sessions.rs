@@ -214,6 +214,7 @@ pub struct Session {
     pub skill_observations: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub context: Context,
+    #[serde(default)]
     pub events: VecDeque<Event>,
     #[serde(skip)]
     pending_events: Vec<Event>,
@@ -369,6 +370,7 @@ struct Indexed {
     offset: u64,
     modified: u64,
     session: Session,
+    #[serde(default)]
     records: HashMap<String, Usage>,
     /// Tool calls whose result hasn't been seen yet: call id → tool name
     #[serde(default)]
@@ -384,6 +386,9 @@ struct Indexed {
     reset: bool,
     #[serde(skip)]
     dirty: bool,
+    /// The event tail and parser maps are in the persisted checkpoint.
+    #[serde(skip)]
+    parked: bool,
 }
 impl Indexed {
     fn new(path: &Path, provider: &str) -> Self {
@@ -436,6 +441,7 @@ impl Indexed {
             tail_hash: 0,
             reset: false,
             dirty: false,
+            parked: false,
         }
     }
     fn usage(&mut self, key: String, usage: Usage, model: String) {
@@ -737,7 +743,15 @@ impl Indexed {
             }
         }
     }
-    fn read(&mut self, path: &Path) -> Result<u64, String> {
+    fn park(&mut self) {
+        self.session.events = VecDeque::new();
+        self.session.pending_events = Vec::new();
+        self.records = HashMap::new();
+        self.calls = HashMap::new();
+        self.parked = true;
+    }
+
+    fn read(&mut self, path: &Path, db: Option<&mut Database>) -> Result<u64, String> {
         if self.parser_version != PARSER_VERSION {
             *self = Self::new(path, &self.session.provider);
             self.reset = true;
@@ -786,6 +800,13 @@ impl Indexed {
         {
             *self = Self::new(path, &self.session.provider);
             self.reset = true;
+        } else if self.parked {
+            // An unchanged transcript returned above. An append needs its exact
+            // deduplication state and event tail, so reload just this checkpoint.
+            let db = db.ok_or("Missing session database")?;
+            let rows = db.rows("SELECT checkpoint FROM files WHERE path=?1", &[path.to_string_lossy().as_ref()])?;
+            let checkpoint = rows.first().ok_or("Missing checkpoint")?;
+            *self = serde_json::from_str(&checkpoint[0]).map_err(|e| format!("Read index checkpoint: {e}"))?;
         }
         self.identity = identity;
         self.modified = modified;
@@ -1046,9 +1067,15 @@ impl Index {
             }
         }
         let mut restored = HashMap::new();
-        for row in db.rows("SELECT path,checkpoint FROM files", &[])? {
-            let indexed =
+        // Project out the large parts in SQLite so fetching the rows also
+        // avoids a temporary copy of all event tails and parser maps.
+        for row in db.rows(
+            "SELECT path,json_remove(checkpoint,'$.session.events','$.records','$.calls') FROM files",
+            &[],
+        )? {
+            let mut indexed: Indexed =
                 serde_json::from_str(&row[1]).map_err(|e| format!("Read index checkpoint: {e}"))?;
+            indexed.parked = true;
             restored.insert(PathBuf::from(&row[0]), indexed);
         }
         self.generation = db.rows("SELECT generation FROM analysis_meta WHERE id=1", &[])?[0][0]
@@ -1081,9 +1108,11 @@ impl Index {
                 db.batch("UPDATE analysis_meta SET generation=generation+1 WHERE id=1")?;
                 Ok(())
             })?;
+            item.park();
+        } else {
+            item.session.pending_events.clear();
         }
         self.generation += 1;
-        item.session.pending_events.clear();
         item.reset = false;
         item.dirty = false;
         Ok(())
@@ -1134,6 +1163,10 @@ impl Index {
         let Some(db) = &mut self.database else {
             return Ok(None);
         };
+        Self::recent_events(db, &path, before).map(Some)
+    }
+
+    fn recent_events(db: &mut Database, path: &Path, before: u64) -> Result<Vec<Event>, String> {
         let rows = db.rows(
             "SELECT body FROM events WHERE path=?1 AND seq<=?2 ORDER BY seq DESC LIMIT 300",
             &[path.to_string_lossy().as_ref(), &before.to_string()],
@@ -1143,13 +1176,13 @@ impl Index {
             events.push(serde_json::from_str(&row[0]).map_err(|e| e.to_string())?);
         }
         events.reverse();
-        Ok(Some(events))
+        Ok(events)
     }
     pub fn memory_events(&mut self, provider: &str, id: &str) -> Result<Vec<Event>, String> {
         let path = self.source(provider, id)?;
         let Some(db) = &mut self.database else {
             return Ok(self
-                .detail(provider, id)
+                .detail(provider, id)?
                 .map(|s| {
                     s.events
                         .into_iter()
@@ -1166,11 +1199,16 @@ impl Index {
             .map(|r| serde_json::from_str(&r[0]).map_err(|e| e.to_string()))
             .collect()
     }
-    pub fn detail(&self, provider: &str, id: &str) -> Option<Session> {
-        self.files
-            .values()
-            .find(|i| i.session.provider == provider && i.session.id == id)
-            .map(|i| i.session.clone())
+    pub fn detail(&mut self, provider: &str, id: &str) -> Result<Option<Session>, String> {
+        let Some((path, item)) = self.files.iter().find(|(_, i)| i.session.provider == provider && i.session.id == id) else {
+            return Ok(None);
+        };
+        let mut session = item.session.clone();
+        if item.parked {
+            let db = self.database.as_mut().ok_or("Missing session database")?;
+            session.events = Self::recent_events(db, path, session.event_count)?.into();
+        }
+        Ok(Some(session))
     }
 
     /// One session without its events: usage, tools and context figures.
@@ -1224,7 +1262,7 @@ impl Index {
                     item.observed_size,
                     item.caught_up,
                 );
-                match item.read(&path) {
+                match item.read(&path, self.database.as_mut()) {
                     Ok(bytes) => bytes_read += bytes,
                     Err(e) => errors.push(format!("{}: {e}", path.display())),
                 }
@@ -1298,7 +1336,10 @@ impl Index {
                 s
             })
             .collect();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
+        sessions.sort_by(|a, b| b.modified.cmp(&a.modified)
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.source.cmp(&b.source)));
         self.last_scan = chrono::Utc::now().timestamp_millis().max(0) as u64;
         self.scan_errors = errors.len();
         Snapshot {
@@ -1405,6 +1446,9 @@ mod tests {
         let initial = drain(&mut first, &home);
         assert!(initial.bytes_read > 0);
         assert_eq!(initial.sessions[0].usage.input, 10);
+        assert!(first.files[&path].parked);
+        assert!(first.files[&path].records.is_empty() && first.files[&path].session.events.is_empty());
+        assert_eq!(first.detail("claude", "s1").unwrap().unwrap().events.back().unwrap().text, "working");
         drop(first);
         let mut second = Index::default();
         second.open_cache(&cache).unwrap();
@@ -1412,6 +1456,8 @@ mod tests {
         assert_eq!(warm.restored_files, 1);
         assert_eq!(warm.bytes_read, 0);
         assert_eq!(warm.sessions[0].usage.input, 10);
+        assert!(second.files[&path].parked);
+        assert!(second.files[&path].records.is_empty() && second.files[&path].session.events.is_empty());
         append(&path, usage);
         append(
             &path,
@@ -1420,6 +1466,9 @@ mod tests {
         let update = drain(&mut second, &home);
         assert_eq!(update.sessions[0].usage.input, 17);
         assert_eq!(update.sessions[0].usage.output, 5);
+        let detail = second.detail("claude", "s1").unwrap().unwrap();
+        assert_eq!(detail.events.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), ["Build a persistent index", "working"]);
+        assert!(second.files[&path].session.events.is_empty());
         assert!(!second
             .cached_events("claude", "s1", 100)
             .unwrap()
@@ -1446,6 +1495,9 @@ mod tests {
         let page = second.cached_events("claude", "s1", 320).unwrap().unwrap();
         assert_eq!(page.len(), 300);
         assert_eq!(page[0].seq, 21);
+        let detail = second.detail("claude", "s1").unwrap().unwrap();
+        assert_eq!(detail.events.len(), 300);
+        assert_eq!(detail.events.front().unwrap().seq, 321);
         fs::write(&path, b"").unwrap();
         append(
             &path,
@@ -1689,19 +1741,19 @@ mod tests {
         ));
         fs::write(&path, b"{\"type\":\"user\"").unwrap();
         let mut i = Indexed::new(&path, "claude");
-        i.read(&path).unwrap();
+        i.read(&path, None).unwrap();
         assert_eq!(i.offset, 0);
         fs::write(
             &path,
             b"{\"type\":\"user\",\"message\":{\"content\":\"CORE-123 hello\"}}\n",
         )
         .unwrap();
-        i.read(&path).unwrap();
-        i.read(&path).unwrap();
+        i.read(&path, None).unwrap();
+        i.read(&path, None).unwrap();
         assert_eq!(i.session.event_count, 1);
         assert!(i.session.tickets.contains("CORE-123"));
         fs::write(&path, b"{}\n").unwrap();
-        i.read(&path).unwrap();
+        i.read(&path, None).unwrap();
         assert_eq!(i.session.event_count, 0);
         fs::remove_file(path).unwrap();
     }

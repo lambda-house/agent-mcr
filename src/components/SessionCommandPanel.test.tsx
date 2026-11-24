@@ -6,7 +6,7 @@ import SessionCommandPanel from './SessionCommandPanel';
 import { harnessApi, type Hosted } from '../utils/harness';
 import type { Session } from '../utils/sessions';
 
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { list: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { listSince: vi.fn() } }));
 // happy-dom reports the platform of the machine the tests run on; each test names the one it means
 const platform = vi.hoisted(() => ({ current: 'macos' as 'macos' | 'windows' | 'linux' }));
 vi.mock('../utils/platform', async importOriginal => {
@@ -32,7 +32,7 @@ beforeEach(() => {
   platform.current = 'macos';
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
-  vi.mocked(harnessApi.list).mockResolvedValue([hosted]);
+  vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'live', sessions: [hosted] });
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 
@@ -55,7 +55,7 @@ describe('Command panel', () => {
 
   it('draws a found session as the Live list does: its row under the folder, nothing more', async () => {
     const waiting: Hosted = { ...hosted, openTasks: 2, harness: { profile: 'claude', state: 'waiting', agentSession: 'b', attention: { kind: 'permission', text: 'Run the tests?' } } as Hosted['harness'] };
-    vi.mocked(harnessApi.list).mockResolvedValue([waiting]);
+    vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'live', sessions: [waiting] });
     const elsewhere = { ...session('c', 'Other folder', 3), cwd: '/Users/me/other' };
     await act(async () => root.render(<SessionCommandPanel open hideTrigger onOpenChange={() => {}} enabled sessions={[elsewhere, session('a', 'Older work', 2), session('b', 'Fix the parser', 1)]}
       directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
@@ -86,7 +86,7 @@ describe('Command panel', () => {
 
   it('uses the same display name as the Live sidebar for supervisor sessions and omits ticket pills', async () => {
     const sup: Hosted = { ...hosted, id: 'sup1', meta: { label: 'Claude Code', profile: 'claude', name: 'ignored', role: 'supervisor' }, harness: { profile: 'claude', state: 'idle', agentSession: 'b' } as Hosted['harness'] };
-    vi.mocked(harnessApi.list).mockResolvedValue([sup]);
+    vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'live', sessions: [sup] });
     const s = { ...session('b', 'Fix the parser', 1), tickets: ['MCR-24', 'MEM-12'] };
     await act(async () => root.render(<SessionCommandPanel open hideTrigger onOpenChange={() => {}} enabled sessions={[s]}
       directory="" onClearDirectory={() => {}} onSelectSession={() => {}} onOpenLive={() => {}} onNavigateView={() => {}} onOpenSettings={() => {}} onRefresh={() => {}} onEnableAccess={() => {}} topTabs={[]}/>));
