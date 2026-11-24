@@ -302,8 +302,10 @@ mod tests {
             (None, &worktree, "auto", false),
             (Some(&lead.profile), &outside, "acceptEdits", true),
             (Some(&validator.profile), &worktree, "auto", false),
-            (Some(&sre.profile), &worktree, "manual", false),
-            (Some(&backlog.profile), &worktree, "manual", false),
+            (Some(&sre.profile), &worktree, "auto", false),
+            (Some(&sre.profile), &outside, "manual", false),
+            (Some(&backlog.profile), &worktree, "auto", false),
+            (Some(&backlog.profile), &outside, "manual", false),
             (Some(&custom_plan), &worktree, "plan", false),
             (Some(&custom_edit), &worktree, "auto", false),
         ] {
@@ -312,9 +314,12 @@ mod tests {
             let launch = Launch { profile: "claude", agent: profile, claude_auto_root: matched.root.as_deref(), settings: "claude-hooks.json", ..Default::default() };
             let args = windows_args(&launch).unwrap();
             assert_eq!(&args[1..3], ["--permission-mode", mode]);
-            if matches!(mode, "manual" | "plan") {
-                assert_eq!(launch.effective_mode(&[]).unwrap(), format!("{mode} (profile mode kept under root ~/work)"));
-            }
+            let reason = match mode {
+                "auto" => "root ~/work",
+                "plan" => "profile mode kept under root ~/work",
+                _ => "profile",
+            };
+            assert_eq!(launch.effective_mode(&[]).unwrap(), format!("{mode} ({reason})"));
             assert_eq!(args.iter().filter(|arg| *arg == "--permission-mode").count(), 1);
             let allowed: Vec<_> = args.iter().skip_while(|arg| *arg != "--allowedTools").skip(1)
                 .take_while(|arg| !arg.starts_with("--")).map(String::as_str).collect();
