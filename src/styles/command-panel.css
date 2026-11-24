@@ -117,12 +117,6 @@
   border-radius: var(--r-full);
 }
 
-.cmd-preview__tickets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-1);
-}
-
 .cmd-status {
   display: inline-flex;
   align-items: center;
