@@ -1388,9 +1388,23 @@ mod tests {
         assert!(!main.contains_key("titleBarStyle") && !main.contains_key("hiddenTitle"));
         assert_eq!(mac.remove("titleBarStyle"), Some(serde_json::json!("Overlay")));
         assert_eq!(mac.remove("hiddenTitle"), Some(serde_json::json!(true)));
-        // The lights stay inside the 80 px the top row leaves them (utils/windowChrome.ts)
+        // MCR-145: where the lights land, measured on macOS 27.2 with tao 0.37.1:
+        // 14 px square, one every 23 px from x, their centre at y - 2 (tao makes
+        // the title bar 14 + y tall, AppKit keeps them 9 px above its bottom)
         let lights = mac.remove("trafficLightPosition").unwrap();
-        assert!(lights["x"].as_f64().unwrap() + 3.0 * 20.0 <= 80.0);
+        let (x, y) = (lights["x"].as_f64().unwrap(), lights["y"].as_f64().unwrap());
+        // Their centre is the top row's: --titlebar-height less its 1 px bottom border, halved
+        let css = include_str!("../../src/styles/index.css");
+        let row: f64 = css
+            .split("--titlebar-height:")
+            .nth(1)
+            .and_then(|rest| rest.split("px;").next())
+            .map(|n| n.trim().parse().unwrap())
+            .unwrap();
+        assert_eq!(y - 2.0, (row - 1.0) / 2.0);
+        // The row leaves them x + 60 + x (utils/windowChrome.ts, TRAFFIC_LIGHT_INSET; its test pins 88)
+        let chrome = include_str!("../../src/utils/windowChrome.ts");
+        assert!(chrome.contains(&format!("export const TRAFFIC_LIGHT_X = {x};")));
         // trafficLightPosition needs the system's decorations
         assert_eq!(mac.get("decorations"), Some(&serde_json::json!(true)));
         assert_eq!(mac, main);

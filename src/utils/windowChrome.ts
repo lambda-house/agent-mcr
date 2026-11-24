@@ -13,8 +13,23 @@ import { documentWindowPath } from './documentWindow';
  * windows, which Rust opens with the default chrome.
  */
 
-/** Room at the left of the top row for the traffic lights (placed at x 14 by tauri.macos.conf.json). */
-export const TRAFFIC_LIGHT_INSET = 80;
+/*
+ * Where the traffic lights land (MCR-145, measured on macOS 27.2 with tao 0.37.1,
+ * which places them for trafficLightPosition {x, y}): each light is 14 px square,
+ * one every 23 px from x, so the third ends at x + 60; tao makes the title bar
+ * 14 + y tall and AppKit keeps the lights 9 px above its bottom, so their centre
+ * is at y - 2 from the window's top. tauri.macos.conf.json has x 14 and y 21:
+ * centre 19, the centre of the row (--titlebar-height 39px less its 1 px border).
+ */
+/** The lights' left edge in the window, trafficLightPosition.x. */
+export const TRAFFIC_LIGHT_X = 14;
+/** From the first light's left edge to the third's right edge. */
+export const TRAFFIC_LIGHTS_WIDTH = 3 * 14 + 2 * 9;
+/**
+ * Room at the left of the top row for the traffic lights: the gap after the
+ * third light is the window's margin before the first, 14 px.
+ */
+export const TRAFFIC_LIGHT_INSET = TRAFFIC_LIGHT_X + TRAFFIC_LIGHTS_WIDTH + TRAFFIC_LIGHT_X;
 
 /**
  * `native`: the system draws the title bar, the top row is an ordinary row.

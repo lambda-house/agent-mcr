@@ -63,8 +63,9 @@
   
   /* Dimensions */
   --toolbar-height: 32px;
-  /* The top row under macOS's overlay title bar (MCR-138); tauri.macos.conf.json centres the traffic lights in it */
-  --titlebar-height: 38px;
+  /* The top row under macOS's overlay title bar (MCR-138). With its 1 px bottom border the pills centre at 19,
+     where tauri.macos.conf.json's y 21 puts the traffic lights' centre (MCR-145, utils/windowChrome.ts) */
+  --titlebar-height: 39px;
   --tab-bar-height: 30px;
   --status-bar-height: 28px;
   --panel-min-width: 200px;

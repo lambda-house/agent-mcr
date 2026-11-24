@@ -17,13 +17,14 @@ describe('the window title bar', () => {
     expect(titleBar(true, true)).toBe('fullscreen');
     expect(titleBar(false, true)).toBe('native');
     expect(topRowInset('overlay')).toBe(TRAFFIC_LIGHT_INSET);
-    expect(TRAFFIC_LIGHT_INSET).toBe(80);
+    // MCR-145: the lights end at 14 + 60, and the row starts 14 px after them
+    expect(TRAFFIC_LIGHT_INSET).toBe(88);
     expect(topRowInset('fullscreen')).toBe(0);
     expect(topRowInset('native')).toBe(0);
   });
 
   it('makes the top row a drag region only while the lights are over it', () => {
-    expect(topRowProps('overlay')).toEqual({ 'data-titlebar': 'overlay', 'data-tauri-drag-region': 'deep', style: { paddingLeft: 80 } });
+    expect(topRowProps('overlay')).toEqual({ 'data-titlebar': 'overlay', 'data-tauri-drag-region': 'deep', style: { paddingLeft: 88 } });
     expect(topRowProps('fullscreen')).toEqual({ 'data-titlebar': 'fullscreen' });
     // Windows and Linux get the row they had: no attribute, no inset
     expect(topRowProps('native')).toEqual({});

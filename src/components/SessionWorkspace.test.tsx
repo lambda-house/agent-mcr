@@ -133,7 +133,7 @@ describe('Sessions workspace', () => {
       await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
       const row = host.querySelector('.sc-topbar') as HTMLElement;
       expect(row.getAttribute('data-tauri-drag-region')).toBe('deep');
-      expect(row.style.paddingLeft).toBe('80px');
+      expect(row.style.paddingLeft).toBe('88px');
       expect(dragsWindow(row)).toBe(true);
       expect(dragsWindow(row.querySelector('.hs-view-switch')!)).toBe(true);
       const tabs = ['documents', 'sessions', 'live', 'journal', 'board', 'slack', 'settings'];

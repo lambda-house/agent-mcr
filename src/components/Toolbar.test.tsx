@@ -21,10 +21,10 @@ beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 afterEach(async () => { chrome.bar = 'native'; await act(async () => root.unmount()); host.remove(); });
 
 describe('the Documents toolbar as the window top row', () => {
-  it('leaves 80 px for the traffic lights and drags by its empty space, never by a control', async () => {
+  it('leaves 88 px for the traffic lights and drags by its empty space, never by a control', async () => {
     const row = await draw('overlay');
     expect(row.getAttribute('data-titlebar')).toBe('overlay');
-    expect(row.style.paddingLeft).toBe('80px');
+    expect(row.style.paddingLeft).toBe('88px');
     expect(dragsWindow(row)).toBe(true);
     expect(dragsWindow(row.querySelector('.toolbar-spacer')!)).toBe(true);
     expect(dragsWindow(row.querySelector('.toolbar-separator')!)).toBe(true);
