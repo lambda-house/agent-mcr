@@ -901,9 +901,10 @@ describe('Live workspace', () => {
 
   it('resumes an earlier session from inside its folder', async () => {
     vi.mocked(harnessApi.list).mockResolvedValue([]);
+    const now = Date.now();
     vi.mocked(harnessApi.resumable).mockResolvedValue([
-      { agent: 'codex', id: 'aaaaaaaa-1111-4111-8111-111111111111', cwd: '/work/api', modified: 9 },
-      { agent: 'claude', id: 'bbbbbbbb-1111-4111-8111-111111111111', cwd: '/work/api', modified: 5 },
+      { agent: 'codex', id: 'aaaaaaaa-1111-4111-8111-111111111111', cwd: '/work/api', modified: now - 1000 },
+      { agent: 'claude', id: 'bbbbbbbb-1111-4111-8111-111111111111', cwd: '/work/api', modified: now - 2000 },
     ]);
     vi.mocked(harnessApi.spawn).mockResolvedValue(running);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} titles={{ 'aaaaaaaa-1111-4111-8111-111111111111': 'Fix the retention job' }}/>)); await flush();
