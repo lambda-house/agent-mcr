@@ -16,7 +16,6 @@ vi.mock('./SessionRow', async importOriginal => {
   return { ...original, hostedDetail: vi.fn(original.hostedDetail) };
 });
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
-vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // Terminals need a real canvas; the pane itself is exercised in the app
 // The link button stands for a click on `mcr:<linkTo>` in that terminal's text
 // and the stand-in takes the keyboard as the pane does: once per request, then says so. `mounts` counts its mounts.
@@ -80,6 +79,36 @@ it('only renders the previous and next session rows when selection changes', asy
   await act(async () => rowButton('Third session').click());
   expect(vi.mocked(hostedDetail).mock.calls.map(([session]) => session.id).sort()).toEqual(['r1', 'r3']);
   expect(host.querySelector('.hs-dir li.selected')?.textContent).toContain('Third session');
+});
+
+it('advances hosted row and Supervisor ages while the list stamp stays the same', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  try {
+    const now = Date.now();
+    const working: Hosted = { ...running, harness: {
+      name: 'Fixing tests', profile: 'claude', state: 'working', since: now - 150_000,
+      precise: true, agentSession: null, lastMessage: null, attention: null, status: 'running tests',
+    } };
+    const supervisor: Hosted = { ...working, id: 'supervisor', meta: { ...working.meta, role: 'supervisor' } };
+    const done: Hosted = { ...working, id: 'done', harness: { ...working.harness!, state: 'idle', lastMessage: 'Fixed', lastMessageAt: now - 270_000 } };
+    const justEnded: Hosted = { ...ended, exit: { ...ended.exit!, at: now - 1000 } };
+    vi.mocked(harnessApi.list).mockResolvedValue([working, supervisor, done, justEnded]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
+    const rowLabels = () => rows().map(row => row.textContent).join('\n');
+    const supervisorAge = () => host.querySelector('.hs-supervisor .hs-lead')?.textContent;
+    expect(rowLabels()).toContain('Working 2m');
+    expect(rowLabels()).toContain('Done 4m ago');
+    expect(rowLabels()).toContain('exited with 0 · just now');
+    expect(supervisorAge()).toBe('Working 2m');
+    vi.mocked(hostedDetail).mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(hostedDetail).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(28_000); });
+    expect(rowLabels()).toContain('Working 3m');
+    expect(rowLabels()).toContain('Done 5m ago');
+    expect(rowLabels()).toContain('exited with 0 · 1 min ago');
+    expect(supervisorAge()).toBe('Working 3m');
+  } finally { vi.useRealTimers(); }
 });
 
 describe('hiding folders and cleaning up (MCR-107)', () => {

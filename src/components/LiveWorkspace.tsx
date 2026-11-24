@@ -33,8 +33,12 @@ const BACK_KEYS = PLATFORM === 'macos' ? '⌘[' : 'Alt+Left';
 const FORWARD_KEYS = PLATFORM === 'macos' ? '⌘]' : 'Alt+Right';
 const isAgent = (h: Hosted) => !h.exit && ['claude', 'codex'].includes(h.harness?.profile || h.meta.profile || '');
 const EMPTY_TITLES: Record<string, string> = {};
-const rowUsesClock = (h: Hosted, session?: Session) =>
-  !h.exit && !!(h.shells?.length || h.subagents?.some(a => !a.finished) || session?.context?.cacheAt);
+const rowUsesClock = (h: Hosted, session?: Session) => {
+  if (h.exit) return true;
+  const t = h.harness;
+  const hasAge = t?.state === 'working' || ((t?.state === 'idle' || t?.state === 'waiting') && (t.status?.trim() || t.lastMessage?.trim()));
+  return !!(hasAge || h.waits?.length || h.shells?.length || h.subagents?.some(a => !a.finished) || session?.context?.cacheAt);
+};
 
 const LIST_WIDTH_KEY = 'hs-list-width';
 /** The session list is never narrower than this, and leaves the terminal at least as much. */
@@ -694,7 +698,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     };
   }, [binding, hosted, titles, home]);
   const [rowClock, setRowClock] = useState(0);
-  const hasTimedRows = hosted.some(h => rowUsesClock(h, indexedSession(h, metrics)));
+  const hasTimedRows = resumable.length > 0 || hosted.some(h => rowUsesClock(h, indexedSession(h, metrics)));
   useEffect(() => {
     if (!active || !hasTimedRows) return;
     const tick = () => { if (!document.hidden) setRowClock(Date.now()); };

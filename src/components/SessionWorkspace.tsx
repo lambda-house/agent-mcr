@@ -1,7 +1,7 @@
 import { homePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, ChevronRight, ClipboardList, History, MessageSquare, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
-import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
+import { applyJournalUpdate, compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { useStore } from '../store';
 import { pluginRegistry, usePluginVersion } from '../plugins';
@@ -71,15 +71,11 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     const epoch = accessEpoch.current;
     const initial = !held.current;
     if (initial) setBusy(true);
-    // Only a snapshot whose content changed comes across: the index of every session, megabytes, every five seconds otherwise (MCR-141)
     try {
-      const { stamp, snapshot } = await sessionApi.snapshotSince(held.current);
+      const update = await sessionApi.journalSince(held.current);
       if (!mounted.current || epoch !== accessEpoch.current) return;
-      if (snapshot) {
-        held.current = stamp;
-        setData(snapshot);
-        setSelected(s => s || (snapshot.sessions[0] ? sessionKey(snapshot.sessions[0]) : ''));
-      }
+      held.current = update.stamp;
+      if (update.snapshot) setData(current => applyJournalUpdate(current, update));
       setError('');
     } catch (e) {
       if (mounted.current && epoch === accessEpoch.current) setError(err(e));
@@ -97,6 +93,10 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     const timer = setTimeout(() => { if (!document.hidden) void refresh(); }, 150);
     return () => clearTimeout(timer);
   }, [enabled, active, data.indexedAt, data.pendingFiles, refresh]);
+  useEffect(() => {
+    const first = data.sessions[0];
+    if (first) setSelected(s => s || sessionKey(first));
+  }, [data.sessions]);
   useEffect(() => { setOlderEvents(null); contextVersion.current++; }, [selected]);
   const filtered = useMemo(() => data.sessions.filter(s =>
     (provider === 'all' || s.provider === provider)
@@ -104,16 +104,16 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     && (!directory || sessionDirectories(s).some(path => within(path,directory)))
     && matchesActivity(s,{activeSince:Date.parse(activeSince),inactiveSince:Date.parse(inactiveSince),activeMinutes:Number(activeMinutes),inactiveMinutes:Number(inactiveMinutes)})
     && (filter === 'all' || (filter === 'recent' ? Date.now()-s.modified<86400000 : filter === 'roots' ? !s.parentId : s.status===filter))
-    && matchesSession(s,query)), [data,provider,role,directory,activeSince,inactiveSince,activeMinutes,inactiveMinutes,filter,query]);
+    && matchesSession(s,query)), [data.sessions,provider,role,directory,activeSince,inactiveSince,activeMinutes,inactiveMinutes,filter,query]);
+  const summary = data.sessions.find(s => sessionKey(s) === selected);
   useEffect(() => {
     if (!active) return;
-    const summary = data.sessions.find(s => sessionKey(s) === selected);
     if (!summary) { setDetail(null); return; }
     let cancelled = false;
     sessionApi.detail(summary.provider, summary.id).then(s => { if (!cancelled) setDetail({ ...s, status: summary.status }); }).catch(e => { if (!cancelled) setError(err(e)); });
     return () => { cancelled = true; };
-  }, [selected, data, active]);
-  const chosen = detail && sessionKey(detail) === selected ? detail : data.sessions.find(s => sessionKey(s) === selected);
+  }, [summary, active]);
+  const chosen = summary && detail && sessionKey(detail) === selected ? detail : summary;
   const usage = sumUsage(filtered); const working = filtered.filter(s => s.status === 'working').length;
   const events = focusedEvidence?.session === selected ? [focusedEvidence.event] : olderEvents ?? chosen?.events ?? [];
   const descendants = chosen ? family(data.sessions,chosen) : [];
