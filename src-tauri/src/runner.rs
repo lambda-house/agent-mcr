@@ -45,6 +45,17 @@ const VIEW_QUEUE: usize = 2048;
 /// Exit when nothing runs and nobody is connected for this long.
 const IDLE_EXIT: Duration = Duration::from_secs(600);
 const MAX_REQUEST: u64 = 1024 * 1024;
+/// How long an ended session's output is still read (`Drained`).
+#[cfg(unix)]
+const EXIT_DRAIN: Duration = Duration::from_secs(3);
+/// How often a reader with nothing to read looks whether it has drained.
+#[cfg(unix)]
+const READ_LOOK: Duration = Duration::from_millis(250);
+/// The soft limit on open files the runner and the service ask for (MCR-151):
+/// each live session holds three pty descriptors in the runner and its views
+/// three sockets each, and launchd starts both with a soft limit of 256.
+#[cfg(unix)]
+const OPEN_FILES: libc::rlim_t = 8192;
 const MAX_OSC: usize = 4096;
 
 pub fn now_ms() -> u64 {
@@ -241,6 +252,64 @@ fn handle_dsr(
     }
 }
 
+/// The reader's own copy of a pty master (unix): `try_clone_reader` would give
+/// the same, but without the descriptor `Drained` needs to poll.
+#[cfg(unix)]
+fn dup_master(master: &(dyn MasterPty + Send)) -> Result<std::fs::File, String> {
+    use std::os::fd::FromRawFd;
+    let fd = master.as_raw_fd().ok_or("The terminal has no descriptor")?;
+    // SAFETY: duplicates a descriptor the master owns, close-on-exec like it
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(format!("Cannot read the terminal: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `copy` is a fresh descriptor owned by nothing else
+    Ok(unsafe { std::fs::File::from_raw_fd(copy) })
+}
+
+/// The terminal's output as the pump reads it (unix). Once the session's
+/// process has ended, output is read for `EXIT_DRAIN` more and then the reader
+/// ends: something the agent left running in the background that kept the
+/// terminal open (a job that ignores hangup) would otherwise hold the reader's
+/// descriptor, the pty and the pump's thread for as long as it lives (MCR-151).
+#[cfg(unix)]
+struct Drained {
+    file: std::fs::File,
+    session: Arc<Session>,
+}
+
+#[cfg(unix)]
+impl Drained {
+    fn drained(&self) -> bool {
+        lock(&self.session.info)
+            .exit
+            .as_ref()
+            .is_some_and(|exit| now_ms().saturating_sub(exit.at) >= EXIT_DRAIN.as_millis() as u64)
+    }
+}
+
+#[cfg(unix)]
+impl Read for Drained {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        loop {
+            if self.drained() {
+                return Ok(0);
+            }
+            let mut ready = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd
+            let n = unsafe { libc::poll(&mut ready, 1, READ_LOOK.as_millis() as libc::c_int) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Output, a hangup or an error: the read says which
+            if n != 0 {
+                return self.file.read(buf);
+            }
+        }
+    }
+}
+
 struct Output {
     ring: VecDeque<u8>,
     /// All the output so far, in bytes: the ring ends at this offset
@@ -358,6 +427,69 @@ pub fn random_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The soft limit on open files to ask for, or none when it is high enough:
+/// `OPEN_FILES`, never above the hard limit or the per-process ceiling the
+/// system names (macOS: `OPEN_MAX` and `kern.maxfilesperproc`).
+#[cfg(unix)]
+fn open_files_target(soft: libc::rlim_t, hard: libc::rlim_t, ceiling: Option<libc::rlim_t>) -> Option<libc::rlim_t> {
+    let target = OPEN_FILES.min(hard).min(ceiling.unwrap_or(libc::RLIM_INFINITY));
+    (target > soft).then_some(target)
+}
+
+/// Raises this process's soft limit on open files toward the hard limit (MCR-151:
+/// launchd's 256 let a runner with some forty sessions refuse to start the next
+/// one). Returns the limit before and after.
+#[cfg(unix)]
+pub fn raise_open_files() -> Result<(libc::rlim_t, libc::rlim_t), String> {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: plain syscall into a local struct
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    #[cfg(target_os = "macos")]
+    let ceiling = {
+        let mut per_process: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: reads one int into a local of that size
+        let read = unsafe {
+            libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&mut per_process as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        // OPEN_MAX: setrlimit refuses more on macOS
+        let open_max: libc::rlim_t = 10240;
+        Some(if read && per_process > 0 { open_max.min(per_process as libc::rlim_t) } else { open_max })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let ceiling = None;
+    let before = limit.rlim_cur;
+    let Some(target) = open_files_target(before, limit.rlim_max, ceiling) else {
+        return Ok((before, before));
+    };
+    limit.rlim_cur = target;
+    // SAFETY: plain syscall with the struct read above
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(format!("{} (asked {target})", std::io::Error::last_os_error()));
+    }
+    Ok((before, target))
+}
+
+/// `raise_open_files` for a unit's start, written to its log (its stderr).
+pub fn note_open_files(unit: &str) {
+    #[cfg(unix)]
+    match raise_open_files() {
+        Ok((before, after)) if before == after => eprintln!("{unit}: open files limit {after}"),
+        Ok((before, after)) => eprintln!("{unit}: open files limit raised from {before} to {after}"),
+        Err(e) => eprintln!("{unit}: open files limit not raised: {e}"),
+    }
+    #[cfg(not(unix))]
+    let _ = unit;
+}
+
 pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A panicking reader thread must not take every other session down with it
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -425,6 +557,9 @@ impl Runner {
                 return Err(e);
             }
         };
+        #[cfg(unix)]
+        let reader = dup_master(pair.master.as_ref())?;
+        #[cfg(not(unix))]
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let info = Info {
@@ -465,6 +600,8 @@ impl Runner {
 
         let runner = self.clone();
         let reading = session.clone();
+        #[cfg(unix)]
+        let reader: Box<dyn Read + Send> = Box::new(Drained { file: reader, session: session.clone() });
         std::thread::spawn(move || runner.pump(&reading, reader));
 
         let runner = self.clone();
@@ -479,6 +616,12 @@ impl Runner {
                 info.exit = Some(exit.clone());
                 info.program.exited();
             }
+            // Nothing is typed into or resized in an ended terminal: its master
+            // and the writer's copy are closed now, not when the session is
+            // forgotten, which may be days later or never (MCR-151). The reader
+            // keeps its own copy until the output is drained (`Drained`).
+            lock(&session.writer).take();
+            lock(&session.master).take();
             runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
         });
         Ok(info)
@@ -1654,6 +1797,129 @@ mod tests {
         assert_eq!(list["sessions"][0]["exit"]["code"], 3);
         control.call(json!({"op": "forget", "id": "t1"})).unwrap();
         assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_files_limit_is_raised_toward_the_hard_limit_and_capped() {
+        let inf = libc::RLIM_INFINITY;
+        assert_eq!(open_files_target(256, inf, None), Some(OPEN_FILES), "launchd's 256 against an unlimited hard limit");
+        assert_eq!(open_files_target(256, inf, Some(10240)), Some(OPEN_FILES));
+        assert_eq!(open_files_target(256, inf, Some(4096)), Some(4096), "never above the per-process ceiling");
+        assert_eq!(open_files_target(256, 1024, None), Some(1024), "never above the hard limit");
+        assert_eq!(open_files_target(256, 256, None), None, "nothing to raise");
+        assert_eq!(open_files_target(65536, inf, None), None, "a higher limit is never lowered");
+        // This process: at least as high as asked afterwards, and asking again changes nothing
+        let (_, after) = raise_open_files().unwrap();
+        let (before, again) = raise_open_files().unwrap();
+        assert_eq!((before, again), (after, after));
+    }
+
+    /// Descriptors this process has open: all of them, and those on a pty master.
+    #[cfg(unix)]
+    fn open_descriptors() -> (usize, usize) {
+        let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
+        let fds: Vec<i32> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        let ptmx = fds.iter().filter(|&&fd| descriptor_path(fd).as_deref() == Some("/dev/ptmx")).count();
+        (fds.len(), ptmx)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn descriptor_path(fd: i32) -> Option<String> {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0)?;
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn descriptor_path(fd: i32) -> Option<String> {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok().map(|p| p.display().to_string())
+    }
+
+    /// MCR-151: the runner held an ended session's pty master and the writer's
+    /// copy until the session was forgotten, and the reader's copy for as long
+    /// as anything kept the terminal open. Counting descriptors needs a process
+    /// of its own (other tests open and close theirs meanwhile), so this test
+    /// runs itself again alone and the copy does the counting.
+    #[cfg(unix)]
+    #[test]
+    fn an_ended_session_gives_back_every_descriptor() {
+        const PROBE: &str = "AMCR_FD_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["runner::tests::an_ended_session_gives_back_every_descriptor", "--exact", "--test-threads=1", "--nocapture"])
+                .env(PROBE, "1")
+                .output()
+                .unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success(), "the probe failed:\n{text}");
+            assert!(text.contains("1 passed"), "the probe did not run:\n{text}");
+            return;
+        }
+        let socket = temp_socket("fds");
+        serve_in_background(&socket);
+        let mut control = Client::connect(&socket).unwrap();
+        let (mut events, _keep) = open_stream(&socket, json!({"op": "watch"})).unwrap();
+        let settle = |want: (usize, usize), what: &str| {
+            let deadline = Instant::now() + EXIT_DRAIN + Duration::from_secs(10);
+            loop {
+                let now = open_descriptors();
+                if now == want {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{what}: open (all, ptmx) {now:?}, expected {want:?}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let exited = |events: &mut BufReader<Stream>, id: &str| {
+            let needle = format!("\"id\":\"{id}\"");
+            loop {
+                let mut line = String::new();
+                assert!(events.read_line(&mut line).unwrap() > 0, "the event stream ended");
+                if line.contains("\"exited\"") && line.contains(&needle) {
+                    return;
+                }
+            }
+        };
+        let base = open_descriptors();
+
+        // A session with a view: three pty descriptors while it runs (the master,
+        // the reader's copy and the writer's copy), all back when it has ended
+        control
+            .call(json!({"op": "spawn", "id": "f1", "argv": ["/bin/sh", "-c", "printf 'ready\\n'; read line; exit 0"], "cwd": "/tmp", "cols": 80, "rows": 24}))
+            .unwrap();
+        let (mut out, mut input) = open_stream(&socket, json!({"op": "attach", "id": "f1"})).unwrap();
+        read_until(&mut out, "ready");
+        assert_eq!(open_descriptors().1, base.1 + 3, "a live session's pty descriptors");
+        input.write_all(b"bye\n").unwrap();
+        exited(&mut events, "f1");
+        drop((out, input));
+        settle(base, "after an ended session, not forgotten");
+
+        // A session that leaves a job behind holding its terminal: the job
+        // ignores hangup and outlives the session
+        let pidfile = socket.with_file_name("job.pid");
+        let script = format!("trap '' HUP; sleep 60 & echo $! > {}; exit 0", pidfile.display());
+        control.call(json!({"op": "spawn", "id": "f2", "argv": ["/bin/sh", "-c", script], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
+        exited(&mut events, "f2");
+        let job: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let alive = unsafe { libc::kill(job, 0) } == 0;
+        settle(base, "after an ended session whose job keeps the terminal");
+        // SAFETY: our own child's child, read from the file it wrote
+        unsafe { libc::kill(job, libc::SIGKILL) };
+        assert!(alive, "the left-behind job was still running while the descriptors were counted");
+
+        // Forgetting them changes nothing more
+        control.call(json!({"op": "forget", "id": "f1"})).unwrap();
+        control.call(json!({"op": "forget", "id": "f2"})).unwrap();
+        settle(base, "after forgetting");
     }
 
     #[cfg(windows)]
