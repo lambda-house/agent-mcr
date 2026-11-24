@@ -268,6 +268,33 @@ pub struct Launch<'a> {
     /// the command line only through the adapter's fixed mapping
     /// (`profile_words`). None: today's line (a bare launch)
     pub agent: Option<&'a crate::profiles::AgentProfile>,
+    /// Set only by the harness after matching an operator-configured root.
+    pub claude_auto_root: Option<&'a str>,
+}
+
+impl Launch<'_> {
+    fn claude_mode(&self) -> &str {
+        if self.claude_auto_root.is_some() { "auto" } else { self.profile_mode().unwrap_or("acceptEdits") }
+    }
+
+    fn profile_mode(&self) -> Option<&str> {
+        self.agent.and_then(|p| p.permissions.mode.as_deref())
+    }
+
+    pub fn effective_mode(&self) -> Option<String> {
+        let mode = match self.profile {
+            "claude" => self.claude_mode(),
+            "codex" => self.profile_mode().unwrap_or("workspace-write"),
+            "antigravity" => "accept-edits",
+            _ => return None,
+        };
+        let reason = match self.claude_auto_root {
+            Some(root) => format!("root {root}"),
+            None if self.profile_mode().is_some() => "profile".into(),
+            None => "adapter default".into(),
+        };
+        Some(format!("{mode} ({reason})"))
+    }
 }
 
 /// What an agent profile may set for a program (MCR-126). Each of these is
@@ -487,9 +514,10 @@ impl Adapter for Claude {
     }
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
-        let mut cmd = match l.agent {
-            Some(p) => format!("exec {} {}", base.split(' ').next().unwrap_or(base), self.profile_words(p)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ")),
-            None => format!("exec {base}"),
+        let mut cmd = if l.agent.is_some() || l.claude_auto_root.is_some() {
+            format!("exec {} {}", base.split(' ').next().unwrap_or(base), self.launch_words(l).iter().map(|w| sh(w)).collect::<Vec<_>>().join(" "))
+        } else {
+            format!("exec {base}")
         };
         if !l.mcp.is_empty() {
             cmd += &format!(" --mcp-config {}", sh(l.mcp));
@@ -565,8 +593,8 @@ impl Adapter for Claude {
     /// `--model`, `--fallback-model`, `--effort`, `--permission-mode`,
     /// `--tools` and `--disallowedTools` (Claude Code 2.1.330). Profile
     /// authors cannot supply `--allowedTools`: it skips the operator's prompt.
-    /// The owner authorized the launcher to allow push and merge for delivery
-    /// leads only (MCR-143), with deny rules still taking precedence.
+    /// The launcher supplies allow rules for delivery leads (MCR-143) and
+    /// auto-mode roots (MCR-152).
     fn expresses(&self) -> Expresses {
         Expresses {
             model: true,
@@ -576,12 +604,21 @@ impl Adapter for Claude {
             tools: true,
         }
     }
+    fn profile_words(&self, p: &crate::profiles::AgentProfile) -> Result<Vec<String>, String> {
+        Ok(self.profile_launch_words(p, p.permissions.mode.as_deref().unwrap_or("acceptEdits")))
+    }
+    fn takes_mcp(&self) -> bool {
+        true
+    }
+}
+
+impl Claude {
     /// The mode first, in place of the bare `--permission-mode acceptEdits`.
     /// The tool lists are variadic flags: each rule is a word of its own, and
     /// the harness's own flags (`--settings` always) follow them, so nothing
     /// after a list is taken as a rule. A rule never starts with `-`
-    fn profile_words(&self, p: &crate::profiles::AgentProfile) -> Result<Vec<String>, String> {
-        let mut w: Vec<String> = vec!["--permission-mode".into(), p.permissions.mode.clone().unwrap_or_else(|| "acceptEdits".into())];
+    fn profile_launch_words(&self, p: &crate::profiles::AgentProfile, mode: &str) -> Vec<String> {
+        let mut w = vec!["--permission-mode".into(), mode.into()];
         let i = &p.inference;
         for (flag, value) in [("--model", &i.model), ("--fallback-model", &i.fallback_model), ("--effort", &i.effort)] {
             if let Some(v) = value {
@@ -642,10 +679,22 @@ impl Adapter for Claude {
             // supply a PR selector but cannot supply a flag to gh.
             w.extend(["--allowedTools", "Bash(git push origin *)", "Bash(gh pr merge --merge -- *)"].map(String::from));
         }
-        Ok(w)
+        w
     }
-    fn takes_mcp(&self) -> bool {
-        true
+
+    fn launch_words(&self, l: &Launch) -> Vec<String> {
+        let mode = l.claude_mode();
+        let mut words = match l.agent {
+            Some(p) => self.profile_launch_words(p, mode),
+            None => vec!["--permission-mode".into(), mode.into()],
+        };
+        if l.claude_auto_root.is_some() {
+            if !l.agent.is_some_and(crate::profiles::AgentProfile::delivers) {
+                words.push("--allowedTools".into());
+            }
+            words.extend(["mcp__teob-memory", "mcp__teob-harness", "mcp__mcr-memory", "mcp__atlassian"].map(String::from));
+        }
+        words
     }
 }
 
@@ -864,9 +913,9 @@ pub fn command_line(l: &Launch) -> Result<String, String> {
 
 /// A profile is launched only by its own adapter and only as the checks
 /// allow it now: a pinned copy is checked again by this build's ceiling.
-/// None for a bare launch.
-fn profile_fits(agent: &dyn Adapter, l: &Launch) -> Result<Option<Vec<String>>, String> {
-    let Some(p) = l.agent else { return Ok(None) };
+/// Bare launches have no agent profile to check.
+fn profile_fits(agent: &dyn Adapter, l: &Launch) -> Result<(), String> {
+    let Some(p) = l.agent else { return Ok(()) };
     if p.adapter != agent.id() {
         return Err(format!("The profile {} is for {}, not {}", p.id, p.adapter, agent.id()));
     }
@@ -874,7 +923,7 @@ fn profile_fits(agent: &dyn Adapter, l: &Launch) -> Result<Option<Vec<String>>, 
     if l.supervisor != (p.role == crate::profiles::Role::Supervisor) {
         return Err("A supervisor profile starts the root Supervisor only, and the root Supervisor only a supervisor profile".into());
     }
-    agent.profile_words(p).map(Some)
+    Ok(())
 }
 
 /// A TOML single-quoted literal string (no escapes, no `"` needed).
@@ -933,7 +982,7 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
     if l.resume.is_some_and(|id| !is_uuid(id)) {
         return Err("Invalid session id to resume".into());
     }
-    let words = profile_fits(agent, l)?;
+    profile_fits(agent, l)?;
     let task = l.task.map(str::trim).filter(|t| !t.is_empty());
     let mut args: Vec<String> = Vec::new();
     match l.profile {
@@ -945,7 +994,7 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
         }
         "claude" => {
             args.push("claude".into());
-            args.extend(words.unwrap_or_else(|| vec!["--permission-mode".into(), "acceptEdits".into()]));
+            args.extend(Claude.launch_words(l));
             if !l.mcp.is_empty() {
                 args.extend(["--mcp-config".into(), l.mcp.to_owned()]);
             }
@@ -967,7 +1016,10 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
             if l.resume.is_some() {
                 args.push("resume".into());
             }
-            args.extend(words.unwrap_or_else(|| ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"].into_iter().map(str::to_owned).collect()));
+            args.extend(match l.agent {
+                Some(p) => agent.profile_words(p)?,
+                None => ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"].map(str::to_owned).to_vec(),
+            });
             let exe_lit = toml_literal(l.exe)?;
             args.extend(["-c".into(), format!("notify=[{exe_lit},'--harness-hook','codex-notify']")]);
             args.extend(["-c".into(), "tui.notifications=true".into()]);

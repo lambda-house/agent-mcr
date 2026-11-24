@@ -27,6 +27,7 @@ mod cockpit;
 mod secret_shape;
 mod task_copy;
 mod harness;
+mod auto_mode;
 mod harness_preferences;
 mod profiles;
 mod harness_commands;
