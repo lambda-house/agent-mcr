@@ -57,8 +57,6 @@ export interface AppState {
   settingsOpen: boolean;
   /** The command palette is showing. Not persisted. */
   paletteOpen: boolean;
-  /** The command panel is mounted (it lives in Sessions). Not persisted. */
-  paletteHosted: boolean;
 
   // Find in document
 
@@ -77,7 +75,6 @@ export interface AppState {
   setStatusBarPinned: (pinned: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
-  setPaletteHosted: (hosted: boolean) => void;
   setLiveList: (change: (prefs: LiveListPrefs) => LiveListPrefs) => void;
 
   // Appearance
@@ -130,7 +127,6 @@ export const useStore = create<AppState>()(
       // Modal state
       settingsOpen: false,
       paletteOpen: false,
-      paletteHosted: false,
 
       
       // ============================================================
@@ -160,7 +156,6 @@ export const useStore = create<AppState>()(
       setSurface: (surface) => set({ surface }),
       setSettingsOpen: (open) => set({ settingsOpen: open }),
       setPaletteOpen: (open) => set({ paletteOpen: open }),
-      setPaletteHosted: (hosted) => set({ paletteHosted: hosted }),
 
 
       setLiveList: (change) => set((state) => ({ liveList: change(state.liveList) })),

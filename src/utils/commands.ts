@@ -50,8 +50,8 @@ export function buildMenu(): MenuItem[] {
   const doc = readerCommands(reader);
   const journalCmd = journalCommands(journal);
   const win = windowCommands({
-    // The command panel is a global overlay of Sessions: over Documents its key stays free
-    palette: { open: () => state().setPaletteOpen(true), enabled: () => state().paletteHosted, label: 'Command Panel…' },
+    // The palette (the command panel) works in Sessions: over Documents its key stays free
+    palette: { open: () => state().setPaletteOpen(true), enabled: () => state().surface === 'sessions', label: 'Command Panel…' },
     settings: { open: () => state().setSettingsOpen(true) },
     theme: { get: () => state().theme, set: (theme) => state().setTheme(theme) },
     statusBar: { pinned: () => state().statusBarPinned, setPinned: (pinned) => state().setStatusBarPinned(pinned) },

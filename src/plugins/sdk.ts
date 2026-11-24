@@ -1,7 +1,8 @@
 import type React from 'react';
 import { createElement } from 'react';
 import { Puzzle } from 'lucide-react';
-import { PluginRegistry, type PluginApi as WorkbenchPluginApi } from '@lambda-house/workbench';
+import { PluginRegistry, useSurfaceShown, type PaletteProvider, type PluginApi as WorkbenchPluginApi, type WorkbenchView } from '@lambda-house/workbench';
+import { SESSIONS_VIEWS } from '../sessionsView';
 import type { LayoutPreset, PaneItem, PaneNode } from '../utils/paneLayout';
 import type { HarnessStatus, Hosted, Resumable } from '../utils/harness';
 import type { Session } from '../utils/sessions';
@@ -23,6 +24,7 @@ export interface TopTabContext {
   active: boolean;
 }
 
+/** A view of Sessions, in its switch: Live is 10, the Journal 200, Board 210 and Slack 220; a plugin's is 100 unless it says otherwise. */
 export interface TopTabPlugin {
   id: string;
   label: string;
@@ -159,7 +161,6 @@ export interface GlobalOverlayContext {
   onOpenSettings: () => void;
   onRefresh: () => void;
   onEnableAccess: () => void;
-  topTabs: TopTabPlugin[];
 }
 
 export interface GlobalOverlayPlugin {
@@ -178,7 +179,10 @@ export interface SettingsTabPlugin {
 }
 
 export interface PluginApi {
+  /** A view of Sessions (the workbench's `workbench:view`). */
   registerTopTab: (tab: TopTabPlugin) => void;
+  /** A source of the palette's items (the workbench's `workbench:palette-provider`). */
+  registerPaletteProvider: (provider: PaletteProvider) => void;
   registerPaneType: (pane: PaneTypePlugin) => void;
   registerSidebarSection: (section: SidebarSectionPlugin) => void;
   registerEmptyAction: (action: EmptyActionPlugin) => void;
@@ -203,10 +207,10 @@ export interface McrPlugin {
 // Agent MCR's extension points, slots and events in the workbench's plugin
 // registry (@lambda-house/workbench), declared by merging. Its plugins keep
 // the typed API above; the registry does the rest (shared UI spec §5.7).
-// Wrappers and Settings tabs go to the workbench's own points, which the
-// Workbench draws with the reader's, the journal's and the app's.
+// Views of Sessions, palette providers, wrappers and Settings tabs go to the
+// workbench's own points, which the Workbench (and Sessions, for its views)
+// draws with the reader's, the journal's and the app's.
 interface McrPoints {
-  'sessions:top-tab': TopTabPlugin;
   'sessions:overlay': GlobalOverlayPlugin;
   'live:pane-type': PaneTypePlugin;
   'live:sidebar-section': SidebarSectionPlugin;
@@ -220,10 +224,19 @@ declare module '@lambda-house/workbench' {
   interface WorkbenchEvents extends PluginEventMap {}
 }
 
+/** A plugin's view of Sessions: `active` while Sessions shows it. */
+function TopTabView({ tab }: { tab: TopTabPlugin }) {
+  return tab.render({ active: useSurfaceShown() });
+}
+
 /** Agent MCR's plugin API on the workbench's: each register* contributes to its point. */
 function mcrApi(api: WorkbenchPluginApi): PluginApi {
   return {
-    registerTopTab: tab => api.contribute('sessions:top-tab', tab),
+    registerTopTab: tab => api.contribute('workbench:view', {
+      surface: 'sessions', id: tab.id, label: tab.label, title: tab.title, icon: tab.icon, order: tab.order,
+      render: () => createElement(TopTabView, { tab }),
+    }),
+    registerPaletteProvider: provider => api.contribute('workbench:palette-provider', provider),
     registerPaneType: pane => api.contribute('live:pane-type', pane),
     registerSidebarSection: section => api.contribute('live:sidebar-section', section),
     registerEmptyAction: action => api.contribute('live:empty-action', action),
@@ -256,7 +269,8 @@ class McrPluginRegistry {
   setEnabled(pluginId: string, enabled: boolean): void { this.workbench.setEnabled(pluginId, enabled); }
   listPlugins(): Array<Omit<McrPlugin, 'setup'> & { enabled: boolean }> { return this.workbench.listPlugins().map(({ setup: _setup, ...plugin }) => plugin); }
 
-  getTopTabs(): TopTabPlugin[] { return this.workbench.items('sessions:top-tab'); }
+  /** The views of Sessions the plugins added (Agent MCR's own are Live, the Journal, Board and Slack). */
+  getTopTabs(): WorkbenchView[] { return this.workbench.items('workbench:view').filter(v => v.surface === 'sessions' && !Object.keys(SESSIONS_VIEWS).includes(v.id)); }
   /** The last plugin to register a kind has it. */
   getPaneType(kind: string): PaneTypePlugin | undefined { return this.workbench.items('live:pane-type').filter(p => p.kind === kind).pop(); }
   getSidebarSections(): SidebarSectionPlugin[] { return this.workbench.items('live:sidebar-section'); }

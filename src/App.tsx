@@ -49,8 +49,6 @@ registry.register(documentsPlugin);
 const menu = buildMenu();
 appMenu.set(menu);
 
-const openPalette = () => useStore.getState().setPaletteOpen(true);
-
 const App: React.FC = () => {
   // The shown surface is the store's: commands of the other one wait
   const surface = useStore((s) => s.surface);
@@ -61,8 +59,9 @@ const App: React.FC = () => {
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
   const theme = useStore((s) => s.theme);
   const setTheme = useStore((s) => s.setTheme);
-  // The command panel lives in Sessions: elsewhere the top bar's ⌕ is disabled
-  const paletteHosted = useStore((s) => s.paletteHosted);
+  // The palette (the command panel) works in Sessions: elsewhere the top bar's ⌕ is disabled
+  const paletteOpen = useStore((s) => s.paletteOpen);
+  const setPaletteOpen = useStore((s) => s.setPaletteOpen);
   const titleBar = useTitleBar();
 
   return (
@@ -78,7 +77,10 @@ const App: React.FC = () => {
       status={{ pinned: statusBarPinned, onPinnedChange: setStatusBarPinned }}
       // macOS: the top bar is the window's title bar (MCR-138); elsewhere, and in reader windows, a native one
       titleBar={titleBar}
-      palette={{ open: openPalette, enabled: paletteHosted }}
+      palette={{
+        open: paletteOpen, onOpenChange: setPaletteOpen, enabled: surface === 'sessions',
+        label: 'Control panel', placeholder: 'Search sessions, tickets, models, or commands…',
+      }}
       settings={{ open: settingsOpen, onOpenChange: setSettingsOpen }}
       appearance={{ theme, setTheme }}
     />

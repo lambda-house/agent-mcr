@@ -2,11 +2,12 @@
 import { act, useEffect } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import SessionWorkspace from './SessionWorkspace';
+import SessionWorkspace, { sessionViews } from './SessionWorkspace';
 import { sessionApi, type Session } from '../utils/sessions';
 import { harnessApi, type Hosted } from '../utils/harness';
 import { createPlugin, pluginRegistry } from '../plugins';
 import { journal } from '../journal';
+import { savedView, useSessionsView } from '../sessionsView';
 vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), snapshotSince: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
@@ -15,10 +16,13 @@ vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<o
 const session: Session = { id:'a',provider:'codex',parentId:null,name:'root',cwd:'/work/demo',title:'Fix CORE-123',model:'model-a',effort:'high',started:'2026-01-01T00:00:00Z',updated:'2026-01-01T00:00:00Z',modified:Date.now(),status:'working',usage:{input:100,cached:70,cacheWrite:0,output:20,reasoning:5},usageKnown:true,models:{},tools:{shell:2},tickets:['CORE-123'],memoryRefs:[],events:[{seq:1,at:'2026-01-01T00:00:00Z',kind:'assistant',text:'<script>untrusted()</script>',tool:null}],eventCount:1,malformedLines:0,source:'/fake/session.jsonl',turnId:'turn'};
 // The journal's store is the app's one; each test starts from its first state
 const fresh = journal.store.getState();
+// Its views, as App's documentsPlugin contributes them
+pluginRegistry.workbench.register({ id: 'sessions-views', name: 'Sessions views', required: true, setup: api => { for (const view of sessionViews) api.contribute('workbench:view', view); } });
+const showView = (view: string) => useSessionsView.setState({ view });
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve,0)); }); };
 const button = (text: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.trim().toLowerCase() === text) || [...host.querySelectorAll('button')].find(b => b.textContent?.toLowerCase().includes(text))!;
-beforeEach(() => { vi.resetAllMocks(); journal.store.setState(fresh, true); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
+beforeEach(() => { vi.resetAllMocks(); journal.store.setState(fresh, true); showView('history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
   // The stamped read answers with what `snapshot` gives, each time as changed
   let stamps = 0; vi.mocked(sessionApi.snapshotSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() })); });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
@@ -26,7 +30,7 @@ describe('Sessions workspace', () => {
   it('reads the snapshot every minute while Live is shown, and every five seconds in Journal (MCR-139)', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {
-      localStorage.setItem('agent-mcr.sessions.view', 'live');
+      showView('live');
       await act(async () => root.render(<SessionWorkspace/>)); await flush();
       const reads = () => vi.mocked(sessionApi.snapshotSince).mock.calls.length;
       const first = reads();
@@ -60,6 +64,7 @@ describe('Sessions workspace', () => {
   });
   it('opens on the Live view until Journal is chosen, and remembers the choice', async () => {
     localStorage.removeItem('agent-mcr.sessions.view');
+    showView(savedView());
     await act(async () => root.render(<SessionWorkspace />)); await flush();
     expect(host.textContent).toContain('Open supervisor');
     // The journal stays mounted under Live (its snapshot names Live's sessions), hidden
@@ -124,6 +129,20 @@ describe('Sessions workspace', () => {
       await act(async () => root.render(<SessionWorkspace active={false} />)); await flush();
       expect(host.querySelector('[data-overlay]')).toBeNull();
     } finally { pluginRegistry.unregister('test-overlay'); }
+  });
+  it('draws a plugin’s view between Live and the Journal, active while it is shown', async () => {
+    const shown = vi.fn();
+    pluginRegistry.register(createPlugin({ id: 'test-view', name: 'Test view', setup(api) { api.registerTopTab({ id: 'notes', label: 'Notes', icon: null, render: ({ active }) => { shown(active); return <p data-notes/>; } }); } }));
+    try {
+      await act(async () => root.render(<SessionWorkspace />)); await flush();
+      const options = [...document.querySelectorAll('[aria-label="Sessions view"] [class*="segmented__option"]')].map(o => o.textContent?.trim());
+      expect(options).toEqual(['Live', 'Notes', 'Journal', 'Board', 'Slack Preview']);
+      expect(host.querySelector('[data-notes]')).toBeNull();
+      await act(async () => button('notes').click()); await flush();
+      expect(host.querySelector('[data-notes]')).not.toBeNull();
+      expect(shown).toHaveBeenLastCalledWith(true);
+      expect(useSessionsView.getState().view).toBe('notes');
+    } finally { pluginRegistry.unregister('test-view'); }
   });
   it('does not read transcripts before access is enabled', async () => {
     vi.mocked(sessionApi.access).mockResolvedValue(false);

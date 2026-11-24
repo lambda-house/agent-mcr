@@ -10,13 +10,13 @@ import Toolbar from './components/Toolbar';
 import { AgentPane } from '@lambda-house/agents';
 import { agents } from './agents';
 import { shortPath } from './utils/harness';
-import SessionWorkspace from './components/SessionWorkspace';
+import SessionWorkspace, { sessionViews } from './components/SessionWorkspace';
 import { appSettingsTabs } from './components/SettingsTabs';
 
 // Agent MCR's own part of the window, as a plugin: the Documents surface (the
 // agents' Markdown: the agent documents beside the reader's document groups
-// and contents), the Sessions surface (Live, the journal, the board, Slack),
-// and its Settings tabs. A memory reader window has Documents only, with its
+// and contents), the Sessions surface and its views (Live, the journal, the
+// board, Slack), and its Settings tabs. A memory reader window has Documents only, with its
 // one document and no list.
 
 /** An empty document group: how to open a document here. */
@@ -74,7 +74,10 @@ export const documentsPlugin: Plugin = {
   setup(api) {
     // Documents is mounted only while shown; Sessions stays once opened
     api.contribute('workbench:surface', { id: 'documents', label: 'Documents', icon: <FileText size={13} />, keepMounted: false, order: 10, render: () => <Documents /> });
-    if (!documentWindowPath) api.contribute('workbench:surface', { id: 'sessions', label: 'Sessions', icon: <Activity size={13} />, order: 20, render: () => <Sessions /> });
+    if (!documentWindowPath) {
+      api.contribute('workbench:surface', { id: 'sessions', label: 'Sessions', icon: <Activity size={13} />, order: 20, render: () => <Sessions /> });
+      for (const view of sessionViews) api.contribute('workbench:view', view);
+    }
     api.contribute('workbench:pane-type', {
       view: 'documents',
       type: {

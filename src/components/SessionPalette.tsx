@@ -1,41 +1,28 @@
 import { homePath } from '../utils/paths';
 import { paletteShortcut, PLATFORM } from '../utils/platform';
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
+import { create, useStore as useZustand } from 'zustand';
 import { Activity, Compass, RefreshCw, Search, Settings, Shield, X } from 'lucide-react';
 import { DescList, Kbd, StatusDot, cx } from '@lambda-house/ui';
-import { Palette, commandItems, matchesQuery, useMenu, type PaletteItem } from '@lambda-house/workbench';
+import { matchesQuery, type PaletteItem, type PaletteProvider } from '@lambda-house/workbench';
+import { errorText, refreshJournal } from '@lambda-house/journal';
 import { cacheState, compact, contextWindow, formatSessionTitle, matchesSession, sessionDirectories, sessionKey, totalTokens, within, type Session } from '../utils/sessions';
 import { formatAge } from '../utils/agent';
 import { hostedState, liveSessionLabel, runningFor, shortPath, STATE_LABEL, type Hosted } from '../utils/harness';
-import type { TopTabPlugin } from '../plugins/sdk';
-import { appMenu, commandContext } from '../utils/commands';
+import { pluginRegistry } from '../plugins/sdk';
+import { useStore } from '../store';
+import { journal } from '../journal';
+import { useSessionsView } from '../sessionsView';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
 import { EarlierRow, HostedRow, rowIdle, useHostedByConversation } from './SessionRow';
 import '../styles/harness.css';
 import '../styles/command-panel.css';
 
-export interface SessionCommandPanelProps {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  hideTrigger?: boolean;
-  enabled: boolean | null;
-  sessions: Session[];
-  directory: string;
-  onClearDirectory: () => void;
-  onSelectSession: (key: string) => void;
-  /** Show a hosted session in Live */
-  onOpenLive?: (hostedId: string) => void;
-  onNavigateView: (viewId: string) => void;
-  onOpenSettings: () => void;
-  onRefresh: () => void;
-  onEnableAccess: () => void;
-  topTabs: TopTabPlugin[];
-}
-
 type QuickFilter = 'all' | 'live' | 'codex' | 'claude' | 'working';
 
-const GROUPS = ['Sessions', 'Navigate', 'Actions', 'Commands'];
+/** The quick filter: kept from one opening to the next. */
+const useQuickFilter = create<{ filter: QuickFilter; set: (filter: QuickFilter) => void }>()((set) => ({ filter: 'all', set: (filter) => set({ filter }) }));
 
 function statusClass(status?: string): string {
   if (status === 'working') return 'cmd-status cmd-status--working';
@@ -102,39 +89,33 @@ function SessionPreview({ session, label, status, live, opensInLive }: { session
   );
 }
 
-/**
- * The command panel: the workbench's Palette with the sessions (drawn as the
- * Live list draws them, under their folders), the views, a few actions and
- * the app's commands. It opens through the command app.commandPalette
- * (Ctrl+Shift+P, ⇧⌘P); it has no key of its own.
- */
-export default function SessionCommandPanel({
-  open,
-  onOpenChange,
-  hideTrigger = false,
-  enabled,
-  sessions,
-  directory,
-  onClearDirectory,
-  onSelectSession,
-  onOpenLive,
-  onNavigateView,
-  onOpenSettings,
-  onRefresh,
-  onEnableAccess,
-  topTabs,
-}: SessionCommandPanelProps) {
-  // Hosted sessions, asked for each time the panel opens: their names and states win over the index's
-  const liveByKey = useHostedByConversation(open);
-  const menu = useMenu(appMenu);
-  const [query, setQuery] = useState('');
-  const [quickFilter, setQuickFilter] = useState<QuickFilter>('all');
+/** What the palette does in Sessions: show a session, a view, Settings; refresh the index; turn access on. */
+const actions = {
+  selectSession: (key: string) => { journal.store.getState().show(key); useSessionsView.getState().show('history'); },
+  openLive: (id: string) => useSessionsView.getState().openLive(id),
+  navigate: (view: string) => useSessionsView.getState().show(view),
+  openSettings: () => useStore.getState().setSettingsOpen(true),
+  refresh: () => void refreshJournal(journal),
+  enableAccess: async () => {
+    const store = journal.store.getState();
+    try { store.setEnabled(await journal.host.enable()); } catch (e) { store.setError(errorText(e)); }
+  },
+};
 
-  const shortcut = paletteShortcut(PLATFORM);
-  const close = () => {
-    onOpenChange(false);
-    setQuery('');
-  };
+/**
+ * The sessions in the palette (drawn as the Live list draws them, under
+ * their folders, with a quick filter and a preview), the views, a few
+ * actions. The workbench lists the app's commands after them.
+ */
+function useSessionResults(query: string) {
+  const { store } = journal;
+  const enabled = useZustand(store, (s) => s.enabled);
+  const sessions = useZustand(store, (s) => s.snapshot.sessions);
+  const directory = useZustand(store, (s) => s.lists[s.lastList]?.directory ?? '');
+  // Hosted sessions, asked for each time the palette opens: their names and states win over the index's
+  const liveByKey = useHostedByConversation(true);
+  const quickFilter = useQuickFilter((s) => s.filter);
+  const setQuickFilter = useQuickFilter((s) => s.set);
 
   const scopedSessions = useMemo(() => {
     if (!enabled) return [];
@@ -155,7 +136,6 @@ export default function SessionCommandPanel({
   );
 
   const items = useMemo<PaletteItem[]>(() => {
-    if (!open) return [];
     const next: PaletteItem[] = [];
 
     if (enabled) {
@@ -198,39 +178,37 @@ export default function SessionCommandPanel({
           row: live
             ? <HostedRow hosted={live} label={title} session={s}/>
             : <EarlierRow agent={s.provider} title={title} modified={s.modified}/>,
-          preview: <SessionPreview session={s} label={title} status={status} live={live} opensInLive={!!live && !!onOpenLive} />,
+          preview: <SessionPreview session={s} label={title} status={status} live={live} opensInLive={!!live} />,
           run: () => {
-            if (live && onOpenLive) onOpenLive(live.id);
-            else onSelectSession(key);
+            if (live) actions.openLive(live.id);
+            else actions.selectSession(key);
           },
         });
       });
     }
 
     const nav: PaletteItem[] = [
-      { id: 'nav:live', group: 'Navigate', label: 'Live workspace', hint: 'Active agents & panes', icon: <Compass size={14} />, run: () => onNavigateView('live') },
-      ...topTabs.map((t) => ({
-        id: `nav:plugin:${t.id}`, group: 'Navigate', label: t.label, hint: t.title || 'Plugin view', icon: <Compass size={14} />, run: () => onNavigateView(t.id),
+      { id: 'nav:live', group: 'Navigate', label: 'Live workspace', hint: 'Active agents & panes', icon: <Compass size={14} />, run: () => actions.navigate('live') },
+      ...pluginRegistry.getTopTabs().map((t) => ({
+        id: `nav:plugin:${t.id}`, group: 'Navigate', label: typeof t.label === 'string' ? t.label : t.id, hint: t.title || 'Plugin view', icon: <Compass size={14} />, run: () => actions.navigate(t.id),
       })),
-      { id: 'nav:settings', group: 'Navigate', label: 'Settings', hint: 'Connections, memories, agent access', icon: <Settings size={14} />, run: onOpenSettings },
+      { id: 'nav:settings', group: 'Navigate', label: 'Settings', hint: 'Connections, memories, agent access', icon: <Settings size={14} />, run: actions.openSettings },
     ];
-    const actions: PaletteItem[] = enabled
+    const more: PaletteItem[] = enabled
       ? [
-        { id: 'action:refresh', group: 'Actions', label: 'Refresh session index', hint: 'Rescan local transcripts', icon: <RefreshCw size={14} />, run: onRefresh },
-        { id: 'action:history-view', group: 'Actions', label: 'Open session inspector', hint: 'Full transcript & filters view', icon: <Activity size={14} />, run: () => onNavigateView('history') },
+        { id: 'action:refresh', group: 'Actions', label: 'Refresh session index', hint: 'Rescan local transcripts', icon: <RefreshCw size={14} />, run: actions.refresh },
+        { id: 'action:history-view', group: 'Actions', label: 'Open session inspector', hint: 'Full transcript & filters view', icon: <Activity size={14} />, run: () => actions.navigate('history') },
       ]
       : [
-        { id: 'action:enable', group: 'Actions', label: 'Enable session access', hint: 'Connect local Codex & Claude transcripts', icon: <Shield size={14} />, run: onEnableAccess },
+        { id: 'action:enable', group: 'Actions', label: 'Enable session access', hint: 'Connect local Codex & Claude transcripts', icon: <Shield size={14} />, run: () => void actions.enableAccess() },
       ];
-    for (const entry of [...nav, ...actions]) {
+    for (const entry of [...nav, ...more]) {
       if (matchesQuery(query, entry.label, entry.hint)) next.push(entry);
     }
+    return next;
+  }, [enabled, scopedSessions, liveByKey, quickFilter, query]);
 
-    // The app's own commands, as its menu offers them now
-    return [...next, ...commandItems(menu, commandContext(), query, 'Commands', commandContext().surface)];
-  }, [open, enabled, scopedSessions, liveByKey, quickFilter, query, topTabs, menu, onSelectSession, onOpenLive, onNavigateView, onOpenSettings, onRefresh, onEnableAccess]);
-
-  const filters = (
+  const toolbar = (
     <>
       <div className="cmd-pills" role="group" aria-label="Quick filter">
         {(['all', 'live', 'codex', 'claude', 'working'] as QuickFilter[]).map((f) => (
@@ -247,41 +225,34 @@ export default function SessionCommandPanel({
       {directory && (
         <span className="cmd-dir-badge" title={directory}>
           <span>in {homePath(directory)}</span>
-          <button type="button" aria-label="Search all folders" onClick={onClearDirectory}><X size={11} /></button>
+          <button type="button" aria-label="Search all folders" onClick={() => journal.store.getState().setFilters(journal.store.getState().lastList, { directory: '' })}><X size={11} /></button>
         </span>
       )}
     </>
   );
+  return { items, toolbar };
+}
 
+/**
+ * The palette in Sessions (the command panel): the sessions, the views and a
+ * few actions, then the app's commands (the workbench's). It opens through
+ * the command app.commandPalette (Ctrl+Shift+P, ⇧⌘P).
+ */
+export const sessionPaletteProvider: PaletteProvider = {
+  id: 'command-panel:sessions',
+  order: 10,
+  useResults: useSessionResults,
+  preview: { empty: <p className="cmd-preview__text">Select a session or command to preview details.</p> },
+};
+
+/** The Live sidebar's Search button: opens the palette, with its key as the platform writes it. */
+export function PaletteTrigger() {
+  const shortcut = paletteShortcut(PLATFORM);
   return (
-    <>
-      {!hideTrigger && (
-        <button
-          type="button"
-          className="cmd-trigger-btn"
-          aria-keyshortcuts={shortcut.aria}
-          onClick={() => onOpenChange(true)}
-          title={`Search sessions & commands (${shortcut.label})`}
-        >
-          <Search size={13} aria-hidden="true" />
-          <span className="cmd-trigger-btn__label">Search</span>
-          <Kbd>{shortcut.label}</Kbd>
-        </button>
-      )}
-
-      <Palette
-        open={open}
-        onClose={close}
-        query={query}
-        onQueryChange={setQuery}
-        items={items}
-        groups={GROUPS}
-        label="Control panel"
-        placeholder="Search sessions, tickets, models, or commands…"
-        toolbar={filters}
-        showPreview
-        emptyPreview={<p className="cmd-preview__text">Select a session or command to preview details.</p>}
-      />
-    </>
+    <button type="button" className="cmd-trigger-btn" aria-keyshortcuts={shortcut.aria} title={`Search sessions & commands (${shortcut.label})`} onClick={() => useStore.getState().setPaletteOpen(true)}>
+      <Search size={13} aria-hidden="true"/>
+      <span className="cmd-trigger-btn__label">Search</span>
+      <Kbd>{shortcut.label}</Kbd>
+    </button>
   );
 }

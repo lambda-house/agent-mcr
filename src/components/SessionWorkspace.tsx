@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { ClipboardList, History, MessageSquare, Terminal } from 'lucide-react';
 import { useStore as useZustand } from 'zustand';
 import { JournalProvider, JournalView, errorText, formatSessionTitle, refreshJournal, type Journal } from '@lambda-house/journal';
@@ -8,32 +8,97 @@ import { journal } from '../journal';
 import { pluginRegistry, usePluginVersion } from '../plugins';
 import '@lambda-house/journal/journal.css';
 import '../styles/sessions.css';
-import { ShellViews, type ShellView } from '@lambda-house/workbench';
+import { ShellViews, useViews, type WorkbenchView } from '@lambda-house/workbench';
 import { HostedByConversation, JournalRow, useHostedByConversation } from './SessionRow';
-import { harnessApi, slackApi } from '../utils/harness';
+import { harnessApi, slackApi, type Hosted } from '../utils/harness';
+import { SESSIONS_VIEWS, useSessionsView } from '../sessionsView';
 import LiveWorkspace from './LiveWorkspace';
 import BoardView from './BoardView';
 import SlackView from './SlackView';
 
-const VIEW_KEY = 'agent-mcr.sessions.view';
 /** How often the snapshot of the index is read while Live is shown: it names earlier sessions there, nothing more (MCR-139) */
 export const LIVE_SNAPSHOT_MS = 60_000;
-function savedView(): string {
-  try { return localStorage.getItem(VIEW_KEY) || 'live'; } catch { return 'live'; }
+
+/** What the views of Sessions share, from the surface. */
+interface Sessions {
+  /** Sessions is shown. */
+  active: boolean;
+  enabled: boolean;
+  titles: Record<string, string>;
+  recentDirectories: string[];
+  /** The journal's search, in one folder. */
+  searchFolder: (path: string) => void;
+  /** The hosted sessions by conversation, for the journal's rows. */
+  live: Map<string, Hosted>;
+  /** The journal whose sessions resume in Live. */
+  withResume: Journal;
+  /** Slack posts that wait for the person's approval. */
+  slackWaiting: number;
+  setSlackWaiting: (count: number) => void;
 }
 
+const SessionsContext = createContext<Sessions | null>(null);
+
+function useSessions(): Sessions {
+  const sessions = useContext(SessionsContext);
+  if (!sessions) throw new Error('A view of Sessions is drawn inside SessionWorkspace');
+  return sessions;
+}
+
+function LiveViewBody() {
+  const { active, recentDirectories, titles, enabled, searchFolder } = useSessions();
+  const shown = useSessionsView(s => s.view === 'live');
+  const focus = useSessionsView(s => s.focus);
+  return <div className="hs-live-wrap"><LiveWorkspace active={active && shown} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>;
+}
+
+function JournalViewBody() {
+  const { active, live, withResume } = useSessions();
+  const liveShown = useSessionsView(s => s.view === 'live');
+  return <HostedByConversation.Provider value={live}>
+    <JournalProvider journal={withResume} row={JournalRow}><JournalView active={active} refreshInterval={liveShown ? LIVE_SNAPSHOT_MS : undefined}/></JournalProvider>
+  </HostedByConversation.Provider>;
+}
+
+function BoardViewBody() {
+  const { active } = useSessions();
+  return <BoardView active={active} onOpen={useSessionsView.getState().openLive}/>;
+}
+
+function SlackViewBody() {
+  const { active, setSlackWaiting } = useSessions();
+  return <SlackView active={active} onOpen={useSessionsView.getState().openLive} onWaiting={setSlackWaiting}/>;
+}
+
+function SlackLabel() {
+  const { slackWaiting } = useSessions();
+  return <>Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</>;
+}
+
+/** Agent MCR's views of Sessions (documents.tsx contributes them); the plugins' come between Live and the Journal. */
+export const sessionViews: WorkbenchView[] = [
+  { surface: 'sessions', id: 'live', order: SESSIONS_VIEWS.live, label: 'Live', icon: <Terminal size={13}/>, keepMounted: 'always', render: () => <LiveViewBody/> },
+  // Always mounted: its snapshot names Live's sessions and feeds the palette
+  { surface: 'sessions', id: 'history', order: SESSIONS_VIEWS.history, label: 'Journal', icon: <History size={13}/>, title: 'Find an earlier session: by text, folder, agent or time', keepMounted: 'always',
+    render: () => <JournalViewBody/> },
+  { surface: 'sessions', id: 'board', order: SESSIONS_VIEWS.board, label: 'Board', icon: <ClipboardList size={13}/>, title: 'What sessions reported to you, and the notes they left for each other',
+    render: () => <BoardViewBody/> },
+  { surface: 'sessions', id: 'slack', order: SESSIONS_VIEWS.slack, label: <SlackLabel/>, icon: <MessageSquare size={13}/>, title: 'Slack: what is listened to, what sessions may post, and posts that wait for your approval',
+    render: () => <SlackViewBody/> },
+];
+
 /**
- * The Sessions surface: Live, the Journal (@lambda-house/journal), Board,
- * Slack and the plugins' views. The journal stays mounted while another view
- * is shown: its snapshot names Live's sessions and feeds the palette.
+ * The Sessions surface: its views, from the plugin registry (Live, the
+ * Journal of @lambda-house/journal, Board, Slack and the plugins' views).
+ * The journal stays mounted while another view is shown: its snapshot names
+ * Live's sessions and feeds the palette.
  */
 export default function SessionWorkspace({ active = true }: { active?: boolean }) {
   usePluginVersion();
-  const topTabs = pluginRegistry.getTopTabs();
+  const views = useViews(pluginRegistry.workbench, 'sessions');
   const globalOverlays = pluginRegistry.getGlobalOverlays();
-  const [view, setViewState] = useState<string>(savedView);
-  const [focus, setFocus] = useState<{ id: string; at: number }>();
-  const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
+  const view = useSessionsView(s => s.view);
+  const { show, openLive } = useSessionsView.getState();
   // Posts that wait for the person's approval: shown on the Slack tab from every view
   const [slackWaiting, setSlackWaiting] = useState(0);
   useEffect(() => {
@@ -52,46 +117,33 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
   /** Continue an earlier session in a hosted terminal, in its own folder. */
   const withResume = useMemo<Journal>(() => ({
     store,
-    host: { ...journal.host, resume: async (s) => { await harnessApi.spawn('', '', 120, 32, s.id); setView('live'); } },
-  }), [store]);
+    host: { ...journal.host, resume: async (s) => { await harnessApi.spawn('', '', 120, 32, s.id); show('live'); } },
+  }), [store, show]);
 
-  // The same cleaned names in Live and the command panel, joined by conversation id
+  // The same cleaned names in Live and the palette, joined by conversation id
   const titles = useMemo(() => Object.fromEntries(sessions.filter(s => !s.parentId).map(s => [s.id, formatSessionTitle(s)])), [sessions]);
   // A found session that runs now is drawn as its Live row
   const live = useHostedByConversation(active && view === 'history' && !!enabled, 5000);
-  const searchFolder = (path: string) => { setDirectory(path); setView('history'); };
+  const searchFolder = (path: string) => { setDirectory(path); show('history'); };
   const recentDirectories = useMemo(() => [...new Set([...sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [sessions]);
-  const views: ShellView[] = [
-    { id: 'live', label: 'Live', icon: <Terminal size={13}/>, keepMounted: 'always',
-      render: () => <div className="hs-live-wrap"><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div> },
-    ...topTabs.map((t): ShellView => ({ id: t.id, label: t.label, icon: t.icon, title: t.title, render: () => t.render({ active }) })),
-    // Always mounted: its snapshot names Live's sessions and feeds the palette
-    { id: 'history', label: 'Journal', icon: <History size={13}/>, title: 'Find an earlier session: by text, folder, agent or time', keepMounted: 'always',
-      render: () => <HostedByConversation.Provider value={live}>
-        <JournalProvider journal={withResume} row={JournalRow}><JournalView active={active} refreshInterval={view === 'live' ? LIVE_SNAPSHOT_MS : undefined}/></JournalProvider>
-      </HostedByConversation.Provider> },
-    { id: 'board', label: 'Board', icon: <ClipboardList size={13}/>, title: 'What sessions reported to you, and the notes they left for each other',
-      render: () => <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/> },
-    { id: 'slack', icon: <MessageSquare size={13}/>, title: 'Slack: what is listened to, what sessions may post, and posts that wait for your approval',
-      label: <>Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</>,
-      render: () => <SlackView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }} onWaiting={setSlackWaiting}/> },
-  ];
+  const shared: Sessions = { active, enabled: !!enabled, titles, recentDirectories, searchFolder, live, withResume, slackWaiting, setSlackWaiting };
   return <section className="session-cockpit">
-    {/* The view switch goes into the window's top bar, and each view's tools while it is shown */}
-    <ShellViews label="Sessions view" views={views} value={view} onChange={setView}/>
-    {/* Only while Sessions is shown: an overlay may listen for keys (the command panel's Cmd+S), and over Documents those are the editor's */}
+    <SessionsContext.Provider value={shared}>
+      {/* The view switch goes into the window's top bar, and each view's tools while it is shown */}
+      <ShellViews label="Sessions view" views={views} value={view} onChange={show}/>
+    </SessionsContext.Provider>
+    {/* Only while Sessions is shown: an overlay may listen for keys, and over Documents those are the editor's */}
     {active && globalOverlays.map(o => o.render({
       enabled,
       sessions,
       directory,
       onClearDirectory: () => setDirectory(''),
-      onSelectSession: (key) => { store.getState().show(key); setView('history'); },
-      onOpenLive: (id) => { setFocus({ id, at: Date.now() }); setView('live'); },
-      onNavigateView: (viewId) => setView(viewId),
+      onSelectSession: (key) => { store.getState().show(key); show('history'); },
+      onOpenLive: openLive,
+      onNavigateView: show,
       onOpenSettings: () => useStore.getState().setSettingsOpen(true),
       onRefresh: () => void refreshJournal(journal),
       onEnableAccess: async () => { try { store.getState().setEnabled(await journal.host.enable()); } catch (e) { store.getState().setError(errorText(e)); } },
-      topTabs,
     }))}
   </section>;
 }

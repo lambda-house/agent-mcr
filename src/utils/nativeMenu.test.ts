@@ -39,12 +39,12 @@ describe('the command panel', () => {
     expect(press({ key: 'S', metaKey: true, shiftKey: true })).toBe('file.saveAll');
   });
 
-  it('opens only while Sessions hosts it', () => {
-    useStore.setState({ paletteHosted: false, paletteOpen: false });
+  it('opens only while Sessions is shown', () => {
+    useStore.setState({ surface: 'documents', paletteOpen: false });
     expect(palette.enabled?.(commandContext())).toBe(false);
     palette.run();
     expect(useStore.getState().paletteOpen).toBe(false);
-    useStore.setState({ paletteHosted: true });
+    useStore.setState({ surface: 'sessions' });
     expect(palette.enabled?.(commandContext())).toBe(true);
     palette.run();
     expect(useStore.getState().paletteOpen).toBe(true);
