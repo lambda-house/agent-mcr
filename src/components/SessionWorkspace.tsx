@@ -49,7 +49,7 @@ function LiveViewBody() {
   const { active, recentDirectories, titles, enabled, searchFolder } = useSessions();
   const shown = useSessionsView(s => s.view === 'live');
   const focus = useSessionsView(s => s.focus);
-  return <div className="hs-live-wrap"><LiveWorkspace active={active && shown} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>;
+  return <div className="hs-live-wrap"><LiveWorkspace active={active && shown} sessionAccess={enabled} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>;
 }
 
 function JournalViewBody() {
@@ -99,15 +99,17 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
   const globalOverlays = pluginRegistry.getGlobalOverlays();
   const view = useSessionsView(s => s.view);
   const { show, openLive } = useSessionsView.getState();
-  // Posts that wait for the person's approval: shown on the Slack tab from every view
+  // Posts that wait for the person's approval: shown on the Slack tab from every view; Slack itself reports them while shown
   const [slackWaiting, setSlackWaiting] = useState(0);
+  const showingSlack = view === 'slack';
   useEffect(() => {
-    if (!active || !isTauri()) return;
-    const look = () => { if (!document.hidden) slackApi.status().then(s => setSlackWaiting(s.counts.waiting)).catch(() => {}); };
+    if (!active || showingSlack || !isTauri()) return;
+    let live = true;
+    const look = () => { if (!document.hidden) slackApi.waiting().then(count => { if (live) setSlackWaiting(count); }).catch(() => {}); };
     look();
     const timer = setInterval(look, 4000);
-    return () => clearInterval(timer);
-  }, [active]);
+    return () => { live = false; clearInterval(timer); };
+  }, [active, showingSlack]);
 
   const { store } = journal;
   const enabled = useZustand(store, s => s.enabled);

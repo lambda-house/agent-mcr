@@ -563,8 +563,10 @@ impl Adapter for Claude {
         transcript.map(|t| crate::harness::subagents(home, t, since)).unwrap_or_default()
     }
     /// `--model`, `--fallback-model`, `--effort`, `--permission-mode`,
-    /// `--tools` and `--disallowedTools` (Claude Code 2.1.330). Never
-    /// `--allowedTools`: an allow rule skips the operator's prompt
+    /// `--tools` and `--disallowedTools` (Claude Code 2.1.330). Profile
+    /// authors cannot supply `--allowedTools`: it skips the operator's prompt.
+    /// The owner authorized the launcher to allow push and merge for delivery
+    /// leads only (MCR-143), with deny rules still taking precedence.
     fn expresses(&self) -> Expresses {
         Expresses {
             model: true,
@@ -593,9 +595,52 @@ impl Adapter for Claude {
             }
             w.extend(only.iter().cloned());
         }
-        if !p.tools.deny.is_empty() {
+        let delivers = p.delivers();
+        if delivers || !p.tools.deny.is_empty() {
             w.push("--disallowedTools".into());
             w.extend(p.tools.deny.iter().cloned());
+            if delivers {
+                // Protect the pre-approved commands even with an older pinned profile.
+                for rule in [
+                    "Bash(gh pr merge --admin*)",
+                    "Bash(gh pr merge * --admin*)",
+                    "Bash(gh pr merge -F*)",
+                    "Bash(gh pr merge * -F*)",
+                    "Bash(gh pr merge --body-file*)",
+                    "Bash(gh pr merge * --body-file*)",
+                    "Bash(git push --receive-pack*)",
+                    "Bash(git push * --receive-pack*)",
+                    "Bash(git push --exec*)",
+                    "Bash(git push * --exec*)",
+                    // Git accepts unique long-option prefixes. Keep --end-of-options usable.
+                    "Bash(git push --rece*)",
+                    "Bash(git push * --rece*)",
+                    "Bash(git push --ex*)",
+                    "Bash(git push * --ex*)",
+                    "Bash(git push --e=*)",
+                    "Bash(git push * --e=*)",
+                    "Bash(git push --e *)",
+                    "Bash(git push * --e *)",
+                    // An explicit ext destination names a command when the transport is enabled.
+                    // End in two wildcards so Claude keeps both literal colons
+                    // instead of treating the last colon and star as `:*`.
+                    "Bash(git push ext::**)",
+                    "Bash(git push * ext::**)",
+                    "Bash(git push --repo=ext::**)",
+                    "Bash(git push * --repo=ext::**)",
+                    "Bash(git push --rep=ext::**)",
+                    "Bash(git push * --rep=ext::**)",
+                ] {
+                    if !p.tools.deny.iter().any(|deny| deny == rule) {
+                        w.push(rule.into());
+                    }
+                }
+            }
+        }
+        if delivers {
+            // The merge wildcard follows the end of option parsing. It can
+            // supply a PR selector but cannot supply a flag to gh.
+            w.extend(["--allowedTools", "Bash(git push origin *)", "Bash(gh pr merge --merge -- *)"].map(String::from));
         }
         Ok(w)
     }
@@ -740,6 +785,11 @@ impl Adapter for Codex {
     /// the effort as a TOML literal (`model_reasoning_effort` is a config key
     /// of codex-cli 0.170, and the operator's own config.toml sets it): one
     /// word without `"` or `%`, so it is the same on Windows
+    ///
+    /// Delivery keeps `on-request` (MCR-143). Codex's `prefix_rule` allows
+    /// commands outside the sandbox through shared config layers. The
+    /// harness's `PermissionRequest` hook reports the prompt. Only the
+    /// operator decides it (D6 in docs/AGENT_HARNESS_DESIGN.md).
     fn profile_words(&self, p: &crate::profiles::AgentProfile) -> Result<Vec<String>, String> {
         if p.inference.fallback_model.is_some() || !p.tools.deny.is_empty() || p.tools.only.is_some() {
             return Err("codex takes no fallback model and no tool lists".into());
@@ -1256,7 +1306,7 @@ mod tests {
         words
     }
 
-    /// Flags and values no profile may ever produce (16647 M1)
+    /// Flags and values forbidden in profile input (16647 M1)
     fn refused_words(words: &[String]) -> Vec<String> {
         const REFUSED: [&str; 17] = [
             "--allowedTools", "--allowed-tools", "--agents", "--add-dir", "--dangerously-skip-permissions", "bypassPermissions", "dontAsk",
@@ -1280,12 +1330,22 @@ mod tests {
 
     #[test]
     fn profiles_reach_both_launch_paths_through_the_mapping_only() {
+        use crate::profiles::{choose, lower_of, Push};
+
         let id = "11111111-2222-3333-4444-555555555555";
-        let loaded = crate::profiles::load(Path::new("/nonexistent-config-dir"));
+        let config = Path::new("/nonexistent-config-dir");
+        let loaded = crate::profiles::load(config);
         let full = full_claude();
         let codex_full = crate::profiles::parse("id = \"custom@cx\"\nversion = 1\nrole = \"custom\"\nadapter = \"codex\"\n[inference]\nmodel = \"gpt-6.1-sol\"\neffort = \"low\"\n[permissions]\nmode = \"read-only\"\n", crate::profiles::Origin::Operator).unwrap();
+        let lead = choose(config, "lead@claude-opus").unwrap();
+        let implementer = choose(config, "implementer@claude-opus").unwrap();
+        let (lowered_lead, _) = lower_of(&lead, &lead.profile).unwrap();
+        let (lowered_implementer, _) = lower_of(&implementer, &lead.profile).unwrap();
+        assert_eq!(lead.profile.permissions.push, Push::Delivery);
+        assert_eq!(lowered_lead.profile.permissions.push, Push::None);
+        assert_eq!(lowered_implementer.profile.permissions.push, Push::None);
         let mut all: Vec<&crate::profiles::AgentProfile> = loaded.profiles.iter().map(|e| &e.profile).collect();
-        all.extend([&full, &codex_full]);
+        all.extend([&full, &codex_full, &lowered_lead.profile, &lowered_implementer.profile]);
         for p in all {
             let supervisor = p.role == crate::profiles::Role::Supervisor;
             for (resume, session) in [(None, Some(id)), (Some(id), None)] {
@@ -1294,7 +1354,15 @@ mod tests {
                 let win = windows_args(&l).unwrap();
                 assert!(cmd_line(&win).is_ok(), "{}", p.id);
                 for words in [&unix[1..], &win[..]] {
-                    assert!(refused_words(words).is_empty(), "{}: {:?}", p.id, refused_words(words));
+                    let refused = refused_words(words);
+                    if p.adapter == "claude" && p.delivers() {
+                        assert_eq!(refused, ["--allowedTools"], "{}", p.id);
+                        let at = words.iter().position(|w| w == "--allowedTools").unwrap();
+                        assert_eq!(&words[at + 1..at + 3], ["Bash(git push origin *)", "Bash(gh pr merge --merge -- *)"]);
+                        assert_eq!(words[at + 3], "--mcp-config");
+                    } else {
+                        assert!(refused.is_empty(), "{}: {refused:?}", p.id);
+                    }
                     let mode = p.permissions.mode.as_deref().unwrap();
                     let flag = if p.adapter == "claude" { "--permission-mode" } else { "--sandbox" };
                     assert_eq!(words.iter().filter(|w| *w == flag).count(), 1, "{}", p.id);
@@ -1309,8 +1377,25 @@ mod tests {
                     // Each deny rule is one word, right after the flag and before the harness's own flags
                     if !p.tools.deny.is_empty() {
                         let at = words.iter().position(|w| w == "--disallowedTools").unwrap();
-                        assert_eq!(&words[at + 1..at + 1 + p.tools.deny.len()], &p.tools.deny[..]);
-                        assert!(words[at + 1 + p.tools.deny.len()].starts_with("--"));
+                        let end = at + 1 + p.tools.deny.len();
+                        assert_eq!(&words[at + 1..end], &p.tools.deny[..]);
+                        if p.adapter == "claude" && p.delivers() {
+                            let allow = words.iter().position(|w| w == "--allowedTools").unwrap();
+                            let added_denies = &words[end..allow];
+                            for (command, arguments) in [
+                                ("gh pr merge", &["--admin", "-F", "--body-file"][..]),
+                                ("git push", &["--receive-pack", "--exec", "--rece", "--ex", "--e=", "--e ", "ext::*", "--repo=ext::*", "--rep=ext::*"][..]),
+                            ] {
+                                for argument in arguments {
+                                    for position in ["", "* "] {
+                                        let rule = format!("Bash({command} {position}{argument}*)");
+                                        assert!(added_denies.contains(&rule), "{} missing {rule}", p.id);
+                                    }
+                                }
+                            }
+                        } else {
+                            assert!(words[end].starts_with("--"));
+                        }
                     }
                     if p.adapter == "codex" {
                         assert_eq!(words[words.iter().position(|w| w == "--ask-for-approval").unwrap() + 1], "on-request");
@@ -1352,8 +1437,15 @@ mod tests {
         let mut p = full.clone();
         p.adapter = "codex".into();
         check(&p, "codex", false);
-        // The supervisor profile is for the root only, and the root takes no other
         let loaded = crate::profiles::load(Path::new("/nonexistent-config-dir"));
+        // A delivery lead cannot supply its own allow flag either
+        let mut lead = loaded.get("lead@claude-opus").unwrap().profile.clone();
+        for flag in ["--allowedTools", "--allowed-tools"] {
+            lead.tools.only = Some(vec![flag.into()]);
+            let (unix, windows) = check(&lead, "claude", false);
+            assert!(unix.contains("tools.only") && windows.contains("tools.only"), "{flag}: {unix}, {windows}");
+        }
+        // The supervisor profile is for the root only, and the root takes no other
         check(&loaded.get("supervisor@claude-opus").unwrap().profile, "claude", false);
         check(&loaded.get("implementer@claude-opus").unwrap().profile, "claude", true);
     }

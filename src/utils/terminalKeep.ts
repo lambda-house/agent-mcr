@@ -1,30 +1,28 @@
 /**
- * Terminals of sessions shown a moment ago, kept with what they showed while
- * no pane shows them (MCR-139). A kept terminal is detached from the runner:
- * it parses nothing and renders nothing. Shown again, it asks the runner for
- * the bytes since `offset` and goes on from there, so it keeps every line it
- * had, up to its own scrollback, however long the session's output was; a
- * new terminal gets only what the runner still holds (4 MiB of raw bytes).
+ * A detached terminal keeps its parser, pending writes and scrollback. On
+ * reattach it asks for the bytes since `offset` and appends them to its write
+ * queue. If the runner cannot continue at that offset, a fresh terminal
+ * consumes the full replay the runner still holds on that same connection.
  *
- * At most `max` are kept, the least recently hidden going first, and a kept
- * terminal of a session that left the list goes at once. A session whose
- * terminal went gets a new one with the runner's replay, as every switch did
- * before MCR-139. Keeping a dropped terminal's contents as serialized text was
- * tried and taken out (review 17086): xterm serializes only what it parsed,
- * and an offset in the middle of an escape sequence cannot be continued from
- * text, so lines were lost or garbled.
+ * Terminals still assigned to a pane are protected even when the pane is
+ * clipped or zero-sized (MCR-140). Of the others, at most `max` are kept,
+ * the least recently detached going first. Sessions that leave the list go
+ * at once. A dropped terminal starts over with the runner's replay. Saving
+ * serialized text lost parser state for unfinished escape sequences (review
+ * 17086), so the keep holds the xterm itself.
  */
 export interface Kept<T> {
   term: T;
-  /** Offset in the session's output of the next byte it has not seen; null when the runner did not say */
+  /** Offset after all bytes handed to xterm, including queued writes; null when the runner did not say */
   offset: number | null;
 }
 
-/** As many hidden terminals as kept: each holds up to its scrollback, 10,000 lines */
+/** Maximum unassigned terminals kept, each with up to 10,000 scrollback lines. */
 export const MAX_KEPT = 4;
 
 export class TerminalKeep<T> {
   private kept = new Map<string, Kept<T>>();
+  private assigned: ReadonlySet<string> = new Set();
   /** The sessions of the last list, and those that were in a list and left it: never kept again */
   private listed = new Set<string>();
   private gone = new Set<string>();
@@ -39,10 +37,8 @@ export class TerminalKeep<T> {
   }
 
   /**
-   * Keep a hidden terminal; the least recently hidden beyond `max` is dropped.
-   * One of a session that left the list is dropped at once: a terminal is put
-   * when xterm has parsed its last bytes, which can be after the list let the
-   * session go (review 17088).
+   * Keep a detached terminal. The least recently detached unassigned one
+   * beyond `max` is dropped, as is a session the list already removed.
    */
   put(id: string, kept: Kept<T>) {
     if (this.gone.has(id)) { this.drop(kept.term); return; }
@@ -50,11 +46,18 @@ export class TerminalKeep<T> {
     if (old && old.term !== kept.term) this.drop(old.term);
     this.kept.delete(id);
     this.kept.set(id, kept);
-    while (this.kept.size > this.max) {
-      const [first, k] = this.kept.entries().next().value as [string, Kept<T>];
-      this.kept.delete(first);
-      this.drop(k.term);
-    }
+    this.trim();
+  }
+
+  /** Update which sessions are still in the pane layout before detaching views. */
+  protect(ids: ReadonlySet<string>) {
+    this.assigned = ids;
+    this.trim();
+  }
+
+  private trim() {
+    const unassigned = [...this.kept.keys()].filter(id => !this.assigned.has(id));
+    for (const id of unassigned.slice(0, Math.max(0, unassigned.length - this.max))) this.forget(id);
   }
 
   /** Drop the kept terminals of sessions that are not in `ids`, the list now */

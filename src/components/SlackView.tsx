@@ -103,13 +103,17 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
   const [busy, setBusy] = useState(false);
   const [bot, setBot] = useState(''); const [appToken, setAppToken] = useState(''); const [operator, setOperator] = useState('');
   const mounted = useRef(true);
+  const statusVersion = useRef(0);
+  const changing = useRef(false);
 
   const show = useCallback((s: SlackStatus | null) => { if (s && mounted.current) { setStatus(held => keepSame(held, s)); onWaiting?.(s.counts.waiting); } }, [onWaiting]);
   const refresh = useCallback(async () => {
-    try {
-      const [s, list] = await Promise.all([slackApi.status(), harnessApi.list()]);
-      if (mounted.current) { show(s); setHosted(held => keepSame(held, list)); }
-    } catch (e) { if (mounted.current) setError(err(e)); }
+    const failed = (e: unknown) => { if (mounted.current) setError(err(e)); };
+    const version = ++statusVersion.current;
+    await Promise.all([
+      slackApi.status().then(s => { if (!changing.current && version === statusVersion.current) show(s); }).catch(failed),
+      harnessApi.list().then(list => { if (mounted.current) setHosted(held => keepSame(held, list)); }).catch(failed),
+    ]);
   }, [show]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
@@ -122,9 +126,14 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
 
   /** One change at a time; the answer is the new state */
   const run = (work: () => Promise<SlackStatus | null>) => {
-    if (busy) return;
+    if (changing.current) return;
+    changing.current = true;
     setBusy(true); setError('');
-    work().then(show).catch(e => { if (mounted.current) setError(err(e)); }).finally(() => { if (mounted.current) setBusy(false); });
+    work().then(show).catch(e => { if (mounted.current) setError(err(e)); }).finally(() => {
+      statusVersion.current++;
+      changing.current = false;
+      if (mounted.current) setBusy(false);
+    });
   };
   const live = useMemo(() => hosted.filter(h => !h.exit), [hosted]);
   const running = useMemo(() => new Set(live.map(h => h.id)), [live]);

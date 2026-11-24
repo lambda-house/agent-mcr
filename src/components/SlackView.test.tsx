@@ -60,6 +60,24 @@ describe('Slack view', () => {
     expect(slackApi.decide).toHaveBeenCalledWith('p2', true, undefined, undefined);
   });
 
+  it('updates the badge on approval and ignores a late status from before the approval', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const onWaiting = vi.fn();
+      vi.mocked(harnessApi.list).mockRejectedValue(new Error('Runner unavailable'));
+      let finishStatus!: (reply: SlackStatus) => void;
+      vi.mocked(slackApi.status).mockResolvedValueOnce(status).mockReturnValueOnce(new Promise(resolve => { finishStatus = resolve; }));
+      vi.mocked(slackApi.decide).mockResolvedValue({ ...status, posts: status.posts.slice(1), counts: { ...status.counts, waiting: 0 } });
+      await act(async () => root.render(<SlackView active onOpen={vi.fn()} onWaiting={onWaiting}/>)); await flush();
+      expect(onWaiting).toHaveBeenLastCalledWith(1);
+      await act(async () => { vi.advanceTimersByTime(3000); });
+      await act(async () => button('Approve').click()); await flush();
+      expect(onWaiting).toHaveBeenLastCalledWith(0);
+      await act(async () => finishStatus(status));
+      expect(onWaiting).toHaveBeenLastCalledWith(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('sends the changed text when the person edits before approving, and a reason when denying', async () => {
     await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
     await type(host.querySelector<HTMLTextAreaElement>('.hs-slack-waiting textarea')!, 'Deployed 1.2.1');

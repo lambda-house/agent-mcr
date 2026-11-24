@@ -2793,9 +2793,13 @@ impl Harness {
         found
     }
 
-    fn sessions(&self) -> Result<Vec<Value>, String> {
-        let list = self.runner(json!({"op": "list"}))?;
-        let infos = list["sessions"].as_array().cloned().unwrap_or_default();
+    /// Reconcile the store with the runner without building the enriched Live rows.
+    fn runner_sessions(&self) -> Result<Vec<Value>, String> {
+        let mut list = self.runner(json!({"op": "list"}))?;
+        let infos = match list["sessions"].take() {
+            Value::Array(infos) => infos,
+            _ => Vec::new(),
+        };
         let ids: BTreeSet<&str> = infos.iter().filter_map(|i| i["id"].as_str()).collect();
         if lock(&self.store).sessions.keys().any(|k| !ids.contains(k.as_str())) {
             self.update(|s| {
@@ -2838,6 +2842,12 @@ impl Harness {
                 }
             });
         }
+        Ok(infos)
+    }
+
+    fn sessions(&self) -> Result<Vec<Value>, String> {
+        let infos = self.runner_sessions()?;
+        let ids: BTreeSet<&str> = infos.iter().filter_map(|i| i["id"].as_str()).collect();
         let processes = self.processes();
         lock(&self.activity).retain(|pid, _| processes.iter().any(|p| p.pid == *pid));
         lock(&self.subagents).retain(|id, _| ids.contains(id.as_str()));
@@ -3984,7 +3994,7 @@ impl Harness {
     fn cockpit_tool(&self, me: Option<&str>, name: &str, args: &Value) -> Result<Value, String> {
         // The runner's list first: it says who the Supervisor is, and the
         // store learns of ended and forgotten sessions from it
-        let sessions = self.sessions()?;
+        let sessions = self.runner_sessions()?;
         let who = me.map(|id| cockpit::Who { id, root: sessions.iter().any(|s| s["id"] == id && s["meta"]["role"] == "supervisor") });
         let now = now_ms();
         match name {
@@ -5068,6 +5078,7 @@ impl Harness {
             "memory_connect" => self.memory.connect(),
             "memory_disconnect" => Ok(self.memory.disconnect()),
             // The Slack connector, as the app sees and steers it. Only the app gets here (see `handle`)
+            "slack" if req["waitingOnly"] == true => Ok(json!(self.slack.waiting())),
             "slack" => Ok(self.slack.status_live(self)),
             "slack_probe" | "slack_connect" => {
                 let text = |key: &str| req[key].as_str().unwrap_or("").trim().to_string();
@@ -7340,7 +7351,9 @@ mod tests {
         // Without a hosted caller (the app, an agent outside): everything is read, nothing published
         assert!(h.tool("cockpit_publish", &json!({"tracks": []})).unwrap_err().contains("outside"));
         assert!(h.tool("cockpit_patch", &json!({"remove": "track", "id": "t", "by": "a"})).unwrap_err().contains("outside"));
+        lock(&h.processes).0 = None;
         let all = h.control(&json!({"op": "cockpit"})).unwrap();
+        assert!(lock(&h.processes).0.is_none(), "cockpit reads need no process table");
         assert_eq!((&all["version"], &all["tracks"][0]["by"], &all["actions"][0]["by"]), (&json!(2), &json!("a"), &json!("supervisor")));
         assert_eq!(h.tool("cockpit_read", &json!({})).unwrap()["tracks"], all["tracks"]);
         assert_eq!(h.agent_tool("a", "cockpit_read", &json!({})).unwrap()["tracks"][0]["lead"], "b");

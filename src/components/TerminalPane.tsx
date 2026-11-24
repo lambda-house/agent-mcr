@@ -10,6 +10,7 @@ import { excerptFromSelection } from '../utils/taskCopy';
 import { isCopyKey, isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
 import TaskCopyDialog from './TaskCopyDialog';
 import { MAX_KEPT, TerminalKeep } from '../utils/terminalKeep';
+import { disableOutputScrollbarReveal, tryWebgl } from '../utils/terminalRenderer';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
 export const RESIZE_SETTLE_MS = 200;
@@ -36,8 +37,61 @@ function theme(element: HTMLElement) {
 
 /** Hidden terminals kept with what they showed (MCR-139); see utils/terminalKeep.ts */
 export const keep = new TerminalKeep<{ term: Terminal; fit: FitAddon }>(MAX_KEPT, ({ term }) => term.dispose());
-/** Sessions a pane shows now: a terminal let go while its session is shown again is not kept */
-const mountedIds = new Set<string>();
+
+type ViewReceiver = {
+  start: (from: number | null) => void;
+  data: (bytes: Uint8Array) => void;
+  ready: () => void;
+  error: (error: unknown) => void;
+};
+
+/** The runner view can outlive the terminal that first asked for it. */
+class TerminalView {
+  handle: number | null = null;
+  private receiver?: ViewReceiver;
+  private from?: number | null;
+  private queued: Uint8Array[] = [];
+  private closed = false;
+
+  listen(receiver: ViewReceiver) {
+    this.receiver = receiver;
+    if (this.from !== undefined) receiver.start(this.from);
+    if (this.receiver !== receiver) return;
+    if (this.handle !== null) receiver.ready();
+    const queued = this.queued;
+    this.queued = [];
+    for (const bytes of queued) receiver.data(bytes);
+  }
+
+  pause() { this.receiver = undefined; }
+
+  open(id: string, since: number | null) {
+    void harnessApi.attach(id, since, {
+      start: from => {
+        if (this.closed) return;
+        this.from = from;
+        this.receiver?.start(from);
+      },
+      data: bytes => {
+        if (this.closed) return;
+        if (this.receiver) this.receiver.data(bytes);
+        else this.queued.push(bytes);
+      },
+    }).then(handle => {
+      if (this.closed) { void harnessApi.detach(handle); return; }
+      this.handle = handle;
+      this.receiver?.ready();
+    }).catch(error => this.receiver?.error(error));
+  }
+
+  dispose() {
+    if (this.closed) return;
+    this.closed = true;
+    this.pause();
+    this.queued = [];
+    if (this.handle !== null) void harnessApi.detach(this.handle);
+  }
+}
 
 /**
  * One hosted terminal. Mounting attaches a view (the runner replays its
@@ -48,8 +102,10 @@ const mountedIds = new Set<string>();
  * with no text is saved and its path typed. Ctrl-V reaches the agent as ^V
  * (Claude Code reads the clipboard image itself).
  */
-export default function TerminalPane({ id, name, active, onQuit, isSession, onSession, focusAt, onFocused }: {
+export default function TerminalPane({ id, name, active, focusOnMount = false, onQuit, isSession, onSession, focusAt, onFocused }: {
   id: string; active: boolean;
+  /** The selected pane may take the keyboard when it mounts. */
+  focusOnMount?: boolean;
   /** Its name in the Live list, for the Copy as task dialog (MCR-125) */
   name?: string;
   /** The session ended right after the person pressed keys in it: they quit the agent themselves */
@@ -76,6 +132,7 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
   const [ended, setEnded] = useState(false);
   // A kept terminal the runner could not go on with is let go, and the pane mounts a new one (review 17088)
   const [fresh, setFresh] = useState(0);
+  const replacement = useRef<{ id: string; view: TerminalView } | null>(null);
   // The terminal let go had the keyboard: the new one takes it (review 17090)
   const refocus = useRef(false);
   const [notice, setNotice] = useState('');
@@ -94,7 +151,16 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
   // Only a terminal that is shown answers the app's command: never one left behind in another pane
   const shown = useRef(active);
   shown.current = active;
+  const takeFocus = useRef(focusOnMount);
+  takeFocus.current = focusOnMount;
   const copyText = (text: string) => { harnessApi.copyText(text).catch(e => setNotice(err(e))); };
+
+  useEffect(() => () => {
+    if (replacement.current?.id === id) {
+      replacement.current.view.dispose();
+      replacement.current = null;
+    }
+  }, [id]);
 
   useEffect(() => {
     const element = host.current;
@@ -102,7 +168,6 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     // A session shown a moment ago comes back with the terminal it had: every
     // line it showed, and only what it missed from the runner (MCR-139)
     const kept = keep.take(id);
-    mountedIds.add(id);
     let t: Terminal, f: FitAddon;
     if (kept) {
       ({ term: t, fit: f } = kept.term);
@@ -122,12 +187,15 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       t.loadAddon(new Unicode11Addon());
       t.unicode.activeVersion = '11';
       t.open(element);
-      if (refocus.current) { refocus.current = false; requestAnimationFrame(() => { if (term.current === t) t.focus(); }); }
+      disableOutputScrollbarReveal(t);
+      if (refocus.current) {
+        refocus.current = false;
+        requestAnimationFrame(() => {
+          const focused = document.activeElement;
+          if (!document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) t.focus();
+        });
+      }
     }
-    // The DOM renderer, on purpose (MCR-139): xterm's WebGL renderer measured
-    // far heavier in this web view, 1.1 GB against 0.2 GB idle under the same
-    // load, mostly graphics memory a context and its glyph atlas keep, made
-    // anew at every mount of a pane and not given back
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
     // On Windows and Linux Ctrl+Shift+C copies the selection, as in other terminals, and is never the agent's
@@ -239,7 +307,9 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     pointers.current = () => remark(0, t.rows - 1);
     try { f.fit(); } catch { /* not laid out yet */ }
 
-    let view: number | null = null;
+    const transferred = replacement.current?.id === id ? replacement.current.view : null;
+    if (transferred) replacement.current = null;
+    const view = transferred ?? new TerminalView();
     let disposed = false;
     // The agent must end up with the size the screen has. Sizes are sent one
     // at a time, newest last: two requests in flight can arrive in the wrong
@@ -266,21 +336,19 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     let offset: number | null = kept?.offset ?? null;
     // This terminal is not to be kept or used again: the runner could not go on where it left off
     let discard = false;
-    // Frames of this view that arrive after it was let go (they were on their
-    // way: detaching is asynchronous) are dropped. The terminal may be kept or
-    // shown again by then, and the offset kept says it never saw them: the next
-    // view gets them from the runner, once. A late start must not reset it
-    harnessApi.attach(id, kept ? offset : null, {
+    view.listen({
       start: from => {
-        if (disposed || discard) return;
         // The runner could not start where this terminal left off (it holds no
         // more, or it is a runner that does not say). The terminal is not reset
         // and reused: a reset leaves xterm's parser inside any sequence the last
         // bytes left unfinished, and the replay's first bytes were read as its
-        // end ("ew line", review 17088). A new terminal takes the replay instead
+        // end ("ew line", review 17088). Pass this view and its replay to a new
+        // terminal, including any frames that arrive before React replaces it.
         if (kept && (from === null || from !== kept.offset)) {
           discard = true;
           refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
+          view.pause();
+          replacement.current = { id, view };
           setFresh(n => n + 1);
           return;
         }
@@ -296,13 +364,12 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
         t.write(bytes);
         if (offset !== null) offset += bytes.length;
       },
-    }).then(handle => {
-      if (disposed) { void harnessApi.detach(handle); return; }
-      view = handle;
-      void sendSize(t.cols, t.rows);
-    }).catch(e => setNotice(err(e)));
+      ready: () => { void sendSize(t.cols, t.rows); },
+      error: e => setNotice(err(e)),
+    });
+    if (!transferred) view.open(id, offset);
 
-    const typed = t.onData(data => { if (view !== null) harnessApi.input(view, data).catch(e => setNotice(err(e))); });
+    const typed = t.onData(data => { if (view.handle !== null) harnessApi.input(view.handle, data).catch(e => setNotice(err(e))); });
     const resized = t.onResize(({ cols, rows }) => { void sendSize(cols, rows); });
 
     const onPaste = (e: ClipboardEvent) => {
@@ -365,21 +432,22 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       // The marks are this mount's: the next one marks the rows it draws
       [...marks].forEach(unmark);
       pointers.current = () => {};
-      if (view !== null) void harnessApi.detach(view);
+      if (replacement.current?.view !== view) view.dispose();
       // Kept, not disposed: shown again it takes only what it missed
       t.element?.remove();
-      mountedIds.delete(id);
-      // Kept once xterm has parsed every byte given to it, so that a kept
-      // terminal holds exactly what its offset says (review 17086). Shown again
-      // before that, the session gets a new terminal and this one goes
-      if (discard) { t.dispose(); } else {
-        const kept = { term: { term: t, fit: f }, offset };
-        // A session removed from the list meanwhile is not taken back (`put` refuses it, review 17088)
-        t.write(new Uint8Array(0), () => { if (mountedIds.has(id)) t.dispose(); else keep.put(id, kept); });
-      }
+      // The same xterm retains its pending writes. A quick reattach can append
+      // the continuation behind them without waiting for the parser or replaying.
+      if (discard) t.dispose();
+      else keep.put(id, { term: { term: t, fit: f }, offset });
       term.current = null; fit.current = null; resend.current = () => {};
     };
   }, [id, fresh]);
+
+  useEffect(() => {
+    // WebGL uses more memory in the Mac demos. Enable it on a trial build
+    // with VITE_TERMINAL_WEBGL=1.
+    if (active && term.current && import.meta.env.VITE_TERMINAL_WEBGL === '1') return tryWebgl(term.current);
+  }, [active, id, fresh]);
 
   // A session that started or ended changes which pointers are links
   useEffect(() => { pointers.current(); }, [isSession]);
@@ -388,8 +456,15 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     if (!active) return;
     // Shown again: fit, and tell the agent the size even when it did not change here
     // (the session may have been resized from elsewhere while this pane was hidden)
-    requestAnimationFrame(() => { try { fit.current?.fit(); } catch { /* hidden */ } resend.current(); term.current?.refresh(0, term.current.rows - 1); term.current?.focus(); });
-  }, [active]);
+    const frame = requestAnimationFrame(() => {
+      if (document.hidden || !term.current) return;
+      try { fit.current?.fit(); } catch { /* hidden */ }
+      resend.current();
+      term.current.refresh(0, term.current.rows - 1);
+      if (takeFocus.current) term.current.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [active, id]);
 
   useEffect(() => {
     if (!focusAt) return;

@@ -6,8 +6,9 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Terminal as Headless } from '@xterm/headless';
+import LiveWorkspace from './LiveWorkspace';
 import TerminalPane, { keep } from './TerminalPane';
-import { harnessApi } from '../utils/harness';
+import { harnessApi, type Hosted } from '../utils/harness';
 import { MAX_KEPT } from '../utils/terminalKeep';
 
 const made = vi.hoisted(() => ({ terms: [] as unknown[] }));
@@ -33,7 +34,11 @@ vi.mock('@xterm/xterm', async () => {
 });
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { activate() {} fit() {} dispose() {} } }));
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { attach: vi.fn(), detach: vi.fn(), resize: vi.fn(() => Promise.resolve()), input: vi.fn(), saveImage: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: {
+  attach: vi.fn(), detach: vi.fn(), resize: vi.fn(() => Promise.resolve()), input: vi.fn(), saveImage: vi.fn(),
+  status: vi.fn(), listSince: vi.fn(), resumable: vi.fn(),
+} }));
+vi.mock('../utils/tauri', async importOriginal => ({ ...await importOriginal<object>(), isTauri: () => true }));
 
 type On = { start: (from: number | null) => void; data: (bytes: Uint8Array) => void };
 let views: { id: string; since: number | null; on: On }[] = [];
@@ -42,33 +47,105 @@ const bytes = (text: string) => new TextEncoder().encode(text);
 const frame = async () => { await act(async () => { await new Promise(resolve => requestAnimationFrame(() => resolve(null))); }); };
 /** Every write queued so far parsed, and the pane's callbacks run */
 const parsed = async () => { await act(async () => { await Promise.all((made.terms as Headless[]).map(t => new Promise<void>(resolve => t.write('', resolve)))); await new Promise(r => setTimeout(r, 0)); }); };
-const show = async (id: string) => { await act(async () => root.render(<TerminalPane id={id} active/>)); await frame(); };
+const show = async (id: string) => { await act(async () => root.render(<TerminalPane id={id} active focusOnMount/>)); await frame(); };
 const hide = async () => { await act(async () => root.render(<div/>)); };
 const lines = (t: Headless) => { const b = t.buffer.active; const out: string[] = []; for (let y = 0; y < b.length; y++) { const l = b.getLine(y)?.translateToString(true) ?? ''; if (l) out.push(l); } return out; };
 const last = () => made.terms[made.terms.length - 1] as Headless;
-/**
- * The runner's answer to the pane's latest view: it starts at `from` and sends
- * `text`. A pane that lets its terminal go on that answer opens a new view,
- * which the runner answers the same way.
- */
-const answer = async (text: string, from: number) => {
-  const first = views[views.length - 1];
-  await act(async () => { first.on.start(from); first.on.data(bytes(text)); });
+/** The replacement must accept the first replay without another attach. */
+const answer = async (text: string, from: number | null) => {
+  const count = views.length;
+  const { on } = views[count - 1];
+  await act(async () => { on.start(from); on.data(bytes(text)); });
   await frame();
-  const now = views[views.length - 1];
-  if (now !== first) await act(async () => { now.on.start(from); now.on.data(bytes(text)); });
+  expect(views).toHaveLength(count);
   await parsed();
 };
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   if (!('ResizeObserver' in globalThis)) Object.assign(globalThis, { ResizeObserver: class { observe() {} disconnect() {} } });
-  keep.retain(new Set()); made.terms = []; views = [];
+  keep.protect(new Set()); keep.retain(new Set()); made.terms = []; views = [];
   let handle = 0;
   vi.mocked(harnessApi.attach).mockImplementation((id, since, on) => { views.push({ id, since, on }); return Promise.resolve(++handle); });
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
 });
-afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
+afterEach(async () => { await act(async () => root.unmount()); host.remove(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+it('keeps the selected terminal focused when a different pane mounts', async () => {
+  const panes = (second: boolean) => <><TerminalPane id="selected" active focusOnMount/>{second && <TerminalPane id="another" active/>}</>;
+  await act(async () => root.render(panes(false)));
+  await frame();
+  const selected = host.querySelector('textarea');
+  expect(document.activeElement).toBe(selected);
+  await act(async () => root.render(panes(true)));
+  await frame();
+  expect(host.querySelectorAll('textarea')).toHaveLength(2);
+  expect(document.activeElement).toBe(selected);
+});
+
+it('detaches zero-height and clipped panes, drops late frames, and reuses the xterm', async () => {
+  const session: Hosted = { id: 'geometry', pid: 7, argv: [], cwd: '/work/repo', started: 1, cols: 80, rows: 24,
+    title: 'Geometry test', lastOutput: 1, exit: null, meta: {} };
+  vi.mocked(harnessApi.status).mockResolvedValue({ runner: { protocol: 1, pid: 8, version: 'test', exe: '/x' }, profiles: [], home: '/work' });
+  vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'geometry', sessions: [session] });
+  vi.mocked(harnessApi.resumable).mockResolvedValue([]);
+  vi.mocked(harnessApi.detach).mockClear();
+  const rect = (height: number) => new DOMRect(0, 0, 640, height);
+  let resize = (_height: number) => {};
+  let intersect = (_height: number) => {};
+  vi.stubGlobal('ResizeObserver', class {
+    constructor(private callback: (entries: Partial<ResizeObserverEntry>[]) => void) {}
+    observe(el: Element) { if (el.classList.contains('hs-pane-slot')) resize = height => this.callback([{ contentRect: rect(height) }]); }
+    disconnect() {}
+  });
+  vi.stubGlobal('IntersectionObserver', class {
+    constructor(private callback: (entries: Partial<IntersectionObserverEntry>[]) => void) {}
+    observe() { intersect = height => this.callback([{ isIntersecting: true, intersectionRect: rect(height) }]); }
+    unobserve() {}
+    disconnect() {}
+    takeRecords() { return []; }
+  });
+  await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
+  await act(async () => host.querySelector<HTMLButtonElement>('button.hs-item')!.click());
+  await act(async () => { resize(0); intersect(0); });
+  expect(views).toHaveLength(0);
+  await act(async () => { resize(400); intersect(400); });
+  expect(views).toHaveLength(1);
+  const term = last();
+  const shown = bytes('shown\r\n');
+  const background = bytes('background\r\n');
+  await act(async () => { views[0].on.start(0); views[0].on.data(shown); });
+  const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')); resize(0); intersect(0); views[0].on.data(background); });
+  await parsed();
+  expect(lines(term)).toEqual(['shown', 'background']);
+  expect(harnessApi.detach).not.toHaveBeenCalled();
+  hidden.mockReturnValue(false);
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')); resize(400); intersect(400); });
+  expect(views).toHaveLength(1);
+
+  await act(async () => intersect(0));
+  expect(vi.mocked(harnessApi.detach).mock.calls).toEqual([[1]]);
+  expect(keep.ids).toContain(session.id);
+  const write = vi.spyOn(term, 'write');
+  act(() => views[0].on.data(bytes('late clipped frame\r\n')));
+  expect(write).not.toHaveBeenCalled();
+
+  await act(async () => intersect(400));
+  expect(views).toHaveLength(2);
+  const offset = shown.length + background.length;
+  expect(views[1].since).toBe(offset);
+  expect(made.terms).toEqual([term]);
+  await act(async () => { views[1].on.start(offset); views[1].on.data(bytes('resumed\r\n')); });
+  await parsed();
+  expect(lines(term)).toEqual(['shown', 'background', 'resumed']);
+
+  await act(async () => resize(0));
+  expect(vi.mocked(harnessApi.detach).mock.calls).toEqual([[1], [2]]);
+  write.mockClear();
+  act(() => views[1].on.data(bytes('late zero-height frame\r\n')));
+  expect(write).not.toHaveBeenCalled();
+});
 
 describe('a pane on a real terminal (review 17086)', () => {
   it('brings a terminal pushed out of the keep back from the runner replay, whole, also when its last frame ended inside an escape sequence', async () => {
@@ -130,6 +207,30 @@ describe('a pane on a real terminal (review 17086)', () => {
     expect(lines(last())).toEqual(['new line']);
   });
 
+  it('hands a legacy replay without an offset to a fresh terminal on the same view', async () => {
+    await show('a');
+    act(() => { views[0].on.start(null); views[0].on.data(bytes('old line\r\n')); });
+    await hide(); await parsed();
+    await show('a');
+    await answer('old line\r\nnew line\r\n', null);
+    expect(lines(last())).toEqual(['old line', 'new line']);
+  });
+
+  it('detaches a transferred view if the pane closes before using its replay', async () => {
+    await show('a');
+    act(() => { views[0].on.start(0); views[0].on.data(bytes('old line\r\n')); });
+    await hide(); await parsed();
+    await show('a');
+    vi.mocked(harnessApi.detach).mockClear();
+    await act(async () => {
+      views[1].on.start(5_000_000);
+      root.render(<div/>);
+      views[1].on.data(bytes('on its way\r\n'));
+    });
+    expect(views).toHaveLength(2);
+    expect(vi.mocked(harnessApi.detach).mock.calls).toEqual([[2]]);
+  });
+
   it('gives the keyboard to the new terminal when it replaces one that had it (review 17090)', async () => {
     await show('a');
     act(() => { views[0].on.start(0); views[0].on.data(bytes('old line\r\n')); });
@@ -163,14 +264,19 @@ describe('a pane on a real terminal (review 17086)', () => {
 
   it('shows every line once when it is shown again before what it had was parsed', async () => {
     await show('a');
-    act(() => { views[0].on.start(0); views[0].on.data(bytes('one\r\ntwo\r\n')); });
+    const term = last();
+    const queued = bytes('\x1b[?2004hone\r\ntwo\r\n');
+    act(() => { views[0].on.start(0); views[0].on.data(queued); });
     // Hidden and shown again at once: the first terminal's bytes are still queued
     await hide();
     await show('a');
     const asked = views[views.length - 1];
-    act(() => { asked.on.start(asked.since ?? 0); if (asked.since === null) asked.on.data(bytes('one\r\ntwo\r\n')); asked.on.data(bytes('three\r\n')); });
+    expect(asked.since).toBe(queued.length);
+    expect(last()).toBe(term);
+    act(() => { asked.on.start(queued.length); asked.on.data(bytes('three\r\n')); });
     await parsed();
     expect(lines(last())).toEqual(['one', 'two', 'three']);
+    expect(term.modes.bracketedPasteMode).toBe(true);
     // The first terminal is not kept beside the one shown
     await hide(); await parsed();
     expect(keep.ids).toEqual(['a']);

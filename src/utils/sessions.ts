@@ -1,15 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { MemoryCatalog, MemoryDocument, Session, SessionEvent, Snapshot } from '@lambda-house/journal';
+import type { JournalUpdate, MemoryCatalog, MemoryDocument, Session, SessionEvent, Snapshot } from '@lambda-house/journal';
 
 // The session types and helpers are the journal's (@lambda-house/journal);
 // this is Agent MCR's IPC contract with its session index. The journal's host
 // (src/journal.ts) is made from it, and the cockpit and Live call it directly.
 
 export {
-  basename, cacheState, CODEX_CACHE_S, compact, contextWindow, COOLING_SHARE, directoryTree, family, filterSessions,
+  applyJournalUpdate, basename, cacheState, CODEX_CACHE_S, compact, contextWindow, COOLING_SHARE, directoryTree, family, filterSessions,
   formatSessionTitle, matchesActivity, matchesSession, origin, sessionDirectories, sessionKey, sessionTitle, sessionTooltip,
   sessionTree, shellQuote, sumUsage, totalTokens, within,
-  type ActivityWindow, type CacheState, type ContextStats, type DirectoryNode, type MemoryCatalog, type MemoryDocument,
+  type ActivityWindow, type CacheState, type ContextStats, type DirectoryNode, type JournalUpdate, type MemoryCatalog, type MemoryDocument,
   type MemoryItem, type Session, type SessionEvent, type SessionNode, type Snapshot, type Usage,
 } from '@lambda-house/journal';
 
@@ -26,8 +26,7 @@ export const sessionApi = {
   stats: (provider: string, id: string) => invoke<Session>('session_stats', { provider, id }),
   detail: (provider: string, id: string) => invoke<Session>('session_details', { provider, id }),
   snapshot: () => invoke<Snapshot>('sessions_snapshot'),
-  /** The same scan for a holder of a snapshot: none when what it shows has the stamp held (MCR-141) */
-  snapshotSince: (stamp: string) => invoke<{ stamp: string; snapshot: Snapshot | null }>('sessions_snapshot_since', { stamp: stamp || null }),
+  journalSince: (stamp: string) => invoke<JournalUpdate>('sessions_journal_since', { stamp: stamp || null }),
   /** The same scan, answered with the named sessions only (`provider:id` keys) */
   pick: (keys: string[]) => invoke<Session[]>('sessions_pick', { keys }),
 };

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { act, useEffect } from 'react';
+import { act, Profiler, useEffect } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionWorkspace, { sessionViews } from './SessionWorkspace';
@@ -8,11 +8,11 @@ import { harnessApi, type Hosted } from '../utils/harness';
 import { createPlugin, pluginRegistry } from '../plugins';
 import { journal } from '../journal';
 import { savedView, useSessionsView } from '../sessionsView';
-vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), snapshotSince: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
+vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), journalSince: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // The Live view connects to the runner; these tests are about History.
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(() => new Promise(() => {})), list: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(() => new Promise(() => {})), listSince: vi.fn() } }));
 const session: Session = { id:'a',provider:'codex',parentId:null,name:'root',cwd:'/work/demo',title:'Fix CORE-123',model:'model-a',effort:'high',started:'2026-01-01T00:00:00Z',updated:'2026-01-01T00:00:00Z',modified:Date.now(),status:'working',usage:{input:100,cached:70,cacheWrite:0,output:20,reasoning:5},usageKnown:true,models:{},tools:{shell:2},tickets:['CORE-123'],memoryRefs:[],events:[{seq:1,at:'2026-01-01T00:00:00Z',kind:'assistant',text:'<script>untrusted()</script>',tool:null}],eventCount:1,malformedLines:0,source:'/fake/session.jsonl',turnId:'turn'};
 // The journal's store is the app's one; each test starts from its first state
 const fresh = journal.store.getState();
@@ -24,7 +24,9 @@ const flush = async () => { await act(async () => { await new Promise(resolve =>
 const button = (text: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.trim().toLowerCase() === text) || [...host.querySelectorAll('button')].find(b => b.textContent?.toLowerCase().includes(text))!;
 beforeEach(() => { vi.resetAllMocks(); journal.store.setState(fresh, true); showView('history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
   // The stamped read answers with what `snapshot` gives, each time as changed
-  let stamps = 0; vi.mocked(sessionApi.snapshotSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() })); });
+  let stamps = 0; vi.mocked(sessionApi.journalSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() }));
+  vi.mocked(harnessApi.listSince).mockImplementation(async stamp => ({ stamp: 'live', sessions: stamp ? null : [] }));
+});
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 describe('Sessions workspace', () => {
   it('reads the snapshot every minute while Live is shown, and every five seconds in Journal (MCR-139)', async () => {
@@ -32,7 +34,7 @@ describe('Sessions workspace', () => {
     try {
       showView('live');
       await act(async () => root.render(<SessionWorkspace/>)); await flush();
-      const reads = () => vi.mocked(sessionApi.snapshotSince).mock.calls.length;
+      const reads = () => vi.mocked(sessionApi.journalSince).mock.calls.length;
       const first = reads();
       await act(async () => { vi.advanceTimersByTime(55_000); }); await flush();
       expect(reads()).toBe(first);
@@ -51,15 +53,41 @@ describe('Sessions workspace', () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {
       const full = await sessionApi.snapshot();
-      vi.mocked(sessionApi.snapshotSince).mockReset()
+      let finish!: (answer: { stamp: string; snapshot: null }) => void;
+      vi.mocked(sessionApi.journalSince).mockReset()
         .mockResolvedValueOnce({ stamp: 'a', snapshot: full })
-        .mockResolvedValue({ stamp: 'a', snapshot: null });
-      await act(async () => root.render(<SessionWorkspace/>)); await flush();
+        .mockReturnValue(new Promise(resolve => { finish = resolve; }));
+      const commit = vi.fn();
+      await act(async () => root.render(<Profiler id="journal" onRender={commit}><SessionWorkspace/></Profiler>)); await flush();
       expect(host.textContent).toContain('Fix CORE-123');
+      commit.mockClear();
       await act(async () => { vi.advanceTimersByTime(5000); }); await flush();
+      expect(commit).not.toHaveBeenCalled();
+      await act(async () => finish({ stamp: 'a', snapshot: null }));
       // The second read names the stamp held; an answer without a snapshot keeps what is shown
-      expect(vi.mocked(sessionApi.snapshotSince).mock.calls.map(c => c[0])).toEqual(['', 'a']);
+      expect(vi.mocked(sessionApi.journalSince).mock.calls.map(c => c[0])).toEqual(['', 'a']);
+      expect(vi.mocked(harnessApi.listSince).mock.calls.map(c => c[0])).toEqual(['', 'live']);
       expect(host.textContent).toContain('Fix CORE-123');
+    } finally { vi.useRealTimers(); }
+  });
+  it('keeps unchanged rows when a Journal poll moves a changed session and removes another', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const full = await sessionApi.snapshot();
+      const second = { ...session, id: 'b', source: '/fake/b.jsonl', title: 'Another task', events: [] };
+      const third = { ...session, id: 'c', source: '/fake/c.jsonl', title: 'Removed task', events: [] };
+      vi.mocked(sessionApi.journalSince)
+        .mockResolvedValueOnce({ stamp: 'a', snapshot: { ...full, sessions: [...full.sessions, second, third] } })
+        .mockResolvedValueOnce({ stamp: 'b', snapshot: { ...full, sessions: [{ ...second, title: 'Changed task' }] }, positions: [0], removed: [third.source] });
+      await act(async () => root.render(<SessionWorkspace/>)); await flush();
+      expect(host.textContent).toContain(third.title);
+      const detailReads = vi.mocked(sessionApi.detail).mock.calls.length;
+      await act(async () => { vi.advanceTimersByTime(5000); }); await flush();
+      expect(host.textContent).toContain('Fix CORE-123');
+      expect(host.textContent).toContain('Changed task');
+      expect(host.textContent).not.toContain(second.title);
+      expect(host.textContent).not.toContain(third.title);
+      expect(sessionApi.detail).toHaveBeenCalledTimes(detailReads);
     } finally { vi.useRealTimers(); }
   });
   it('opens on the Live view until Journal is chosen, and remembers the choice', async () => {
@@ -97,8 +125,8 @@ describe('Sessions workspace', () => {
   it('draws a found session that runs now as its Live row', async () => {
     const hosted: Hosted = { id: 'h1', pid: 42, argv: ['codex'], cwd: '/work/demo', started: 1, cols: 120, rows: 32, title: '', lastOutput: 1, exit: null, unread: 1,
       meta: { label: 'Codex', profile: 'codex', name: 'Parser fixer' }, harness: { profile: 'codex', state: 'waiting', agentSession: 'a', attention: { kind: 'permission', text: 'Approve the command?' } } as Hosted['harness'] };
-    vi.mocked(harnessApi.list).mockResolvedValue([hosted]);
-    await act(async () => root.render(<SessionWorkspace />)); await flush(); await flush();
+    vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'live', sessions: [hosted] });
+    await act(async () => root.render(<SessionWorkspace/>)); await flush(); await flush();
     const row = host.querySelector('.ss-results .sc-session')!;
     expect(row.classList.contains('hs-resume')).toBe(false);
     expect(row.querySelector('.hs-dot.waiting')).not.toBeNull();

@@ -100,13 +100,28 @@ export function useHostedByConversation(active: boolean, every = 0): Map<string,
   useEffect(() => {
     if (!active) return;
     let live = true;
-    const load = () => {
-      Promise.resolve().then(() => harnessApi.list())
-        .then(list => { if (live) setHosted(held => keepSame(held, Array.isArray(list) ? list : [])); })
-        .catch(() => { if (live) setHosted(held => held.length ? [] : held); });
+    let pending = false;
+    let stamp = '';
+    const load = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const { sessions, stamp: next } = await harnessApi.listSince(stamp);
+        if (live && sessions) {
+          stamp = next;
+          setHosted(held => keepSame(held, sessions));
+        }
+      } catch {
+        if (live) {
+          stamp = '';
+          setHosted(held => held.length ? [] : held);
+        }
+      } finally {
+        pending = false;
+      }
     };
-    load();
-    const timer = every ? setInterval(() => { if (!document.hidden) load(); }, every) : undefined;
+    void load();
+    const timer = every ? setInterval(() => { if (!document.hidden) void load(); }, every) : undefined;
     return () => { live = false; if (timer) clearInterval(timer); };
   }, [active, every]);
   return useMemo(() => new Map(hosted.filter(h => !h.exit && h.harness?.agentSession).map(h => [conversation(h), h])), [hosted]);

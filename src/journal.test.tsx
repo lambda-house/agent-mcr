@@ -16,7 +16,7 @@ const session: Session = { id: 'a', provider: 'claude', parentId: null, name: 'r
 
 const backend: Record<string, (args?: Record<string, unknown>) => unknown> = {
   session_access: () => true,
-  sessions_snapshot_since: (args) => ({
+  sessions_journal_since: (args) => ({
     stamp: 's1',
     snapshot: args?.stamp === 's1' ? null : { sessions: [{ ...session, events: [] }], scannedFiles: 1, pendingFiles: 0, indexedAt: Date.now(), errors: [] },
   }),
@@ -46,8 +46,8 @@ describe('the journal in Agent MCR', () => {
     await act(async () => root.render(<JournalProvider journal={{ store, host: journalHost }}><JournalView /></JournalProvider>));
     await flush();
     expect(invoke).toHaveBeenCalledWith('session_access');
-    // The snapshot with a stamp: the first time none is held
-    expect(invoke).toHaveBeenCalledWith('sessions_snapshot_since', { stamp: null });
+    // What changed since the stamp held: the first time none is held (MCR-141)
+    expect(invoke).toHaveBeenCalledWith('sessions_journal_since', { stamp: null });
     expect(invoke).toHaveBeenCalledWith('session_details', { provider: 'claude', id: 'a' });
     expect(container.querySelector('.sc-detail h2')?.textContent).toBe('Fix CORE-123');
     expect(journalHost.context).toBeUndefined();
