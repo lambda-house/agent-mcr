@@ -95,7 +95,8 @@ it('detaches zero-height and clipped panes, drops late frames, and reuses the xt
   let intersect = (_height: number) => {};
   vi.stubGlobal('ResizeObserver', class {
     constructor(private callback: (entries: Partial<ResizeObserverEntry>[]) => void) {}
-    observe(el: Element) { if (el.classList.contains('hs-pane-slot')) resize = height => this.callback([{ contentRect: rect(height) }]); }
+    // The session pane's body is what Live observes (its kept-alive pane holds the terminal)
+    observe(el: Element) { if (el.classList.contains('hs-pane-body')) resize = height => this.callback([{ contentRect: rect(height) }]); }
     disconnect() {}
   });
   vi.stubGlobal('IntersectionObserver', class {
