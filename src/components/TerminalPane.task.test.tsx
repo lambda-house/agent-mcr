@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import TerminalPane from './TerminalPane';
+import TerminalPane, { keep } from './TerminalPane';
 import { harnessApi } from '../utils/harness';
 import { terminalTask } from '../utils/terminalTask';
 
@@ -34,6 +34,8 @@ vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<o
 
 let root: Root; let host: HTMLDivElement;
 beforeEach(() => {
+  // Each test starts with no kept terminal (MCR-139)
+  keep.retain(new Set());
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   if (!('ResizeObserver' in globalThis)) Object.assign(globalThis, { ResizeObserver: class { observe() {} disconnect() {} } });
   fake.selection = '';

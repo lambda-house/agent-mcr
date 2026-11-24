@@ -20,6 +20,8 @@ export const journalHost: JournalHost = {
   enable: () => sessionApi.enable(),
   disable: () => sessionApi.disable(),
   snapshot: () => sessionApi.snapshot(),
+  // Only a snapshot whose content changed comes across (MCR-141)
+  snapshotSince: (stamp) => sessionApi.snapshotSince(stamp),
   detail: (provider, id) => sessionApi.detail(provider, id),
   events: (provider, id, before) => sessionApi.events(provider, id, before),
 

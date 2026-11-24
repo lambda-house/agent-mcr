@@ -386,6 +386,8 @@ pub struct Fact {
     pub waits: Vec<FactWait>,
     /// When the operator last pressed Enter in its terminal, by the app's word
     pub typed: Option<u64>,
+    /// The owner words its agent profile adds to `WORDS` (MCR-126 L3), as the harness recorded them at its launch
+    pub words: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -975,7 +977,12 @@ fn check_need(path: &str, n: &Need, key: &str, part: &Part, who: &Who, facts: &F
     one_of(&format!("{path}.ask"), &n.ask, &NEED_KINDS)?;
     required("text", &n.text, MAX_LINE).map_err(|e| format!("{e}. With need, text is the question in one line; put the rest in need.detail"))?;
     let word = if n.word.is_empty() { "none" } else { n.word.as_str() };
-    one_of(&format!("{path}.word"), word, &WORDS)?;
+    // The core words, and those the acting session's profile adds (MCR-126 L3,
+    // 16647 L2): `guarded` then treats such a word like a core one
+    let added = target(key, n, facts).and_then(|s| facts.sessions.get(s)).map(|f| f.words.as_slice()).unwrap_or_default();
+    if !added.iter().any(|w| w == word) {
+        one_of(&format!("{path}.word"), word, &WORDS)?;
+    }
     let ask = n.ask.as_str();
     let choices = match ask {
         "decision" => 2..=MAX_OPTIONS,
@@ -3243,6 +3250,22 @@ mod tests {
     fn the_owner_words_are_the_shared_list_with_none_first() {
         assert_eq!(WORDS[0], "none");
         assert_eq!(WORDS[1..], crate::profiles::OWNER_WORDS);
+    }
+
+    /// A word an acting session's profile adds is an owner word for a need
+    /// it acts on, and only for it (MCR-126 L3, 16647 L2)
+    #[test]
+    fn a_profiles_owner_words_count_for_the_session_that_acts() {
+        let mut c = Cockpit::default();
+        let mut f = facts();
+        let restart = |id: &str| json!({ "id": id, "ask": "go", "word": "restart", "actor": "ex", "options": [{ "id": "go", "label": "restart the pod", "risk": "reversible" }] });
+        assert!(c.declare(&SUP, &f, &restart("r1"), "Restart?", NOW).unwrap_err().contains("need.word"));
+        f.sessions.get_mut("ex").unwrap().words = vec!["restart".into(), "scale".into()];
+        c.declare(&SUP, &f, &restart("r1"), "Restart?", NOW).unwrap();
+        assert!(c.parts["sup"].needs.iter().find(|n| n.id == "r1").unwrap().guarded());
+        assert!(c.act("sup", "r1", NOW, Act::Place, &f).unwrap_err().contains("owner word"));
+        // Not for a need whose actor's profile does not add it
+        assert!(c.declare(&SUP, &f, &json!({ "id": "r2", "ask": "go", "word": "restart", "options": [{ "id": "go", "label": "restart", "risk": "reversible" }] }), "Restart?", NOW).unwrap_err().contains("need.word"));
     }
 
     #[test]

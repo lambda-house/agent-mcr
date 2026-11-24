@@ -7,7 +7,7 @@ import { sessionApi, type Session } from '../utils/sessions';
 import { harnessApi, type Hosted } from '../utils/harness';
 import { createPlugin, pluginRegistry } from '../plugins';
 import { journal } from '../journal';
-vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
+vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<object>(), sessionApi: { access: vi.fn(), enable: vi.fn(), disable: vi.fn(), snapshot: vi.fn(), snapshotSince: vi.fn(), detail: vi.fn(), control: vi.fn(), context: vi.fn() } }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // The Live view connects to the runner; these tests are about History.
@@ -18,9 +18,46 @@ const fresh = journal.store.getState();
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve,0)); }); };
 const button = (text: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.trim().toLowerCase() === text) || [...host.querySelectorAll('button')].find(b => b.textContent?.toLowerCase().includes(text))!;
-beforeEach(() => { vi.resetAllMocks(); journal.store.setState(fresh, true); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session); });
+beforeEach(() => { vi.resetAllMocks(); journal.store.setState(fresh, true); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
+  // The stamped read answers with what `snapshot` gives, each time as changed
+  let stamps = 0; vi.mocked(sessionApi.snapshotSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() })); });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 describe('Sessions workspace', () => {
+  it('reads the snapshot every minute while Live is shown, and every five seconds in Journal (MCR-139)', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      localStorage.setItem('agent-mcr.sessions.view', 'live');
+      await act(async () => root.render(<SessionWorkspace/>)); await flush();
+      const reads = () => vi.mocked(sessionApi.snapshotSince).mock.calls.length;
+      const first = reads();
+      await act(async () => { vi.advanceTimersByTime(55_000); }); await flush();
+      expect(reads()).toBe(first);
+      await act(async () => { vi.advanceTimersByTime(5_000); }); await flush();
+      expect(reads()).toBe(first + 1);
+      // Journal: read at once, then every five seconds
+      await act(async () => button('journal').click()); await flush();
+      const journal = reads();
+      expect(journal).toBe(first + 2);
+      await act(async () => { vi.advanceTimersByTime(5_000); }); await flush();
+      expect(reads()).toBe(journal + 1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('takes the index again only when its content changed, and says which stamp it holds (MCR-141)', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const full = await sessionApi.snapshot();
+      vi.mocked(sessionApi.snapshotSince).mockReset()
+        .mockResolvedValueOnce({ stamp: 'a', snapshot: full })
+        .mockResolvedValue({ stamp: 'a', snapshot: null });
+      await act(async () => root.render(<SessionWorkspace/>)); await flush();
+      expect(host.textContent).toContain('Fix CORE-123');
+      await act(async () => { vi.advanceTimersByTime(5000); }); await flush();
+      // The second read names the stamp held; an answer without a snapshot keeps what is shown
+      expect(vi.mocked(sessionApi.snapshotSince).mock.calls.map(c => c[0])).toEqual(['', 'a']);
+      expect(host.textContent).toContain('Fix CORE-123');
+    } finally { vi.useRealTimers(); }
+  });
   it('opens on the Live view until Journal is chosen, and remembers the choice', async () => {
     localStorage.removeItem('agent-mcr.sessions.view');
     await act(async () => root.render(<SessionWorkspace />)); await flush();

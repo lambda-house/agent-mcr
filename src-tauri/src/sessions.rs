@@ -1186,6 +1186,12 @@ impl Index {
             .ok_or_else(|| "Session not indexed".into())
     }
     pub fn scan(&mut self, home: &Path, workspace: Option<&Path>) -> Snapshot {
+        self.scan_where(home, workspace, |_| true)
+    }
+
+    /// `scan`, with only the sessions `keep` takes summarised into the
+    /// snapshot: the index is brought up to date all the same (MCR-139).
+    pub fn scan_where(&mut self, home: &Path, workspace: Option<&Path>, keep: impl Fn(&Session) -> bool) -> Snapshot {
         let mut errors = vec![];
         let mut paths = vec![];
         let began = std::time::Instant::now();
@@ -1279,6 +1285,7 @@ impl Index {
             .filter(|i| {
                 !i.session.cwd.is_empty()
                     && workspace.is_none_or(|w| Path::new(&i.session.cwd).starts_with(w))
+                    && keep(&i.session)
             })
             .map(|i| {
                 let mut s = i.session.summary();

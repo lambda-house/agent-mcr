@@ -20,9 +20,14 @@ let linkTo = '';
 const givenIsSession: unknown[] = [];
 const focused: string[] = [];
 const mounts: string[] = [];
+// Every render of a terminal stand-in: a list poll that changed nothing renders none (MCR-139)
+const renders: string[] = [];
+// The keep of hidden terminals (MCR-139): what the view tells it to retain
+const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); } }));
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
-  return { default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
+  return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
+    renders.push(id);
     useEffect(() => { mounts.push(id); }, [id]);
     useEffect(() => { givenIsSession.push(isSession); }, [isSession]);
     useEffect(() => { if (focusAt) { focused.push(id); onFocused?.(); } }, [focusAt]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -205,6 +210,27 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
     await act(async () => ([...document.querySelectorAll('[role="alertdialog"] button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
     expect(vi.mocked(harnessApi.forget).mock.calls.map(c => c[0]).sort()).toEqual(['e1', 'e2']);
     expect(harnessApi.signal).not.toHaveBeenCalled();
+  });
+});
+
+describe('executors in a worktree below their lead (MCR-133)', () => {
+  const lead: Hosted = { ...running, id: 'lead', cwd: '/work/teob-ai', started: 1, harness: { profile: 'claude', state: 'idle', name: 'Lead' } as Hosted['harness'] };
+  const wt = '/work/teob-ai/.claude/worktrees/agent-mcr-129';
+  const worker: Hosted = { ...running, id: 'w1', cwd: wt, started: 2, harness: { profile: 'claude', state: 'working', name: 'Worker', supervisor: 'lead' } as Hosted['harness'] };
+
+  it('lists the executor in its lead\'s section with a tag, and its folder\'s earlier conversations there too', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([lead, worker]);
+    vi.mocked(harnessApi.resumable).mockResolvedValue([{ agent: 'claude', id: 'old', cwd: '/work/teob-ai/.claude/worktrees/agent-mcr-120', modified: 1, title: 'Earlier worker' }]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(folders().map(f => f.getAttribute('aria-label'))).toEqual(['Folder /work/teob-ai']);
+    expect(rows().map(r => [r.getAttribute('data-depth'), r.querySelector('.hs-rel.subdir')?.textContent ?? null])).toEqual([[null, null], ['1', 'agent-mcr-129']]);
+    expect(rows()[1].querySelector('.hs-rel.subdir')!.getAttribute('title')).toBe(`Works in ${wt}`);
+    await act(async () => (host.querySelector('.hs-earlier-toggle') as HTMLButtonElement).click());
+    const earlier = host.querySelector('.hs-earlier-row .hs-resume')!;
+    expect(earlier.querySelector('.hs-rel.subdir')?.textContent).toBe('agent-mcr-120');
+    expect(earlier.getAttribute('title')).toContain('in /work/teob-ai/.claude/worktrees/agent-mcr-120');
+    // A session is still started in the section's own folder
+    expect(button('Start a session in /work/teob-ai')).not.toBeNull();
   });
 });
 
@@ -495,6 +521,95 @@ describe('Live workspace', () => {
     expect(focused).toEqual(['s1', 'r1']);
   });
 
+  it('keeps a terminal only for a session a pane shows, and mounts it anew when it is shown again (MCR-139)', async () => {
+    const shell: Hosted = { ...running, id: 's1', title: '', meta: { label: 'Shell', profile: 'shell' } };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const terminals = () => [...host.querySelectorAll('[data-terminal]')].map(t => t.getAttribute('data-terminal'));
+    const mountsOf = (id: string) => mounts.filter(m => m === id).length;
+    const before = mountsOf('r1');
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(terminals()).toEqual(['r1']);
+    // Another session in the one pane: the first one's terminal is gone, not kept hidden and streaming
+    await act(async () => row('Shell').click()); await flush();
+    expect(terminals()).toEqual(['s1']);
+    expect(host.querySelector('[hidden] [data-terminal]')).toBeNull();
+    // Shown again: a new terminal, which attaches and gets the scrollback from the runner
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(terminals()).toEqual(['r1']);
+    expect(mountsOf('r1')).toBe(before + 2);
+    // Two panes show two sessions: both have their terminal
+    await act(async () => button('Two columns').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    expect(terminals().sort()).toEqual(['r1', 's1']);
+  });
+
+  it('sets no new list when a poll brings the same sessions, so the view does not render again (MCR-139)', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running }]));
+      await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+      const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+      await act(async () => row('Fixing tests').click()); await flush();
+      const rendered = renders.length;
+      const calls = vi.mocked(harnessApi.list).mock.calls.length;
+      // Same content, fresh objects, a few polls: nothing renders again
+      for (let i = 0; i < 3; i++) { await act(async () => { vi.advanceTimersByTime(2000); }); await flush(); }
+      expect(vi.mocked(harnessApi.list).mock.calls.length).toBeGreaterThan(calls);
+      expect(renders.length).toBe(rendered);
+      // A change does come through
+      vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running, title: 'Writing docs' }]));
+      await act(async () => { vi.advanceTimersByTime(2000); }); await flush();
+      expect(row('Writing docs')).toBeTruthy();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('reads the list and the earlier sessions again when the window gets focus, and renders nothing when they are the same (MCR-139)', async () => {
+    vi.mocked(harnessApi.list).mockImplementation(() => Promise.resolve([{ ...ended }, { ...running }]));
+    vi.mocked(harnessApi.resumable).mockImplementation(() => Promise.resolve([{ agent: 'codex', id: 'old-1', cwd: '/work/repo', modified: 5 }]));
+    // Every answer a fresh object with the same content, as from the service
+    const base = await harnessApi.status();
+    vi.mocked(harnessApi.status).mockImplementation(() => Promise.resolve(JSON.parse(JSON.stringify(base))));
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    await act(async () => row('Fixing tests').click()); await flush();
+    const [lists, earlier, statuses, rendered] = [vi.mocked(harnessApi.list).mock.calls.length, vi.mocked(harnessApi.resumable).mock.calls.length, vi.mocked(harnessApi.status).mock.calls.length, renders.length];
+    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush(); await flush();
+    expect(vi.mocked(harnessApi.status).mock.calls.length).toBe(statuses + 1);
+    expect(vi.mocked(harnessApi.list).mock.calls.length).toBeGreaterThan(lists);
+    expect(vi.mocked(harnessApi.resumable).mock.calls.length).toBeGreaterThan(earlier);
+    expect(renders.length).toBe(rendered);
+  });
+
+  it('takes the terminals away while the Live view itself is hidden, and gives them back when it is shown (MCR-139)', async () => {
+    const shell: Hosted = { ...running, id: 's1', title: '', meta: { label: 'Shell', profile: 'shell' } };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+    const terminals = () => [...host.querySelectorAll('[data-terminal]')].map(t => t.getAttribute('data-terminal'));
+    await act(async () => row('Fixing tests').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    await act(async () => button('Two columns').click()); await flush();
+    expect(terminals().sort()).toEqual(['r1', 's1']);
+    const before = mounts.length;
+    // Another view of the Sessions workspace, or another workspace: no terminal streams
+    await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
+    expect(terminals()).toEqual([]);
+    // Back: the same panes, each with its terminal mounted again
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(terminals().sort()).toEqual(['r1', 's1']);
+    expect(mounts.length).toBe(before + 2);
+  });
+
+  it('lets kept terminals go with their sessions from the list, once the list has been read (MCR-139)', async () => {
+    kept.retained = [];
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(kept.retained[kept.retained.length - 1]).toEqual(['e1', 'r1']);
+    expect(kept.retained.every(ids => ids.length > 0)).toBe(true);
+  });
+
   it('drops a session the person quit from its own terminal', async () => {
     vi.mocked(harnessApi.forget).mockResolvedValue();
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
@@ -718,7 +833,7 @@ describe('Live workspace', () => {
 });
 
 describe('panes on the workbench layout', () => {
-  it('keeps terminals mounted while panes are split, closed and laid out again', async () => {
+  it('keeps terminals mounted while panes are split and closed; a hidden one goes to the keep (MCR-139)', async () => {
     const shell: Hosted = { ...ended, id: 's1', started: 3, exit: null };
     vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
@@ -737,13 +852,14 @@ describe('panes on the workbench layout', () => {
     // Close the empty pane, then one pane and two columns again
     await act(async () => (host.querySelector('.hs-pane-title--empty button[aria-label="Close pane"]') as HTMLButtonElement).click()); await flush();
     expect(host.querySelector('.hs-pane-title--empty')).toBeNull();
+    expect(mounts.length).toBe(before);
     await act(async () => button('Single pane').click()); await flush();
     expect(shown()).toHaveLength(1);
-    // The other terminal waits, mounted and hidden
-    expect(host.querySelectorAll('[data-terminal]')).toHaveLength(2);
+    // No terminal is kept mounted hidden: the other one detached and went to the keep
+    expect(host.querySelectorAll('[data-terminal]')).toHaveLength(1);
     await act(async () => button('Two columns').click()); await flush();
     expect(shown()).toHaveLength(2);
-
-    expect(mounts.length).toBe(before);
+    // Shown again, it is mounted again (and takes from the keep only what it missed)
+    expect(mounts.length).toBe(before + 1);
   });
 });

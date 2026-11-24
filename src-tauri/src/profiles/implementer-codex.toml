@@ -1,0 +1,27 @@
+# Implementer on Codex (MCR-130): one issue on a branch, the full gate, a
+# hand-in; never merges. Codex takes no tool lists, so there are no push
+# denies: the push boundary is the sandbox plus branch protection. The model
+# is the operator's Codex default until the owner names one.
+id = "implementer@codex"
+version = 1
+role = "implementer"
+adapter = "codex"
+summary = "Builds one issue on a branch, runs the gate, hands in; never merges"
+
+[inference]
+effort = "high"
+
+[permissions]
+mode = "workspace-write"
+push = "none"
+
+[context]
+skills = ["discovered-work", "close-out"]
+
+[contract]
+done = ["refs", "gates", "unverified"]
+report_status_every_min = 60
+
+[limits]
+max_executors = 0
+reservations = ["mac-gate", "mermaid"]

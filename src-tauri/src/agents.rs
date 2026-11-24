@@ -264,6 +264,10 @@ pub struct Launch<'a> {
     /// docs/WINDOWS_PORT.md, "Not on Windows yet"
     #[cfg_attr(windows, allow(dead_code))]
     pub own_hooks: bool,
+    /// The agent profile it is launched with (MCR-126 P2): its fields reach
+    /// the command line only through the adapter's fixed mapping
+    /// (`profile_words`). None: today's line (a bare launch)
+    pub agent: Option<&'a crate::profiles::AgentProfile>,
 }
 
 /// What an agent profile may set for a program (MCR-126). Each of these is
@@ -406,6 +410,18 @@ pub trait Adapter: Sync {
     fn expresses(&self) -> Expresses {
         Expresses::default()
     }
+    /// The words a profile puts on the command line, through a fixed mapping
+    /// of validated fields only (16647 M1): no field passes words through.
+    /// They stand where the bare launch has its mode flags. An adapter that
+    /// takes nothing from a profile refuses any field that is set, never
+    /// dropping one
+    fn profile_words(&self, p: &crate::profiles::AgentProfile) -> Result<Vec<String>, String> {
+        let i = &p.inference;
+        if i.model.is_some() || i.fallback_model.is_some() || i.effort.is_some() || p.permissions.mode.is_some() || !p.tools.deny.is_empty() || p.tools.only.is_some() {
+            return Err(format!("{} takes no model, effort, mode or tool list from a profile", self.id()));
+        }
+        Ok(Vec::new())
+    }
     /// It is started with the `mcr` MCP server; otherwise it reaches the
     /// harness tools through the command form (`--harness-tool`) only
     fn takes_mcp(&self) -> bool {
@@ -471,7 +487,10 @@ impl Adapter for Claude {
     }
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
-        let mut cmd = format!("exec {base}");
+        let mut cmd = match l.agent {
+            Some(p) => format!("exec {} {}", base.split(' ').next().unwrap_or(base), self.profile_words(p)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ")),
+            None => format!("exec {base}"),
+        };
         if !l.mcp.is_empty() {
             cmd += &format!(" --mcp-config {}", sh(l.mcp));
         }
@@ -555,6 +574,31 @@ impl Adapter for Claude {
             tools: true,
         }
     }
+    /// The mode first, in place of the bare `--permission-mode acceptEdits`.
+    /// The tool lists are variadic flags: each rule is a word of its own, and
+    /// the harness's own flags (`--settings` always) follow them, so nothing
+    /// after a list is taken as a rule. A rule never starts with `-`
+    fn profile_words(&self, p: &crate::profiles::AgentProfile) -> Result<Vec<String>, String> {
+        let mut w: Vec<String> = vec!["--permission-mode".into(), p.permissions.mode.clone().unwrap_or_else(|| "acceptEdits".into())];
+        let i = &p.inference;
+        for (flag, value) in [("--model", &i.model), ("--fallback-model", &i.fallback_model), ("--effort", &i.effort)] {
+            if let Some(v) = value {
+                w.extend([flag.to_string(), v.clone()]);
+            }
+        }
+        if let Some(only) = &p.tools.only {
+            w.push("--tools".into());
+            if only.is_empty() {
+                w.push(String::new());
+            }
+            w.extend(only.iter().cloned());
+        }
+        if !p.tools.deny.is_empty() {
+            w.push("--disallowedTools".into());
+            w.extend(p.tools.deny.iter().cloned());
+        }
+        Ok(w)
+    }
     fn takes_mcp(&self) -> bool {
         true
     }
@@ -567,6 +611,14 @@ impl Adapter for Codex {
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
+        let profiled;
+        let flags = match l.agent {
+            Some(p) => {
+                profiled = self.profile_words(p)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ");
+                profiled.as_str()
+            }
+            None => flags,
+        };
         let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
         // The harness tools and the memory server, for this launch only (values are TOML; a JSON string is one)
         let memory = crate::memory::SERVER;
@@ -684,6 +736,24 @@ impl Adapter for Codex {
     fn expresses(&self) -> Expresses {
         Expresses { model: true, fallback_model: false, efforts: &["low", "medium", "high"], modes: &["read-only", "workspace-write"], tools: false }
     }
+    /// The sandbox with `on-request` in place of the bare pair, then `-m` and
+    /// the effort as a TOML literal (`model_reasoning_effort` is a config key
+    /// of codex-cli 0.170, and the operator's own config.toml sets it): one
+    /// word without `"` or `%`, so it is the same on Windows
+    fn profile_words(&self, p: &crate::profiles::AgentProfile) -> Result<Vec<String>, String> {
+        if p.inference.fallback_model.is_some() || !p.tools.deny.is_empty() || p.tools.only.is_some() {
+            return Err("codex takes no fallback model and no tool lists".into());
+        }
+        let mode = p.permissions.mode.clone().unwrap_or_else(|| "workspace-write".into());
+        let mut w: Vec<String> = vec!["--sandbox".into(), mode, "--ask-for-approval".into(), "on-request".into()];
+        if let Some(m) = &p.inference.model {
+            w.extend(["-m".into(), m.clone()]);
+        }
+        if let Some(e) = &p.inference.effort {
+            w.extend(["-c".into(), format!("model_reasoning_effort='{e}'")]);
+        }
+        Ok(w)
+    }
     fn takes_mcp(&self) -> bool {
         true
     }
@@ -737,8 +807,24 @@ pub fn command_line(l: &Launch) -> Result<String, String> {
     if l.resume.is_some_and(|id| !is_uuid(id)) {
         return Err("Invalid session id to resume".into());
     }
+    profile_fits(agent, l)?;
     let task = l.task.map(str::trim).filter(|t| !t.is_empty());
     agent.command_line(agent.profile().command, &Launch { task, ..*l })
+}
+
+/// A profile is launched only by its own adapter and only as the checks
+/// allow it now: a pinned copy is checked again by this build's ceiling.
+/// None for a bare launch.
+fn profile_fits(agent: &dyn Adapter, l: &Launch) -> Result<Option<Vec<String>>, String> {
+    let Some(p) = l.agent else { return Ok(None) };
+    if p.adapter != agent.id() {
+        return Err(format!("The profile {} is for {}, not {}", p.id, p.adapter, agent.id()));
+    }
+    crate::profiles::check(p, crate::profiles::Origin::Operator)?;
+    if l.supervisor != (p.role == crate::profiles::Role::Supervisor) {
+        return Err("A supervisor profile starts the root Supervisor only, and the root Supervisor only a supervisor profile".into());
+    }
+    agent.profile_words(p).map(Some)
 }
 
 /// A TOML single-quoted literal string (no escapes, no `"` needed).
@@ -797,6 +883,7 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
     if l.resume.is_some_and(|id| !is_uuid(id)) {
         return Err("Invalid session id to resume".into());
     }
+    let words = profile_fits(agent, l)?;
     let task = l.task.map(str::trim).filter(|t| !t.is_empty());
     let mut args: Vec<String> = Vec::new();
     match l.profile {
@@ -807,7 +894,8 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
             return Ok(vec!["powershell.exe".into(), "-NoLogo".into()]);
         }
         "claude" => {
-            args.extend(["claude", "--permission-mode", "acceptEdits"].into_iter().map(str::to_owned));
+            args.push("claude".into());
+            args.extend(words.unwrap_or_else(|| vec!["--permission-mode".into(), "acceptEdits".into()]));
             if !l.mcp.is_empty() {
                 args.extend(["--mcp-config".into(), l.mcp.to_owned()]);
             }
@@ -829,9 +917,7 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
             if l.resume.is_some() {
                 args.push("resume".into());
             }
-            args.extend([
-                "--sandbox", "workspace-write", "--ask-for-approval", "on-request",
-            ].into_iter().map(str::to_owned));
+            args.extend(words.unwrap_or_else(|| ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"].into_iter().map(str::to_owned).collect()));
             let exe_lit = toml_literal(l.exe)?;
             args.extend(["-c".into(), format!("notify=[{exe_lit},'--harness-hook','codex-notify']")]);
             args.extend(["-c".into(), "tui.notifications=true".into()]);
@@ -1134,5 +1220,141 @@ mod tests {
         }).unwrap();
         assert_eq!(agy, vec!["agy", "--mode", "accept-edits", "--conversation", id]);
         assert!(cmd_line(&agy).is_ok());
+    }
+
+    /// The words of a Unix command line, as the shell would split it (only
+    /// the quoting `sh` writes: single quotes and `'\''`)
+    fn shell_words(line: &str) -> Vec<String> {
+        let (mut words, mut word, mut quoted, mut any, mut escaped) = (Vec::new(), String::new(), false, false, false);
+        for c in line.chars() {
+            if escaped {
+                word.push(c);
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\'' => {
+                    quoted = !quoted;
+                    any = true;
+                }
+                '\\' if !quoted => {
+                    escaped = true;
+                    any = true;
+                }
+                ' ' if !quoted => {
+                    if any || !word.is_empty() {
+                        words.push(std::mem::take(&mut word));
+                    }
+                    any = false;
+                }
+                c => word.push(c),
+            }
+        }
+        if any || !word.is_empty() {
+            words.push(word);
+        }
+        words
+    }
+
+    /// Flags and values no profile may ever produce (16647 M1)
+    fn refused_words(words: &[String]) -> Vec<String> {
+        const REFUSED: [&str; 17] = [
+            "--allowedTools", "--allowed-tools", "--agents", "--add-dir", "--dangerously-skip-permissions", "bypassPermissions", "dontAsk",
+            "--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "-p", "--profile",
+            "danger-full-access", "never", "--strict-mcp-config", "--yolo", "--full-auto",
+        ];
+        let mut bad: Vec<String> = words.iter().filter(|w| REFUSED.contains(&w.as_str()) || w.contains("approval_policy") || w.contains("sandbox_mode")).cloned().collect();
+        if words.iter().filter(|w| *w == "--settings").count() > 1 {
+            bad.push("a second --settings".into());
+        }
+        bad
+    }
+
+    fn full_claude() -> crate::profiles::AgentProfile {
+        crate::profiles::parse(
+            "id = \"custom@all\"\nversion = 2\nrole = \"custom\"\nadapter = \"claude\"\n[inference]\nmodel = \"opus[1m]\"\nfallback_model = \"sonnet\"\neffort = \"max\"\n[permissions]\nmode = \"manual\"\n[tools]\ndeny = [\"Bash(git push:*)\", \"Bash(gh pr merge:*)\", \"Edit\", \"mcp__x__y\", \"Bash(echo $HOME; rm -rf *)\"]\nonly = [\"Bash\", \"Read\"]\n",
+            crate::profiles::Origin::Operator,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn profiles_reach_both_launch_paths_through_the_mapping_only() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let loaded = crate::profiles::load(Path::new("/nonexistent-config-dir"));
+        let full = full_claude();
+        let codex_full = crate::profiles::parse("id = \"custom@cx\"\nversion = 1\nrole = \"custom\"\nadapter = \"codex\"\n[inference]\nmodel = \"gpt-6.1-sol\"\neffort = \"low\"\n[permissions]\nmode = \"read-only\"\n", crate::profiles::Origin::Operator).unwrap();
+        let mut all: Vec<&crate::profiles::AgentProfile> = loaded.profiles.iter().map(|e| &e.profile).collect();
+        all.extend([&full, &codex_full]);
+        for p in all {
+            let supervisor = p.role == crate::profiles::Role::Supervisor;
+            for (resume, session) in [(None, Some(id)), (Some(id), None)] {
+                let l = Launch { profile: &p.adapter, agent: Some(p), supervisor, exe: "/x/mcr", settings: "/cfg/claude-hooks.json", mcp: "/cfg/claude-mcp.json", plugin: "/cfg/claude-plugin", note: true, resume, agent_session: session, ..Default::default() };
+                let unix = shell_words(&command_line(&l).unwrap());
+                let win = windows_args(&l).unwrap();
+                assert!(cmd_line(&win).is_ok(), "{}", p.id);
+                for words in [&unix[1..], &win[..]] {
+                    assert!(refused_words(words).is_empty(), "{}: {:?}", p.id, refused_words(words));
+                    let mode = p.permissions.mode.as_deref().unwrap();
+                    let flag = if p.adapter == "claude" { "--permission-mode" } else { "--sandbox" };
+                    assert_eq!(words.iter().filter(|w| *w == flag).count(), 1, "{}", p.id);
+                    assert_eq!(words[words.iter().position(|w| w == flag).unwrap() + 1], mode, "{}", p.id);
+                    if let Some(m) = &p.inference.model {
+                        let flag = if p.adapter == "claude" { "--model" } else { "-m" };
+                        assert_eq!(words[words.iter().position(|w| w == flag).unwrap() + 1], *m);
+                    }
+                    if let Some(e) = &p.inference.effort {
+                        assert!(words.iter().any(|w| *w == *e || *w == format!("model_reasoning_effort='{e}'")), "{}", p.id);
+                    }
+                    // Each deny rule is one word, right after the flag and before the harness's own flags
+                    if !p.tools.deny.is_empty() {
+                        let at = words.iter().position(|w| w == "--disallowedTools").unwrap();
+                        assert_eq!(&words[at + 1..at + 1 + p.tools.deny.len()], &p.tools.deny[..]);
+                        assert!(words[at + 1 + p.tools.deny.len()].starts_with("--"));
+                    }
+                    if p.adapter == "codex" {
+                        assert_eq!(words[words.iter().position(|w| w == "--ask-for-approval").unwrap() + 1], "on-request");
+                    }
+                }
+                // The Unix line runs the program first, the profile's words next
+                assert_eq!(unix[0], "exec");
+                assert_eq!(unix[1], p.adapter);
+            }
+        }
+        // A bare launch is today's line
+        let bare = command_line(&Launch { profile: "claude", settings: "/s", ..Default::default() }).unwrap();
+        assert!(bare.starts_with("exec claude --permission-mode acceptEdits --settings"));
+        assert_eq!(&windows_args(&Launch { profile: "codex", exe: "/x", ..Default::default() }).unwrap()[1..5], ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]);
+    }
+
+    #[test]
+    fn a_profile_the_ceiling_or_its_adapter_refuses_starts_nothing() {
+        let full = full_claude();
+        let check = |p: &crate::profiles::AgentProfile, profile: &str, supervisor: bool| {
+            let l = Launch { profile, agent: Some(p), supervisor, exe: "/x", settings: "/s", ..Default::default() };
+            (command_line(&l).unwrap_err(), windows_args(&l).unwrap_err())
+        };
+        // Built from code, past the parser: the launch checks again
+        for mode in ["bypassPermissions", "dontAsk", "auto", "default"] {
+            let mut p = full.clone();
+            p.permissions.mode = Some(mode.into());
+            check(&p, "claude", false);
+        }
+        let mut p = full.clone();
+        p.tools.deny.push("--dangerously-skip-permissions".into());
+        check(&p, "claude", false);
+        let mut p = full.clone();
+        p.inference.model = Some("opus --dangerously-skip-permissions".into());
+        check(&p, "claude", false);
+        // Another adapter's profile, and a profile for an adapter that takes no fields
+        let (unix, _) = check(&full, "codex", false);
+        assert!(unix.contains("is for claude"), "{unix}");
+        let mut p = full.clone();
+        p.adapter = "codex".into();
+        check(&p, "codex", false);
+        // The supervisor profile is for the root only, and the root takes no other
+        let loaded = crate::profiles::load(Path::new("/nonexistent-config-dir"));
+        check(&loaded.get("supervisor@claude-opus").unwrap().profile, "claude", false);
+        check(&loaded.get("implementer@claude-opus").unwrap().profile, "claude", true);
     }
 }

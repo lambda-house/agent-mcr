@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ConfirmDialog } from '@lambda-house/ui';
+import { ConfirmDialog, keepSame } from '@lambda-house/ui';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
-import { ACTION_KIND, actionSource, clickable, foldRows, harnessChips, harnessSaw, liveFacts, named, needsYouRows, shownUrgency, staleMarks, stillAwaits, trackStateShown, trackWaits, type Named } from '../utils/cockpit';
+import { ACTION_KIND, actionSource, ageTitle, clickable, harnessChips, harnessSaw, isOld, liveFacts, named, oneView, shownUrgency, staleMarks, stillAwaits, trackPublisher, trackStateShown, trackWaits, type Named, type NeedGroup } from '../utils/cockpit';
 import { harnessApi, type Cockpit, type CockpitAct, type CockpitAction, type CockpitLink, type CockpitTrack, type Hosted } from '../utils/harness';
 
 /**
- * The cockpit above the Supervisor's terminal (MCR-96): what needs the
- * person, then every track on one line. It only reads. What a session
+ * The cockpit above the Supervisor's terminal (MCR-96): one view of tracks
+ * and needs (MCR-131), each track with what it needs from the person under
+ * it, and what belongs to no track first, as Unassigned. It only reads. What a session
  * published is shown as its text with who said it and when; what the harness
  * knows of a session is drawn as a chip (`ck-live`) and comes from the session
  * list at every display.
@@ -34,6 +35,8 @@ const store = (key: string, value: string) => { try { localStorage.setItem(key, 
 function SessionLink({ who, onSession }: { who: Named; onSession: (id: string) => void }) {
   // Running by the service's word, not in the list yet: named, and not called ended
   if (!who.hosted && who.standing === 'running') return <span className="ck-session you" title={`${who.name}: not in the session list yet`}>{who.name}</span>;
+  // A gone session the cockpit kept no name of is said in words, its id only in the tooltip (MCR-127)
+  if (!who.hosted && who.standing === 'gone' && who.name === who.id) return <span className="ck-session gone" title={`mcr:${who.id}: the harness has no such session any more`}>a gone session</span>;
   if (!who.hosted) return <span className="ck-session gone" title={`${who.name}: ${who.standing === 'gone' ? 'the harness has no such session any more' : 'this session ended'}`}>{who.name}{who.standing === 'gone' ? ' (gone)' : ' (ended)'}</span>;
   const h = who.hosted;
   return <button type="button" className="ck-session" title={`Open ${who.name}`} onClick={() => onSession(h.id)}>{who.name}</button>;
@@ -52,7 +55,6 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   const who = (id: string) => named(id, cockpit, hosted, label);
   const at = a.where?.session ? who(a.where.session) : null;
   const publisher = a.by ? who(a.by) : null;
-  const track = a.track ? cockpit.tracks.find(t => t.id === a.track && (!a.trackBy || t.by === a.trackBy)) : undefined;
   // An action the harness knows to be behind keeps its text and loses its urgency
   const awaits = stillAwaits(a);
   const urgency = shownUrgency(a);
@@ -161,8 +163,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
       )}
       {said && <p className={said.bad ? 'ck-said bad' : 'ck-said'} role={said.bad ? 'alert' : 'status'}>{said.text}</p>}
       <p className="ck-source">
-        {actionSource(a, publisher ? publisher.name : 'a session')}
-        {track && <span>track: {track.title}</span>}
+        <span className={!a.derived && isOld(a) ? 'ck-old' : undefined} title={a.derived ? undefined : ageTitle(a)}>{actionSource(a, publisher ? publisher.name : 'a session')}</span>
         {a.trackMissing && <span className="ck-stale">its track was removed</span>}
         {a.blocks?.length ? <span>blocks: {a.blocks.join(', ')}</span> : null}
         {a.source?.length ? <span>source: {a.source.join(', ')}</span> : null}
@@ -188,37 +189,70 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   );
 }
 
-function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: CockpitTrack; cockpit: Cockpit; hosted: Hosted[]; label: (h: Hosted) => string; onSession: (id: string) => void }) {
+type Shared = { cockpit: Cockpit; hosted: Hosted[]; label: (h: Hosted) => string; onSession: (id: string) => void };
+
+/** What the harness itself saw among a group's needs, on its header row (MCR-131): a mark, the group stays where it is. */
+function Marks({ marks }: { marks: string[] }) {
+  return marks.length ? <span className="ck-live harness ck-mark" title="From the harness, now: among this track's needs">{marks.join(' · ')}</span> : null;
+}
+
+/** A group's needs, under its line and items, with the publishers folded beyond the first few. */
+function Needs({ group, onUnfold, ...shared }: Shared & { group: NeedGroup; onUnfold: (by: string) => void }) {
+  if (!group.rows.length && !group.folded.size) return null;
+  return (
+    <div className="ck-track-needs">
+      <ul className="ck-actions">{group.rows.map(a => <ActionRow key={`${a.by ?? ''}:${a.id}:${a.updated ?? 0}`} action={a} {...shared}/>)}</ul>
+      {[...group.folded].map(([by, n]) => <button key={by} type="button" className="ck-do quiet ck-more" onClick={() => onUnfold(by)}>{n} more from {named(by, shared.cockpit, shared.hosted, shared.label).name}</button>)}
+    </div>
+  );
+}
+
+/** What belongs to no track: first in the view, and only when it holds a need. */
+function UnassignedRow({ group, onUnfold, ...shared }: Shared & { group: NeedGroup; onUnfold: (by: string) => void }) {
+  return (
+    <li className="ck-track ck-unassigned" data-group="unassigned">
+      <div className="ck-track-line">
+        <span className="ck-expand" aria-hidden/>
+        <strong className="ck-track-title">Unassigned</strong>
+        <span className="ck-track-meta">
+          <Marks marks={group.marks}/>
+          <span className="ck-role" title="Needs that name no track, and whose session no track leads or is below the lead of">no track</span>
+        </span>
+      </div>
+      <Needs group={group} onUnfold={onUnfold} {...shared}/>
+    </li>
+  );
+}
+
+function TrackRow({ track: t, group, onUnfold, cockpit, hosted, label, onSession }: Shared & { track: CockpitTrack; group: NeedGroup; onUnfold: (by: string) => void }) {
   const [open, setOpen] = useState(false);
   const who = (id: string) => named(id, cockpit, hosted, label);
   const lead = who(t.lead);
   const waits = trackWaits(t, id => who(id).name);
   const items = t.items ?? [];
   const state = trackStateShown(t);
-  // Who wrote the text is not always who leads the work: the Supervisor publishes tracks led by others
-  const publishedByOther = t.by !== t.lead;
-  const age = `${publishedByOther ? `by ${who(t.by).name} · ` : ''}${t.updated ? formatAge(t.updated) : ''}`;
+  // Who wrote the text, when it is neither the lead nor the Supervisor whose panel this is (MCR-127)
+  const publisher = trackPublisher(t);
   return (
-    <li className={`ck-track ${t.state}${state.tone === 'stale' ? ' stale' : ''}`} data-track={t.id}>
+    <li className={`ck-track ${t.state}${state.old ? ' old' : ''}`} data-track={t.id}>
       <div className="ck-track-line">
         <button type="button" className="ck-expand" aria-expanded={open} aria-label={`${open ? 'Hide' : 'Show'} the items of ${t.title}`} disabled={!items.length} onClick={() => setOpen(o => !o)}>
           {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}
         </button>
         <span className={`ck-state ${state.tone}`} title={state.tone === 'answered' ? 'From the harness: you pressed Enter in the lead session\'s terminal after this track was published as waiting for you. Its publisher was told to update it' : undefined}>{state.text}</span>
         <strong className="ck-track-title">{t.title}</strong>
-        {/* Who and when give way to the title: cut with an ellipsis, whole in the tooltip, and on a
-            line of their own under the title when the column is narrow (MCR-105) */}
+        {/* Who leads and when, never cut: beside the title when both fit, else on the next line (MCR-127) */}
         <span className="ck-track-meta">
-          {publishedByOther && <span className="ck-role">lead</span>}
+          <Marks marks={group.marks}/>
+          {publisher && <span className="ck-role">lead</span>}
           <SessionLink who={lead} onSession={onSession}/>
+          {publisher && <span className="ck-role">by {who(publisher).name}</span>}
           <Stale marks={staleMarks(t, cockpit, hosted, label)}/>
-          <span className="ck-age" title={age || undefined}>{age}</span>
+          {t.updated ? <span className={state.old ? 'ck-age ck-old' : 'ck-age'} title={ageTitle(t)}>{formatAge(t.updated)}</span> : null}
         </span>
       </div>
-      {(t.line || waits.length > 0) && <div className="ck-track-sub">
-        {t.line && <span className="ck-line" title={t.line}>{t.line}</span>}
-        {waits.length > 0 && <span className="ck-waits">waits on {waits.join(', ')}</span>}
-      </div>}
+      {t.line && <p className="ck-track-text">{t.line}</p>}
+      {waits.length > 0 && <p className="ck-track-text ck-track-waits">waits on {waits.join(', ')}</p>}
       {open && (
         <div className="ck-track-body">
           {lead.hosted && (() => {
@@ -245,6 +279,7 @@ function TrackRow({ track: t, cockpit, hosted, label, onSession }: { track: Cock
           </ul>
         </div>
       )}
+      <Needs group={group} onUnfold={onUnfold} cockpit={cockpit} hosted={hosted} label={label} onSession={onSession}/>
     </li>
   );
 }
@@ -275,7 +310,7 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
       // A read that hangs is said, never covered by the last good one: "nothing needs you" is a claim
       const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer from the harness service in ${READ_TIMEOUT_MS / 1000} s`)), READ_TIMEOUT_MS); });
       Promise.race([Promise.resolve().then(() => harnessApi.cockpit()), late])
-        .then(c => { if (live && n > shown) { shown = n; setCockpit(c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null); setError(''); } })
+        .then(c => { if (live && n > shown) { shown = n; const next = c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null; setCockpit(held => keepSame(held, next)); setError(''); } })
         .catch(e => { if (live && n > shown) { shown = n; setError(String(e instanceof Error ? e.message : e)); } })
         .finally(() => clearTimeout(timer));
     };
@@ -293,13 +328,15 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
     setHeight(next); store(HEIGHT_KEY, String(next));
   }, []);
 
-  const actions = cockpit ? needsYouRows(cockpit) : [];
   // Publishers whose rows beyond the first few were unfolded
   const [unfolded, setUnfolded] = useState<ReadonlySet<string>>(new Set());
-  const { shown, folded } = foldRows(actions, unfolded);
+  const unfold = (by: string) => setUnfolded(u => new Set([...u, by]));
+  const view = cockpit ? oneView(cockpit, hosted, unfolded) : null;
+  const actions = view?.all ?? [];
   const tracks = cockpit?.tracks ?? [];
+  const shared = { cockpit: cockpit!, hosted, label, onSession };
   // "Nothing needs you" is a claim: made only on a cockpit that was read, and read without an error just now
-  // Counted: what still stands. An action you already typed for is shown, and not counted
+  // Counted: what still stands, over every track and Unassigned. An action you already typed for is shown, and not counted
   const open = actions.filter(stillAwaits).length;
   const count = error ? 'could not be read' : !cockpit ? 'reading…' : open ? `${open} need${open === 1 ? 's' : ''} you` : actions.length ? 'nothing new needs you' : 'nothing needs you';
   return (
@@ -318,15 +355,13 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
           <div className="ck-body">
             {error && <p className="ck-empty" role="alert">The cockpit could not be read: {error}</p>}
             {cockpit && !actions.length && !tracks.length && <p className="ck-empty">Nothing is published yet. A session publishes its track with cockpit_publish; a prompt or an open report shows here by itself.</p>}
-            {/* Side by side in a wide pane, so the tracks stay in sight under any number of actions */}
-            {actions.length > 0 && <div className="ck-col">
-              <h3>Needs you</h3>
-              <ul className="ck-actions">{shown.map(a => <ActionRow key={`${a.by ?? ''}:${a.id}:${a.updated ?? 0}`} action={a} cockpit={cockpit!} hosted={hosted} label={label} onSession={onSession}/>)}</ul>
-              {[...folded].map(([by, n]) => <button key={by} type="button" className="ck-do quiet ck-more" onClick={() => setUnfolded(u => new Set([...u, by]))}>{n} more from {named(by, cockpit!, hosted, label).name}</button>)}
-            </div>}
-            {tracks.length > 0 && <div className="ck-col">
-              <h3>Tracks</h3>
-              <ul className="ck-tracks">{tracks.map(t => <TrackRow key={`${t.by}:${t.id}`} track={t} cockpit={cockpit!} hosted={hosted} label={label} onSession={onSession}/>)}</ul>
+            {/* One list (MCR-131): each track with its needs under it, what belongs to no track first */}
+            {view && (view.unassigned || tracks.length > 0) && <div className="ck-col">
+              <h3>Tracks and needs</h3>
+              <ul className="ck-tracks">
+                {view.unassigned && <UnassignedRow group={view.unassigned} onUnfold={unfold} {...shared}/>}
+                {tracks.map((t, i) => <TrackRow key={`${t.by}:${t.id}`} track={t} group={view.tracks[i]} onUnfold={unfold} {...shared}/>)}
+              </ul>
             </div>}
           </div>
         )}

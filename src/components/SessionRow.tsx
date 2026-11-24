@@ -6,6 +6,7 @@ import { formatAge } from '../utils/agent';
 import { formatUntil, harnessApi, heldNote, hostedState, liveSessionLabel, programHint, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
 import { sessionKey, sessionTooltip, type Session } from '../utils/sessions';
 import type { SessionRowProps } from '@lambda-house/journal';
+import { keepSame } from '@lambda-house/ui';
 
 /**
  * The two rows of the Live list. The list itself, the Journal's results and
@@ -101,8 +102,8 @@ export function useHostedByConversation(active: boolean, every = 0): Map<string,
     let live = true;
     const load = () => {
       Promise.resolve().then(() => harnessApi.list())
-        .then(list => { if (live) setHosted(Array.isArray(list) ? list : []); })
-        .catch(() => { if (live) setHosted([]); });
+        .then(list => { if (live) setHosted(held => keepSame(held, Array.isArray(list) ? list : [])); })
+        .catch(() => { if (live) setHosted(held => held.length ? [] : held); });
     };
     load();
     const timer = every ? setInterval(() => { if (!document.hidden) load(); }, every) : undefined;

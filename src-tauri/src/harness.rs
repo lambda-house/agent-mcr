@@ -57,7 +57,7 @@ const MAX_SENT: usize = 40;
 /// The name agents see the harness tools under (`mcp__mcr__…` in Claude Code)
 pub const AGENT_SERVER: &str = "mcr";
 /// What every hosted agent is told at launch, whatever its kind.
-pub const PEER_NOTE: &str = "You run in a terminal hosted by Agent MCR, next to other agent sessions (Claude Code, Codex and others) that the same operator runs on this machine. The `mcr` MCP tools connect you to them and to the operator. When you start: call list_peers to see who works in your folder and in what role, and bulletin_read for the notes left for sessions like yours. While you work: set_status with your role and what you are doing; send_message, ask, reply and read_inbox to reach a peer; report with kind needs_human when you cannot go on without the operator, and with kind done when a piece of work is complete; bulletin_post for a fact that later sessions must know, with an honest expiry. The `guide` tool of the mcr server (in Claude Code also the skills agent-mcr:peers and agent-mcr:reporting) has the working rules; read it before your first message or report. A mcr:<id> in a prompt is the operator pointing at a peer session: pass it to these tools as it is.";
+pub const PEER_NOTE: &str = "You run in a terminal hosted by Agent MCR, next to other agent sessions (Claude Code, Codex and others) that the same operator runs on this machine. The `mcr` MCP tools connect you to them and to the operator. When you start: call list_peers to see who works in your folder and in what role, and bulletin_read for the notes left for sessions like yours. While you work: set_status with your role and what you are doing; send_message, ask, reply and read_inbox to reach a peer; report with kind needs_human when you cannot go on without the operator, and with kind done when a piece of work is complete; bulletin_post for a fact that later sessions must know, with an honest expiry. The `guide` tool of the mcr server (in Claude Code also the skills agent-mcr:peers and agent-mcr:reporting) has the working rules; read it before your first message or report. When whoami names an agent profile, the guide also holds your role (in Claude Code the skill agent-mcr:role): read it before you start. A mcr:<id> in a prompt is the operator pointing at a peer session: pass it to these tools as it is.";
 
 /// Working rules, part one: the peers. With `REPORT_GUIDE` it is the answer of
 /// the `guide` tool, and each part is a Claude Code skill, so every agent kind
@@ -181,6 +181,20 @@ pub fn claude_plugin() -> [(&'static str, String); 3] {
         "---\nname: reporting\ndescription: How to tell the operator of Agent MCR that you need their assessment or that a piece of work is complete (the mcr report tool), and how to read and leave notes for later sessions on the bulletin board (bulletin_read, bulletin_post). Read before your first report or note, when you are blocked on a human decision, and when you finish a task.\n---\n\n{REPORT_GUIDE}"
     );
     [(".claude-plugin/plugin.json", manifest.to_string()), ("skills/peers/SKILL.md", peers), ("skills/reporting/SKILL.md", reporting)]
+}
+
+/// The plugin of a session with a role: the two skills and its role guide
+/// as the skill `agent-mcr:role` (MCR-126 P2), in a folder per role.
+pub fn role_plugin(role: &str) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = claude_plugin().into_iter().collect();
+    files.push((
+        "skills/role/SKILL.md",
+        format!(
+            "---\nname: role\ndescription: Your role in Agent MCR as your agent profile sets it ({role}): its contract, what done means for it, its owner words and what it never does. Read at the start of a session, before you report done, and before any step that may need the owner's word.\n---\n\n{}",
+            crate::profiles::role_guide(role)
+        ),
+    ));
+    files
 }
 
 /// The name the hosted supervisor session sees the supervisor tools under
@@ -384,10 +398,11 @@ pub fn find_resumable(home: &Path, id: &str) -> Option<Resumable> {
 
 /// The agent kind a `session_create` starts: the resumed transcript's, as
 /// `create` takes it, else `profile`. `None`: no such transcript (`create` says so).
-fn asked_profile(home: &Path, args: &Value) -> Option<String> {
+fn asked_profile(config_dir: &Path, home: &Path, args: &Value) -> Option<String> {
     match args["resume"].as_str().filter(|s| !s.is_empty()) {
         Some(id) => find_resumable(home, id).map(|r| r.agent.to_string()),
-        None => Some(args["profile"].as_str().unwrap_or("").to_string()),
+        // An agent profile's adapter (MCR-126); one that cannot be used is refused at the launch
+        None => Some(args["profile"].as_str().unwrap_or("")).map(|p| crate::profiles::choose(config_dir, p).map(|l| l.profile.adapter).unwrap_or_else(|_| p.to_string())),
     }
 }
 
@@ -1290,6 +1305,7 @@ impl Store {
                     done: open.filter(|r| r.kind == "done").map(|r| (r.id.clone(), r.text.clone(), r.created)),
                     typed: Some(t.operator_sent).filter(|at| *at > 0),
                     waits: self.open_waits(id).iter().map(|w| cockpit::FactWait { id: w.id.clone(), kind: w.kind.clone(), on: w.on.clone(), reference: w.reference.clone(), since: w.created, overdue: w.expect_by <= now }).collect(),
+                    words: t.agent_profile.as_ref().map(|r| r.words.clone()).unwrap_or_default(),
                 };
                 (id.clone(), fact)
             })
@@ -2223,6 +2239,16 @@ fn drop_prompt(tracked: &mut Tracked) {
     }
 }
 
+/// A prompt is marked in front of the session's own report (MCR-132): the
+/// report stays open behind it (`open`, from `Store::open_report`), and its
+/// mark comes back once the prompt is gone (`raise_pending`), as for a
+/// report made at a prompt (M7). Call it before the prompt's mark is set.
+fn keep_behind_prompt(tracked: &mut Tracked, open: &Option<String>) {
+    if tracked.attention.as_ref().is_some_and(|a| a.report.is_some()) {
+        tracked.pending_report = open.clone();
+    }
+}
+
 /// A prompt of the session was answered: it moved on (MCR-122). The keys
 /// that answered it (a digit, which Claude Code takes without Enter, an
 /// arrow) reached the app as typing and may have left a "draft" there, which
@@ -2273,11 +2299,13 @@ enum Seen {
 /// fallback for prompts no hook reports, as Codex's approval requests.
 /// Returns true when the session started to wait.
 fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
+    let open = store.open_report(session).map(|r| r.id.clone());
     // Nothing is asked in the terminal of a session that ended (a late title, a last screen)
     let Some(tracked) = store.sessions.get_mut(session).filter(|t| t.state != ENDED) else { return false };
     let prompt = tracked.attention.as_ref().filter(|a| a.kind == "permission" && a.report.is_none());
     match (seen, prompt) {
         (Seen::Asking(text), None) => {
+            keep_behind_prompt(tracked, &open);
             // What the screen showed may be a command line: in memory only
             tracked.attention = Some(Attention { kind: "permission".into(), text, since: now, guess: true, was: tracked.state.clone(), unsaved: true, ..Attention::default() });
             store.set_state(session, "waiting");
@@ -2305,6 +2333,7 @@ fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
 /// What a hook event does to a session. Returns true when the session became
 /// ready for its next queued task.
 fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) -> bool {
+    let open = store.open_report(session).map(|r| r.id.clone());
     // A hook that arrives after the end changes nothing: no mark, no state, no task typed
     let Some(tracked) = store.sessions.get_mut(session).filter(|t| t.state != ENDED) else { return false };
     let text = |v: &Value| v.as_str().map(|s| s.chars().take(MAX_TEXT).collect::<String>());
@@ -2360,6 +2389,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
                     None => tracked.state.clone(),
                 };
                 tracked.precise = true;
+                keep_behind_prompt(tracked, &open);
                 tracked.attention = Some(Attention { kind: "permission".into(), text: asks, since: now_ms(), was, unsaved: true, ..Attention::default() });
                 store.set_state(session, "waiting");
                 return false;
@@ -2421,6 +2451,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
             // A prompt the harness did not type is the operator's: they have seen the report
             if event == "UserPromptSubmit" && now_ms().saturating_sub(tracked.injected) > INJECTED_PROMPT_MS {
                 tracked.attention = None;
+                tracked.pending_report = None;
             }
             store.set_state(session, "working");
             false
@@ -2429,6 +2460,7 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
             let kind = payload["notification_type"].as_str().unwrap_or("");
             if kind == "permission_prompt" || kind == "elicitation_dialog" {
                 let message = text(&payload["message"]).unwrap_or_else(|| "The agent is waiting for your answer".into());
+                keep_behind_prompt(tracked, &open);
                 tracked.attention = Some(Attention { kind: "permission".into(), text: message, since: now_ms(), ..Attention::default() });
                 store.set_state(session, "waiting");
             }
@@ -2882,13 +2914,13 @@ impl Harness {
         let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
         let profile = prefs.supervisor_profile.ok_or("Choose a supervisor in Settings → Harnesses")?;
         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true)
+        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true, None)
     }
 
     fn create(&self, req: &Value) -> Result<Value, String> {
         // Who assigns and who created is known from the caller's process, never from
         // what the app or a supervisor sends: only `executor_create` sets it
-        self.create_as(&without_assigner(req), false)
+        self.create_as(&without_assigner(req), false, None)
     }
 
     /// End a session's agent and continue its conversation in a new process,
@@ -2897,8 +2929,33 @@ impl Harness {
     /// the messages; the old terminal output is dropped (the agent prints the
     /// conversation again). Without a transcript to continue it starts fresh
     /// in the same folder.
-    fn restart(&self, id: &str, force: bool) -> Result<Value, String> {
+    /// A session started from an agent profile is started again from the
+    /// version it ran (its pin, 16647 L5), or with `refresh` from the profile
+    /// as it is now, lowered again to the ceiling it was started under (its
+    /// creator's profile, recorded at the start). Both are settled before the
+    /// old process is ended.
+    fn restart(&self, id: &str, force: bool, refresh: bool) -> Result<Value, String> {
         let old = self.session(id)?;
+        let recorded = lock(&self.store).sessions.get(id).and_then(|t| t.agent_profile.clone());
+        let launch = match recorded {
+            None => None,
+            Some(r) if refresh => Some(crate::profiles::refreshed(&self.dir, &r)?),
+            Some(r) => Some(crate::profiles::pinned(&self.dir, &r)?),
+        };
+        // It goes on working for the session it works for: below any but the
+        // root Supervisor, or as an executor a session created, it does not
+        // deliver, whatever its pin or the profile now say (MCR-136)
+        let launch = match launch {
+            Some(l) => {
+                let (above, creator) = lock(&self.store).sessions.get(id).map(|t| (t.supervisor.clone(), t.created_by.clone())).unwrap_or_default();
+                // The root by its record, also while it is not running
+                let all = self.sessions()?;
+                let root = |up: &String| all.iter().any(|s| s["id"] == up.as_str() && s["meta"]["role"] == "supervisor");
+                let free = [above, creator].iter().flatten().all(root);
+                Some(crate::profiles::below(l, free)?.0)
+            }
+            None => None,
+        };
         let profile = old["harness"]["profile"].as_str().unwrap_or("").to_string();
         crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
         if !adapter(&profile).is_agent() {
@@ -2942,7 +2999,7 @@ impl Harness {
                 Some(conversation) => req["resume"] = json!(conversation),
                 None => req["profile"] = json!(profile),
             }
-            self.create_as(&req, old["meta"]["role"] == "supervisor")
+            self.create_as(&req, old["meta"]["role"] == "supervisor", launch.clone())
         })();
         let new = match started {
             Ok(new) => new,
@@ -3008,16 +3065,28 @@ impl Harness {
         Ok(out)
     }
 
-    fn create_as(&self, req: &Value, supervisor: bool) -> Result<Value, String> {
+    /// `pinned`: the agent profile to launch, settled by the caller (a
+    /// restart's pin, an executor's lowered profile). Otherwise `profile` in
+    /// `req` is an adapter id (a bare launch) or an agent profile id, taken
+    /// as it is now (MCR-126 P2). Never profile text from a request.
+    fn create_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>) -> Result<Value, String> {
         let home = dirs::home_dir().ok_or("Home directory unavailable")?;
         let resume = req["resume"].as_str().filter(|s| !s.is_empty());
         let found = match resume {
             Some(id) => Some(find_resumable(&home, id).ok_or_else(|| format!("No Claude or Codex session {id} to resume"))?),
             None => None,
         };
-        let profile = match &found {
-            Some(r) => r.agent.to_string(),
-            None => req["profile"].as_str().unwrap_or("").to_string(),
+        let asked = req["profile"].as_str().unwrap_or("");
+        let mut chosen = match pinned {
+            Some(l) => Some(l),
+            None if crate::profiles::is_profile_id(asked) => Some(crate::profiles::choose(&self.dir, asked)?),
+            None => None,
+        };
+        let profile = match (&found, &chosen) {
+            (Some(r), Some(c)) if r.agent != c.profile.adapter => return Err(format!("The conversation to resume is {}'s; the profile {} is for {}", r.agent, c.profile.id, c.profile.adapter)),
+            (Some(r), _) => r.agent.to_string(),
+            (None, Some(c)) => c.profile.adapter.clone(),
+            (None, None) => asked.to_string(),
         };
         let label = profiles().iter().find(|p| p.id == profile).ok_or_else(|| format!("Unknown profile {profile:?}"))?.label;
         crate::harness_preferences::HarnessPreferences::load(&self.dir)?.require_enabled(&profile)?;
@@ -3050,6 +3119,10 @@ impl Harness {
             if !adapter(live["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
                 return Err("Only an agent session can have executors".into());
             }
+            // Below any session but the root Supervisor, a lead does not deliver (MCR-136)
+            if let Some(c) = chosen.take() {
+                chosen = Some(crate::profiles::below(c, live["meta"]["role"] == "supervisor")?.0);
+            }
             let store = lock(&self.store);
             if store.chain(up).len() + 1 > MAX_DEPTH {
                 return Err(format!("Refused: more than {MAX_DEPTH} levels of supervisors"));
@@ -3070,7 +3143,17 @@ impl Harness {
         }
         let settings = self.dir.join(if supervisor { "claude-supervisor-hooks.json" } else { "claude-hooks.json" });
         let mcp = self.dir.join(if supervisor { "claude-supervisor-mcp.json" } else { "claude-mcp.json" });
-        let plugin = self.dir.join("claude-plugin");
+        // A session with a role gets the plugin with its role skill too (agent-mcr:role);
+        // the bare root Supervisor gets the supervisor's (16647 M5)
+        let role = chosen.as_ref().map(|c| c.profile.role.as_str()).or(supervisor.then_some("supervisor"));
+        let plugin = match role {
+            Some(role) if agent.files(&exe, supervisor).iter().any(|(name, _)| name.starts_with("claude-plugin/")) => {
+                let folder = self.dir.join(format!("claude-plugin-{role}"));
+                crate::profiles::write_tree(&folder, &role_plugin(role))?;
+                folder
+            }
+            _ => self.dir.join("claude-plugin"),
+        };
         let agent_session = (agent.names_conversation() && resume.is_none()).then(new_uuid);
         if cfg!(windows) {
             if let Some(text) = task {
@@ -3099,7 +3182,20 @@ impl Harness {
             // Free text never goes in Windows argv; it is queued and typed when ready.
             task: if cfg!(windows) { None } else { task },
             own_hooks: lock(&self.store).codex_hooks,
+            agent: chosen.as_ref().map(|c| &c.profile),
         })?;
+        // The text launched is kept, so a restart starts the same version (L5)
+        if let Some(c) = &chosen {
+            crate::profiles::pin(&self.dir, c)?;
+            // The versions sessions run, and the ceilings they were started under
+            let keep: std::collections::BTreeSet<String> = lock(&self.store)
+                .sessions
+                .values()
+                .filter_map(|t| t.agent_profile.as_ref())
+                .flat_map(|r| std::iter::once(r.digest.clone()).chain(r.ceiling.as_ref().map(|c| c.digest.clone())))
+                .collect();
+            crate::profiles::prune_pins(&self.dir, &keep, now_ms());
+        }
         spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
         let id = runner::random_id()[..12].to_string();
         spawn_env.insert("AGENT_MCR_SESSION".into(), id.clone());
@@ -3148,6 +3244,7 @@ impl Harness {
                     supervisor: above.clone(),
                     // Set only by `executor_create`: the session that may end it later
                     created_by: above.clone().filter(|up| *up == assigner),
+                    agent_profile: chosen.as_ref().map(|c| c.reference()),
                     ..Tracked::default()
                 },
             );
@@ -3410,7 +3507,8 @@ impl Harness {
             let known = tracked.is_some_and(|t| adapter(&t.profile).is_agent());
             if known {
                 s.set_state(session, "working");
-                if let Some(t) = s.sessions.get_mut(session) {
+                // What it reported itself stays: a task typed in is not the owner's answer (MCR-132)
+                if let Some(t) = s.sessions.get_mut(session).filter(|t| t.attention.as_ref().is_some_and(|a| a.report.is_none())) {
                     t.attention = None;
                 }
             }
@@ -3533,6 +3631,13 @@ impl Harness {
             let above = live(up).ok_or_else(|| format!("No running session {up}"))?;
             if !adapter(above["harness"]["profile"].as_str().unwrap_or("")).is_agent() {
                 return Err("Only an agent session can have executors".into());
+            }
+            // A delivering lead works for the root Supervisor or for nobody (MCR-136);
+            // a pin that cannot be read counts as delivering when it was a lead's
+            let recorded = lock(&self.store).sessions.get(child).and_then(|t| t.agent_profile.clone());
+            let delivers = recorded.is_some_and(|r| crate::profiles::pinned(&self.dir, &r).map(|l| l.profile.delivers()).unwrap_or(r.role == "lead"));
+            if delivers && above["meta"]["role"] != "supervisor" {
+                return Err("Refused: that session is a lead that delivers, and an executor never delivers. Put it under the Supervisor, or start the work below that session as a new executor".into());
             }
         }
         let before = lock(&self.store).sessions.get(child).and_then(|t| t.supervisor.clone());
@@ -3927,6 +4032,14 @@ impl Harness {
                 let store = lock(&self.store);
                 out["supervisor"] = json!(store.sessions.get(me).and_then(|t| t.supervisor.clone()));
                 out["executors"] = json!(store.executors(me));
+                // The fields of the version it runs, from its pin; the core owner words without one
+                match store.sessions.get(me).and_then(|t| t.agent_profile.clone()) {
+                    Some(r) => match crate::profiles::pinned(&self.dir, &r) {
+                        Ok(l) => out["profileDetails"] = crate::profiles::details(&l),
+                        Err(e) => out["profileDetails"] = json!({ "error": e }),
+                    },
+                    None => out["ownerWords"] = json!(crate::profiles::OWNER_WORDS),
+                }
                 out
             }
             "list_peers" => {
@@ -4149,7 +4262,23 @@ impl Harness {
                 self.wait_for(timeout, |s| (s.unread(me) > 0).then_some(()));
                 Self::inbox(self.update(|s| s.take_unread(me)))
             }
-            "guide" => json!({ "guide": format!("{PEER_GUIDE}\n{REPORT_GUIDE}") }),
+            "guide" => {
+                // The third part is the caller's role guide (MCR-126 P2): from the version it runs
+                // Not in the scrutinee: `session` below may update the store, and the lock is not re-entrant
+                let recorded = lock(&self.store).sessions.get(me).and_then(|t| t.agent_profile.clone());
+                let role = match recorded {
+                    Some(r) => Some(match crate::profiles::pinned(&self.dir, &r) {
+                        Ok(l) => format!("{}\nYour profile: {} v{}{}. whoami shows its fields.\n", crate::profiles::role_guide(l.profile.role.as_str()), l.profile.id, l.profile.version, if l.lowered { ", lowered to your creator's ceiling" } else { "" }),
+                        Err(e) => format!("{}\nYour profile {} v{} cannot be read now ({e}); its role guide is above.\n", crate::profiles::role_guide(&r.role), r.id, r.version),
+                    }),
+                    None if self.session(me).is_ok_and(|s| s["meta"]["role"] == "supervisor") => Some(format!("{}\nYou were started without an agent profile: a bare Supervisor.\n", crate::profiles::role_guide("supervisor"))),
+                    None => None,
+                };
+                match role {
+                    Some(role) => json!({ "guide": format!("{PEER_GUIDE}\n{REPORT_GUIDE}\n{role}") }),
+                    None => json!({ "guide": format!("{PEER_GUIDE}\n{REPORT_GUIDE}") }),
+                }
+            }
             "set_status" => {
                 let line = |key: &str, max: usize| args[key].as_str().map(|v| v.chars().filter(|c| !c.is_control()).take(max).collect::<String>());
                 let (status, role) = (line("text", 200), line("role", 80));
@@ -4241,9 +4370,40 @@ impl Harness {
             "executor_create" => {
                 let mine = self.session(me)?;
                 let profile = args["profile"].as_str().filter(|p| !p.is_empty()).unwrap_or(mine["harness"]["profile"].as_str().unwrap_or("")).to_string();
-                if !adapter(&profile).is_agent() {
-                    return Err("An executor is an agent session: profile claude or codex".into());
+                // Never wider than the creator's own profile (16639 9.2, 16647 L6): an
+                // agent profile, or a bare adapter taken as its bare line, is lowered to it
+                let own_ref = lock(&self.store).sessions.get(me).and_then(|t| t.agent_profile.clone());
+                let own = match &own_ref {
+                    Some(r) => Some(crate::profiles::pinned(&self.dir, r).map_err(|e| format!("Refused: your own profile's ceiling cannot be read, so no executor is started ({e})"))?.profile),
+                    None => None,
+                };
+                // Its profile's limit on executors, besides the harness's own (16771 M1)
+                if let Some(max) = own.as_ref().and_then(|o| o.limits.max_executors) {
+                    let running = lock(&self.store).executors(me).len();
+                    if running >= max as usize {
+                        return Err(format!("Refused: your profile allows {max} executors, and you have {running}"));
+                    }
                 }
+                let asked = if crate::profiles::is_profile_id(&profile) { Some(crate::profiles::choose(&self.dir, &profile)?) } else { own.as_ref().and_then(|_| crate::profiles::bare(&profile)) };
+                if !adapter(asked.as_ref().map_or(profile.as_str(), |a| a.profile.adapter.as_str())).is_agent() {
+                    return Err("An executor is an agent session: a profile id (see whoami and the guide), claude or codex".into());
+                }
+                let (launch, lowered) = match (asked, &own) {
+                    (Some(a), Some(own)) => {
+                        let (mut l, notes) = crate::profiles::lower_of(&a, own)?;
+                        // Recorded whether or not it was lowered, for a refresh (16771 M2)
+                        l.ceiling = own_ref.clone();
+                        // A bare request that the ceiling leaves as it was stays a bare launch
+                        if notes.is_empty() && !crate::profiles::is_profile_id(&profile) { (None, notes) } else { (Some(l), notes) }
+                    }
+                    // A creator without a profile has no ceiling to lower to, but an
+                    // executor never delivers unless it works for the root (MCR-136)
+                    (Some(a), None) => {
+                        let (l, notes) = crate::profiles::below(a, mine["meta"]["role"] == "supervisor")?;
+                        (Some(l), notes)
+                    }
+                    (None, _) => (None, Vec::new()),
+                };
                 if let Some(task) = args["task"].as_str() {
                     plain_prompt(task)?;
                 }
@@ -4266,9 +4426,12 @@ impl Harness {
                 let created = self.create_as(&json!({
                     "profile": profile, "cwd": cwd, "name": args["name"], "role": args["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("executor"),
                     "task": args["task"], "supervisor": me, "by": me,
-                }), false)?;
+                }), false, launch)?;
                 let mut out = Self::brief(&created);
                 out["task"] = created["task"].clone();
+                if !lowered.is_empty() {
+                    out["lowered"] = json!(lowered);
+                }
                 out["note"] = json!("Started as your executor; the operator sees it in the session list under yours. Follow its first task with task_wait, or end your turn: you are told in your inbox when the task ends. You cannot answer its permission prompts.");
                 out
             }
@@ -4301,14 +4464,17 @@ impl Harness {
         Ok(out)
     }
 
-    /// The hosted session a connection comes from: its process descends from
-    /// one of the runner's children. Nothing the caller says is trusted.
-    fn caller(&self, peer: &peer::Peer) -> Result<String, String> {
-        match self.who(peer) {
-            Caller::Session { id, .. } => Ok(id),
-            Caller::Outside => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
-            Caller::Unknown => Err("Cannot tell which process is calling".into()),
-        }
+    /// Counts a connected `mcr` bridge of a session, or one fewer; the
+    /// session has the tools for as long as one is connected.
+    fn bridged(&self, id: &str, by: isize) {
+        self.update(|s| {
+            let count = s.bridges.entry(id.to_string()).or_default();
+            *count = count.saturating_add_signed(by);
+            let tools = *count > 0;
+            if let Some(t) = s.sessions.get_mut(id) {
+                t.tools = tools;
+            }
+        });
     }
 
     /// Where a connection comes from, by the caller's process alone.
@@ -4329,29 +4495,30 @@ impl Harness {
         }
     }
 
-    fn agent(&self, mut reader: BufReader<Stream>, mut writer: Stream, mcp_client: bool, peer: &peer::Peer) -> std::io::Result<()> {
+    /// `who` is the caller's process, asked through `Bridge`: once at connect
+    /// and again at each request while it is unknown (MCR-129).
+    fn agent(&self, mut reader: impl BufRead, mut writer: impl Write, mcp_client: bool, who: impl Fn() -> Caller) -> std::io::Result<()> {
         // Refused callers still get a working MCP server whose tools say why
-        let me = self.caller(peer);
-        // The session has the tools for as long as a bridge of its is connected
-        let bridged = |by: isize| {
-            if let (true, Ok(id)) = (mcp_client, &me) {
-                self.update(|s| {
-                    let count = s.bridges.entry(id.clone()).or_default();
-                    *count = count.saturating_add_signed(by);
-                    let tools = *count > 0;
-                    if let Some(t) = s.sessions.get_mut(id) {
-                        t.tools = tools;
-                    }
-                });
+        let mut bridge = Bridge::default();
+        // The session has the tools for as long as a bridge of its is connected,
+        // counted from the moment it is known and released for that same id
+        let mut counted: Option<String> = None;
+        let identify = |bridge: &mut Bridge, counted: &mut Option<String>| {
+            let me = bridge.caller(&who);
+            if let (true, None, Ok(id)) = (mcp_client, &*counted, &me) {
+                self.bridged(id, 1);
+                *counted = Some(id.clone());
             }
+            me
         };
-        bridged(1);
+        let _ = identify(&mut bridge, &mut counted);
         let mut protocol = Protocol::default();
         let result = loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
                 Ok(None) | Err(_) => break Ok(()),
             };
+            let me = identify(&mut bridge, &mut counted);
             let call = |name: &str, args: Value| match &me {
                 Ok(me) => self.agent_tool(me, name, &args),
                 Err(e) => Err(e.clone()),
@@ -4362,21 +4529,23 @@ impl Harness {
                 }
             }
         };
-        bridged(-1);
+        if let Some(id) = counted {
+            self.bridged(&id, -1);
+        }
         result
     }
 
     /// The `mcr-memory` MCP server for one bridge (`--memory-mcp`). Memory is for
     /// hosted sessions: who calls is taken from the caller's process, as for
-    /// `mcr`, and anybody else gets a server that lists nothing and says why.
-    fn memory_mcp(&self, mut reader: BufReader<Stream>, mut writer: Stream, peer: &peer::Peer) -> std::io::Result<()> {
-        let me = self.caller(peer);
+    /// `mcr` (`Bridge`), and anybody else gets a server that lists nothing and says why.
+    fn memory_mcp(&self, mut reader: impl BufRead, mut writer: impl Write, who: impl Fn() -> Caller) -> std::io::Result<()> {
+        let mut bridge = Bridge::default();
         loop {
             let frame = match read_frame(&mut reader) {
                 Ok(Some(frame)) => frame,
                 Ok(None) | Err(_) => return Ok(()),
             };
-            if let Some(reply) = self.memory.handle(&me, &frame) {
+            if let Some(reply) = self.memory.handle(&bridge.caller(&who), &frame) {
                 writeln!(writer, "{reply}")?;
             }
         }
@@ -4473,6 +4642,7 @@ impl Harness {
             Some("notify") => {
                 let body = event["body"].as_str().or(event["title"].as_str()).unwrap_or("").to_string();
                 let raised = self.update(|s| {
+                    let open = s.open_report(id).map(|r| r.id.clone());
                     let tracked = s.sessions.get_mut(id)?;
                     // An agent that reports through hooks: its terminal notifications would only repeat them
                     if adapter(&tracked.profile).reports_from_start() || tracked.state == "waiting" || tracked.state == ENDED {
@@ -4484,6 +4654,9 @@ impl Harness {
                         return None;
                     }
                     let was = if approval { tracked.state.clone() } else { String::new() };
+                    if approval {
+                        keep_behind_prompt(tracked, &open);
+                    }
                     tracked.attention = Some(Attention { kind: if approval { "permission" } else { "notification" }.into(), text: body.clone(), since: now_ms(), was, unsaved: approval, ..Attention::default() });
                     if approval {
                         s.set_state(id, "waiting");
@@ -4718,7 +4891,7 @@ impl Harness {
             // The operator connects a session to a supervising one, or detaches it
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
             "supervisor" => self.supervisor(req),
-            "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true),
+            "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true, req["refreshProfile"] == true),
             "settings" => {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
@@ -4773,7 +4946,7 @@ impl Harness {
                     store.sessions.get(id).is_some_and(|t| {
                         t.state != ENDED
                             && (t.draft != draft
-                                || (enter && (t.injected != 0 || t.attention.as_ref().is_some_and(|a| a.kind != "permission")))
+                                || (enter && (t.injected != 0 || t.pending_report.is_some() || t.attention.as_ref().is_some_and(|a| a.kind != "permission")))
                                 || (enter && (now.saturating_sub(t.operator_sent) >= SENT_STEP_MS || store.cockpit.points_at(id))))
                     })
                 };
@@ -4792,6 +4965,9 @@ impl Harness {
                             if enter {
                                 t.operator_sent = now;
                                 t.injected = 0;
+                                // The owner's Enter answers a report kept behind a prompt too
+                                // (MCR-132); the prompt's own mark stays until the agent moves on
+                                t.pending_report = None;
                                 if t.attention.as_ref().is_some_and(|a| a.kind != "permission") {
                                     t.attention = None;
                                 }
@@ -4966,7 +5142,7 @@ impl Harness {
         };
         // The agent kind a first task would go to
         let tasked = match name {
-            "session_create" if args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => dirs::home_dir().and_then(|home| asked_profile(&home, args)),
+            "session_create" if args["task"].as_str().is_some_and(|t| !t.trim().is_empty()) => dirs::home_dir().and_then(|home| asked_profile(&self.dir, &home, args)),
             _ => None,
         };
         match name {
@@ -5062,7 +5238,7 @@ impl Harness {
                 };
                 Ok(json!({ "interrupted": true }))
             }
-            "session_restart" => self.restart(text("session")?, args["force"] == true).map(|s| {
+            "session_restart" => self.restart(text("session")?, args["force"] == true, args["refresh_profile"] == true).map(|s| {
                 let mut brief = Self::brief(&s);
                 brief["replaced"] = s["replaced"].clone();
                 brief["resumed"] = s["resumed"].clone();
@@ -5208,10 +5384,10 @@ impl Harness {
                 return self.supervise(reader, writer, &peer, req["cli"] == true);
             }
             if req["op"] == "agent" {
-                return self.agent(reader, writer, req["cli"] != true, &peer);
+                return self.agent(reader, writer, req["cli"] != true, || self.who(&peer));
             }
             if req["op"] == "memory" {
-                return self.memory_mcp(reader, writer, &peer);
+                return self.memory_mcp(reader, writer, || self.who(&peer));
             }
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
@@ -5430,6 +5606,32 @@ enum Caller {
     Unknown,
 }
 
+/// Who an `mcr` or `mcr-memory` bridge connection is, by the caller's process
+/// alone (MCR-129). A connection made while the service could not tell (the
+/// runner did not answer, the ancestry could not be read) asks again at each
+/// request instead of keeping that refusal; the first answer that is not
+/// `Unknown` is kept for the rest of the connection, so an identified
+/// connection never becomes another session and `Outside` stays refused.
+#[derive(Default)]
+struct Bridge {
+    known: Option<Caller>,
+}
+
+impl Bridge {
+    /// The hosted session this connection comes from: its process descends
+    /// from one of the runner's children. Nothing the caller says is trusted.
+    fn caller(&mut self, who: impl FnOnce() -> Caller) -> Result<String, String> {
+        if matches!(self.known, None | Some(Caller::Unknown)) {
+            self.known = Some(who());
+        }
+        match &self.known {
+            Some(Caller::Session { id, .. }) => Ok(id.clone()),
+            Some(Caller::Outside) => Err("These tools are for agent sessions hosted by Agent MCR; this process is not one of them".into()),
+            Some(Caller::Unknown) | None => Err("Cannot tell which process is calling".into()),
+        }
+    }
+}
+
 fn supervisor_info() -> Value {
     json!({
         "protocolVersion": "",
@@ -5449,7 +5651,7 @@ fn supervisor_tools() -> Value {
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
         tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
-            "profile": {"type": "string", "description": "Enabled harness id (see profiles_list)"},
+            "profile": {"type": "string", "description": "An agent profile id such as implementer@claude-opus (see profiles_list), or an enabled harness id for a session without a profile"},
             "role": {"type": "string", "description": "The part it plays (reviewer, implementer of X): its peers see it in list_peers"},
             "cwd": {"type": "string", "description": "Working folder (absolute path)"},
             "name": {"type": "string", "description": "A short name shown to the operator"},
@@ -5465,7 +5667,7 @@ fn supervisor_tools() -> Value {
         tool("terminal_read", "The session's terminal as text (last lines).", json!({"session": session, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"]),
         tool("terminal_write", "Type raw input into a session's terminal. Escape sequences in input are not interpreted: to press Enter, set submit to true (a trailing \\r or \\n written out as two characters counts as submit too). Refused while the session waits on a permission prompt.", json!({"session": session, "input": {"type": "string"}, "submit": {"type": "boolean", "description": "Press Enter after the text, as a separate key 250 ms later; the text goes in as a paste when the program asked for that"}}), &["session", "input"]),
         tool("session_interrupt", "Stop the current turn (Esc for Claude, Ctrl-C otherwise).", json!({"session": session}), &["session"]),
-        tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}}), &["session"]),
+        tool("session_restart", "End a session's agent and continue its conversation in a new process, so it loads its settings, MCP servers and the harness tools as they are now. Returns the new session: its id changes, the name, queued tasks and messages move over. Refused in the middle of a turn unless force is true. Without a saved conversation it starts fresh in the same folder (resumed: false).", json!({"session": session, "force": {"type": "boolean", "description": "Restart even while a turn is running; the turn is cut off"}, "refresh_profile": {"type": "boolean", "description": "A session started from an agent profile restarts with the version it ran; true takes the profile as it is now"}}), &["session"]),
         tool("session_end", "End a session (hangup, as when its terminal window closes). Its terminal output stays until session_forget.", json!({"session": session}), &["session"]),
         tool("session_forget", "Drop an ended session and its terminal output.", json!({"session": session}), &["session"]),
         tool("messages_list", "Messages, newest last. Full objects for small lists; brief returns compact rows with columns and a session-name dictionary; source is set for a message no session sent (from Slack, or a notice of the harness). Text is cut at Unicode characters; truncated is explicit. Filters apply before limit.", json!({"session": {"type": "string"}, "pair": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2, "description": "Both directions between exactly these two session ids"}, "since": {"type": ["number", "string"], "description": "Last N minutes (number), or strictly after a message id (string); unknown ids are errors"}, "brief": {"type": ["boolean", "integer"], "description": "First N characters (1..500), true = 48, false = full text. Defaults to 48 above 20 returned messages"}, "limit": {"type": "integer", "description": "Default 50, at most 500"}}), &[]),
@@ -5519,7 +5721,7 @@ fn agent_tools() -> Value {
         tool("bulletin_post", "Leave a note for the sessions that start after you: a fact they must know and would not find in the code. Not for messages to one peer or for your own progress.", json!({"text": {"type": "string", "description": "The fact, complete without your context"}, "expires_hours": {"type": "integer", "description": "How long it stays true or useful: 1 to 336. A stale note misleads; choose shorter when unsure"}, "until_i_end": {"type": "boolean", "description": "Also remove it when your session ends: for what is about your running work"}, "scope": {"type": "string", "enum": ["folder", "all"], "description": "folder (default): sessions in your folder, below and above it. all: every session"}}), &["text", "expires_hours"], false),
         tool("bulletin_remove", "Take back a note of yours that is no longer true.", json!({"note": {"type": "string", "description": "Note id from bulletin_read"}}), &["note"], false),
         tool("executor_create", "Start a new agent session that works for you: your executor. The operator sees it under your session. It starts in your folder with your agent kind unless you say otherwise. Give it a first task here or later with task_assign. Use it for work that should run next to yours with its own context; not for a quick question (ask a peer) or a subtask your own subagents can do.", json!({
-            "profile": {"type": "string", "description": "claude or codex (default: your own)"},
+            "profile": {"type": "string", "description": "An agent profile id such as implementer@claude-opus, or claude or codex for a session without a profile (default: your own agent kind). It is lowered to your own profile where it would be wider"},
             "cwd": {"type": "string", "description": "Working folder: your own (default) or a folder below it, absolute path"},
             "name": {"type": "string", "description": "A short name shown to the operator"},
             "role": {"type": "string", "description": "Its part, in a few words"},
@@ -5901,6 +6103,230 @@ mod tests {
     fn socket_test_dir(prefix: &str) -> PathBuf {
         let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
         base.join(format!("{prefix}{}", runner::random_id()))
+    }
+
+    /// MCR-129: a bridge that connected while the service could not tell who
+    /// called asks again at each request, keeps the first answer, never moves
+    /// to another session, and `Outside` is never asked again.
+    #[test]
+    fn a_bridge_asks_who_again_until_it_knows() {
+        let session = |id: &str| Caller::Session { id: id.into(), supervisor: false };
+        let mut bridge = Bridge::default();
+        assert!(bridge.caller(|| Caller::Unknown).unwrap_err().contains("Cannot tell"));
+        assert!(bridge.caller(|| Caller::Unknown).unwrap_err().contains("Cannot tell"));
+        assert_eq!(bridge.caller(|| session("a")), Ok("a".into()));
+        assert_eq!(bridge.caller(|| session("b")), Ok("a".into()));
+        assert_eq!(bridge.caller(|| Caller::Unknown), Ok("a".into()));
+        let mut outside = Bridge::default();
+        assert!(outside.caller(|| Caller::Outside).unwrap_err().contains("not one of them"));
+        assert!(outside.caller(|| session("a")).unwrap_err().contains("not one of them"));
+    }
+
+    /// MCR-129: an `mcr` bridge whose caller is unknown at connect is served
+    /// once a later call can tell, and the session's `tools` flag goes on then
+    /// and off at the close, for that same session.
+    #[test]
+    fn an_unidentified_agent_bridge_is_identified_at_a_later_call() {
+        let dir = state_dir(None);
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        let frames = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}, "capabilities": {}}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "read_inbox", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_inbox", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "read_inbox", "arguments": {}}}),
+        ];
+        let input: String = frames.iter().map(|f| format!("{f}\n")).collect();
+        // Unknown at connect and for the first three frames, then session "a";
+        // a later answer of "b" must never be taken
+        let asked = std::cell::Cell::new(0);
+        let who = || {
+            asked.set(asked.get() + 1);
+            match asked.get() {
+                1..=4 => Caller::Unknown,
+                5 => Caller::Session { id: "a".into(), supervisor: false },
+                _ => Caller::Session { id: "b".into(), supervisor: false },
+            }
+        };
+        // Each line written records whether "a" had the tools at that moment
+        struct Probe<'a> {
+            h: &'a Harness,
+            out: Vec<u8>,
+            tools: Vec<bool>,
+        }
+        impl Write for Probe<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.out.extend_from_slice(buf);
+                if buf.contains(&b'\n') {
+                    self.tools.push(lock(&self.h.store).sessions["a"].tools);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut probe = Probe { h: &h, out: Vec::new(), tools: Vec::new() };
+        h.agent(std::io::Cursor::new(input), &mut probe, true, who).unwrap();
+        let replies: Vec<Value> = String::from_utf8(probe.out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 4);
+        assert!(replies[1].to_string().contains("Cannot tell which process is calling"), "{}", replies[1]);
+        for reply in &replies[2..] {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            assert!(!reply.to_string().contains("Cannot tell"), "{reply}");
+        }
+        assert_eq!(asked.get(), 5);
+        assert_eq!(probe.tools, [false, false, true, true]);
+        let store = lock(&h.store);
+        assert!(!store.sessions["a"].tools);
+        assert_eq!(store.bridges.get("a"), Some(&0));
+        assert!(!store.bridges.contains_key("b"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCR-129 (review 16964): an `mcr-memory` bridge whose caller is unknown at
+    /// connect lists nothing then, and is served once a later call can tell;
+    /// it never moves to another session and takes no `mcr` bridge count.
+    #[test]
+    fn an_unidentified_memory_bridge_is_served_once_a_later_call_can_tell() {
+        let rig = crate::memory::tests::Rig::signed_in();
+        let dir = state_dir(None);
+        let mut h = Harness::open(&dir);
+        h.memory = rig.memory.clone();
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        let frames = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}, "capabilities": {}}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_list", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "memory_list", "arguments": {}}}),
+        ];
+        let input: String = frames.iter().map(|f| format!("{f}\n")).collect();
+        // Unknown for the first three frames, then "a"; "b" must never be taken
+        let asked = std::cell::Cell::new(0);
+        let who = || {
+            asked.set(asked.get() + 1);
+            match asked.get() {
+                1..=3 => Caller::Unknown,
+                4 => Caller::Session { id: "a".into(), supervisor: false },
+                _ => Caller::Session { id: "b".into(), supervisor: false },
+            }
+        };
+        let mut out = Vec::new();
+        h.memory_mcp(std::io::Cursor::new(input), &mut out, who).unwrap();
+        let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 4);
+        assert_eq!(replies[0]["result"]["instructions"], "Cannot tell which process is calling");
+        assert_eq!(replies[1]["result"]["tools"], json!([]));
+        for reply in &replies[2..] {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            assert_eq!(reply["result"]["content"][0]["text"], json!({"memory": "mcr-agents"}).to_string(), "{reply}");
+        }
+        assert_eq!(asked.get(), 4);
+        let store = lock(&h.store);
+        assert!(!store.sessions["a"].tools && store.bridges.is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writer that hands each line it is given to the test.
+    struct Lines(std::sync::mpsc::Sender<String>, Vec<u8>);
+    impl Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.1.extend_from_slice(buf);
+            while let Some(end) = self.1.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.1.drain(..=end).collect();
+                let _ = self.0.send(String::from_utf8_lossy(&line).into_owned());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// MCR-129 (review 16964): two `mcr` bridges of one session are counted
+    /// apart, and the session keeps the tools until the last one is closed.
+    #[test]
+    fn two_bridges_of_one_session_are_counted_apart() {
+        let dir = state_dir(None);
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        let seen = || {
+            let store = lock(&h.store);
+            (store.bridges.get("a").copied().unwrap_or(0), store.sessions["a"].tools)
+        };
+        let ping = |n: u64| format!("{}\n", json!({"jsonrpc": "2.0", "id": n, "method": "ping"}));
+        let mut counts = vec![seen()];
+        std::thread::scope(|scope| {
+            // A bridge is open once it answered a ping: it counted itself before reading it
+            let open = |n: u64| {
+                let (reader, mut feed) = std::io::pipe().unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let h = &h;
+                let served = scope.spawn(move || h.agent(BufReader::new(reader), Lines(tx, Vec::new()), true, || Caller::Session { id: "a".into(), supervisor: false }));
+                feed.write_all(ping(n).as_bytes()).unwrap();
+                rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                (feed, served)
+            };
+            let (first, first_served) = open(1);
+            counts.push(seen());
+            let (second, second_served) = open(2);
+            counts.push(seen());
+            drop(first);
+            first_served.join().unwrap().unwrap();
+            counts.push(seen());
+            drop(second);
+            second_served.join().unwrap().unwrap();
+            counts.push(seen());
+        });
+        assert_eq!(counts, [(0, false), (1, true), (2, true), (1, true), (0, false)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCR-129 (review 16964): a bridge whose writer fails gives back the count
+    /// it took for the session it was identified as.
+    #[test]
+    fn a_bridge_whose_writer_fails_gives_its_count_back() {
+        let dir = state_dir(None);
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            s.sessions.insert("a".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
+        });
+        struct Broken<'a>(&'a Harness, Vec<bool>);
+        impl Write for Broken<'_> {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.1.push(lock(&self.0.store).sessions["a"].tools);
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Unknown at connect, "a" at the first frame, whose answer cannot be written
+        let asked = std::cell::Cell::new(0);
+        let who = || {
+            asked.set(asked.get() + 1);
+            if asked.get() == 1 { Caller::Unknown } else { Caller::Session { id: "a".into(), supervisor: false } }
+        };
+        let input = format!("{}\n{}\n", json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}), json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+        let mut broken = Broken(&h, Vec::new());
+        assert!(h.agent(std::io::Cursor::new(input), &mut broken, true, who).is_err());
+        assert_eq!(broken.1, [true]);
+        assert_eq!(asked.get(), 2);
+        let store = lock(&h.store);
+        assert_eq!(store.bridges.get("a"), Some(&0));
+        assert!(!store.sessions["a"].tools);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A folder with a state file as `state` gives it, for the load tests (MCR-99).
@@ -6420,7 +6846,7 @@ mod tests {
         // A session launched with a profile (P2 sets it) shows it
         let launched = Tracked {
             profile: "claude".into(),
-            agent_profile: Some(crate::profiles::ProfileRef { id: "implementer@claude-opus".into(), version: 1, role: "implementer".into(), digest: "d".into() }),
+            agent_profile: Some(crate::profiles::ProfileRef { id: "implementer@claude-opus".into(), version: 1, role: "implementer".into(), digest: "d".into(), ..Default::default() }),
             ..Tracked::default()
         };
         let h = serde_json::to_value(&launched).unwrap();
@@ -6595,6 +7021,268 @@ mod tests {
         assert_eq!(mine["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(mine["sessions"][0], *child);
         assert!(s.overview(&sessions, Some("unknown"), 10000)["sessions"].as_array().unwrap().is_empty());
+    }
+
+    /// MCR-126 P2 through the service, with a runner that records what it is
+    /// asked to start: a session from an agent profile, the refusals before
+    /// anything starts, an executor lowered to its creator's profile, and a
+    /// restart that will not start a version it cannot pin.
+    #[test]
+    #[cfg(unix)]
+    fn sessions_start_from_agent_profiles_and_executors_are_lowered() {
+        let dir = socket_test_dir("mcr-p2-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dunce::canonicalize(&dir).unwrap().display().to_string();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let spawned: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = spawned.clone();
+        let folder = cwd.clone();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "spawn" => {
+                        seen.lock().unwrap().push(req.clone());
+                        json!({})
+                    }
+                    // Notices typed into the lead about its new executor
+                    "write" => json!({}),
+                    // Codex's screen, read for its input box: nothing on it yet
+                    "snapshot" => json!({"data": ""}),
+                    "list" => {
+                        let mut sessions = vec![json!({"id": "lead", "cwd": folder, "meta": {"profile": "claude"}}), json!({"id": "lost", "cwd": folder, "meta": {"profile": "claude"}})];
+                        sessions.extend(seen.lock().unwrap().iter().map(|r| json!({"id": r["id"], "cwd": r["cwd"], "meta": r["meta"]})));
+                        json!({ "sessions": sessions })
+                    }
+                    // A restart that refuses must not have ended anything
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        let line = |i: usize| spawned.lock().unwrap()[i]["argv"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect::<Vec<_>>().join(" ");
+
+        // From a built-in profile: its words on the line, its role skill, its record and its pin
+        let started = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": cwd, "name": "impl"})).unwrap();
+        let id = started["id"].as_str().unwrap().to_string();
+        let first = line(0);
+        assert!(first.contains("exec claude '--permission-mode' 'acceptEdits' '--model' 'opus' '--fallback-model' 'sonnet' '--effort' 'high' '--disallowedTools' 'Bash(git push:*)' 'Bash(gh pr merge:*)' --mcp-config"), "{first}");
+        assert!(first.contains("claude-plugin-implementer"), "{first}");
+        assert!(dir.join("claude-plugin-implementer/skills/role/SKILL.md").is_file());
+        assert_eq!((started["agentProfile"]["id"].as_str(), started["roleKind"].as_str(), started["profileLabel"].as_str()), (Some("implementer@claude-opus"), Some("implementer"), Some("implementer@claude-opus v1")));
+        let recorded = lock(&h.store).sessions[&id].agent_profile.clone().unwrap();
+        assert_eq!(crate::profiles::pinned(&dir, &recorded).unwrap().profile.id, "implementer@claude-opus");
+        // A bare launch is today's line, with no record
+        h.tool("session_create", &json!({"profile": "claude", "cwd": cwd})).unwrap();
+        assert!(line(1).contains("exec claude --permission-mode acceptEdits --mcp-config"));
+        assert!(lock(&h.store).sessions.values().filter(|t| t.agent_profile.is_some()).count() == 1);
+
+        // Refused before anything starts
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("profiles/mine.toml"), "id = \"custom@mine\"\nversion = 1\nrole = \"custom\"\nadapter = \"claude\"\n[permissions]\nmode = \"manual\"\n").unwrap();
+        assert!(h.tool("session_create", &json!({"profile": "custom@mine", "cwd": cwd})).unwrap_err().contains("not approved"));
+        assert!(h.tool("session_create", &json!({"profile": "custom@nothing", "cwd": cwd})).unwrap_err().contains("No usable agent profile"));
+        assert!(h.tool("session_create", &json!({"profile": "supervisor@claude-opus", "cwd": cwd})).unwrap_err().contains("root Supervisor only"));
+        assert_eq!(spawned.lock().unwrap().len(), 2);
+
+        // An executor never wider than its creator: a backlog lead (manual, edits denied)
+        let backlog = crate::profiles::choose(&dir, "backlog@claude-opus").unwrap();
+        crate::profiles::pin(&dir, &backlog).unwrap();
+        h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), agent_profile: Some(backlog.reference()), ..Tracked::default() });
+        });
+        let out = h.agent_tool("lead", "executor_create", &json!({"profile": "implementer@claude-opus", "name": "worker"})).unwrap();
+        assert!(out["lowered"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("lowered to manual")), "{out}");
+        let lowered = line(2);
+        assert!(lowered.contains("'--permission-mode' 'manual'") && lowered.contains("'--disallowedTools' 'Bash(git push:*)' 'Bash(gh pr merge:*)' 'Edit' 'Write' --mcp-config"), "{lowered}");
+        let record = lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.clone().unwrap();
+        assert!(record.lowered && record.id == "implementer@claude-opus");
+        assert!(crate::profiles::pinned(&dir, &record).unwrap().profile.tools.deny.contains(&"Edit".to_string()));
+        // A bare Codex for it is lowered too: its sandbox drops to read-only
+        let out = h.agent_tool("lead", "executor_create", &json!({"profile": "codex"})).unwrap();
+        assert!(line(3).contains("'--sandbox' 'read-only' '--ask-for-approval' 'on-request'"), "{}", line(3));
+        let record = lock(&h.store).sessions[out["id"].as_str().unwrap()].agent_profile.clone().unwrap();
+        assert_eq!(record.id, "custom@bare-codex");
+        // Started under the lead's profile, which is recorded for a refresh (16771 M2)
+        assert_eq!(record.ceiling.as_deref().map(|c| c.id.as_str()), Some("backlog@claude-opus"));
+        // The lead's profile allows two executors: a third is refused (16771 M1)
+        assert!(h.agent_tool("lead", "executor_create", &json!({"profile": "claude"})).unwrap_err().contains("allows 2 executors"));
+        // A validator's allows none, so it starts no Codex that could edit what it reviews
+        let validator = crate::profiles::choose(&dir, "validator@claude-opus").unwrap();
+        crate::profiles::pin(&dir, &validator).unwrap();
+        h.update(|s| {
+            s.sessions.insert("lost".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), agent_profile: Some(validator.reference()), ..Tracked::default() });
+        });
+        assert!(h.agent_tool("lost", "executor_create", &json!({"profile": "codex"})).unwrap_err().contains("allows 0 executors"));
+        // What the lead is told of itself
+        let me = h.agent_tool("lead", "whoami", &json!({})).unwrap();
+        assert_eq!((me["profileDetails"]["mode"].as_str(), me["profileDetails"]["role"].as_str()), (Some("manual"), Some("backlog")));
+        assert!(h.agent_tool("lead", "guide", &json!({})).unwrap()["guide"].as_str().unwrap().contains("## Backlog analyst"));
+        assert!(h.agent_tool(&id, "guide", &json!({})).unwrap()["guide"].as_str().unwrap().contains("## Implementer"));
+
+        // A session whose pinned version is gone is not restarted, and nothing is ended
+        let gone = crate::profiles::ProfileRef { digest: "0".repeat(64), ..recorded.clone() };
+        h.update(|s| {
+            s.sessions.insert("lost".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), agent_profile: Some(gone), ..Tracked::default() });
+        });
+        assert!(h.tool("session_restart", &json!({"session": "lost"})).unwrap_err().contains("pinned copy"));
+        // Nor does a session without its pin start executors
+        assert!(h.agent_tool("lost", "executor_create", &json!({"profile": "claude"})).unwrap_err().contains("ceiling cannot be read"));
+        assert_eq!(spawned.lock().unwrap().len(), 4);
+        // A lowered one whose creator is gone is not refreshed to the wider profile
+        h.update(|s| s.sessions.get_mut("lost").unwrap().agent_profile = Some(crate::profiles::ProfileRef { lowered: true, ..recorded.clone() }));
+        assert!(h.tool("session_restart", &json!({"session": "lost", "refresh_profile": true})).unwrap_err().contains("not recorded"));
+
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// MCR-136 review 17005 P1: an executor never delivers, whoever starts it.
+    /// A creator without a profile, the Supervisor's session_create for
+    /// another session, a bind and a restart all keep delivery for a lead
+    /// that works for the root Supervisor or for nobody, and give it to no
+    /// one else; below a lead, a Claude executor keeps the push and merge denies.
+    #[test]
+    #[cfg(unix)]
+    fn an_executor_never_delivers_whoever_starts_it() {
+        let dir = socket_test_dir("mcr-136-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dunce::canonicalize(&dir).unwrap().display().to_string();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let spawned: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = spawned.clone();
+        let folder = cwd.clone();
+        // A session hung up for a restart has ended at the runner's next answer
+        let hung_up: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "spawn" => {
+                        seen.lock().unwrap().push(req.clone());
+                        json!({})
+                    }
+                    "write" | "forget" => json!({}),
+                    "signal" => {
+                        hung_up.lock().unwrap().insert(req["id"].as_str().unwrap().to_string());
+                        json!({})
+                    }
+                    "snapshot" => json!({"data": ""}),
+                    "list" => {
+                        let mut sessions = vec![
+                            json!({"id": "root", "cwd": folder, "meta": {"profile": "claude", "role": "supervisor"}}),
+                            json!({"id": "bare", "cwd": folder, "meta": {"profile": "claude"}}),
+                            // Ended already, so a restart starts it again without a hangup
+                            json!({"id": "old", "cwd": folder, "exit": 0, "meta": {"profile": "claude"}}),
+                        ];
+                        let gone = hung_up.lock().unwrap().clone();
+                        sessions.extend(seen.lock().unwrap().iter().map(|r| {
+                            let mut s = json!({"id": r["id"], "cwd": r["cwd"], "meta": r["meta"]});
+                            if gone.contains(r["id"].as_str().unwrap()) {
+                                s["exit"] = json!(0);
+                            }
+                            s
+                        }));
+                        json!({ "sessions": sessions })
+                    }
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            for id in ["root", "bare"] {
+                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), ..Tracked::default() });
+            }
+        });
+        let record = |id: &str| lock(&h.store).sessions[id].agent_profile.clone().unwrap();
+        let launched = |id: &str| crate::profiles::pinned(&dir, &record(id)).unwrap().profile;
+        let no_push = |p: &crate::profiles::AgentProfile| {
+            assert!(!p.delivers(), "{}: {:?}", p.id, p.permissions.push);
+            if p.adapter == "claude" {
+                for rule in crate::profiles::NO_DELIVERY_DENIES {
+                    assert!(p.tools.deny.iter().any(|d| d == rule), "{}: {rule} in {:?}", p.id, p.tools.deny);
+                }
+            }
+        };
+
+        // A creator without a profile: both leads start without delivery, and the result says so
+        for lead in ["lead@claude-opus", "lead@codex"] {
+            let out = h.agent_tool("bare", "executor_create", &json!({"profile": lead})).unwrap();
+            no_push(&launched(out["id"].as_str().unwrap()));
+            assert!(record(out["id"].as_str().unwrap()).lowered);
+            assert!(out["lowered"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("never delivers")), "{out}");
+        }
+        // Review 17009 P2: the very session, started under a creator without a
+        // profile, is refreshed by lowering the profile again, never refused
+        let first = spawned.lock().unwrap()[0]["id"].as_str().unwrap().to_string();
+        assert!(record(&first).undelivered && record(&first).ceiling.is_none());
+        let out = h.tool("session_restart", &json!({"session": first, "refresh_profile": true, "force": true})).unwrap();
+        let refreshed = out["id"].as_str().unwrap().to_string();
+        assert_ne!(refreshed, first);
+        no_push(&launched(&refreshed));
+        assert!(record(&refreshed).undelivered);
+        assert_eq!(lock(&h.store).sessions[&refreshed].supervisor.as_deref(), Some("bare"));
+        // ... and the push and merge denies reach the Claude lead's command line
+        let line = spawned.lock().unwrap()[0]["argv"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect::<Vec<_>>().join(" ");
+        assert!(line.contains("'Bash(git push:*)'") && line.contains("'Bash(gh pr merge:*)'"), "{line}");
+        // The root Supervisor's own executor is a lead that delivers
+        let out = h.agent_tool("root", "executor_create", &json!({"profile": "lead@claude-opus"})).unwrap();
+        let delivering = out["id"].as_str().unwrap().to_string();
+        assert!(launched(&delivering).delivers() && !record(&delivering).lowered);
+
+        // session_create for another session: below a non-root session no delivery, below the root or nobody it keeps it
+        let out = h.tool("session_create", &json!({"profile": "lead@claude-opus", "cwd": cwd, "supervisor": "bare"})).unwrap();
+        no_push(&launched(out["id"].as_str().unwrap()));
+        let out = h.tool("session_create", &json!({"profile": "lead@codex", "cwd": cwd, "supervisor": "root"})).unwrap();
+        assert!(launched(out["id"].as_str().unwrap()).delivers());
+        let out = h.tool("session_create", &json!({"profile": "lead@claude-opus", "cwd": cwd})).unwrap();
+        let independent = out["id"].as_str().unwrap().to_string();
+        assert!(launched(&independent).delivers());
+
+        // A delivering lead is never bound below another session; below the root it may be
+        assert!(h.bind(&independent, Some("bare")).unwrap_err().contains("never delivers"));
+        assert!(lock(&h.store).sessions[&independent].supervisor.is_none());
+        h.bind(&independent, Some("root")).unwrap();
+        assert_eq!(lock(&h.store).sessions[&independent].supervisor.as_deref(), Some("root"));
+
+        // A restart below a non-root session drops delivery, also for a pin that has it, with refresh or without
+        let lead = crate::profiles::choose(&dir, "lead@claude-opus").unwrap();
+        crate::profiles::pin(&dir, &lead).unwrap();
+        for refresh in [false, true] {
+            h.update(|s| {
+                s.sessions.insert("old".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), supervisor: Some("bare".into()), agent_profile: Some(lead.reference()), ..Tracked::default() });
+            });
+            let out = h.tool("session_restart", &json!({"session": "old", "refresh_profile": refresh})).unwrap();
+            let new = out["id"].as_str().unwrap();
+            no_push(&launched(new));
+            assert_eq!(lock(&h.store).sessions[new].supervisor.as_deref(), Some("bare"));
+        }
+        // ... and keeps it for a lead that works for the root
+        h.update(|s| {
+            s.sessions.insert("old".into(), Tracked { profile: "claude".into(), state: "idle".into(), cwd: cwd.clone(), supervisor: Some("root".into()), agent_profile: Some(lead.reference()), ..Tracked::default() });
+        });
+        let out = h.tool("session_restart", &json!({"session": "old"})).unwrap();
+        assert!(launched(out["id"].as_str().unwrap()).delivers());
+
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6851,6 +7539,105 @@ mod tests {
         assert!(lock(&h.store).sessions["a"].attention.is_none() && lock(&h.store).open_report("a").is_none());
         // The guide explains needs, and that a relayed go is not the owner's word (H2)
         assert!(REPORT_GUIDE.contains("kind: \"closed\"") && REPORT_GUIDE.contains("is not the owner's word") && PEER_GUIDE.contains("is not the owner's word"));
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// MCR-132: an open needs_human report with its need stays open, with its
+    /// mark, through what the session does next: a status report, the hooks of
+    /// its turn, a task typed in, a permission prompt. The owner's Enter there
+    /// answers it, also while a prompt stands in front of it.
+    #[test]
+    fn a_status_report_leaves_an_open_need_and_its_mark_as_they_are() {
+        let dir = socket_test_dir("mcr-132-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": [
+                        {"id": "lead", "cwd": "/tmp", "meta": {"profile": "claude"}},
+                        {"id": "root", "cwd": "/tmp", "meta": {"profile": "claude", "role": "supervisor"}}
+                    ]}),
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let h = Harness::open(&dir);
+        *lock(&h.typed) = Some(Vec::new());
+        h.update(|s| {
+            for id in ["lead", "root"] {
+                s.sessions.insert(id.into(), Tracked { profile: "claude".into(), state: "working".into(), hooked: true, precise: true, ..Tracked::default() });
+            }
+            s.bind("lead", Some("root")).unwrap();
+        });
+        let asked = h.agent_tool("lead", "report", &json!({"kind": "needs_human", "text": "Go for gate 2c?", "need": {"id": "gate", "ask": "question"}})).unwrap();
+        let rid = asked["report"].as_str().unwrap().to_string();
+        let open = |h: &Harness| {
+            let s = lock(&h.store);
+            let mark = s.sessions["lead"].attention.as_ref().and_then(|a| a.report.clone());
+            (mark, s.open_report("lead").map(|r| r.id.clone()))
+        };
+        let shown = |h: &Harness| {
+            let overview = h.tool("overview", &json!({})).unwrap();
+            let lead = overview["sessions"].as_array().unwrap().iter().find(|x| x["id"] == "root").unwrap()["executors"][0].clone();
+            let waiting = h.tool("attention_list", &json!({})).unwrap()["waiting"].as_array().unwrap().iter().any(|w| w["session"] == "lead");
+            let all = h.tool("cockpit_read", &json!({})).unwrap();
+            let action = all["actions"].as_array().unwrap().iter().find(|a| a["id"] == "gate").cloned().unwrap_or(Value::Null);
+            (lead["lastOpenReport"]["id"].clone(), waiting, action["live"]["reportOpen"].clone())
+        };
+        let standing = (Some("needs_human".to_string()), Some(rid.clone()));
+        let listed = (json!(rid), true, json!(true));
+        assert_eq!((open(&h), shown(&h)), (standing.clone(), listed.clone()));
+        // The rest of its turn, then a status report and the hooks of that turn
+        h.hook("lead", "PostToolUse", &json!({}));
+        h.hook("lead", "Stop", &json!({"last_assistant_message": "Waiting for the owner"}));
+        // An inbox notice the harness typed starts its next turn
+        h.update(|s| s.sessions.get_mut("lead").unwrap().injected = now_ms());
+        h.hook("lead", "UserPromptSubmit", &json!({}));
+        let status = h.agent_tool("lead", "report", &json!({"kind": "status", "text": "Round 1 done; gate 2c waits for the owner"})).unwrap();
+        assert_eq!(status["kind"], "status");
+        h.hook("lead", "PostToolUse", &json!({}));
+        h.hook("lead", "Stop", &json!({"last_assistant_message": "Status reported"}));
+        assert_eq!((open(&h), shown(&h)), (standing.clone(), listed.clone()));
+        // A task typed in by the harness is not the owner's answer
+        h.update(|s| {
+            s.tasks.insert("t1".into(), Task { id: "t1".into(), session: "lead".into(), text: "Next round".into(), state: "queued".into(), created: 1, started: 0, finished: 0, result: None, by: String::new(), told: false });
+        });
+        h.pump("lead");
+        assert_eq!(lock(&h.store).tasks["t1"].state, "working");
+        assert_eq!((open(&h), shown(&h)), (standing.clone(), listed.clone()));
+        // A permission prompt stands in front of it, and when it is answered the report's mark is back
+        h.hook("lead", "Notification", &json!({"notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"}));
+        assert_eq!(lock(&h.store).sessions["lead"].attention.as_ref().unwrap().kind, "permission");
+        assert_eq!(open(&h).1, Some(rid.clone()));
+        assert_eq!(shown(&h), listed);
+        h.hook("lead", "PostToolUse", &json!({}));
+        assert_eq!((open(&h), shown(&h)), (standing, listed));
+        // The owner's Enter in the session answers it, also while a prompt
+        // stands in front of it: the prompt stays marked, and once it is gone
+        // the report's mark does not come back
+        h.hook("lead", "Notification", &json!({"notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"}));
+        assert_eq!(open(&h).1, Some(rid.clone()));
+        h.control(&json!({"op": "operator_input", "id": "lead", "draft": false})).unwrap();
+        {
+            let s = lock(&h.store);
+            assert_eq!(s.sessions["lead"].attention.as_ref().unwrap().kind, "permission");
+            assert!(s.sessions["lead"].pending_report.is_none());
+            assert!(s.open_report("lead").is_none());
+        }
+        h.hook("lead", "PostToolUse", &json!({}));
+        assert_eq!(open(&h), (None, None));
+        assert_eq!(shown(&h).0, Value::Null);
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
@@ -7580,12 +8367,12 @@ mod tests {
         assert!(find_resumable(&home, "../../etc/passwd").is_none());
         assert!(resumable(&home, now_ms() + 60_000, 10).is_empty());
         // A first task goes to the agent of the resumed transcript, whatever `profile` says (MCR-76)
-        assert_eq!(asked_profile(&home, &json!({"resume": a, "task": "go"})).as_deref(), Some("claude"));
-        assert_eq!(asked_profile(&home, &json!({"resume": b, "profile": "shell"})).as_deref(), Some("codex"));
-        assert!(asked_profile(&home, &json!({"resume": c})).is_none());
-        assert_eq!(asked_profile(&home, &json!({"profile": "shell"})).as_deref(), Some("shell"));
-        assert_eq!(asked_profile(&home, &json!({"resume": "", "profile": "pi"})).as_deref(), Some("pi"));
-        assert_eq!(asked_profile(&home, &json!({})).as_deref(), Some(""));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": a, "task": "go"})).as_deref(), Some("claude"));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": b, "profile": "shell"})).as_deref(), Some("codex"));
+        assert!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": c})).is_none());
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"profile": "shell"})).as_deref(), Some("shell"));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({"resume": "", "profile": "pi"})).as_deref(), Some("pi"));
+        assert_eq!(asked_profile(Path::new("/nonexistent-config-dir"), &home, &json!({})).as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -16,6 +16,8 @@ import BoardView from './BoardView';
 import SlackView from './SlackView';
 
 const VIEW_KEY = 'agent-mcr.sessions.view';
+/** How often the snapshot of the index is read while Live is shown: it names earlier sessions there, nothing more (MCR-139) */
+export const LIVE_SNAPSHOT_MS = 60_000;
 function savedView(): string {
   try { return localStorage.getItem(VIEW_KEY) || 'live'; } catch { return 'live'; }
 }
@@ -66,7 +68,7 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
     // Always mounted: its snapshot names Live's sessions and feeds the palette
     { id: 'history', label: 'Journal', icon: <History size={13}/>, title: 'Find an earlier session: by text, folder, agent or time', keepMounted: 'always',
       render: () => <HostedByConversation.Provider value={live}>
-        <JournalProvider journal={withResume} row={JournalRow}><JournalView active={active}/></JournalProvider>
+        <JournalProvider journal={withResume} row={JournalRow}><JournalView active={active} refreshInterval={view === 'live' ? LIVE_SNAPSHOT_MS : undefined}/></JournalProvider>
       </HostedByConversation.Provider> },
     { id: 'board', label: 'Board', icon: <ClipboardList size={13}/>, title: 'What sessions reported to you, and the notes they left for each other',
       render: () => <BoardView active={active} onOpen={id => { setFocus({ id, at: Date.now() }); setView('live'); }}/> },

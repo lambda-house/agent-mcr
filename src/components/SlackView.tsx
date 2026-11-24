@@ -4,6 +4,7 @@ import { harnessApi, hostedLabel, isSupervisor, slackApi, SLACK_POSTING, type Ho
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
+import { keepSame } from '@lambda-house/ui';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const LINK: Record<SlackStatus['link'], string> = { off: 'Off', connecting: 'Connecting…', connected: 'Connected', reconnecting: 'Reconnecting…', refused: 'Refused by Slack' };
@@ -103,11 +104,11 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
   const [bot, setBot] = useState(''); const [appToken, setAppToken] = useState(''); const [operator, setOperator] = useState('');
   const mounted = useRef(true);
 
-  const show = useCallback((s: SlackStatus | null) => { if (s && mounted.current) { setStatus(s); onWaiting?.(s.counts.waiting); } }, [onWaiting]);
+  const show = useCallback((s: SlackStatus | null) => { if (s && mounted.current) { setStatus(held => keepSame(held, s)); onWaiting?.(s.counts.waiting); } }, [onWaiting]);
   const refresh = useCallback(async () => {
     try {
       const [s, list] = await Promise.all([slackApi.status(), harnessApi.list()]);
-      if (mounted.current) { show(s); setHosted(list); }
+      if (mounted.current) { show(s); setHosted(held => keepSame(held, list)); }
     } catch (e) { if (mounted.current) setError(err(e)); }
   }, [show]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);

@@ -1,16 +1,23 @@
 # A lead on Codex: C2 is enough to supervise executors below the root
 # (owner's decision 16697 B). Its model is the operator's Codex default.
+# It delivers its track (MCR-136, owner's decision of 2026-11-23): it pushes
+# and merges a commit an independent validator approved, under the delivery
+# contract of its role guide, and never force-pushes. Codex takes no tool
+# lists, so no force push is a rule of its guide; it keeps its sandbox, and a
+# push or merge over the network still asks the operator at Codex's approval
+# prompt until the owner widens it. The boundary is branch protection.
 id = "lead@codex"
-version = 1
+version = 2
 role = "lead"
 adapter = "codex"
-summary = "Leads one track below the Supervisor with its own executors; never merges"
+summary = "Leads one track below the Supervisor with its own executors; delivers what an independent validator approved"
 
 [inference]
 effort = "high"
 
 [permissions]
 mode = "workspace-write"
+push = "delivery"
 
 [contract]
 done = ["refs", "unverified"]

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { PLATFORM } from '../utils/platform';
 import { harnessApi, type Background, type BackgroundUnit } from '../utils/harness';
+import { keepSame } from '@lambda-house/ui';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 
@@ -40,7 +41,7 @@ export function BackgroundPanel({ onStopped }: { onStopped: () => void }) {
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     let live = true;
-    const load = () => harnessApi.background().then(b => { if (live) setBackground(b); }).catch(e => { if (live) setError(err(e)); });
+    const load = () => harnessApi.background().then(b => { if (live) setBackground(held => keepSame(held, b)); }).catch(e => { if (live) setError(err(e)); });
     void load();
     const timer = setInterval(() => { if (!document.hidden) void load(); }, 5000);
     return () => { live = false; clearInterval(timer); };

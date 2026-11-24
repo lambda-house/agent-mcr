@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { cacheState, compact, contextWindow, sessionApi, type Session } from '../utils/sessions';
 import { runningFor, type Hosted } from '../utils/harness';
+import { keepSame } from '@lambda-house/ui';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const size = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} B`;
@@ -31,7 +32,7 @@ export default function SessionStats({ session, active }: { session: Hosted; act
     if (!active || !id || (provider !== 'claude' && provider !== 'codex')) return;
     let live = true;
     const load = () => sessionApi.stats(provider, id)
-      .then(s => { if (live) { setStats(s); setNote(''); } })
+      .then(s => { if (live) { setStats(held => keepSame(held, s)); setNote(''); } })
       .catch(e => { if (live) setNote(err(e)); });
     void load();
     const timer = setInterval(() => { if (!document.hidden) void load(); }, 10_000);

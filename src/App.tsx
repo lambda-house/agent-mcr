@@ -12,6 +12,7 @@ import { journal } from './journal';
 import { pluginRegistry } from './plugins';
 import { agentFilesWatched, refreshAgentWorkspace } from './utils/agent';
 import { documentWindowPath } from './utils/documentWindow';
+import { useTitleBar } from './utils/windowChrome';
 import { NO_DOCUMENT, documentsPlugin, zoomOf } from './documents';
 
 // ============================================================
@@ -59,6 +60,7 @@ const App: React.FC = () => {
   const setTheme = useStore((s) => s.setTheme);
   // The command panel lives in Sessions: elsewhere the top bar's ⌕ is disabled
   const paletteHosted = useStore((s) => s.paletteHosted);
+  const titleBar = useTitleBar();
   const agentEntries = useStore((s) => s.agentEntries);
   const hasAgentTabs = useReader((s) => allTabs(s).some((t) => agentEntries.some((e) => e.path === t.path)));
   // A memory reader window shows its one document and no list
@@ -108,6 +110,8 @@ const App: React.FC = () => {
       onMenuOpen={flushEditorChanges}
       nativeMenu={onMenuCommand}
       status={{ pinned: statusBarPinned, onPinnedChange: setStatusBarPinned }}
+      // macOS: the top bar is the window's title bar (MCR-138); elsewhere, and in reader windows, a native one
+      titleBar={titleBar}
       palette={{ open: openPalette, enabled: paletteHosted }}
       settings={{ open: settingsOpen, onOpenChange: setSettingsOpen }}
       appearance={{ theme, setTheme }}

@@ -1,12 +1,33 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Flame } from 'lucide-react';
 import { cacheState, compact, contextWindow, sessionApi, sessionKey, type Session } from '../utils/sessions';
 import { runningFor, type Hosted } from '../utils/harness';
 import { estimatedCost } from '../utils/sessionCost';
+import { keepSame } from '@lambda-house/ui';
 
-/** One index refresh for the entire sidebar, never one scan per row. */
-export function useSessionMetrics(active: boolean) {
+/** The index keys of the listed Claude and Codex conversations, running or ended, in one order */
+export function hostedKeys(hosted: Hosted[]): string[] {
+  const keys = new Set<string>();
+  for (const h of hosted) {
+    const provider = h.harness?.profile || h.meta.profile;
+    const id = h.harness?.agentSession;
+    // Ended rows too: they stay in the list with their figures until they are removed
+    if (id && (provider === 'claude' || provider === 'codex')) keys.add(`${provider}:${id}`);
+  }
+  return [...keys].sort();
+}
+
+/**
+ * One index refresh for the entire sidebar, never one scan per row. Only the
+ * hosted conversations come back (MCR-139): the whole index, sent every ten
+ * seconds, was megabytes the web view parsed and dropped each time.
+ */
+export function useSessionMetrics(active: boolean, hosted: Hosted[] = []) {
   const [data, setData] = useState<Record<string, Session>>({});
+  const keys = hostedKeys(hosted).join(' ');
+  const wanted = useRef(keys);
+  wanted.current = keys;
+  const loader = useRef<() => void>(() => {});
   useEffect(() => {
     if (!active) return;
     let live = true, pending = false;
@@ -14,15 +35,19 @@ export function useSessionMetrics(active: boolean) {
       if (pending || document.hidden) return;
       pending = true;
       try {
-        const snapshot = await sessionApi.snapshot();
-        if (live) setData(Object.fromEntries(snapshot.sessions.map(s => [sessionKey(s), s])));
-      } catch { if (live) setData({}); }
+        const asked = wanted.current ? wanted.current.split(' ') : [];
+        const sessions = asked.length ? await sessionApi.pick(asked) : [];
+        if (live) { const next = Object.fromEntries(sessions.map(s => [sessionKey(s), s])); setData(held => keepSame(held, next)); }
+      } catch { if (live) setData(held => Object.keys(held).length ? {} : held); }
       finally { pending = false; }
     };
+    loader.current = () => void load();
     void load();
     const timer = setInterval(() => void load(), 10_000);
-    return () => { live = false; clearInterval(timer); };
+    return () => { live = false; clearInterval(timer); loader.current = () => {}; };
   }, [active]);
+  // A session that started or ended is asked for at once, not at the next tick
+  useEffect(() => { loader.current(); }, [keys]);
   return data;
 }
 

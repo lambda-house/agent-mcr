@@ -14,9 +14,12 @@ vi.mock('./utils/tauri', () => ({ isTauri: () => true }));
 
 const session: Session = { id: 'a', provider: 'claude', parentId: null, name: 'root', cwd: '/work/demo', title: 'Fix CORE-123', model: 'model-a', effort: 'high', started: '2026-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z', modified: Date.now(), status: 'idle', usage: { input: 100, cached: 70, cacheWrite: 0, output: 20, reasoning: 5 }, usageKnown: true, models: {}, tools: { shell: 2 }, tickets: ['CORE-123'], memoryRefs: [], events: [{ seq: 1, at: '2026-01-01T00:00:00Z', kind: 'assistant', text: 'Done', tool: null }], eventCount: 1, malformedLines: 0, source: '/fake/session.jsonl', turnId: 'turn' };
 
-const backend: Record<string, () => unknown> = {
+const backend: Record<string, (args?: Record<string, unknown>) => unknown> = {
   session_access: () => true,
-  sessions_snapshot: () => ({ sessions: [{ ...session, events: [] }], scannedFiles: 1, pendingFiles: 0, indexedAt: Date.now(), errors: [] }),
+  sessions_snapshot_since: (args) => ({
+    stamp: 's1',
+    snapshot: args?.stamp === 's1' ? null : { sessions: [{ ...session, events: [] }], scannedFiles: 1, pendingFiles: 0, indexedAt: Date.now(), errors: [] },
+  }),
   session_details: () => session,
 };
 
@@ -25,10 +28,10 @@ const flush = async () => { await act(async () => { await new Promise((resolve) 
 
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
-  vi.mocked(invoke).mockImplementation(async (command) => {
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
     const answer = backend[command];
     if (!answer) throw new Error(`unexpected command ${command}`);
-    return answer();
+    return answer(args as Record<string, unknown>);
   });
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   container = document.createElement('div');
@@ -43,7 +46,8 @@ describe('the journal in Agent MCR', () => {
     await act(async () => root.render(<JournalProvider journal={{ store, host: journalHost }}><JournalView /></JournalProvider>));
     await flush();
     expect(invoke).toHaveBeenCalledWith('session_access');
-    expect(invoke).toHaveBeenCalledWith('sessions_snapshot');
+    // The snapshot with a stamp: the first time none is held
+    expect(invoke).toHaveBeenCalledWith('sessions_snapshot_since', { stamp: null });
     expect(invoke).toHaveBeenCalledWith('session_details', { provider: 'claude', id: 'a' });
     expect(container.querySelector('.sc-detail h2')?.textContent).toBe('Fix CORE-123');
     expect(journalHost.context).toBeUndefined();

@@ -1164,7 +1164,7 @@ fn page(stream: TcpStream, signed_in: bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::vault::Held;
     use std::collections::BTreeMap;
@@ -1404,8 +1404,9 @@ mod tests {
         world
     }
 
-    struct Rig {
-        memory: Arc<Memory>,
+    /// A memory signed in to a fake memory service; harness tests use it too.
+    pub(crate) struct Rig {
+        pub(crate) memory: Arc<Memory>,
         vault: Arc<Held>,
         world: Arc<Mutex<World>>,
         dir: PathBuf,
@@ -1445,7 +1446,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        fn signed_in() -> Self {
+        pub(crate) fn signed_in() -> Self {
             let rig = Self::new();
             let url = rig.memory.connect().unwrap()["url"].as_str().unwrap().to_string();
             assert!(rig.browse(&url, |_| {}).contains("Memory is connected"));

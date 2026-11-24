@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { actionSource, clickable, foldRows, harnessChips, harnessSaw, heldFor, liveFacts, named, needsYouRows, ROWS_PER_PUBLISHER, STALE_AFTER_MS, staleMarks, stillAwaits, shownUrgency, trackStateShown, trackWaits, urgencyRank } from './cockpit';
-import type { Cockpit, CockpitAction, Hosted } from './harness';
+import { actionSource, ageTitle, attachTrack, clickable, foldRows, harnessChips, harnessSaw, heldFor, isOld, liveFacts, named, harnessMarks, needsYouRows, oneView, ROOT_PART, ROWS_PER_PUBLISHER, STALE_AFTER_MS, staleMarks, stillAwaits, shownUrgency, trackPublisher, trackStateShown, trackWaits, urgencyRank } from './cockpit';
+import type { Cockpit, CockpitAction, CockpitTrack, Hosted } from './harness';
 
 const NOW = 100 * 3600_000;
 const session = (id: string, over: Partial<Hosted> = {}): Hosted => ({ id, pid: 1, argv: ['claude'], cwd: '/work', started: 1, cols: 80, rows: 24, title: '', lastOutput: 1, exit: null, meta: { label: 'Claude Code', profile: 'claude' }, harness: { name: id.toUpperCase(), named: true, profile: 'claude', state: 'working' } as Hosted['harness'], ...over });
@@ -60,20 +60,28 @@ describe('the join with the session list', () => {
   it('does not call a session ended because the list has not shown it yet', () => {
     const late = named('a', doc, [], label);
     expect(late).toEqual({ id: 'a', name: 'stale name', standing: 'running' });
-    expect(staleMarks({ by: 'a', updated: NOW }, doc, [], label, NOW)).toEqual([]);
+    expect(staleMarks({ by: 'a' }, doc, [], label)).toEqual([]);
   });
 });
 
 describe('stale marks', () => {
   const doc = cockpit({ sessions: { ended: { name: 'Old one', ended: true }, lost: { gone: true } } });
   const hosted = [session('a')];
-  it('marks nothing on a fresh entry of a running publisher', () => {
-    expect(staleMarks({ by: 'a', updated: NOW - STALE_AFTER_MS + 1000 }, doc, hosted, label, NOW)).toEqual([]);
+  it('marks nothing for a running publisher, however old the entry: its age is the row\'s to show (MCR-127)', () => {
+    const old = { by: 'a', updated: NOW - STALE_AFTER_MS - 3600_000 };
+    expect(staleMarks(old, doc, hosted, label)).toEqual([]);
   });
-  it('marks an entry older than the limit, and one whose publisher ended or is gone', () => {
-    expect(staleMarks({ by: 'a', updated: NOW - STALE_AFTER_MS - 3600_000 }, doc, hosted, label, NOW)).toEqual(['not updated since 7 h ago']);
-    expect(staleMarks({ by: 'ended', updated: NOW }, doc, hosted, label, NOW)).toEqual(['its publisher Old one ended']);
-    expect(staleMarks({ by: 'lost', updated: NOW - 2 * STALE_AFTER_MS }, doc, hosted, label, NOW)).toEqual(['its publisher is gone', 'not updated since 12 h ago']);
+  it('marks an entry whose publisher ended or is gone', () => {
+    expect(staleMarks({ by: 'ended' }, doc, hosted, label)).toEqual(['its publisher Old one ended']);
+    expect(staleMarks({ by: 'lost' }, doc, hosted, label)).toEqual(['its publisher is gone']);
+  });
+  it('says an entry is old once, in the tooltip of its age', () => {
+    expect(isOld({ updated: NOW - STALE_AFTER_MS + 1000 }, NOW)).toBe(false);
+    expect(isOld({ updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toBe(true);
+    expect(isOld({}, NOW)).toBe(false);
+    expect(ageTitle({ updated: NOW - 60_000 }, NOW)).toBe('Published 1 min ago');
+    expect(ageTitle({ updated: NOW - STALE_AFTER_MS - 3600_000 }, NOW)).toBe('Published 7 h ago. Not updated for more than 6 h: the published text may be behind');
+    expect(ageTitle({}, NOW)).toBeUndefined();
   });
 });
 
@@ -100,17 +108,25 @@ describe('what the harness knows to be behind (MCR-103)', () => {
     expect(rows.map(stillAwaits)).toEqual([true, true, false, false]);
   });
 
-  it('reads a waiting track as answered once the owner typed in its lead, and an old one as stale', () => {
+  it('reads a waiting track as answered once the owner typed in its lead, and an old one as old without a word on its state', () => {
     const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'waiting_human' as const, updated: NOW - 40 * 60000 };
-    expect(trackStateShown(track, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human' });
-    expect(trackStateShown({ ...track, ownerTyped: NOW - 36 * 60000 }, NOW)).toEqual({ text: 'you typed 36 min ago', tone: 'answered' });
+    expect(trackStateShown(track, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human', old: false });
+    expect(trackStateShown({ ...track, ownerTyped: NOW - 36 * 60000 }, NOW)).toEqual({ text: 'you typed 36 min ago', tone: 'answered', old: false });
     // Only a track that says it waits for the owner is answered by their typing
     expect(trackStateShown({ ...track, state: 'moving', ownerTyped: NOW }, NOW).tone).toBe('moving');
-    expect(trackStateShown({ ...track, state: 'moving', updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'stale: moving', tone: 'stale' });
-    expect(trackStateShown({ ...track, updated: NOW - STALE_AFTER_MS - 1 }, NOW).tone).toBe('stale');
-    // What rests is not stale for resting
-    expect(trackStateShown({ ...track, state: 'parked', updated: 1 }, NOW).tone).toBe('parked');
-    expect(trackStateShown({ ...track, state: 'done', updated: 1 }, NOW).tone).toBe('done');
+    // Old: said once and quietly by the row, never as "stale:" on the state (MCR-127)
+    expect(trackStateShown({ ...track, state: 'moving', updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'moving', tone: 'moving', old: true });
+    expect(trackStateShown({ ...track, updated: NOW - STALE_AFTER_MS - 1 }, NOW)).toEqual({ text: 'waits for you', tone: 'waiting_human', old: true });
+    // What rests is not old for resting
+    expect(trackStateShown({ ...track, state: 'parked', updated: 1 }, NOW)).toEqual({ text: 'parked', tone: 'parked', old: false });
+    expect(trackStateShown({ ...track, state: 'done', updated: 1 }, NOW).old).toBe(false);
+  });
+
+  it('names who published a track only when it is neither its lead nor the Supervisor (MCR-127)', () => {
+    const track = { id: 't', title: 'T', lead: 'a', by: 'a', state: 'moving' as const };
+    expect(trackPublisher(track)).toBeNull();
+    expect(trackPublisher({ ...track, by: ROOT_PART })).toBeNull();
+    expect(trackPublisher({ ...track, by: 'b' })).toBe('b');
   });
 
   it('no longer says that a track waits on the owner once they typed there', () => {
@@ -195,5 +211,103 @@ describe('what the harness knows, derived or merged (MCR-118)', () => {
     // Asking its publisher more stays possible
     expect(clickable({ ...word, live: { prompt: NOW } }, 'ask')).toBe(true);
     expect(clickable({ ...word, live: { held: NOW } }, 'say')).toBe(true);
+  });
+});
+
+describe('one view: tracks with their needs (MCR-131)', () => {
+  const track = (id: string, lead: string, by = lead, over: Partial<CockpitTrack> = {}): CockpitTrack => ({ id, title: id, lead, by, state: 'moving', ...over });
+  const under = (id: string, supervisor: string | null, over: Partial<Hosted> = {}) => session(id, { harness: { name: id.toUpperCase(), named: true, profile: 'claude', state: 'working', supervisor } as Hosted['harness'], ...over });
+  // lead leads `mem`; e1 works for lead, e2 for e1; loner works for nobody; sup is the root Supervisor
+  const hosted = [session('sup', { meta: { label: 'Claude Code', profile: 'claude', role: 'supervisor' } }), under('lead', 'sup'), under('e1', 'lead'), under('e2', 'e1'), under('loner', null)];
+  const tracks = [track('mem', 'lead'), track('infra', 'other', ROOT_PART), track('ops', 'ops-lead', ROOT_PART)];
+  const ids = (rows: CockpitAction[]) => rows.map(a => a.id);
+
+  it('attaches a need to its own track, of its publisher\'s part or of the part `trackBy` names', () => {
+    expect(attachTrack(action('n', { by: 'lead', track: 'mem' }), tracks, hosted)?.id).toBe('mem');
+    // The Supervisor files an action on another part's track
+    expect(attachTrack(action('n', { by: ROOT_PART, track: 'mem', trackBy: 'lead' }), tracks, hosted)?.id).toBe('mem');
+    // A track id of another part is not its own: it attaches by its session instead (here: none)
+    expect(attachTrack(action('n', { by: 'loner', track: 'mem', where: { session: 'loner' } }), tracks, hosted)).toBeNull();
+    // A track that does not exist falls through to the session's lead
+    expect(attachTrack(action('n', { by: 'lead', track: 'nope', where: { session: 'e1' } }), tracks, hosted)?.id).toBe('mem');
+  });
+
+  it('attaches by `where.session` to the track its session leads, and to the track of the lead above an executor, two levels down', () => {
+    expect(attachTrack(action('n', { by: 'x', where: { session: 'lead' } }), tracks, hosted)?.id).toBe('mem');
+    expect(attachTrack(action('n', { by: 'x', where: { session: 'e1' } }), tracks, hosted)?.id).toBe('mem');
+    expect(attachTrack(action('n', { by: 'x', where: { session: 'e2' } }), tracks, hosted)?.id).toBe('mem');
+    // Without where.session, the publisher's own box is the session
+    expect(attachTrack(action('n', { by: 'e2', where: {} }), tracks, hosted)?.id).toBe('mem');
+    // The nearest lead wins: e1 leading a track of its own takes e2's needs
+    expect(attachTrack(action('n', { by: 'x', where: { session: 'e2' } }), [...tracks, track('sub', 'e1')], hosted)?.id).toBe('sub');
+    // A circle in the relation ends
+    const circle = [under('c1', 'c2'), under('c2', 'c1')];
+    expect(attachTrack(action('n', { by: 'x', where: { session: 'c1' } }), tracks, circle)).toBeNull();
+  });
+
+  it('attaches derived prompt and held rows the same way', () => {
+    const prompt = action('prompt:e2', { kind: 'answer_prompt', derived: 'prompt', by: undefined, where: { session: 'e2' }, since: 1 });
+    const held = action('held:lead', { kind: 'held_line', derived: 'held', by: undefined, where: { session: 'lead' }, since: 2 });
+    const loose = action('prompt:loner', { kind: 'answer_prompt', derived: 'prompt', by: undefined, where: { session: 'loner' }, since: 3 });
+    const view = oneView(cockpit({ tracks, actions: [prompt, held, loose] }), hosted, new Set());
+    expect(ids(view.tracks[0].rows)).toEqual(['prompt:e2', 'held:lead']);
+    expect(view.tracks[0].marks).toEqual(['at a prompt', 'unsent line']);
+    expect(ids(view.unassigned!.rows)).toEqual(['prompt:loner']);
+  });
+
+  it('attaches a need for the root Supervisor to the first track the Supervisor published', () => {
+    expect(attachTrack(action('n', { by: ROOT_PART, where: { session: 'sup' } }), tracks, hosted)?.id).toBe('infra');
+    expect(attachTrack(action('n', { by: ROOT_PART }), tracks, hosted)?.id).toBe('infra');
+    // A track the Supervisor leads itself comes first
+    expect(attachTrack(action('n', { by: ROOT_PART }), [...tracks, track('own', 'sup', ROOT_PART)], hosted)?.id).toBe('own');
+  });
+
+  it('puts a need whose track was removed under Unassigned, even when its session leads a track', () => {
+    const a = action('n', { by: 'lead', track: 'gone', trackMissing: true, where: { session: 'lead' } });
+    expect(attachTrack(a, tracks, hosted)).toBeNull();
+    expect(ids(oneView(cockpit({ tracks, actions: [a] }), hosted, new Set()).unassigned!.rows)).toEqual(['n']);
+  });
+
+  it('orders a track\'s needs as the needs-you list did: the harness\'s first, then by urgency and age, what is behind last', () => {
+    const actions = [
+      action('late', { by: 'lead', track: 'mem', urgency: 'whenever', updated: 1 }),
+      action('behind', { by: 'lead', track: 'mem', urgency: 'now', updated: 2, ownerTyped: 5 }),
+      action('soon', { by: 'lead', track: 'mem', urgency: 'now', updated: 9 }),
+      action('older', { by: 'lead', track: 'mem', urgency: 'now', updated: 3 }),
+      action('prompt:e1', { kind: 'answer_prompt', derived: 'prompt', by: undefined, where: { session: 'e1' }, since: 7 }),
+    ];
+    // Unfolded: four rows of one publisher would fold the fourth
+    expect(ids(oneView(cockpit({ tracks, actions }), hosted, new Set(['lead'])).tracks[0].rows)).toEqual(['prompt:e1', 'older', 'soon', 'late', 'behind']);
+  });
+
+  it('keeps tracks in published order and shows Unassigned only when it holds a need', () => {
+    const attached = oneView(cockpit({ tracks, actions: [action('n', { by: 'lead', track: 'mem' })] }), hosted, new Set());
+    expect(attached.unassigned).toBeNull();
+    expect(attached.tracks.map(g => g.track!.id)).toEqual(['mem', 'infra', 'ops']);
+    expect(attached.tracks.map(g => g.rows.length)).toEqual([1, 0, 0]);
+    expect(oneView(cockpit({ tracks: [] }), hosted, new Set()).unassigned).toBeNull();
+    expect(oneView(cockpit({ tracks: [], actions: [action('n', { by: 'loner' })] }), hosted, new Set()).unassigned!.rows).toHaveLength(1);
+  });
+
+  it('still folds one publisher beyond the first few, counted over the whole view, and never the harness\'s rows', () => {
+    // Five rows of `lead`, spread over its track and Unassigned, and a prompt
+    const spread = [
+      ...Array.from({ length: 3 }, (_, i) => action(`t${i}`, { by: 'lead', track: 'mem', urgency: 'now', updated: i + 1 })),
+      ...Array.from({ length: 2 }, (_, i) => action(`u${i}`, { by: 'lead', where: { session: 'loner' }, urgency: 'today', updated: i + 1 })),
+      action('prompt:loner', { kind: 'answer_prompt', derived: 'prompt', by: undefined, where: { session: 'loner' }, since: 9 }),
+    ];
+    const view = oneView(cockpit({ tracks, actions: spread }), hosted, new Set());
+    expect(ids(view.tracks[0].rows)).toEqual(['t0', 't1', 't2']);
+    expect(ids(view.unassigned!.rows)).toEqual(['prompt:loner']);
+    expect([...view.unassigned!.folded]).toEqual([['lead', 2]]);
+    expect(view.tracks[0].folded.size).toBe(0);
+    const open = oneView(cockpit({ tracks, actions: spread }), hosted, new Set(['lead']));
+    expect(ids(open.unassigned!.rows)).toEqual(['prompt:loner', 'u0', 'u1']);
+    expect(open.unassigned!.folded.size).toBe(0);
+  });
+
+  it('marks what the harness saw among a group\'s needs, merged into a published row or derived, each kind once', () => {
+    expect(harnessMarks([action('a', { live: { report: { id: 'r', since: 1, text: 't' } } }), action('w', { derived: 'wait' }), action('p', { live: { prompt: 1 } })])).toEqual(['at a prompt', 'open report', 'late wait']);
+    expect(harnessMarks([action('plain'), action('k', { live: { reportOpen: true } })])).toEqual([]);
   });
 });

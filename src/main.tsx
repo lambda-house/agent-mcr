@@ -17,6 +17,7 @@ import '@lambda-house/ui/ui.css';
 import '@lambda-house/workbench/workbench.css';
 import '@lambda-house/reader/reader.css';
 import './styles/index.css';
+import { watchWindowActivity } from './utils/motion';
 
 // Apply the persisted theme before the first paint (no dark flash in light
 // mode), and follow later changes
@@ -29,6 +30,8 @@ applyTheme(useStore.getState().theme);
 useStore.subscribe((state, prev) => {
   if (state.theme !== prev.theme) applyTheme(state.theme);
 });
+// Animations pause while the window is in the background (MCR-139)
+watchWindowActivity();
 
 // Local images in documents are served by the backend's localfile protocol
 if ('__TAURI_INTERNALS__' in window) setImageUrl((path) => convertFileSrc(path, 'localfile'));

@@ -1,16 +1,16 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
-import { Button, ConfirmDialog, Dialog, Menu } from '@lambda-house/ui';
+import { Button, ConfirmDialog, Dialog, Menu, keepSame } from '@lambda-house/ui';
 import { LayoutView, isPx, type Layout, type LayoutNode } from '@lambda-house/workbench';
-import TerminalPane from './TerminalPane';
+import TerminalPane, { keep } from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
 import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou, ProgramLine } from './SessionRow';
-import { canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { agentProfileTitle, canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, subfolderTag, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { useStore } from '../store';
 import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
 import { liveNav } from '../utils/liveNav';
@@ -20,6 +20,7 @@ import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
 import '../styles/harness.css';
+import { formatSessionTitle } from '../utils/sessions';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const PINNED_KEY = 'hs-dirs';
@@ -36,7 +37,7 @@ const storedWidth = (): number | null => {
   try { const v = Number(localStorage.getItem(LIST_WIDTH_KEY)); return v >= LIST_MIN_WIDTH ? v : null; } catch { return null; }
 };
 
-interface Action { label: string; icon: React.ReactNode; run: () => void }
+interface Action { label: string; icon: React.ReactNode; run: () => void; title?: string }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
 function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false, wrapItems = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean; wrapItems?: boolean }) {
@@ -49,7 +50,7 @@ function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-acti
       setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
     }}>{icon ?? <MoreHorizontal size={14}/>}</button>
     {at && <Menu label={label} at={at} anchorRef={wrap} wrap={wrapItems} onClose={() => setAt(null)}
-      items={actions.map(a => ({ key: a.label, label: a.label, icon: a.icon, onSelect: a.run }))}/>}
+      items={actions.map(a => ({ key: a.label, label: a.label, title: a.title, icon: a.icon, onSelect: a.run }))}/>}
   </span>;
 }
 
@@ -83,7 +84,7 @@ function splitRatios(node: LayoutNode, out = new Map<string, number>()): Map<str
  * Agent terminals hosted by the runner. They keep running when this view, the
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
  */
-export default function LiveWorkspace({ active, recentDirectories, titles = {}, onSearch, focus }: {
+export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = {}, onSearch, focus }: {
   active: boolean; recentDirectories: string[];
   /** A session to show, asked for from another view; `at` makes a repeated ask count */
   focus?: { id: string; at: number };
@@ -93,7 +94,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   onSearch?: (directory: string) => void;
 }) {
   const sessionLabel = (h: Hosted) => liveSessionLabel(h, titles);
-  const metrics = useSessionMetrics(active);
   // Null: the default width, a share of the window
   const [listWidth, setListWidth] = useState<number | null>(storedWidth);
   const resizeList = (x: number | null, handle?: HTMLElement) => {
@@ -107,6 +107,10 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // The background processes are not allowed: never asked ('new'), or stopped by the person
   const [gate, setGate] = useState<'new' | 'stopped' | null>(null);
   const [hosted, setHosted] = useState<Hosted[]>([]);
+  const metrics = useSessionMetrics(active, hosted);
+  // The hosted conversations' titles come with their figures, every ten seconds; the index's (for earlier
+  // sessions) with the Sessions workspace's snapshot, which it reads seldom while Live is shown (MCR-139)
+  const titles = useMemo(() => ({ ...indexTitles, ...Object.fromEntries(Object.values(metrics).filter(s => !s.parentId).map(s => [s.id, formatSessionTitle(s)])) }), [indexTitles, metrics]);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState('');
   const [opened, setOpened] = useState<string[]>([]);
@@ -141,6 +145,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
   // Sessions the person closed: once they have ended they leave the list too
   const closing = useRef(new Set<string>());
+  // The service's list has been read since this view mounted: before that an empty list says nothing
+  const listRead = useRef(false);
   const mounted = useRef(true);
 
   // Nothing runs and nothing may be started: the list gives way to the question
@@ -152,7 +158,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     harnessApi.status().then(s => {
       if (!Array.isArray(s.profiles)) throw new Error('An older harness service returned no launch profiles. Update the app and restart the harness service.');
       if (mounted.current) {
-        setStatus(s);
+        // A focus asks again; the same answer keeps the held one, so nothing below starts over (MCR-139)
+        setStatus(held => keepSame(held, s));
         setGate(null);
         setError('');
         setCwd(c => c || s.home);
@@ -161,7 +168,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     }).catch(e => { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); });
   }, [closed]);
   const refresh = useCallback(async () => {
-    try { const list = await harnessApi.list(); if (mounted.current) { setHosted(list); setError(''); } }
+    try { const list = await harnessApi.list(); if (mounted.current) { listRead.current = true; setHosted(held => keepSame(held, list)); setError(''); } }
     catch (e) { if (!mounted.current) return; if (notAllowed(e)) closed(); else setError(err(e)); }
   }, [closed]);
 
@@ -183,10 +190,17 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // Earlier sessions to resume; without the Sessions grant there are none to offer
   const loadResumable = useCallback(() => {
     harnessApi.resumable()
-      .then(r => { if (mounted.current) setResumable(r); })
+      .then(r => { if (mounted.current) setResumable(held => keepSame(held, r)); })
       .catch(() => {});
   }, []);
   useEffect(() => { if (active && status) loadResumable(); }, [active, status, newAgentOpen, loadResumable]);
+  // Back in the window: the list and the earlier sessions are read again at once, and render only if they changed
+  useEffect(() => {
+    if (!active || !status) return;
+    const again = () => { void refresh(); loadResumable(); };
+    window.addEventListener('focus', again);
+    return () => window.removeEventListener('focus', again);
+  }, [active, status, refresh, loadResumable]);
 
   usePluginVersion();
 
@@ -280,6 +294,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
   // The same function while the same sessions run: a terminal looks at its links again when it changes (MCR-106)
   const liveIds = hosted.filter(h => !h.exit).map(h => h.id).join(' ');
   const isSession = useCallback((id: string) => liveIds.split(' ').includes(id), [liveIds]);
+  // A kept terminal goes with its session from the list (an ended session in the list keeps its own)
+  const listedIds = hosted.map(h => h.id).join(' ');
+  useEffect(() => { if (listRead.current) keep.retain(new Set(listedIds.split(' ').filter(Boolean))); }, [listedIds]);
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
   useEffect(() => {
@@ -512,7 +529,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
     };
   };
   const supervisorSummary = supervisor ? sessionSummary(supervisor, Date.now()) : null;
-  const row = ({ session: h, depth, executors, elsewhere }: RelationRow) => {
+  /** `section`: the folder of the section the row is listed in, for the tag of an executor in a folder below it (MCR-133) */
+  const row = ({ session: h, depth, executors, elsewhere }: RelationRow, section = h.cwd) => {
+    const sub = subfolderTag(section, h.cwd);
     const state = hostedState(h);
     const role = executors ? 'is-supervisor' : '';
     const works = h.harness?.supervisor ? 'is-executor' : '';
@@ -534,7 +553,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         <HostedRow hosted={h} label={label} session={indexedSession(h, metrics)} detail={detail}
           before={works && <span className="hs-rel executor" title={`Executor of ${names.get(h.harness?.supervisor ?? '') ?? 'a session'}${depth > 4 ? ` · level ${depth}` : ''}`} aria-label="Executor"><CornerDownRight size={11}/>{depth > 4 ? depth : ''}</span>}
           after={executors > 0 && <span className="hs-rel supervisor" title={`Supervises ${executors} executor${executors > 1 ? 's' : ''}`} aria-label={`Supervisor of ${executors}`}><Network size={11}/>{executors}</span>}
-          under={elsewhere && <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>}/>
+          // Its folder below the section's on a line of its own: in the name it would be the first thing the ellipsis cuts (MCR-133)
+          under={elsewhere ? <small className="hs-under" title={elsewhere.cwd}>under {sessionLabel(elsewhere)} · {shortPath(tildePath(elsewhere.cwd, home))}</small>
+            : sub && <small className="hs-under"><span className="hs-rel subdir" title={`Works in ${sub.path}`}>{sub.tag}</span></small>}/>
       </button>
       <RowMenu label={`Actions for ${label}`} actions={actions(h)}/>
       {binding === h.id && <form className="hs-bind" aria-label={`Connect ${label} to a supervisor`} onSubmit={e => e.preventDefault()}>
@@ -721,23 +742,28 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               <span className="hs-dir-path" title={d.path}>{shortPath(name)}</span>
               <span className="hs-dir-rule"/>
               <RowMenu className="hs-dir-tools" label={`Start a session in ${d.path}`} title={`Start a session in ${name}`} icon={<Plus size={13}/>} disabled={!status?.profiles.length || starting}
-                actions={(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) }))}/>
+                actions={[
+                  ...(status?.profiles ?? []).map(p => ({ label: p.id === 'shell' ? 'Terminal' : p.label, icon: <AgentMark profile={p.id} size={13}/>, run: () => void start(p.id, d.path) })),
+                  // Agent profiles (MCR-126 P2): the id goes to the service, which starts the session from it
+                  ...(status?.agentProfiles ?? []).map(p => ({ label: p.id, title: agentProfileTitle(p), icon: <AgentMark profile={p.adapter} size={13}/>, run: () => void start(p.id, d.path) })),
+                ]}/>
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
               {!d.sessions.some(h => !h.exit) && <button type="button" className="hs-dir-start" title={`Hide ${name}: it goes to Hidden folders at the end of the list. Nothing is deleted`} aria-label={`Hide folder ${d.path}`} onClick={() => hideFolder(d.path)}><EyeOff size={12}/></button>}
             </header>
-            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(row)}</ul>}
+            {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(r => row(r, d.path))}</ul>}
             {d.earlier.length > 0 && <div className="hs-earlier">
               <button type="button" className="hs-earlier-toggle" aria-expanded={open} onClick={() => setEarlierOpen(old => { const next = new Set(old); if (next.has(d.path)) next.delete(d.path); else next.add(d.path); return next; })}>
                 {open ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<History size={11}/> Earlier · {d.earlier.length} · last {formatAge(d.earlier[0].modified)}
               </button>
               {open && <ul aria-label={`Earlier sessions in ${d.path}`}>
-                {d.earlier.slice(0, 12).map(r => <li key={r.id} className="hs-earlier-row">
-                  <button type="button" className="hs-item hs-resume" disabled={!status || starting} title={`Continue this ${r.agent === 'claude' ? 'Claude' : 'Codex'} session here${maybeOpenElsewhere(r, Date.now()) ? '. It changed minutes ago: close it in its other terminal first' : ''}\n${r.id}`} onClick={() => void start(undefined, r.cwd, r.id)}>
+                {d.earlier.slice(0, 12).map(r => { const sub = subfolderTag(d.path, r.cwd); return <li key={r.id} className="hs-earlier-row">
+                  <button type="button" className="hs-item hs-resume" disabled={!status || starting} title={`Continue this ${r.agent === 'claude' ? 'Claude' : 'Codex'} session ${sub ? `in ${r.cwd}` : 'here'}${maybeOpenElsewhere(r, Date.now()) ? '. It changed minutes ago: close it in its other terminal first' : ''}\n${r.id}`} onClick={() => void start(undefined, r.cwd, r.id)}>
                     <EarlierRow agent={r.agent} title={titles[r.id] || r.title || `${r.agent === 'claude' ? 'Claude' : 'Codex'} session`} modified={r.modified} note={maybeOpenElsewhere(r, Date.now()) ? ' · open elsewhere?' : ''}/>
+                    {sub && <small className="hs-subdir-line"><span className="hs-rel subdir" title={`In ${sub.path}`}>{sub.tag}</span></small>}
                   </button>
                   <button type="button" className="hs-dir-start hs-earlier-hide" title="Hide this session from the list. Its conversation stays on disk and can still be found by search" aria-label={`Hide session ${titles[r.id] || r.title || r.id}`} onClick={() => hideSession(r.id)}><EyeOff size={11}/></button>
-                </li>)}
+                </li>; })}
                 {d.earlier.length > 12 && <li className="hs-earlier-more">{d.earlier.length - 12} older: use search</li>}
                 {d.hiddenEarlier > 0 && <li className="hs-earlier-more"><button type="button" className="hs-earlier-unhide" onClick={() => showFolder(d.path, 'sessions hidden', sessionsOf(d.path))}>{d.hiddenEarlier} hidden · show them</button></li>}
               </ul>}
@@ -800,11 +826,14 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
         const leaves = listLeaves(layout);
         const multiPane = leaves.length > 1;
         const visibleSessions = new Set(leaves.map(l => l.item?.kind === 'session' && l.item.id ? l.item.id : null).filter((x): x is string => !!x));
-        const bgOpened = opened.filter(id => !visibleSessions.has(id) && hosted.some(h => h.id === id));
         const emptyActions = pluginRegistry.getEmptyActions();
         const emptyPaneOverride = pluginRegistry.getOverride('live:empty-pane');
         // A leaf's pane: a session (header, cockpit, terminal, usage), a plugin's pane, or the empty pane.
-        // A session's pane is kept alive by the layout; one opened but in no pane waits parked and hidden.
+        // A session's pane is kept alive by the layout while a leaf shows it. Its terminal is there only
+        // while the pane is visible and the Live view is shown (MCR-139): a hidden one detaches from the
+        // runner and goes to the keep (TerminalPane's `keep`), and shown again takes only what it missed.
+        // A terminal kept attached for every session ever opened parsed all their output for good, and one
+        // mounted hidden told the agent 80×24. (`parked`, a pane no leaf shows, no longer happens.)
         const renderPane = (node: PaneLeaf, parked = false, visible = true): React.ReactNode => {
           const sessItem = node.item?.kind === 'session' ? node.item : null;
           const h = sessItem ? hosted.find(x => x.id === sessItem.id) : undefined;
@@ -950,7 +979,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
                     {/* The cockpit sits over the Supervisor's own terminal and nowhere else (MCR-96) */}
                     {!parked && !h.exit && isSupervisor(h) && <CockpitPanel active={active} hosted={hosted} label={sessionLabel} onSession={follow}/>}
                     <div className="hs-pane-body">
-                      {opened.includes(h.id) && <TerminalPane key={h.id} id={h.id} name={sessionLabel(h)} active={active && visible} onQuit={() => { closing.current.add(h.id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === h.id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === h.id ? null : l)}/>}
+                      {opened.includes(h.id) && active && visible && <TerminalPane key={h.id} id={h.id} name={sessionLabel(h)} active={active} onQuit={() => { closing.current.add(h.id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === h.id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === h.id ? null : l)}/>}
                       {!parked && stats && isFocused && <SessionStats session={h} active={active}/>}
                     </div>
                   </>
@@ -1005,7 +1034,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
               renderEmpty={(leaf) => leaves.length === 1
                 ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
                 : renderPane({ kind: 'leaf', id: leaf.id, item: null })}
-              retain={bgOpened.map(id => ({ type: 'session', key: `session:${id}`, state: { kind: 'session', id } }))}
             />
           </>
         );

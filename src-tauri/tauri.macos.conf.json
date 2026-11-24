@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0.0",
+  "app": {
+    "windows": [
+      {
+        "title": "TEOB HQ",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 768,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 14, "y": 21 }
+      }
+    ]
+  }
+}
