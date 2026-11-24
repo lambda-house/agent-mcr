@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { CloseRequest } from '@lambda-house/reader';
 
 /**
  * Check if running inside Tauri environment
@@ -178,6 +179,18 @@ export async function onMenuCommand(handler: (id: string) => void): Promise<() =
   if (!isTauri()) return () => {};
   const { listen } = await import('@tauri-apps/api/event');
   return listen<string>('menu-command', (event) => handler(event.payload));
+}
+
+/**
+ * The window's close requests (the reader's `confirmClose`): the handler may
+ * keep the window open and close it later. Unheld, it closes once the handler is done.
+ */
+export async function onWindowCloseRequested(handler: (request: CloseRequest) => Promise<void>): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { getCurrentWindow } = await import('@tauri-apps/api/window');
+  const appWindow = getCurrentWindow();
+  return appWindow.onCloseRequested((event) =>
+    handler({ preventDefault: () => event.preventDefault(), close: () => appWindow.destroy() }));
 }
 
 /**

@@ -95,7 +95,7 @@ export interface AppState {
   setLiveList: (change: (prefs: LiveListPrefs) => LiveListPrefs) => void;
 
   // Appearance
-  toggleTheme: () => void;
+  setTheme: (theme: ColorTheme) => void;
 
   setAgentEntries: (entries: AgentEntry[], folders?: string[]) => void;
 
@@ -188,7 +188,7 @@ export const useStore = create<AppState>()(
 
 
       // Appearance
-      toggleTheme: () => set((state) => ({ theme: state.theme === 'dark' ? 'light' : 'dark' })),
+      setTheme: (theme) => set({ theme }),
 
 
       setAgentEntries: (entries, folders) => set((state) => ({ agentEntries: entries, agentFolders: folders ?? state.agentFolders })),

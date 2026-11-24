@@ -1,13 +1,12 @@
-import React, { useEffect, useCallback } from 'react';
+import React, { useEffect } from 'react';
 import { useStore, panelShown } from './store';
 import { useReader } from './reader';
 import { reader } from './readerHost';
 import { allTabs, flushEditorChanges, readerPlugin } from '@lambda-house/reader';
 import { journalPlugin } from '@lambda-house/journal';
 import { Workbench } from '@lambda-house/workbench';
-import { isTauri, onMenuCommand, onAgentFilesChanged } from './utils/tauri';
+import { isTauri, onMenuCommand, onAgentFilesChanged, onWindowCloseRequested } from './utils/tauri';
 import { appMenu, buildMenu, commandContext, useCommandContext } from './utils/commands';
-import { ToolbarEnd } from './components/Toolbar';
 import MemoryConnection from './components/MemoryConnection';
 import { journal } from './journal';
 import { pluginRegistry } from './plugins';
@@ -19,8 +18,8 @@ import { NO_DOCUMENT, documentsPlugin, zoomOf } from './documents';
 // Agent MCR's window: the Workbench of its plugins (shared UI spec §3.3), the
 // reader's, the journal's, Agent MCR's own (documents.tsx: Documents and
 // Sessions) and the plugins in src/plugins, and what the window does through
-// Tauri: rescanning agent files, closing with unsaved edits. A memory reader
-// window (`documentWindowPath`) is the Documents surface with one document.
+// Tauri: rescanning agent files. A memory reader window (`documentWindowPath`)
+// is the Documents surface with one document.
 // ============================================================
 
 /** Quiet time after the last agent file change before agent files are rescanned. */
@@ -35,6 +34,7 @@ registry.register(readerPlugin(reader, {
   // A memory window doesn't take the main window's tabs
   restore: isTauri() && !documentWindowPath,
   windowDocument: documentWindowPath,
+  confirmClose: { name: 'Agent MCR', onCloseRequested: onWindowCloseRequested },
 }));
 // Its view is a view of Sessions (SessionWorkspace); here its tabs, with the TEOB connection above the memories
 registry.register(journalPlugin(journal, { memories: <MemoryConnection /> }));
@@ -45,9 +45,7 @@ registry.register(documentsPlugin);
 const menu = buildMenu();
 appMenu.set(menu);
 
-const setTheme = (theme: 'dark' | 'light') => {
-  if (useStore.getState().theme !== theme) useStore.getState().toggleTheme();
-};
+const openPalette = () => useStore.getState().setPaletteOpen(true);
 
 const App: React.FC = () => {
   // The shown surface is the store's: commands of the other one wait
@@ -56,8 +54,11 @@ const App: React.FC = () => {
   const statusBarPinned = useStore((s) => s.statusBarPinned);
   const setStatusBarPinned = useStore((s) => s.setStatusBarPinned);
   const settingsOpen = useStore((s) => s.settingsOpen);
-  const closeSettings = useCallback(() => useStore.getState().setSettingsOpen(false), []);
+  const setSettingsOpen = useStore((s) => s.setSettingsOpen);
   const theme = useStore((s) => s.theme);
+  const setTheme = useStore((s) => s.setTheme);
+  // The command panel lives in Sessions: elsewhere the top bar's ⌕ is disabled
+  const paletteHosted = useStore((s) => s.paletteHosted);
   const agentEntries = useStore((s) => s.agentEntries);
   const hasAgentTabs = useReader((s) => allTabs(s).some((t) => agentEntries.some((e) => e.path === t.path)));
   // A memory reader window shows its one document and no list
@@ -96,52 +97,19 @@ const App: React.FC = () => {
     };
   }, [documentsShown, filePanelVisible, hasAgentTabs]);
 
-  // Closing the window with unsaved edits asks first
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-
-    import('@tauri-apps/api/window')
-      .then(({ getCurrentWindow }) => {
-        const appWindow = getCurrentWindow();
-        return appWindow.onCloseRequested(async (event) => {
-          const dirty = allTabs(useReader.getState()).filter((t) => t.isDirty);
-          if (dirty.length === 0) return;
-          event.preventDefault();
-          const names = dirty.map((t) => t.title).join(', ');
-          if (window.confirm(`Unsaved changes in ${names}. Close Agent MCR and discard them?`)) {
-            await appWindow.destroy();
-          }
-        });
-      })
-      .then((fn) => {
-        if (disposed) fn();
-        else unlisten = fn;
-      })
-      .catch((error) => console.error('Failed to watch window close:', error));
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-
   return (
     <Workbench
       registry={registry}
-      className="app-container"
       surface={surface}
       onSurface={setSurface}
       menu={menu}
       commandContext={commandContext}
       useCommandContext={useCommandContext}
       onMenuOpen={flushEditorChanges}
-      menuButtonClassName="toolbar-button"
       nativeMenu={onMenuCommand}
-      end={<ToolbarEnd />}
       status={{ pinned: statusBarPinned, onPinnedChange: setStatusBarPinned }}
-      settings={{ open: settingsOpen, onClose: closeSettings }}
+      palette={{ open: openPalette, enabled: paletteHosted }}
+      settings={{ open: settingsOpen, onOpenChange: setSettingsOpen }}
       appearance={{ theme, setTheme }}
     />
   );

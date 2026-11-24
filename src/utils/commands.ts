@@ -2,14 +2,14 @@ import { createMenuStore, type Command as WorkbenchCommand, type MenuItem as Wor
 import { useMemo } from 'react';
 import { focusedGroupOf, readerCommands, type ReaderState } from '@lambda-house/reader';
 import { journalCommands } from '@lambda-house/journal';
-import { layoutCommands, zoomCommands } from '@lambda-house/workbench';
+import { layoutCommands, windowCommands, zoomCommands } from '@lambda-house/workbench';
 import { useStore, panelShown, type AppState } from '../store';
 import { useReader } from '../reader';
 import { reader } from '../readerHost';
 import { journal } from '../journal';
 import { liveNav } from './liveNav';
 import { terminalTask, TASK_SHORTCUT } from './terminalTask';
-import { PALETTE_SHORTCUT, PLATFORM } from './platform';
+import { PLATFORM } from './platform';
 
 // The app's commands in one place: the main menu shows them (MainMenu.tsx)
 // and the keyboard handler in App.tsx runs them, so a command, its place in
@@ -45,13 +45,17 @@ export function useCommandContext(): CommandContext {
 export function buildMenu(): MenuItem[] {
   const state = useStore.getState;
   const documents = useReader.getState;
-  const setTheme = (theme: AppState['theme']) => {
-    if (state().theme !== theme) state().toggleTheme();
-  };
   /** Commands that act on what the Documents surface shows: they wait while Sessions is shown. */
   const onDocuments = (command: Command): Command => ({ ...command, surface: 'documents' });
   const doc = readerCommands(reader);
   const journalCmd = journalCommands(journal);
+  const win = windowCommands({
+    // The command panel is a global overlay of Sessions: over Documents its key stays free
+    palette: { open: () => state().setPaletteOpen(true), enabled: () => state().paletteHosted, label: 'Command Panel…' },
+    settings: { open: () => state().setSettingsOpen(true) },
+    theme: { get: () => state().theme, set: (theme) => state().setTheme(theme) },
+    statusBar: { pinned: () => state().statusBarPinned, setPinned: (pinned) => state().setStatusBarPinned(pinned) },
+  });
   const [splitPaneRight, splitPaneDown, closePane, focusNext, focusPrevious, resetLayout] = layoutCommands();
   // Zoom acts on the focused pane; before any pane had the focus, on the document
   const [zoomIn, zoomOut, resetZoom] = zoomCommands({
@@ -84,12 +88,7 @@ export function buildMenu(): MenuItem[] {
           checked: (s) => panelShown(s, 'contents'),
           run: () => state().toggleTocVisible(),
         }),
-        {
-          id: 'view.pinStatusBar',
-          label: 'Pin Status Bar',
-          checked: (s) => s.statusBarPinned,
-          run: () => state().setStatusBarPinned(!state().statusBarPinned),
-        },
+        win.pinStatusBar,
         'separator',
         onDocuments(doc.splitRight),
         onDocuments(doc.splitDown),
@@ -104,18 +103,8 @@ export function buildMenu(): MenuItem[] {
         zoomOut,
         resetZoom,
         'separator',
-        {
-          id: 'view.darkTheme',
-          label: 'Dark Theme',
-          checked: (s) => s.theme === 'dark',
-          run: () => setTheme('dark'),
-        },
-        {
-          id: 'view.lightTheme',
-          label: 'Light Theme',
-          checked: (s) => s.theme === 'light',
-          run: () => setTheme('light'),
-        },
+        win.darkTheme,
+        win.lightTheme,
       ],
     },
     {
@@ -137,15 +126,7 @@ export function buildMenu(): MenuItem[] {
     {
       label: 'Search',
       items: [
-        {
-          // The command panel is a global overlay of Sessions: over Documents its key stays free
-          id: 'app.commandPalette',
-          label: 'Command Panel…',
-          shortcut: { ...PALETTE_SHORTCUT },
-          palette: false,
-          enabled: (s) => s.paletteHosted,
-          run: () => { if (state().paletteHosted) state().setPaletteOpen(true); },
-        },
+        win.palette,
         onDocuments(doc.find),
       ],
     },
@@ -179,11 +160,6 @@ export function buildMenu(): MenuItem[] {
       items: [{ ...journalCmd.refresh, surface: 'sessions' }, { ...journalCmd.newList, surface: 'sessions' }],
     },
     'separator',
-    {
-      id: 'app.settings',
-      label: 'Settings…',
-      shortcut: { mod: true, key: ',' },
-      run: () => state().setSettingsOpen(true),
-    },
+    win.settings,
   ];
 }
