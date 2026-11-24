@@ -17,7 +17,6 @@ import '@lambda-house/ui/ui.css';
 import '@lambda-house/workbench/workbench.css';
 import '@lambda-house/reader/reader.css';
 import './styles/index.css';
-import { pluginRegistry, usePluginVersion } from './plugins';
 
 // Apply the persisted theme before the first paint (no dark flash in light
 // mode), and follow later changes
@@ -31,21 +30,11 @@ useStore.subscribe((state, prev) => {
   if (state.theme !== prev.theme) applyTheme(state.theme);
 });
 
-function PluginAppRoot() {
-  usePluginVersion();
-  const wrappers = pluginRegistry.getAppWrappers();
-  let node: React.ReactNode = <App />;
-  for (let i = wrappers.length - 1; i >= 0; i--) {
-    node = wrappers[i].wrap(node);
-  }
-  return <>{node}</>;
-}
-
 // Local images in documents are served by the backend's localfile protocol
 if ('__TAURI_INTERNALS__' in window) setImageUrl((path) => convertFileSrc(path, 'localfile'));
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <PluginAppRoot />
+    <App />
   </React.StrictMode>
 );

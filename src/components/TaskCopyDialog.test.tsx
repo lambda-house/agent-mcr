@@ -107,7 +107,7 @@ it('has its key on macOS only, leaves Ctrl+Shift+C to copy elsewhere, and a menu
     }
     return undefined;
   };
-  const command = find(buildMenu({ reopenClosedTab: () => {} }))!;
+  const command = find(buildMenu())!;
   const s = {} as Parameters<NonNullable<Command['enabled']>>[0];
   expect(command.enabled!(s)).toBe(false);
   const open = vi.fn();

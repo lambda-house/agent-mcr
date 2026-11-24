@@ -1,4 +1,6 @@
 import type React from 'react';
+import { createElement } from 'react';
+import { Puzzle } from 'lucide-react';
 import { PluginRegistry, type PluginApi as WorkbenchPluginApi } from '@lambda-house/workbench';
 import type { LayoutPreset, PaneItem, PaneNode } from '../utils/paneLayout';
 import type { HarnessStatus, Hosted, Resumable } from '../utils/harness';
@@ -201,6 +203,8 @@ export interface McrPlugin {
 // Agent MCR's extension points, slots and events in the workbench's plugin
 // registry (@lambda-house/workbench), declared by merging. Its plugins keep
 // the typed API above; the registry does the rest (shared UI spec §5.7).
+// Wrappers and Settings tabs go to the workbench's own points, which the
+// Workbench draws with the reader's, the journal's and the app's.
 interface McrPoints {
   'sessions:top-tab': TopTabPlugin;
   'sessions:overlay': GlobalOverlayPlugin;
@@ -208,8 +212,6 @@ interface McrPoints {
   'live:sidebar-section': SidebarSectionPlugin;
   'live:empty-action': EmptyActionPlugin;
   'live:session-enricher': SessionEnricher;
-  'app:wrapper': AppWrapperPlugin;
-  'settings:tab': SettingsTabPlugin;
 }
 
 declare module '@lambda-house/workbench' {
@@ -226,9 +228,13 @@ function mcrApi(api: WorkbenchPluginApi): PluginApi {
     registerSidebarSection: section => api.contribute('live:sidebar-section', section),
     registerEmptyAction: action => api.contribute('live:empty-action', action),
     registerSessionEnricher: enricher => api.contribute('live:session-enricher', enricher),
-    registerAppWrapper: wrapper => api.contribute('app:wrapper', wrapper),
+    registerAppWrapper: wrapper => api.contribute('workbench:wrapper', wrapper),
     registerGlobalOverlay: overlay => api.contribute('sessions:overlay', overlay),
-    registerSettingsTab: tab => api.contribute('settings:tab', tab),
+    // A plugin's tab without a group or icon goes under Workspace & Agent, with the puzzle
+    registerSettingsTab: tab => api.contribute('workbench:settings-tab', {
+      id: tab.id, label: tab.label, group: tab.group ?? 'Workspace & Agent', order: tab.order ?? 100,
+      icon: tab.icon ?? createElement(Puzzle, { size: 15 }), render: tab.render,
+    }),
     overrideComponent: (slot, render) => api.overrideSlot(slot, render),
     onEvent: (event, handler) => api.onEvent(event, handler),
     emitEvent: (event, payload) => api.emitEvent(event, payload),
@@ -256,9 +262,10 @@ class McrPluginRegistry {
   getSidebarSections(): SidebarSectionPlugin[] { return this.workbench.items('live:sidebar-section'); }
   getEmptyActions(): EmptyActionPlugin[] { return this.workbench.items('live:empty-action'); }
   getSessionEnrichers(): SessionEnricher[] { return this.workbench.items('live:session-enricher'); }
-  getAppWrappers(): AppWrapperPlugin[] { return this.workbench.items('app:wrapper'); }
+  getAppWrappers(): AppWrapperPlugin[] { return this.workbench.items('workbench:wrapper'); }
   getGlobalOverlays(): GlobalOverlayPlugin[] { return this.workbench.items('sessions:overlay'); }
-  getSettingsTabs(): SettingsTabPlugin[] { return this.workbench.items('settings:tab'); }
+  /** Every tab of the Settings dialog: the plugins', the reader's, the journal's, the app's. */
+  getSettingsTabs(): SettingsTabPlugin[] { return this.workbench.items('workbench:settings-tab'); }
   getOverride<K extends OverrideSlot>(slot: K): ComponentOverrideMap[K] | undefined { return this.workbench.slot(slot); }
 
   onEvent<E extends PluginEventName>(event: E, handler: (payload: PluginEventMap[E]) => void): () => void { return this.workbench.onEvent(event, handler); }

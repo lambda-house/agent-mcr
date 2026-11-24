@@ -6,7 +6,7 @@ import { useReader } from '../reader';
 
 describe('Back and Forward commands (MCR-108)', () => {
   afterEach(() => { liveNav.current = null; });
-  const command = (id: string) => menuCommands(buildMenu({ reopenClosedTab: () => {} })).find(c => c.id === id)!;
+  const command = (id: string) => menuCommands(buildMenu()).find(c => c.id === id)!;
 
   it('go through the Live view\'s history while it is shown', () => {
     const back = vi.fn(); const forward = vi.fn();

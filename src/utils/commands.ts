@@ -41,13 +41,8 @@ export function useCommandContext(): CommandContext {
   return useMemo(() => ({ ...app, reader: readerState }), [app, readerState]);
 }
 
-/** What the commands need from the app shell (App.tsx); the rest is in the store. */
-export interface MenuActions {
-  reopenClosedTab: () => void;
-}
-
 /** The main menu, top to bottom: Agent MCR's commands, the reader's, the journal's and the workbench's. */
-export function buildMenu(actions: MenuActions): MenuItem[] {
+export function buildMenu(): MenuItem[] {
   const state = useStore.getState;
   const documents = useReader.getState;
   const setTheme = (theme: AppState['theme']) => {
@@ -176,13 +171,7 @@ export function buildMenu(actions: MenuActions): MenuItem[] {
         'separator',
         onDocuments(doc.closeTab),
         onDocuments(doc.closeAllTabs),
-        onDocuments({
-          id: 'tabs.reopen',
-          label: 'Reopen Closed Tab',
-          shortcut: { mod: true, shift: true, key: 't' },
-          enabled: (s) => s.reader.recentlyClosed.length > 0,
-          run: actions.reopenClosedTab,
-        }),
+        onDocuments(doc.reopenClosedTab),
       ],
     },
     {
