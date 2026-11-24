@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { CloseRequest } from '@lambda-house/reader';
+import type { AgentWorkspace, ReadSnapshot } from '@lambda-house/agents';
 
 /**
  * Check if running inside Tauri environment
@@ -213,43 +214,6 @@ export async function writeFile(path: string, content: string): Promise<void> {
 // ============================================================
 // Agent workspace
 // ============================================================
-
-export type AgentKind = 'instructions' | 'rule' | 'memory' | 'plan' | 'skill' | 'agent' | 'command';
-
-/** A markdown file a coding agent reads or writes (see src-tauri/src/agent.rs). */
-export interface AgentEntry {
-  path: string;
-  kind: AgentKind;
-  title: string;
-  description: string | null;
-  /** What it belongs to: an agent ("Claude Code"), a project folder or a plugin. */
-  group: string;
-  scope: 'user' | 'project' | 'plugin';
-  /** The session folder it belongs to; null for the agents' own files. */
-  folder: string | null;
-  /** Last change, ms since the epoch. */
-  modified: number;
-  /** Changed since the user last read it. */
-  unread: boolean;
-  /** Never read. */
-  isNew: boolean;
-}
-
-export interface AgentWorkspace {
-  enabled: boolean;
-  entries: AgentEntry[];
-  /** The session folders that were looked through, most recent first. */
-  folders: string[];
-  /** Changes arrive as `agent-files-changed` events; otherwise poll. */
-  watching: boolean;
-}
-
-/** The copy of a document kept when it was last read. */
-export interface ReadSnapshot {
-  path: string;
-  content: string;
-  readAt: number;
-}
 
 export async function getAgentWorkspace(): Promise<AgentWorkspace> {
   if (!isTauri()) return { enabled: false, entries: [], folders: [], watching: false };

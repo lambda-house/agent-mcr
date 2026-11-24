@@ -1,11 +1,11 @@
 import type { Reader, ReaderHost } from '@lambda-house/reader';
-import { followLocalLink, openExternal, openInExplorer, readFile, readSnapshot, saveFile, writeFile } from './utils/tauri';
-import { markAgentFilesRead } from './utils/agent';
-import { useStore } from './store';
+import { agentChanges } from '@lambda-house/agents';
+import { followLocalLink, openExternal, openInExplorer, readFile, saveFile, writeFile } from './utils/tauri';
+import { agents } from './agents';
 import { useReader } from './reader';
 
 // The reader's host in Agent MCR: Tauri for files, links and the save dialog;
-// the app store for the agent documents whose reads are tracked.
+// the agent documents (./agents.ts) are the ones whose reads are tracked.
 
 /** Open a file in a tab of the focused group (links, reopened tabs, the memory reader window). */
 export async function openPath(path: string, options?: { preview?: boolean }): Promise<void> {
@@ -24,12 +24,7 @@ export const readerHost: ReaderHost = {
   followLocalLink: (path) => followLocalLink(path),
   openExternal: (url) => openExternal(url),
   revealInFolder: (path) => openInExplorer(path),
-  changes: {
-    // Agent documents (the app store's agent entries)
-    useIsTracked: (path) => useStore((s) => s.agentEntries.some((e) => e.path === path)),
-    readSnapshot: (path) => readSnapshot(path),
-    markRead: (paths) => markAgentFilesRead(paths),
-  },
+  changes: agentChanges(agents),
 };
 
 export const reader: Reader = { store: useReader, host: readerHost };

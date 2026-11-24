@@ -7,7 +7,9 @@ import { defaultDocumentsLayout } from './store/documentsLayout';
 import { pluginRegistry } from './plugins';
 import { documentWindowPath } from './utils/documentWindow';
 import Toolbar from './components/Toolbar';
-import AgentPanel from './components/AgentPanel';
+import { AgentPane } from '@lambda-house/agents';
+import { agents } from './agents';
+import { shortPath } from './utils/harness';
 import SessionWorkspace from './components/SessionWorkspace';
 import { appSettingsTabs } from './components/SettingsTabs';
 
@@ -78,7 +80,7 @@ export const documentsPlugin: Plugin = {
       type: {
         type: 'agent-docs', label: 'agent documents', title: 'Agent documents', icon: <Bot size={14} />, singleton: true, collapsible: true,
         min: { w: PANEL_MIN_WIDTH }, max: { w: PANEL_MAX_WIDTH }, zoom: zoomOf('files'),
-        render: () => <AgentPanel />,
+        render: () => <AgentPane agents={agents} folderLabel={shortPath} about="Covers the agents' own folders (Claude Code, Codex, Gemini CLI) and the folders your sessions work in." />,
       },
     });
     for (const tab of appSettingsTabs()) api.contribute('workbench:settings-tab', tab);

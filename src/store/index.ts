@@ -3,7 +3,6 @@ import { create } from 'zustand';
 import { useReader } from '../reader';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { ColorTheme } from '@lambda-house/reader';
-import type { AgentEntry } from '../utils/tauri';
 import { DEFAULT_LIVE_LIST, type LiveListPrefs } from '../utils/harness';
 import { documentWindowPath, documentWindowStorage } from '../utils/documentWindow';
 import { stepPaneZoom, type LayoutNode } from '@lambda-house/workbench';
@@ -61,11 +60,6 @@ export interface AppState {
   /** The command panel is mounted (it lives in Sessions). Not persisted. */
   paletteHosted: boolean;
 
-  /** Agent files from the last scan; empty while the workspace is off. */
-  agentEntries: AgentEntry[];
-  /** The session folders the last scan looked through, most recent first */
-  agentFolders: string[];
-
   // Find in document
 
   
@@ -89,7 +83,6 @@ export interface AppState {
   // Appearance
   setTheme: (theme: ColorTheme) => void;
 
-  setAgentEntries: (entries: AgentEntry[], folders?: string[]) => void;
 
 }
 
@@ -139,9 +132,6 @@ export const useStore = create<AppState>()(
       paletteOpen: false,
       paletteHosted: false,
 
-      agentEntries: [],
-      agentFolders: [],
-
       
       // ============================================================
       // Actions - UI
@@ -181,7 +171,6 @@ export const useStore = create<AppState>()(
       setTheme: (theme) => set({ theme }),
 
 
-      setAgentEntries: (entries, folders) => set((state) => ({ agentEntries: entries, agentFolders: folders ?? state.agentFolders })),
 
 
       // Search
