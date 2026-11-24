@@ -331,7 +331,7 @@ impl Read for Drained {
         use std::os::fd::AsRawFd;
         loop {
             // A monotonic clock: a wall clock set back would keep the reader on (review 17215)
-            if self.session.ended.get().is_some_and(|at| at.elapsed() >= EXIT_DRAIN) {
+            if lock(&self.session.ended).is_some_and(|at| at.elapsed() >= EXIT_DRAIN) {
                 return Ok(0);
             }
             if !wait_for(self.file.as_raw_fd(), libc::POLLIN)? {
@@ -363,8 +363,11 @@ struct Session {
     info: Mutex<Info>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Option<Writer>>,
-    /// When the wait thread saw the process end, on a monotonic clock
-    ended: std::sync::OnceLock<Instant>,
+    /// When the wait thread saw the process end, on a monotonic clock. Its
+    /// lock is held only for a moment: by the exit to publish it, and by
+    /// `type_in` around its last look and one non-blocking write, so no byte
+    /// is typed once the end is published (review 17220)
+    ended: Mutex<Option<Instant>>,
     #[cfg(windows)]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     #[cfg(windows)]
@@ -389,13 +392,23 @@ impl Session {
             use std::os::fd::AsRawFd;
             let mut rest = bytes;
             while !rest.is_empty() {
-                if self.ended.get().is_some() {
+                if lock(&self.ended).is_some() {
                     return Err(ended());
                 }
                 if !wait_for(writer.as_raw_fd(), libc::POLLOUT)? {
                     continue;
                 }
-                match writer.write(rest) {
+                // The session may have ended while `poll` waited: the last look
+                // and the write are one step against the end's publication. The
+                // write cannot block (the master is non-blocking)
+                let wrote = {
+                    let gate = lock(&self.ended);
+                    if gate.is_some() {
+                        return Err(ended());
+                    }
+                    writer.write(rest)
+                };
+                match wrote {
                     Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                     Ok(n) => rest = &rest[n..],
                     Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
@@ -404,8 +417,12 @@ impl Session {
             }
             Ok(())
         }
+        // Windows writes block; the exit takes the writer first and waits for one under way
         #[cfg(not(unix))]
         {
+            if lock(&self.ended).is_some() {
+                return Err(ended());
+            }
             writer.write_all(bytes).and_then(|_| writer.flush())
         }
     }
@@ -662,7 +679,7 @@ impl Runner {
             info: Mutex::new(info.clone()),
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
-            ended: std::sync::OnceLock::new(),
+            ended: Mutex::new(None),
             #[cfg(windows)]
             killer: Mutex::new(killer),
             #[cfg(windows)]
@@ -699,17 +716,36 @@ impl Runner {
                 info.exit = Some(exit.clone());
                 info.program.exited();
             }
-            let _ = session.ended.set(Instant::now());
+            *lock(&session.ended) = Some(Instant::now());
             // Nothing is typed into or resized in an ended terminal: its master
             // and the writer's copy are closed now, not when the session is
             // forgotten, which may be days later or never (MCR-151). The reader
             // keeps its own copy until the output is drained (`Drained`).
-            // The master's lock is held only for an ioctl; the end is told
+            //
+            // Unix: the master's lock is held only for an ioctl; the end is told
             // before the writer's lock is taken, which a write under way holds
-            // until it sees the end (at most `READ_LOOK` on unix, review 17215).
-            lock(&session.master).take();
-            runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
-            lock(&session.writer).take();
+            // until it sees the end (at most `READ_LOOK`, review 17215). Closing
+            // the master is a plain close.
+            #[cfg(unix)]
+            {
+                lock(&session.master).take();
+                runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
+                lock(&session.writer).take();
+            }
+            // Windows: the writer goes first. Dropping the master calls
+            // ClosePseudoConsole, which before Windows 11 24H2 waits until the
+            // console host has drained its output; while the synchronous input
+            // writer is still open, the pump can block in a DSR answer on that
+            // writer (`handle_dsr`) and stop draining, and the close would wait
+            // for good (review 17220). No test pins this order or the hang it
+            // avoids; CI's Windows job runs the Windows tests, which end their
+            // sessions through it.
+            #[cfg(not(unix))]
+            {
+                lock(&session.writer).take();
+                lock(&session.master).take();
+                runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
+            }
         });
         Ok(info)
     }
@@ -1890,6 +1926,131 @@ mod tests {
         assert_eq!((before, again), (after, after));
     }
 
+    /// What a fixture leaves running, ended also when an assertion fails
+    /// first: the release file lets its shell end, and the background job whose
+    /// pid it wrote is killed (review 17220).
+    #[cfg(unix)]
+    struct Leftover {
+        release: Option<PathBuf>,
+        pidfile: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Leftover {
+        fn job(&self) -> Option<i32> {
+            std::fs::read_to_string(&self.pidfile).ok()?.trim().parse().ok().filter(|&pid| pid > 0)
+        }
+
+        fn alive(&self) -> bool {
+            // SAFETY: signal 0 only asks whether the process exists
+            self.job().is_some_and(|job| unsafe { libc::kill(job, 0) } == 0)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Leftover {
+        fn drop(&mut self) {
+            if let Some(release) = &self.release {
+                let _ = std::fs::write(release, "");
+            }
+            if let Some(job) = self.job() {
+                // SAFETY: our own child's child, by the pid it wrote itself
+                unsafe { libc::kill(job, libc::SIGKILL) };
+            }
+            // Killed once: a later drop must not hit a reused pid
+            let _ = std::fs::remove_file(&self.pidfile);
+        }
+    }
+
+    /// A session around a terminal the test holds, with nothing running in it.
+    #[cfg(unix)]
+    fn bare_session(writer: std::fs::File) -> Session {
+        Session {
+            info: Mutex::new(Info {
+                id: "bare".into(),
+                pid: None,
+                argv: Vec::new(),
+                cwd: "/".into(),
+                started: 0,
+                cols: 80,
+                rows: 24,
+                title: String::new(),
+                last_output: 0,
+                exit: None,
+                meta: BTreeMap::new(),
+                program: Program::default(),
+            }),
+            master: Mutex::new(None),
+            writer: Mutex::new(Some(writer)),
+            ended: Mutex::new(None),
+            output: Mutex::new(Output {
+                ring: VecDeque::new(),
+                total: 0,
+                views: Vec::new(),
+                next_view: 0,
+                scanner: Scanner::default(),
+                last_bell: 0,
+                last_query: 0,
+                closed: false,
+            }),
+        }
+    }
+
+    /// Review 17220: a write waiting for room in a full input queue when the
+    /// end is published types nothing more once room comes, and fails.
+    #[cfg(unix)]
+    #[test]
+    fn no_byte_is_typed_once_the_end_is_published() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty fills two descriptors; the rest may be null
+        let opened = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: fresh descriptors, each owned once
+        let (master, mut slave) = unsafe { (std::fs::File::from_raw_fd(master), std::fs::File::from_raw_fd(slave)) };
+        // Raw: the input queue fills without a line, and nothing is echoed back
+        // SAFETY: termios calls on our own terminal
+        unsafe {
+            let mut mode: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut mode), 0);
+            libc::cfmakeraw(&mut mode);
+            assert_eq!(libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &mode), 0);
+        }
+        nonblocking(&master).unwrap();
+        nonblocking(&slave).unwrap();
+        let drain = |slave: &mut std::fs::File| {
+            let (mut total, mut buf) = (0, [0u8; 65536]);
+            while let Ok(n @ 1..) = slave.read(&mut buf) {
+                total += n;
+            }
+            total
+        };
+
+        let session = Arc::new(bare_session(master));
+        let typing = {
+            let session = session.clone();
+            std::thread::spawn(move || session.type_in(&vec![b'x'; 1 << 20]))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!typing.is_finished(), "the terminal's input did not fill up");
+        // The end is published while the write waits in poll; then room comes
+        *lock(&session.ended) = Some(Instant::now());
+        assert!(drain(&mut slave) > 0, "nothing was queued before the end");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !typing.is_finished() {
+            assert!(Instant::now() < deadline, "the write did not see the end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(typing.join().unwrap().is_err(), "a write cut short by the end reports it");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(drain(&mut slave), 0, "bytes were typed after the end was published");
+        // And a write that starts after the end types nothing at all
+        assert!(session.type_in(b"late").is_err());
+        assert_eq!(drain(&mut slave), 0);
+    }
+
     /// Descriptors this process has open: all of them, and those on a pty master.
     #[cfg(unix)]
     fn open_descriptors() -> (usize, usize) {
@@ -2000,6 +2161,8 @@ mod tests {
             .call(json!({"op": "spawn", "id": "f1", "argv": ["/bin/sh", "-c", "printf 'ready\\n'; read line; exit 0"], "cwd": "/tmp", "cols": 80, "rows": 24}))
             .unwrap();
         let (mut out, mut input) = open_stream(&socket, json!({"op": "attach", "id": "f1"})).unwrap();
+        // `read_until` gives up at its deadline only if a read returns
+        input.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
         read_until(&mut out, "ready");
         assert_eq!(open_descriptors().1, base.1 + 3, "a live session's pty descriptors");
         input.write_all(b"bye\n").unwrap();
@@ -2009,30 +2172,30 @@ mod tests {
 
         // A session that leaves a job behind holding its terminal: the job
         // ignores hangup and outlives the session
-        let pidfile = socket.with_file_name("job.pid");
-        let script = format!("trap '' HUP; sleep 60 & echo $! > {}; exit 0", pidfile.display());
+        let leftover = Leftover { release: None, pidfile: socket.with_file_name("job.pid") };
+        let script = format!("trap '' HUP; sleep 60 & echo $! > {}; exit 0", leftover.pidfile.display());
         control.call(json!({"op": "spawn", "id": "f2", "argv": ["/bin/sh", "-c", script], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
         exited(&mut events, "f2", quick);
-        let job: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        let alive = unsafe { libc::kill(job, 0) } == 0;
+        let alive = leftover.alive();
         settle(base, "after an ended session whose job keeps the terminal");
-        // SAFETY: our own child's child, read from the file it wrote
-        unsafe { libc::kill(job, libc::SIGKILL) };
+        drop(leftover);
         assert!(alive, "the left-behind job was still running while the descriptors were counted");
 
         // Typing that cannot go on: nobody reads the terminal's input, it is
         // full and a write is pending when the session ends, while a job that
         // ignores hangup keeps the terminal open. The end is still told at once,
         // the pending write fails, and every descriptor comes back (review 17215)
-        let pidfile = socket.with_file_name("full.pid");
         let go = socket.with_file_name("full.go");
+        let leftover = Leftover { release: Some(go.clone()), pidfile: socket.with_file_name("full.pid") };
+        // The shell waits for the release file at most about 15 s
         let script = format!(
-            "trap '' HUP; stty raw -echo; sleep 60 & echo $! > {}; printf 'ready\\n'; while [ ! -e {} ]; do sleep 0.05; done; exit 0",
-            pidfile.display(),
+            "trap '' HUP; stty raw -echo; sleep 60 & echo $! > {}; printf 'ready\\n'; i=0; while [ ! -e {} ] && [ $i -lt 300 ]; do sleep 0.05; i=$((i+1)); done; exit 0",
+            leftover.pidfile.display(),
             go.display()
         );
         control.call(json!({"op": "spawn", "id": "f3", "argv": ["/bin/sh", "-c", script], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
         let (mut out, input) = open_stream(&socket, json!({"op": "attach", "id": "f3"})).unwrap();
+        input.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
         read_until(&mut out, "ready");
         drop((out, input));
         let typing_socket = socket.clone();
@@ -2050,11 +2213,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(typing.join().unwrap().is_err(), "a write into an ended session reports it");
-        let job: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        let alive = unsafe { libc::kill(job, 0) } == 0;
+        let alive = leftover.alive();
         settle(base, "after an ended session with a full input queue");
-        // SAFETY: as above
-        unsafe { libc::kill(job, libc::SIGKILL) };
+        drop(leftover);
         assert!(alive, "the left-behind job was still running while the descriptors were counted");
 
         // Forgetting them changes nothing more
