@@ -600,8 +600,35 @@ impl Adapter for Claude {
             w.push("--disallowedTools".into());
             w.extend(p.tools.deny.iter().cloned());
             if delivers {
-                // Apply the admin-merge denies to previously pinned profiles too.
-                for rule in ["Bash(gh pr merge --admin*)", "Bash(gh pr merge * --admin*)"] {
+                // Protect the pre-approved commands even with an older pinned profile.
+                for rule in [
+                    "Bash(gh pr merge --admin*)",
+                    "Bash(gh pr merge * --admin*)",
+                    "Bash(gh pr merge -F*)",
+                    "Bash(gh pr merge * -F*)",
+                    "Bash(gh pr merge --body-file*)",
+                    "Bash(gh pr merge * --body-file*)",
+                    "Bash(git push --receive-pack*)",
+                    "Bash(git push * --receive-pack*)",
+                    "Bash(git push --exec*)",
+                    "Bash(git push * --exec*)",
+                    // Git accepts unique long-option prefixes. Keep --end-of-options usable.
+                    "Bash(git push --rece*)",
+                    "Bash(git push * --rece*)",
+                    "Bash(git push --ex*)",
+                    "Bash(git push * --ex*)",
+                    "Bash(git push --e=*)",
+                    "Bash(git push * --e=*)",
+                    "Bash(git push --e *)",
+                    "Bash(git push * --e *)",
+                    // An explicit ext destination names a command when the transport is enabled.
+                    "Bash(git push ext::*)",
+                    "Bash(git push * ext::*)",
+                    "Bash(git push --repo=ext::*)",
+                    "Bash(git push * --repo=ext::*)",
+                    "Bash(git push --rep=ext::*)",
+                    "Bash(git push * --rep=ext::*)",
+                ] {
                     if !p.tools.deny.iter().any(|deny| deny == rule) {
                         w.push(rule.into());
                     }
@@ -1348,13 +1375,23 @@ mod tests {
                         let at = words.iter().position(|w| w == "--disallowedTools").unwrap();
                         let end = at + 1 + p.tools.deny.len();
                         assert_eq!(&words[at + 1..end], &p.tools.deny[..]);
-                        let end = if p.adapter == "claude" && p.delivers() {
-                            assert_eq!(&words[end..end + 2], ["Bash(gh pr merge --admin*)", "Bash(gh pr merge * --admin*)"]);
-                            end + 2
+                        if p.adapter == "claude" && p.delivers() {
+                            let allow = words.iter().position(|w| w == "--allowedTools").unwrap();
+                            let added_denies = &words[end..allow];
+                            for (command, arguments) in [
+                                ("gh pr merge", &["--admin", "-F", "--body-file"][..]),
+                                ("git push", &["--receive-pack", "--exec", "--rece", "--ex", "--e=", "--e ", "ext::", "--repo=ext::", "--rep=ext::"][..]),
+                            ] {
+                                for argument in arguments {
+                                    for position in ["", "* "] {
+                                        let rule = format!("Bash({command} {position}{argument}*)");
+                                        assert!(added_denies.contains(&rule), "{} missing {rule}", p.id);
+                                    }
+                                }
+                            }
                         } else {
-                            end
-                        };
-                        assert!(words[end].starts_with("--"));
+                            assert!(words[end].starts_with("--"));
+                        }
                     }
                     if p.adapter == "codex" {
                         assert_eq!(words[words.iter().position(|w| w == "--ask-for-approval").unwrap() + 1], "on-request");
