@@ -6,7 +6,7 @@ import {
 import { useStore, panelShown } from '../store';
 import { DocumentTools, DocumentZoom } from '@lambda-house/reader';
 import clsx from 'clsx';
-import { ShellTools } from '@lambda-house/workbench';
+import { ShellTools, useCommandTitle } from '@lambda-house/workbench';
 
 // ============================================================
 // Toolbar Component
@@ -26,6 +26,9 @@ const Toolbar: React.FC<ToolbarProps> = ({
 }) => {
   const tocVisible = useStore((s) => panelShown(s, 'contents'));
   const toggleTocVisible = useStore((s) => s.toggleTocVisible);
+  // The tooltips name the keys of the menu's commands
+  const filesTitle = useCommandTitle('view.filePanel', 'Agent documents');
+  const contentsTitle = useCommandTitle('view.toc', 'Contents');
 
   const handleToggleToc = useCallback(() => {
     toggleTocVisible();
@@ -38,7 +41,7 @@ const Toolbar: React.FC<ToolbarProps> = ({
         <button
           className={clsx('wb-tool', filePanelVisible && 'active')}
           onClick={onToggleFilePanel}
-          title="Agent documents (Ctrl+B)"
+          title={filesTitle}
         >
           <PanelLeft size={16} />
         </button>
@@ -63,7 +66,7 @@ const Toolbar: React.FC<ToolbarProps> = ({
         <button
           className={clsx('wb-tool', tocVisible && 'active')}
           onClick={handleToggleToc}
-          title="Toggle Table of Contents"
+          title={contentsTitle}
         >
           <List size={16} />
         </button>

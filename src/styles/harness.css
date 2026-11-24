@@ -183,7 +183,6 @@
 .session-cockpit .hs-layout-btn.active { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-line, var(--line)); }
 .hs-layout-root { flex: 1; min-width: 0; min-height: 0; display: flex; }
 .hs-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
-.hs-pane.focused { box-shadow: inset 0 2px 0 var(--accent); }
 /* The terminal carries the name its session has in the list */
 /* A pane's header is 40 px, as every pane's (shared UI spec §4.2) */
 .hs-pane-title { flex: 0 0 auto; display: flex; align-items: center; gap: 7px; height: 40px; padding: 0 12px; border-bottom: 1px solid var(--line); background: var(--surface-1); font-size: 12px; min-width: 0; }

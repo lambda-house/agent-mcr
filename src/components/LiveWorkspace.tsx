@@ -927,7 +927,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles = {}, 
 
           return (
             // No key: a kept-alive pane moves between leaves (and in from the parking); a key that changed would remount its terminal
-            <div className={`hs-pane${multiPane && isFocused ? ' focused' : ''}`} hidden={parked} onMouseDown={parked ? undefined : () => focusPane(node.id, node.item)}>
+            <div className="hs-pane" hidden={parked} onMouseDown={parked ? undefined : () => focusPane(node.id, node.item)}>
               {h ? (() => {
                 const defaultHeader = () => (
                   <header className="hs-pane-title">
