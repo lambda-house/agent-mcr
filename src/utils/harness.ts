@@ -80,6 +80,14 @@ export interface Hosted {
   /** What it registered that it waits for outside itself, oldest first */
   waits?: SessionWait[];
 }
+
+/** How long an ended session stays in Live without an open report. */
+export const ENDED_ROW_GRACE_MS = 0;
+
+export function showHostedRow(h: Hosted, now: number, graceMs = ENDED_ROW_GRACE_MS): boolean {
+  return !h.exit || !!h.harness?.attention?.report || (graceMs > 0 && now - h.exit.at < graceMs);
+}
+
 /** Something outside a session that it waits for (its `wait_register` tool). */
 export interface SessionWait {
   id: string; kind: 'pipeline' | 'integration' | 'human' | 'peer' | 'timer' | 'other'; on: string; ref: string;
@@ -288,7 +296,7 @@ export function formatUntil(ms: number, now = Date.now()): string {
 export function openReports(reports: Report[], hosted: Hosted[]): Set<string> {
   const open = new Set<string>();
   for (const h of hosted) {
-    const kind = h.exit ? undefined : h.harness?.attention?.report;
+    const kind = h.harness?.attention?.report;
     if (!kind) continue;
     const last = reports.filter(r => r.session === h.id && r.kind === kind).pop();
     if (last) open.add(last.id);
@@ -887,9 +895,7 @@ export interface ShownSection extends DirSection { hiddenEarlier: number }
 
 /**
  * Which folders the Live list shows and which go into "Hidden folders", with
- * the reason. A folder with a running session always shows, whatever was
- * chosen: a session that waits for the person, or has a report open for
- * them, is a running one, and nothing that needs them may be out of sight.
+ * the reason. A folder with a running session or an open report always shows.
  * Hiding changes what is shown only: no session ends and no transcript is touched.
  */
 export function folderVisibility(sections: DirSection[], prefs: LiveListPrefs): { shown: ShownSection[]; hidden: { section: ShownSection; reason: HiddenReason }[] } {
@@ -900,7 +906,7 @@ export function folderVisibility(sections: DirSection[], prefs: LiveListPrefs): 
     const earlier = d.earlier.filter(r => !hiddenSessions.has(r.id));
     const section: ShownSection = { ...d, earlier, hiddenEarlier: d.earlier.length - earlier.length };
     const reason = ((): HiddenReason | null => {
-      if (d.sessions.some(h => !h.exit)) return null;
+      if (d.sessions.some(h => !h.exit || h.harness?.attention?.report)) return null;
       if (prefs.hiddenFolders.includes(d.path)) return 'hidden';
       // Added by the person, or shown again by them: the automatic rule is theirs to overrule
       if (prefs.hideNoise && !d.pinned && !prefs.shownFolders.includes(d.path)) {

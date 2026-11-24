@@ -355,7 +355,6 @@
 .session-cockpit .hs-earlier-hide { opacity: 0; }
 .hs-earlier-row:hover .hs-earlier-hide, .hs-earlier-hide:focus-visible { opacity: .8; }
 .session-cockpit .hs-earlier-unhide { height: auto; padding: 0; border: 0; background: transparent; color: var(--sc-muted); font-size: 11px; text-decoration: underline; text-underline-offset: 2px; }
-.session-cockpit .hs-cleanup { display: flex; align-items: center; gap: 5px; }
 .hs-hidden { margin: 0 8px 8px; border-top: 1px solid var(--sc-border); padding-top: 4px; }
 .hs-list .hs-hidden ul { padding: 2px 0 2px 14px; }
 .hs-list li.hs-hidden-row { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 1px 6px; flex-wrap: nowrap; }

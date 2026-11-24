@@ -126,7 +126,11 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const clearFilters = () => { setActiveSince(''); setInactiveSince(''); setInactiveMinutes(''); setActiveMinutes(''); setDirectory(''); setRole('all'); setProvider('all'); setFilter('all'); setQuery(''); };
   /** Continue an earlier session in a hosted terminal, in its own folder. */
   const resumeLive = async (s: Session) => {
-    try { await harnessApi.spawn('', '', 120, 32, s.id); setView('live'); } catch (e) { setError(err(e)); }
+    try {
+      const resumed = await harnessApi.spawn('', '', 120, 32, s.id);
+      setFocus({ id: resumed.id, at: Date.now() });
+      setView('live');
+    } catch (e) { setError(err(e)); }
   };
   const recentDirectories = useMemo(() => [...new Set([...data.sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [data.sessions]);
   return <section className="session-cockpit">

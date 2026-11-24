@@ -1,7 +1,7 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, BarChart3, BellRing, Check, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@/ui';
 import TerminalPane, { keep } from './TerminalPane';
 import AgentMark from './AgentMark';
@@ -10,9 +10,8 @@ import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
 import { EarlierRow, HostedRow, hostedDetail, needsYou, ProgramLine } from './SessionRow';
-import { agentProfileTitle, canRestart, directorySections, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, STATE_LABEL, storeNoticeLines, subagentActive, subfolderTag, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
+import { agentProfileTitle, canRestart, directorySections, ENDED_ROW_GRACE_MS, folderVisibility, HIDDEN_REASON, type HiddenReason, executorsBelow, HARNESS_PREFERENCES_CHANGED, harnessApi, hostedState, isSupervisor, liveSessionLabel, maybeOpenElsewhere, notAllowed, relationRows, runningFor, SESSION_DRAG_TYPE, sessionReference, sessionSummary, shellHealth, shortPath, showHostedRow, STATE_LABEL, storeNoticeLines, subagentActive, subfolderTag, supervisorChoices, tildePath, type HarnessStatus, type RelationRow, type Hosted, type Resumable } from '../utils/harness';
 import { useStore } from '../store';
-import ConfirmDialog from './ConfirmDialog';
 import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
 import { liveNav } from '../utils/liveNav';
 import { PLATFORM } from '../utils/platform';
@@ -291,20 +290,19 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const liveList = useStore(s => s.liveList);
   const setLiveList = useStore(s => s.setLiveList);
   const [hiddenOpen, setHiddenOpen] = useState(false);
-  // "Remove ended sessions": the ones counted when the question was asked
-  const [removing, setRemoving] = useState<string[] | null>(null);
   // The session being connected to a supervisor: its row shows the chooser
   const [binding, setBinding] = useState('');
   // The usage pane beside the terminal: open or closed is this viewer's preference
   const [stats, setStats] = useState(() => { try { return localStorage.getItem('hs-stats') === '1'; } catch { return false; } });
   const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
-  // Sessions the person closed: once they have ended they leave the list too
+  // Sessions the person closed: once they end, also clear their terminal panes.
   const closing = useRef(new Set<string>());
   // The service's list has been read since this view mounted: before that an empty list says nothing
   const listRead = useRef(false);
   const listStamp = useRef('');
   const listRequest = useRef(0);
   const listShown = useRef(0);
+  const [listNow, setListNow] = useState(Date.now);
   const mounted = useRef(true);
 
   // Nothing runs and nothing may be started: the list gives way to the question
@@ -337,6 +335,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       // An overlapping read replaced the base for this unchanged reply.
       if (!answer.sessions && stamp !== listStamp.current) return refreshList();
       listRead.current = true;
+      if (ENDED_ROW_GRACE_MS > 0) setListNow(Date.now());
       if (answer.sessions) {
         listStamp.current = answer.stamp;
         const next = answer.sessions;
@@ -370,12 +369,19 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   }, [active, status, refresh]);
 
   // Earlier sessions to resume; without the Sessions grant there are none to offer
+  const resumableRequest = useRef(0);
   const loadResumable = useCallback(() => {
+    const request = ++resumableRequest.current;
     harnessApi.resumable()
-      .then(r => { if (mounted.current) setResumable(held => keepSame(held, r)); })
+      .then(r => { if (mounted.current && request === resumableRequest.current) setResumable(held => keepSame(held, r)); })
       .catch(() => {});
   }, []);
   useEffect(() => { if (active && status) loadResumable(); }, [active, status, newAgentOpen, loadResumable]);
+  const previouslyRunning = useRef(new Set<string>());
+  useEffect(() => {
+    if (hosted.some(h => h.exit && previouslyRunning.current.has(h.id))) loadResumable();
+    previouslyRunning.current = new Set(hosted.filter(h => !h.exit).map(h => h.id));
+  }, [hosted, loadResumable]);
   // Back in the window: the list and the earlier sessions are read again at once, and render only if they changed
   useEffect(() => {
     if (!active || !status) return;
@@ -476,7 +482,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   // The same function while the same sessions run: a terminal looks at its links again when it changes (MCR-106)
   const liveIds = hosted.filter(h => !h.exit).map(h => h.id).join(' ');
   const isSession = useCallback((id: string) => liveIds.split(' ').includes(id), [liveIds]);
-  // A kept terminal goes with its session from the list (an ended session in the list keeps its own)
+  // A kept terminal goes when the runner forgets its session, independently of the sidebar.
   const listedIds = hosted.map(h => h.id).join(' ');
   useEffect(() => { if (listRead.current) keep.retain(new Set(listedIds.split(' ').filter(Boolean))); }, [listedIds]);
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
@@ -484,7 +490,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   useEffect(() => {
     const acknowledge = () => {
       if (!active || document.hidden || !document.hasFocus()) return;
-      const attention = hosted.find(h => h.id === selected)?.harness?.attention;
+      const attention = hosted.find(h => h.id === selected && !h.exit)?.harness?.attention;
       if (attention?.kind !== 'notification' || acknowledging.current.get(selected) === attention.since) return;
       acknowledging.current.set(selected, attention.since);
       void harnessApi.ack(selected, attention.since).then(refresh).catch(e => setError(err(e))).finally(() => acknowledging.current.delete(selected));
@@ -580,11 +586,11 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     window.addEventListener('mouseup', onUp);
   };
   useEffect(() => { if (focus?.id) select(focus.id); }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
-  const waiting = useMemo(() => hosted.filter(h => !h.exit && h.harness?.attention), [hosted]);
+  const waiting = useMemo(() => hosted.filter(needsYou), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
-  // Rows keep their place: running ones in the order they were started, ended ones after them.
-  // One that needs the person is marked, not moved. The supervisor has its own tile above the list
-  const sorted = useMemo(() => hosted.filter(h => h.exit || !isSupervisor(h)).sort((a, b) => Number(!!a.exit) - Number(!!b.exit) || a.started - b.started || a.id.localeCompare(b.id)), [hosted]);
+  // The running Supervisor has its own tile. Any ended rows follow running rows.
+  const sorted = useMemo(() => hosted.filter(h => (h.exit || !isSupervisor(h)) && showHostedRow(h, listNow))
+    .sort((a, b) => Number(!!a.exit) - Number(!!b.exit) || a.started - b.started || a.id.localeCompare(b.id)), [hosted, listNow]);
 
   const start = async (overrideProfile?: string, overrideCwd?: string, overrideResume?: string) => {
     const p = overrideProfile ?? profile;
@@ -609,21 +615,19 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     finally { setStarting(false); }
   };
   const act = (fn: () => Promise<void>) => { fn().then(refresh).catch(e => setError(err(e))); };
-  const forget = (id: string) => act(async () => {
-    await harnessApi.forget(id);
-    closing.current.delete(id);
-    setOpened(o => o.filter(x => x !== id));
-    setLayout(l => removeSessionFromLayout(l, id));
-    setSelected(s => s === id ? '' : s);
-    pluginRegistry.emitEvent('session:closed', { id });
-  });
-  /** One step to be rid of a session: it is ended, then dropped from the list with its output. */
   const close = (h: Hosted) => {
-    if (h.exit) { forget(h.id); return; }
     closing.current.add(h.id);
     act(() => harnessApi.signal(h.id, 'HUP'));
   };
-  useEffect(() => { hosted.filter(h => h.exit && closing.current.has(h.id)).forEach(h => forget(h.id)); }, [hosted]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    for (const { id, exit } of hosted) {
+      if (!exit || !closing.current.delete(id)) continue;
+      setOpened(o => o.filter(x => x !== id));
+      setLayout(l => removeSessionFromLayout(l, id));
+      setSelected(s => s === id ? '' : s);
+      pluginRegistry.emitEvent('session:closed', { id });
+    }
+  }, [hosted]);
   const copyReference = (h: Hosted) => {
     navigator.clipboard.writeText(sessionReference(h, titles)).then(() => { setReferenced(h.id); setTimeout(() => setReferenced(r => r === h.id ? '' : r), 1500); }).catch(e => setError(err(e)));
   };
@@ -655,7 +659,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     ...(!h.exit && h.harness?.supervisor ? [{ label: 'Detach from supervisor', icon: <Unlink size={13}/>, run: () => connect_to(h.id, null) }] : []),
     { label: 'Copy reference', icon: <Copy size={13}/>, run: () => copyReference(h) },
     ...(canRestart(h) ? [{ label: 'Restart (reload settings)', icon: <RotateCw size={13}/>, run: () => restart(h) }] : []),
-    { label: h.exit ? 'Remove from the list' : 'Close session', icon: <X size={13}/>, run: () => close(h) },
+    ...(!h.exit ? [{ label: 'Close session', icon: <X size={13}/>, run: () => close(h) }] : []),
+    ...(h.exit && h.harness?.attention?.report ? [{ label: 'Mark report as seen', icon: <Check size={13}/>, run: () => act(() => harnessApi.ack(h.id, h.harness!.attention!.since)) }] : []),
   ];
   const names = new Map(hosted.map(h => [h.id, sessionLabel(h)]));
   const addFolder = (raw: string) => {
@@ -687,19 +692,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     const known = new Set(pastSessions.map(r => r.id));
     if (liveList.hiddenSessions.some(id => !known.has(id))) setLiveList(p => ({ ...p, hiddenSessions: p.hiddenSessions.filter(id => known.has(id)) }));
   }, [pastSessions, liveList.hiddenSessions, setLiveList]);
-  const ended = hosted.filter(h => h.exit);
-  /** Every ended session the question counted leaves the list; a session's conversation stays on disk. */
-  const removeEnded = (ids: string[]) => act(async () => {
-    // Each on its own: one that fails leaves the others removed, and is said
-    const results = await Promise.allSettled(ids.map(id => harnessApi.forget(id)));
-    const done = ids.filter((_, i) => results[i].status === 'fulfilled');
-    setOpened(o => o.filter(x => !done.includes(x)));
-    setLayout(l => done.reduce((layout, id) => removeSessionFromLayout(layout, id), l));
-    setSelected(s => done.includes(s) ? '' : s);
-    done.forEach(id => pluginRegistry.emitEvent('session:closed', { id }));
-    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
-    if (failed) throw new Error(`${ids.length - done.length} of ${ids.length} ended sessions could not be removed: ${err(failed.reason)}`);
-  });
 
   const projectResumables = useMemo(() => resumable.filter(r => r.cwd === cwd), [resumable, cwd]);
   const selectedResume = useMemo(() => projectResumables.find(r => r.id === resume) ?? null, [projectResumables, resume]);
@@ -932,7 +924,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                 ]}/>
               {onSearch && <button type="button" className="hs-dir-start" title={`Search the history of ${name}`} aria-label={`Search the history of ${d.path}`} onClick={() => onSearch(d.path)}><Search size={12}/></button>}
               {d.pinned && !d.sessions.length && <button type="button" className="hs-dir-start" title="Remove this folder from the list" aria-label={`Remove folder ${d.path}`} onClick={() => pin(pinned.filter(x => x !== d.path))}><X size={12}/></button>}
-              {!d.sessions.some(h => !h.exit) && <button type="button" className="hs-dir-start" title={`Hide ${name}: it goes to Hidden folders at the end of the list. Nothing is deleted`} aria-label={`Hide folder ${d.path}`} onClick={() => hideFolder(d.path)}><EyeOff size={12}/></button>}
+              {!d.sessions.some(h => !h.exit || needsYou(h)) && <button type="button" className="hs-dir-start" title={`Hide ${name}: it goes to Hidden folders at the end of the list. Nothing is deleted`} aria-label={`Hide folder ${d.path}`} onClick={() => hideFolder(d.path)}><EyeOff size={12}/></button>}
             </header>
             {d.sessions.length > 0 && <ul aria-label={`Sessions in ${d.path}`}>{relationRows(d.sessions, hosted).map(r => row(r, d.path))}</ul>}
             {d.earlier.length > 0 && <div className="hs-earlier">
@@ -955,7 +947,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
         })}
       </ul>
       {sections.length > shown.length && <button type="button" className="hs-more-folders" onClick={() => setAllHistory(true)}>{sections.length - shown.length} more folders with history</button>}
-      {ended.length > 0 && <button type="button" className="hs-more-folders hs-cleanup" onClick={() => setRemoving(ended.map(h => h.id))}><Trash2 size={11}/> Remove ended sessions · {ended.length}</button>}
       {hiddenFolders.length > 0 && <div className="hs-hidden">
         <button type="button" className="hs-earlier-toggle" aria-expanded={hiddenOpen} onClick={() => setHiddenOpen(o => !o)}>
           {hiddenOpen ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}<EyeOff size={11}/> Hidden folders · {hiddenFolders.length}
@@ -972,10 +963,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
           {liveList.hideNoise && <li className="hs-earlier-more">Folders that are gone and agents' temporary folders are left out by themselves; turn that off in Settings → Harnesses.</li>}
         </ul>}
       </div>}
-      {removing && <ConfirmDialog title={`Remove ${removing.length} ended session${removing.length === 1 ? '' : 's'} from the list?`} confirmLabel={`Remove ${removing.length}`}
-        onCancel={() => setRemoving(null)} onConfirm={() => { const ids = removing; setRemoving(null); removeEnded(ids); }}>
-        <p>Their terminal output in Agent MCR goes with them. Their conversations stay on disk with Claude Code and Codex: you find them under their folder's Earlier sessions and in Journal, and can resume them.</p>
-      </ConfirmDialog>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
     </aside>
   );

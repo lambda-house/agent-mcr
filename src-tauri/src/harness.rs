@@ -1331,22 +1331,20 @@ impl Store {
     }
 
     /// The session's process ended (the runner said so, or its list shows it):
-    /// the store knows it from here on. Nothing waits on an ended session:
-    /// its mark goes, and its open waits are closed. Returns true when this
-    /// changed anything.
+    /// the store knows it from here on. Prompts and waits end with the process,
+    /// but the operator can still have a report to read.
     fn end(&mut self, id: &str) -> bool {
         let Some(t) = self.sessions.get_mut(id) else { return false };
-        if t.state == ENDED && t.attention.is_none() {
+        if t.state == ENDED {
             return false;
         }
-        t.attention = None;
+        let pending = t.pending_report.take().and_then(|id| self.reports.iter().find(|r| r.id == id));
+        t.attention = t.attention.take().filter(|a| a.report.is_some()).or_else(|| pending.map(|r| report_mark(&r.kind, &r.text, r.created)));
         t.draft = false;
         t.draft_generation = None;
         t.held_told = false;
-        if t.state != ENDED {
-            t.state = ENDED.into();
-            t.since = now_ms();
-        }
+        t.state = ENDED.into();
+        t.since = now_ms();
         // A restart ends the process and carries the waits to the new one
         if !self.restarting.contains(id) {
             let now = now_ms();
@@ -1441,7 +1439,8 @@ impl Store {
 
     /// A report made at a prompt gets its mark once the prompt is gone (MCR-124,
     /// M7). Run at every write of the store, so no place that takes a prompt
-    /// mark away can forget it. A later report, or the session's end, ends it.
+    /// mark away can forget it. A later report replaces it. An exit raises it
+    /// in `end`, when the prompt itself can no longer be answered.
     fn raise_pending(&mut self, now: u64) {
         let pending: Vec<(String, String)> = self.sessions.iter().filter_map(|(id, t)| t.pending_report.clone().map(|r| (id.clone(), r))).collect();
         for (id, report) in pending {
@@ -1844,7 +1843,7 @@ fn short_text(text: &str, chars: usize) -> String {
 impl Store {
     // Matches the Board's openReports rule: one active mark, latest matching report.
     fn open_report(&self, session: &str) -> Option<&Report> {
-        let tracked = self.sessions.get(session).filter(|t| t.state != ENDED)?;
+        let tracked = self.sessions.get(session)?;
         // A report made at a prompt is open while the prompt stands (MCR-124, M7)
         if let Some(pending) = tracked.pending_report.as_deref().filter(|_| tracked.attention.as_ref().is_some_and(|a| a.kind == "permission")) {
             return self.reports.iter().find(|r| r.id == pending);
@@ -2820,7 +2819,7 @@ impl Harness {
         // An exit the service did not hear of (it was down, or restarting): the list says so
         let ended: Vec<&str> = {
             let store = lock(&self.store);
-            infos.iter().filter(|i| !i["exit"].is_null()).filter_map(|i| i["id"].as_str()).filter(|id| store.sessions.get(*id).is_some_and(|t| t.state != ENDED || t.attention.is_some())).collect()
+            infos.iter().filter(|i| !i["exit"].is_null()).filter_map(|i| i["id"].as_str()).filter(|id| store.sessions.get(*id).is_some_and(|t| t.state != ENDED)).collect()
         };
         if !ended.is_empty() {
             self.update(|s| ended.iter().for_each(|id| { s.end(id); }));
@@ -2885,7 +2884,7 @@ impl Harness {
                 });
                 if !info["exit"].is_null() {
                     tracked.state = "exited".into();
-                    tracked.attention = None;
+                    tracked.attention = tracked.attention.filter(|a| a.report.is_some());
                 }
                 // An unnamed session goes by the title its agent gave it
                 tracked.named = !tracked.name.is_empty();
@@ -5074,8 +5073,12 @@ impl Harness {
             // The human looked at this version of the notice; a newer one must survive.
             "ack" => {
                 let id = id()?;
+                let since = req["since"].as_u64();
                 self.update(|s| {
-                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| a.kind == "notification" && req["since"].as_u64().is_none_or(|since| since == a.since))) {
+                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| {
+                        let can_ack = a.kind == "notification" || (t.state == ENDED && a.report.is_some() && since.is_some());
+                        can_ack && since.is_none_or(|since| since == a.since)
+                    })) {
                         t.attention = None;
                     }
                 });
@@ -10171,6 +10174,8 @@ mod tests {
             s.sessions.insert("gone".into(), Tracked { name: "Trust check Codex".into(), profile: "codex".into(), state: "waiting".into(), supervisor: Some("up".into()), ..Tracked::default() });
             s.sessions.get_mut("gone").unwrap().attention = Some(Attention { kind: "permission".into(), text: "Trust this folder?".into(), since: 1, ..Attention::default() });
             s.waits.insert("w".into(), Wait { id: "w".into(), session: "gone".into(), created: 1, expect_by: now_ms() + 3_600_000, on: "CI".into(), ..Wait::default() });
+            s.sessions.insert("worktree".into(), Tracked { name: "Worktree executor".into(), profile: "claude".into(), state: "idle".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            s.report("worktree", "done", "Ready to read").unwrap();
         });
         // The status report asks the list first: only the running executor is in it
         let report = h.agent_tool("up", "report", &json!({"kind": "status", "text": "where things stand"})).unwrap();
@@ -10186,13 +10191,20 @@ mod tests {
         assert!(lock(&h.store).waits["w"].cleared > 0);
         let on_disk: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
         assert_eq!((on_disk.sessions["gone"].state.as_str(), on_disk.sessions["gone"].attention.is_none()), (ENDED, true));
-        // And nothing in the attention list
-        assert!(h.attention().unwrap().is_empty());
+        // The dead prompt is gone. The report survives reconciliation and later polls.
+        let attention = h.attention().unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0]["session"], "worktree");
+        assert_eq!(attention[0]["attention"]["report"], "done");
         // An ended session whose folder is no longer on disk says so in the list (MCR-107);
         // one whose folder is there, and a running one, do not
         let listed = h.sessions().unwrap();
+        let ended_report = listed.iter().find(|s| s["id"] == "worktree").unwrap();
+        assert_eq!(ended_report["harness"]["attention"]["report"], "done");
         let gone_folder = |id: &str| listed.iter().find(|s| s["id"] == id).unwrap()["cwdGone"].clone();
         assert_eq!((gone_folder("worktree"), gone_folder("gone"), gone_folder("running-in-gone"), gone_folder("up")), (json!(true), Value::Null, Value::Null, Value::Null));
+        h.control(&json!({"op": "ack", "id": "worktree", "since": ended_report["harness"]["attention"]["since"]})).unwrap();
+        assert!(h.attention().unwrap().is_empty());
         // The Slack connector is told only of running sessions, so a channel routed to the
         // ended one is held as "The routed session is not running", and its inbox takes nothing
         use crate::slack::Host;
@@ -10255,6 +10267,53 @@ mod tests {
         let ex = lock(&harness.store).sessions["ex"].clone();
         assert_eq!((ex.state.as_str(), ex.attention.is_none()), (ENDED, true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ended_executor_keeps_its_open_report_and_the_assigner_can_read_its_result() {
+        let dir = socket_test_dir("mcr-ended-report-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = Harness::open(&dir);
+        let report = h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { name: "Lead".into(), state: "working".into(), ..Tracked::default() });
+            s.sessions.insert("worker".into(), Tracked { name: "Worker".into(), state: "waiting".into(), supervisor: Some("lead".into()),
+                attention: Some(Attention { kind: "permission".into(), since: 1, ..Attention::default() }), ..Tracked::default() });
+            s.sessions.insert("done".into(), Tracked { state: "idle".into(), ..Tracked::default() });
+            s.report("done", "done", "Finished").unwrap();
+            s.tasks.insert("task".into(), Task { id: "task".into(), session: "worker".into(), text: "Run the checks".into(), state: "completed".into(),
+                created: 1, started: 2, finished: 3, result: Some("All checks passed".into()), by: "lead".into(), told: false });
+            s.post(Message { from: "worker".into(), to: "lead".into(), text: "A final message".into(), ..Message::default() });
+            s.report("worker", "needs_human", "Check the result").unwrap()
+        });
+        h.runner_event(&json!({"event": "exited", "id": "worker"}));
+        h.runner_event(&json!({"event": "exited", "id": "worker"}));
+        h.runner_event(&json!({"event": "exited", "id": "done"}));
+        h.tell_assigners();
+        let state = Harness::open(&dir);
+        {
+            let s = lock(&state.store);
+            assert!(s.executors("lead").is_empty());
+            assert!(s.under("lead", "worker"));
+            assert!(s.sessions["worker"].pending_report.is_none());
+            let mark = s.sessions["worker"].attention.as_ref().unwrap();
+            assert_eq!((mark.kind.as_str(), mark.since), ("assessment", report.created));
+            assert_eq!(s.open_report("worker").unwrap().id, report.id);
+            assert_eq!(s.open_report("done").unwrap().kind, "done");
+        }
+        let task = state.agent_tool("lead", "task_status", &json!({"task": "task"})).unwrap();
+        assert_eq!(task["result"], "All checks passed");
+        let inbox = state.agent_tool("lead", "read_inbox", &json!({})).unwrap();
+        let messages = inbox["messages"].as_array().unwrap();
+        for text in ["A final message", "All checks passed"] {
+            assert!(messages.iter().any(|m| m["from"]["id"] == "worker" && m["text"].as_str().is_some_and(|s| s.contains(text))), "{inbox}");
+        }
+        state.control(&json!({"op": "ack", "id": "worker", "since": report.created - 1})).unwrap();
+        assert!(lock(&state.store).open_report("worker").is_some());
+        state.control(&json!({"op": "ack", "id": "worker", "since": report.created})).unwrap();
+        let s = lock(&state.store);
+        assert!(s.open_report("worker").is_none());
+        assert!(s.board_reports().iter().any(|r| r.id == report.id));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
