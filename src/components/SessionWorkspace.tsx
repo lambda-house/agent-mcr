@@ -1,7 +1,7 @@
 import { homePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, ChevronRight, ClipboardList, History, MessageSquare, Play, Search, Settings, Shield, Terminal, X, Zap } from 'lucide-react';
-import { compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
+import { applyJournalUpdate, compact, formatSessionTitle, family, origin, within, sessionDirectories, matchesActivity, matchesSession, sessionApi, sessionKey, sumUsage, totalTokens, type SessionEvent, type Session, type Snapshot } from '../utils/sessions';
 import { isTauri } from '../utils/tauri';
 import { useStore } from '../store';
 import { pluginRegistry, usePluginVersion } from '../plugins';
@@ -43,13 +43,15 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const activePluginTab = topTabs.find(t => t.id === view);
   // Posts that wait for the person's approval: shown on the Slack tab from every view
   const [slackWaiting, setSlackWaiting] = useState(0);
+  const showingSlack = view === 'slack';
   useEffect(() => {
-    if (!active || !isTauri()) return;
-    const look = () => { if (!document.hidden) slackApi.status().then(s => setSlackWaiting(s.counts.waiting)).catch(() => {}); };
+    if (!active || showingSlack || !isTauri()) return;
+    let live = true;
+    const look = () => { if (!document.hidden) slackApi.waiting().then(count => { if (live) setSlackWaiting(count); }).catch(() => {}); };
     look();
     const timer = setInterval(look, 4000);
-    return () => clearInterval(timer);
-  }, [active]);
+    return () => { live = false; clearInterval(timer); };
+  }, [active, showingSlack]);
   const [data, setData] = useState<Snapshot>(empty);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [focusedEvidence, setFocusedEvidence] = useState<{ session: string; event: SessionEvent } | null>(null);
@@ -62,12 +64,25 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const [filter, setFilter] = useState('all');
   const [tab, setTab] = useState('activity'); const [eventFilter, setEventFilter] = useState('all');
   const inflight = useRef(false); const mounted = useRef(true); const contextVersion = useRef(0); const held = useRef('');
+  const accessEpoch = useRef(0);
   const refresh = useCallback(async () => {
-    if (inflight.current) return; inflight.current = true; setBusy(true);
-    // Only a snapshot whose content changed comes across: the index of every session, megabytes, every five seconds otherwise (MCR-141)
-    try { const answer = await sessionApi.snapshotSince(held.current); const result = answer.snapshot; if (mounted.current) { if (result) { held.current = answer.stamp; setData(result); setSelected(s => s || (result.sessions[0] ? sessionKey(result.sessions[0]) : '')); } setError(''); } }
-    catch(e) { if(mounted.current) setError(err(e)); }
-    finally { inflight.current = false; if(mounted.current) setBusy(false); }
+    if (inflight.current) return;
+    inflight.current = true;
+    const epoch = accessEpoch.current;
+    const initial = !held.current;
+    if (initial) setBusy(true);
+    try {
+      const update = await sessionApi.journalSince(held.current);
+      if (!mounted.current || epoch !== accessEpoch.current) return;
+      held.current = update.stamp;
+      if (update.snapshot) setData(current => applyJournalUpdate(current, update));
+      setError('');
+    } catch (e) {
+      if (mounted.current && epoch === accessEpoch.current) setError(err(e));
+    } finally {
+      inflight.current = false;
+      if (initial && mounted.current && epoch === accessEpoch.current) setBusy(false);
+    }
   }, []);
   useEffect(() => { mounted.current = true; if (!isTauri()) { setEnabled(false); return; } sessionApi.access().then(setEnabled).catch(e => setError(err(e))); return () => { mounted.current = false; }; }, []);
   // On Live the snapshot only names earlier sessions (the hosted ones come with their figures): read it seldom there (MCR-139)
@@ -78,6 +93,10 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     const timer = setTimeout(() => { if (!document.hidden) void refresh(); }, 150);
     return () => clearTimeout(timer);
   }, [enabled, active, data.indexedAt, data.pendingFiles, refresh]);
+  useEffect(() => {
+    const first = data.sessions[0];
+    if (first) setSelected(s => s || sessionKey(first));
+  }, [data.sessions]);
   useEffect(() => { setOlderEvents(null); contextVersion.current++; }, [selected]);
   const filtered = useMemo(() => data.sessions.filter(s =>
     (provider === 'all' || s.provider === provider)
@@ -85,16 +104,16 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
     && (!directory || sessionDirectories(s).some(path => within(path,directory)))
     && matchesActivity(s,{activeSince:Date.parse(activeSince),inactiveSince:Date.parse(inactiveSince),activeMinutes:Number(activeMinutes),inactiveMinutes:Number(inactiveMinutes)})
     && (filter === 'all' || (filter === 'recent' ? Date.now()-s.modified<86400000 : filter === 'roots' ? !s.parentId : s.status===filter))
-    && matchesSession(s,query)), [data,provider,role,directory,activeSince,inactiveSince,activeMinutes,inactiveMinutes,filter,query]);
+    && matchesSession(s,query)), [data.sessions,provider,role,directory,activeSince,inactiveSince,activeMinutes,inactiveMinutes,filter,query]);
+  const summary = data.sessions.find(s => sessionKey(s) === selected);
   useEffect(() => {
     if (!active) return;
-    const summary = data.sessions.find(s => sessionKey(s) === selected);
     if (!summary) { setDetail(null); return; }
     let cancelled = false;
     sessionApi.detail(summary.provider, summary.id).then(s => { if (!cancelled) setDetail({ ...s, status: summary.status }); }).catch(e => { if (!cancelled) setError(err(e)); });
     return () => { cancelled = true; };
-  }, [selected, data, active]);
-  const chosen = detail && sessionKey(detail) === selected ? detail : data.sessions.find(s => sessionKey(s) === selected);
+  }, [summary, active]);
+  const chosen = summary && detail && sessionKey(detail) === selected ? detail : summary;
   const usage = sumUsage(filtered); const working = filtered.filter(s => s.status === 'working').length;
   const events = focusedEvidence?.session === selected ? [focusedEvidence.event] : olderEvents ?? chosen?.events ?? [];
   const descendants = chosen ? family(data.sessions,chosen) : [];
@@ -138,7 +157,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         </div>
       </details>}
     </header>
-    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
+    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} sessionAccess={enabled === true} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
     {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
     {/* Only while Sessions is shown: an overlay may listen for keys (the command panel's Cmd+S), and over Documents those are the editor's */}
     {active && globalOverlays.map(o => o.render({
@@ -180,7 +199,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
           <button className="sc-clear-filters" onClick={clearFilters}><X size={12}/> Clear</button>
         </div>}
         <SessionResults all={data.sessions} matches={filtered} selected={selected} select={setSelected} directory={directory} narrow={setDirectory} live={live}/>
-        {!filtered.length && <div className="sc-empty">{busy ? 'Indexing transcripts…' : 'No sessions match these filters.'}</div>}
+        {!filtered.length && <div className="sc-empty">{busy || data.pendingFiles > 0 ? 'Indexing transcripts…' : 'No sessions match these filters.'}</div>}
       </aside>
       <main className="sc-detail">{chosen ? <><div className="sc-detail-heading"><div className="sc-session-meta"><span className={`sc-provider ${chosen.provider}`}>{chosen.provider}</span><span className={`sc-status ${chosen.status}`}>{chosen.status}</span><span>{origin(chosen)==='human' ? 'Human session' : origin(chosen)} · {chosen.name}</span></div><h2 title={label(chosen)}>{label(chosen)}</h2><p title={chosen.cwd}>{chosen.cwd}</p><div className="sc-detail-info"><span><Zap size={14}/>{chosen.model || 'Unknown model'} {chosen.effort && `· ${chosen.effort}`}</span><span>{compact(totalTokens(chosen.usage))} recorded tokens</span><span>{chosen.eventCount.toLocaleString()} events</span>{!chosen.parentId && isTauri() && <button className="ss-resume" title="Continue this session in a hosted terminal, in its folder" onClick={() => void resumeLive(chosen)}><Play size={11}/> Resume in Live</button>}</div></div>
         <nav className="sc-tabs" aria-label="Session details">{['activity','agents','usage','memories','linked work'].map(t => <button key={t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>{t}{t === 'agents' && <span>{descendants.length - 1}</span>}</button>)}</nav>
@@ -193,7 +212,7 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
         {tab === 'usage' && <><h3>Recorded usage</h3><p className="sc-note">Lifetime of this session. Cached and cache-write input are included in input; reasoning is included in output. Token counts are not a monetary bill. Missing telemetry is shown as unknown.</p>{!chosen.usageKnown ? <p>No usage reported in this transcript.</p> : <><div className="sc-usage-grid">{Object.entries(chosen.usage).map(([k,v]) => <Metric key={k} label={k.replace('cacheWrite','cache write')} value={v.toLocaleString()} hint="tokens"/>)}</div><h3>By model</h3><table><thead><tr><th>Model</th><th>Input</th><th>Cached</th><th>Output</th></tr></thead><tbody>{Object.entries(chosen.models).map(([m,u]) => <tr key={m}><td>{m || 'Unattributed'}</td><td>{compact(u.input)}</td><td>{compact(u.cached)}</td><td>{compact(u.output)}</td></tr>)}</tbody></table></>}<h3>Tools used</h3>{Object.entries(chosen.tools).sort((a,b) => b[1]-a[1]).map(([tool,count]) => <div className="sc-tool-row" key={tool}><code>{tool}</code><span>{count}</span></div>)}<details className="sc-provenance"><summary>Source & accounting provenance</summary><p>{chosen.source}</p><p>Started {date(chosen.started)} · updated {date(chosen.updated)}</p><p>{chosen.provider === 'codex' ? 'Unique response usage records for this thread; older transcripts fall back to cumulative usage differences.' : 'Unique message IDs; repeated usage fragments are counted by positive increments.'}</p><p>Skipped malformed records: {chosen.malformedLines}</p></details></>}
         {tab === 'linked work' && <><h3>Ticket mentions</h3><p className="sc-note">Keys found in messages and tool activity. A mention is evidence of a reference, not an assignment.</p><div className="sc-ticket-list">{chosen.tickets.map(key => <code key={key}>{key}</code>)}</div>{!chosen.tickets.length && <p>No ticket mentions found.</p>}<h3>Memory tools observed</h3>{chosen.memoryRefs.length ? chosen.memoryRefs.map(r => <code className="sc-memory-ref" key={r}>{r}</code>) : <p className="sc-note">No named memory calls observed. Calls through shell wrappers may not be identifiable.</p>}</>}
         </div></> : <div className="sc-empty"><Bot size={32}/><h2>Select a session</h2><p>Inspect its activity, agents and linked work.</p></div>}</main></div>
-      <footer className="sc-footer"><span title={data.cachePath || 'No persistent cache'}><i className="sc-local-dot"/> {data.cachePath ? 'SQLite index' : 'In-memory index'} · {data.restoredFiles || 0} restored · {data.pendingFiles ? `${data.pendingFiles} files still indexing · totals partial` : 'history indexed'} · {compact(data.bytesRead || 0)} bytes read this scan · {data.errors.length} warnings</span><button onClick={async () => { try { await sessionApi.disable(); setEnabled(false); setData(empty); held.current = ''; } catch(e) {setError(err(e));} }}>Revoke session access</button></footer>
+      <footer className="sc-footer"><span title={data.cachePath || 'No persistent cache'}><i className="sc-local-dot"/> {data.cachePath ? 'SQLite index' : 'In-memory index'} · {data.restoredFiles || 0} restored · {data.pendingFiles ? `${data.pendingFiles} files still indexing · totals partial` : 'history indexed'} · {compact(data.bytesRead || 0)} bytes read this scan · {data.errors.length} warnings</span><button onClick={async () => { try { await sessionApi.disable(); accessEpoch.current++; setEnabled(false); setData(empty); setDetail(null); setBusy(false); held.current = ''; } catch(e) {setError(err(e));} }}>Revoke session access</button></footer>
       {data.errors.length > 0 && <details className="sc-errors"><summary>Index warnings</summary>{data.errors.map((e,i) => <p key={i}>{e}</p>)}</details>}
     </>}</>}</section>;
 }

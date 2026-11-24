@@ -22,33 +22,47 @@ export function hostedKeys(hosted: Hosted[]): string[] {
  * hosted conversations come back (MCR-139): the whole index, sent every ten
  * seconds, was megabytes the web view parsed and dropped each time.
  */
-export function useSessionMetrics(active: boolean, hosted: Hosted[] = []) {
-  const [data, setData] = useState<Record<string, Session>>({});
+const NO_METRICS: Record<string, Session> = {};
+
+export function useSessionMetrics(active: boolean, hosted: Hosted[], sessionAccess: boolean) {
+  const [data, setData] = useState(NO_METRICS);
   const keys = hostedKeys(hosted).join(' ');
   const wanted = useRef(keys);
   wanted.current = keys;
   const loader = useRef<() => void>(() => {});
   useEffect(() => {
+    if (!sessionAccess) { setData(NO_METRICS); return; }
     if (!active) return;
     let live = true, pending = false;
     const load = async () => {
       if (pending || document.hidden) return;
       pending = true;
+      const requested = wanted.current;
       try {
-        const asked = wanted.current ? wanted.current.split(' ') : [];
+        const asked = requested ? requested.split(' ') : [];
         const sessions = asked.length ? await sessionApi.pick(asked) : [];
-        if (live) { const next = Object.fromEntries(sessions.map(s => [sessionKey(s), s])); setData(held => keepSame(held, next)); }
-      } catch { if (live) setData(held => Object.keys(held).length ? {} : held); }
-      finally { pending = false; }
+        if (live) setData(held => {
+          const next = Object.fromEntries(sessions.map(s => {
+            const key = sessionKey(s);
+            return [key, keepSame(held[key], s)];
+          }));
+          const entries = Object.entries(next);
+          return entries.length === Object.keys(held).length && entries.every(([key, s]) => held[key] === s) ? held : next;
+        });
+      } catch { if (live) setData(NO_METRICS); }
+      finally {
+        pending = false;
+        if (live && requested !== wanted.current) void load();
+      }
     };
     loader.current = () => void load();
     void load();
     const timer = setInterval(() => void load(), 10_000);
     return () => { live = false; clearInterval(timer); loader.current = () => {}; };
-  }, [active]);
+  }, [active, sessionAccess]);
   // A session that started or ended is asked for at once, not at the next tick
   useEffect(() => { loader.current(); }, [keys]);
-  return data;
+  return sessionAccess ? data : NO_METRICS;
 }
 
 const STALE_MS = 5 * 60_000;
@@ -61,9 +75,8 @@ export function indexedSession(hosted: Hosted, data: Record<string, Session>): S
 }
 
 /** The row class of a live session by its prompt cache: glowing while warm, ashes once cold. */
-export function cacheClass(hosted: Hosted, data: Record<string, Session>, now: number): string {
-  const s = hosted.exit ? undefined : indexedSession(hosted, data);
-  const cache = s && cacheState(s, now);
+export function cacheClass(hosted: Hosted, session: Session | undefined, now: number): string {
+  const cache = !hosted.exit && session && cacheState(session, now);
   if (!cache) return '';
   // A session at work refreshes its cache with every request, whatever the index last saw
   if (cache.warm || hosted.harness?.state === 'working') return cache.cooling ? 'cache-warm cache-cooling' : 'cache-warm';

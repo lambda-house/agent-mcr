@@ -62,7 +62,7 @@ export interface ProgramStatus {
 /** A terminal the runner hosts (`runner::Info`), with the service's view of it. */
 export interface Hosted {
   id: string; pid: number | null; argv: string[]; cwd: string; started: number;
-  cols: number; rows: number; title: string; lastOutput: number;
+  cols: number; rows: number; title: string; lastOutput?: number;
   exit: HostedExit | null; meta: Record<string, string>;
   /** What the program said of itself in its output (absent from a runner older than MCR-115) */
   program?: ProgramStatus;
@@ -397,6 +397,7 @@ export const SLACK_POSTING: Record<SlackPosting, string> = {
 
 export const slackApi = {
   status: () => invoke<SlackStatus>('slack_status'),
+  waiting: () => invoke<number>('slack_waiting'),
   /** Null when the person said no in the native dialog */
   connect: (bot: string, appToken: string, operator: string) => invoke<SlackStatus | null>('slack_connect', { bot, appToken, operator }),
   disconnect: () => invoke<SlackStatus>('slack_disconnect'),
@@ -453,6 +454,7 @@ export const harnessApi = {
   /** Ends every session and both processes after a native dialog; resolves to whether it was done */
   stopBackground: (uninstall: boolean) => invoke<boolean>('harness_background_stop', { uninstall }),
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
+  listSince: (stamp: string) => invoke<{ stamp: string; sessions: Hosted[] | null }>('harness_list_since', { stamp: stamp || null }),
   /** `supervisor`: the session the new one works for, as its executor */
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string, supervisor?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume, supervisor: supervisor ?? null }),
   /** Connect a session to a supervising one (asked in a native dialog; null when the person said no), or detach it */

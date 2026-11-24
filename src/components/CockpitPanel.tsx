@@ -297,11 +297,12 @@ function TrackRow({ track: t, group, onUnfold, cockpit, hosted, label, onSession
 
 /**
  * `hosted` is the Live list as it is now; `label` names a session as the list
- * does; `onSession` opens one. The cockpit document is asked for while
- * `active`, as often as the list.
+ * does; `onSession` opens one. A collapsed panel refreshes its header count
+ * less often and reads again when opened.
  */
 /** How long a read of the cockpit may take before the panel says it could not be read (MCR-118). */
 export const READ_TIMEOUT_MS = 5000;
+export const CLOSED_POLL_MS = 15_000;
 
 export default function CockpitPanel({ active, hosted, label, onSession }: { active: boolean; hosted: Hosted[]; label: (h: Hosted) => string; onSession: (id: string) => void }) {
   const [cockpit, setCockpit] = useState<Cockpit | null>(null);
@@ -313,22 +314,21 @@ export default function CockpitPanel({ active, hosted, label, onSession }: { act
   useEffect(() => {
     if (!active) return;
     let live = true;
-    // Only the newest read may change what is shown: one that hung and answers late is older than what came since
-    let started = 0; let shown = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const load = () => {
-      const n = ++started;
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (document.hidden || timer !== undefined) return;
       // A read that hangs is said, never covered by the last good one: "nothing needs you" is a claim
       const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer from the harness service in ${READ_TIMEOUT_MS / 1000} s`)), READ_TIMEOUT_MS); });
       Promise.race([Promise.resolve().then(() => harnessApi.cockpit()), late])
-        .then(c => { if (live && n > shown) { shown = n; const next = c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null; setCockpit(held => keepSame(held, next)); setError(''); } })
-        .catch(e => { if (live && n > shown) { shown = n; setError(String(e instanceof Error ? e.message : e)); } })
-        .finally(() => clearTimeout(timer));
+        .then(c => { if (live) { const next = c && Array.isArray(c.tracks) && Array.isArray(c.actions) ? { ...c, sessions: c.sessions ?? {} } : null; setCockpit(held => keepSame(held, next)); setError(''); } })
+        .catch(e => { if (live) setError(String(e instanceof Error ? e.message : e)); })
+        .finally(() => { clearTimeout(timer); timer = undefined; });
     };
     load();
-    const timer = setInterval(() => { if (!document.hidden) load(); }, 2000);
-    return () => { live = false; clearInterval(timer); };
-  }, [active]);
+    const interval = setInterval(load, closed ? CLOSED_POLL_MS : 2000);
+    document.addEventListener('visibilitychange', load);
+    return () => { live = false; clearTimeout(timer); clearInterval(interval); document.removeEventListener('visibilitychange', load); };
+  }, [active, closed]);
 
   const toggle = () => setClosed(c => { store(CLOSED_KEY, c ? '0' : '1'); return !c; });
   const resize = useCallback((clientY: number) => {

@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import CockpitPanel, { READ_TIMEOUT_MS } from './CockpitPanel';
+import CockpitPanel, { CLOSED_POLL_MS, READ_TIMEOUT_MS } from './CockpitPanel';
 import { harnessApi, type Cockpit, type Hosted } from '../utils/harness';
 import { readFileSync } from 'node:fs';
 
@@ -261,6 +261,26 @@ it('does not say that nothing needs the person before it has read the cockpit, o
   await show();
   expect(host.querySelector('.ck-head [role="alert"]')!.textContent).toBe('could not be read');
   expect(host.querySelector('.ck-head')!.textContent).not.toContain('nothing needs you');
+});
+
+it('reads a collapsed cockpit less often and refreshes immediately on opening', async () => {
+  vi.useFakeTimers();
+  try {
+    localStorage.setItem('hs-cockpit-closed', '1');
+    await act(async () => root.render(<CockpitPanel active hosted={hosted} label={label} onSession={() => {}}/>));
+    expect(harnessApi.cockpit).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTimeAsync(CLOSED_POLL_MS - 1));
+    expect(harnessApi.cockpit).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(harnessApi.cockpit).toHaveBeenCalledTimes(2);
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Show the cockpit"]')!.click());
+    expect(harnessApi.cockpit).toHaveBeenCalledTimes(3);
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(harnessApi.cockpit).toHaveBeenCalledTimes(4);
+    await act(async () => root.render(<CockpitPanel active={false} hosted={hosted} label={label} onSession={() => {}}/>));
+    await act(async () => vi.advanceTimersByTimeAsync(CLOSED_POLL_MS));
+    expect(harnessApi.cockpit).toHaveBeenCalledTimes(4);
+  } finally { vi.useRealTimers(); }
 });
 
 it('names a session the service says runs, and the list has not shown yet, without calling it ended', async () => {

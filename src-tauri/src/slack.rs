@@ -273,6 +273,10 @@ struct State {
 }
 
 impl State {
+    fn waiting(&self) -> usize {
+        self.posts.values().filter(|p| p.state == "waiting").count()
+    }
+
     fn log(&mut self, kind: &str, text: String) {
         self.audit.push(Audit { at: now_ms(), kind: kind.into(), text });
     }
@@ -447,6 +451,11 @@ impl Slack {
         self.shown(None)
     }
 
+    /// The workspace tab's badge only needs the approval count.
+    pub fn waiting(&self) -> usize {
+        lock(&self.state).waiting()
+    }
+
     fn shown(&self, live: Option<&[Peer]>) -> Value {
         let link = lock(&self.link).clone();
         let state = lock(&self.state);
@@ -491,7 +500,7 @@ impl Slack {
                 "refusedApprovals": state.refused_approvals,
                 "deliveredFromStrangers": state.received.values().filter(|r| r.session.is_some() && !r.allowed).count(),
                 "held": state.received.values().filter(|r| r.held.is_some()).count(),
-                "waiting": state.posts.values().filter(|p| p.state == "waiting").count(),
+                "waiting": state.waiting(),
             },
         })
     }
@@ -1847,6 +1856,7 @@ mod tests {
         let (_dir, slack, web, host) = connected("approve");
         let p = ask(&slack, &host, "slack_post", json!({"channel": "#ops", "text": "done <!channel> & more"}));
         assert_eq!(p.state, "waiting");
+        assert_eq!(slack.waiting(), 1);
         assert_eq!(lock(&host.notices).len(), 1);
         // The approval message goes to the operator's direct messages; nothing is posted to the channel
         slack.work(&host);
@@ -1859,6 +1869,7 @@ mod tests {
         assert_eq!(post_of(&slack, &p.id).state, "waiting");
         assert_eq!(slack.status()["counts"]["refusedApprovals"], 1);
         slack.on_action(&host, &press("UOP", "post_approve", &p));
+        assert_eq!(slack.waiting(), 0);
         assert_eq!(post_of(&slack, &p.id).allowed_by, "slack");
         while slack.work(&host) {}
         let sent = web.last("chat.postMessage");
