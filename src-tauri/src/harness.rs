@@ -943,6 +943,11 @@ pub struct Tracked {
     /// The operator has a line in its input box that is not sent yet, by the
     /// app's word (`operator_draft`, MCR-85): nothing is typed into it meanwhile
     pub draft: bool,
+    /// Which app's local key count began the current hold, if known.
+    /// A monotonic generation is boot-scoped. After a service restart the
+    /// saved hold stays, and a local key count alone cannot release it.
+    #[serde(skip)]
+    draft_generation: Option<u64>,
     /// When the app last said that `draft` changed
     pub typed: u64,
     /// The operator was told that something waits for this draft (once per draft)
@@ -1336,6 +1341,7 @@ impl Store {
         }
         t.attention = None;
         t.draft = false;
+        t.draft_generation = None;
         t.held_told = false;
         if t.state != ENDED {
             t.state = ENDED.into();
@@ -2274,6 +2280,7 @@ fn answered(tracked: &mut Tracked, now: u64) {
 /// the app is telling just now lands before anything is typed there.
 fn clear_draft(tracked: &mut Tracked, now: u64) {
     tracked.draft = false;
+    tracked.draft_generation = None;
     tracked.typed = now;
     tracked.held_told = false;
     if tracked.attention.as_ref().is_some_and(|a| a.text == HELD_MARK) {
@@ -2543,6 +2550,8 @@ pub struct Harness {
     shown: Mutex<BTreeMap<String, String>>,
     /// When a held session's screen was last read for an empty input box (`check_drafts`)
     drafts_checked: Mutex<BTreeMap<String, u64>>,
+    /// Latest app generation seen by the service, ordered with draft updates.
+    draft_window: Mutex<u64>,
     /// When the app last said a session has an unsent line, by any word
     /// (`operator_draft` says so again while the person types): kept here,
     /// not in the store, which is written only when the draft changes
@@ -2697,7 +2706,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_words: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()) };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -3461,6 +3470,7 @@ impl Harness {
             None => {
                 let t = s.sessions.get_mut(session).ok_or("that session has ended or is gone")?;
                 (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
+                t.draft_generation = None;
                 Ok(())
             }
         });
@@ -3471,6 +3481,7 @@ impl Harness {
             self.update(|s| {
                 if let Some(t) = s.sessions.get_mut(session) {
                     (t.draft, t.typed) = (false, now_ms());
+                    t.draft_generation = None;
                 }
             });
             return Err(e);
@@ -4889,7 +4900,22 @@ impl Harness {
     /// Requests from the app and from hooks.
     fn control(&self, req: &Value) -> Result<Value, String> {
         let id = || req["id"].as_str().ok_or_else(|| "Missing id".to_string());
-        match req["op"].as_str().unwrap_or("") {
+        let op = req["op"].as_str().unwrap_or("");
+        let generation = req["windowGeneration"].as_u64();
+        // Registration only orders draft reports. The PTY and any line in it
+        // outlive the app. Other operations have their own validity checks.
+        let _window = if let Some(generation) = generation.filter(|_| matches!(op, "window_opened" | "operator_input" | "operator_draft" | "clear_draft")) {
+            let mut latest = lock(&self.draft_window);
+            if generation < *latest && op != "window_opened" {
+                return Err("The app window was replaced".into());
+            }
+            *latest = (*latest).max(generation);
+            Some(latest)
+        } else {
+            None
+        };
+        match op {
+            "window_opened" => Ok(json!({})),
             "hello" => Ok(json!({
                 "protocol": PROTOCOL,
                 "pid": std::process::id(),
@@ -4930,6 +4956,19 @@ impl Harness {
                 let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
                 Ok(json!({"profiles": profiles(), "enabledProfiles": prefs.enabled_profiles, "supervisorProfile": prefs.supervisor_profile}))
             }
+            // The operator checked the box and dismissed the hold in the cockpit.
+            // The timestamp prevents a stale row from clearing a newer draft.
+            "clear_draft" => {
+                let id = id()?;
+                let since = req["since"].as_u64().ok_or("Missing draft timestamp")?;
+                self.update(|s| {
+                    let t = s.sessions.get_mut(id).filter(|t| t.draft && t.typed == since)
+                        .ok_or("The hold changed. Check the input box again.")?;
+                    clear_draft(t, now_ms());
+                    lock(&self.draft_words).remove(id);
+                    Ok(json!({}))
+                })
+            }
             // The operator pressed Enter in a terminal (`operator_input`) or
             // started or emptied a line there without sending it
             // (`operator_draft`, MCR-85). `draft` is whether the input box may
@@ -4942,6 +4981,10 @@ impl Harness {
                 // cannot know that; it says so again when the person types on
                 let asks = |t: &Tracked| t.attention.as_ref().is_some_and(|a| a.kind == "permission");
                 let draft = req["draft"].as_bool().unwrap_or(false) && !lock(&self.store).sessions.get(id).is_some_and(|t| !t.draft && asks(t));
+                // Keep the legacy app's key count working for holds it starts.
+                // None belongs to holds no app can clear by counting keys.
+                let owner = Some(generation.unwrap_or(0));
+                let may_clear = |t: &Tracked| enter || t.draft_generation == owner;
                 if draft {
                     lock(&self.draft_words).insert(id.to_string(), now_ms());
                 }
@@ -4955,7 +4998,8 @@ impl Harness {
                     let store = lock(&self.store);
                     store.sessions.get(id).is_some_and(|t| {
                         t.state != ENDED
-                            && (t.draft != draft
+                            && ((t.draft != draft && (draft || may_clear(t)))
+                                || (enter && draft)
                                 || (enter && (t.injected != 0 || t.pending_report.is_some() || t.attention.as_ref().is_some_and(|a| a.kind != "permission")))
                                 || (enter && (now.saturating_sub(t.operator_sent) >= SENT_STEP_MS || store.cockpit.points_at(id))))
                     })
@@ -4963,13 +5007,13 @@ impl Harness {
                 if changes {
                     self.update(|s| {
                         if let Some(t) = s.sessions.get_mut(id) {
-                            if t.draft != draft {
-                                t.draft = draft;
-                                t.typed = now_ms();
-                                t.held_told = false;
-                                // The mark that said so goes with the line
-                                if !draft && t.attention.as_ref().is_some_and(|a| a.text == HELD_MARK) {
-                                    t.attention = None;
+                            if t.draft != draft || (enter && draft) {
+                                if draft {
+                                    (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
+                                    t.draft_generation = owner;
+                                } else if may_clear(t) {
+                                    clear_draft(t, now_ms());
+                                    lock(&self.draft_words).remove(id);
                                 }
                             }
                             if enter {
@@ -8865,7 +8909,7 @@ mod tests {
     /// idle Claude sessions at an empty input box, and `lead`'s cockpit part:
     /// a typed word for `ex`, a decision and a command.
     fn clickable(name: &str) -> (PathBuf, Harness, u64) {
-        let dir = std::env::temp_dir().join(format!("agent-mcr-{name}-{}", runner::random_id()));
+        let dir = socket_test_dir(&format!("mcr-{name}-"));
         let harness = Harness::open(&dir);
         *lock(&harness.typed) = Some(Vec::new());
         let stamp = now_ms();
@@ -9139,6 +9183,178 @@ mod tests {
     }
 
     #[test]
+    fn a_placed_decision_stays_held_after_a_key_is_typed_and_deleted() {
+        let (dir, harness, stamp) = clickable("placed-decision");
+        std::fs::create_dir(&dir).unwrap();
+        let listener = Listener::bind(runner_socket(&dir)).unwrap();
+        let runner = std::thread::spawn(move || {
+            let sessions: Vec<_> = ["lead", "ex", "other"].map(|id| json!({"id": id})).into();
+            for (op, answer) in [("hello", json!({"protocol": runner::PROTOCOL})), ("list", json!({"sessions": sessions}))] {
+                let mut stream = listener.incoming().next().unwrap().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["op"], op);
+                writeln!(stream, "{answer}").unwrap();
+            }
+        });
+        let generation = 1;
+        harness.control(&json!({"op": "window_opened", "windowGeneration": generation})).unwrap();
+        let placed = harness.control(&json!({
+            "op": "cockpit_act", "by": "lead", "id": "pick", "updated": stamp,
+            "act": "choose", "option": 1, "windowGeneration": generation,
+        })).unwrap();
+        runner.join().unwrap();
+        assert_eq!(placed, json!({"placed": "lead"}));
+
+        for draft in [true, false] {
+            let answer = harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": draft, "windowGeneration": generation})).unwrap();
+            assert_eq!(answer["draft"], true);
+        }
+        assert_eq!(harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": false})).unwrap()["draft"], true);
+        lock(&harness.shown).insert("lead".into(), claude_idle_screen().replace("❯\n", "❯ Decision pick: Drop it\n"));
+        harness.update(|s| {
+            s.sessions.get_mut("lead").unwrap().typed = now_ms() - DRAFT_QUIET_MS;
+            s.post(Message { to: "lead".into(), text: "hello".into(), ..Message::default() });
+        });
+        harness.nudge("lead");
+        assert_eq!(typed_so_far(&harness), [("lead".to_string(), "\x1b[200~Decision pick: Drop it\x1b[201~".to_string())]);
+        let enter = harness.control(&json!({"op": "operator_input", "id": "lead", "draft": false, "windowGeneration": generation})).unwrap();
+        assert_eq!(enter["draft"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reopened_window_keeps_real_drafts_and_can_clear_empty_input_boxes() {
+        let (dir, harness, stamp) = clickable("window-drafts");
+        std::fs::create_dir(&dir).unwrap();
+        let first = 1;
+        let second = 2;
+        let report = |h: &Harness, id: &str, draft, generation| {
+            h.control(&json!({"op": "operator_draft", "id": id, "draft": draft, "windowGeneration": generation})).unwrap()
+        };
+        report(&harness, "lead", true, first);
+        harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place).unwrap();
+        harness.update(|s| {
+            s.sessions.insert("codex".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });
+        });
+        for id in ["other", "codex"] {
+            report(&harness, id, true, first);
+        }
+        harness.update(|s| {
+            for t in s.sessions.values_mut() {
+                t.typed = now_ms() - DRAFT_CHECK_MS;
+            }
+            s.post(Message { to: "lead".into(), text: "hello".into(), ..Message::default() });
+            s.add_task_for_test("ex", "queued work");
+        });
+
+        let open = |h: &Harness| h.control(&json!({"op": "window_opened", "windowGeneration": second})).unwrap();
+        open(&harness);
+        for id in ["lead", "ex"] {
+            // Typing one character and backspacing it in the new app is
+            // compatible with the old line still being in the box.
+            report(&harness, id, true, second);
+            assert_eq!(report(&harness, id, false, second)["draft"], true);
+        }
+        drop(harness);
+
+        let harness = Harness::open(&dir);
+        // Reconnecting the same app after a service restart cannot prove its
+        // local count describes the persisted line.
+        assert_eq!(report(&harness, "lead", false, first)["draft"], true);
+        open(&harness);
+        *lock(&harness.typed) = Some(Vec::new());
+        let draft = |id: &str| lock(&harness.store).sessions[id].draft;
+        for (id, text) in [("lead", " half a line"), ("ex", " merge MCR-97"), ("other", "")] {
+            let screen = claude_idle_screen().replace("❯\n", &format!("❯{text}\n"));
+            lock(&harness.shown).insert(id.into(), screen);
+            assert!(draft(id), "opening the window cleared {id} without proof");
+        }
+        harness.check_drafts();
+        assert!(!draft("other"), "the empty Claude box is proof");
+        assert!(draft("codex"), "the Codex box is unproven");
+        harness.nudge("lead");
+        harness.pump("ex");
+        assert!(draft("lead") && draft("ex"));
+        assert!(typed_so_far(&harness).is_empty());
+        assert!(lock(&harness.store).messages.values().any(|m| m.to == "lead" && !m.notified));
+        assert!(lock(&harness.store).tasks.values().any(|k| k.session == "ex" && k.open()));
+
+        harness.control(&json!({"op": "operator_input", "id": "codex", "draft": false, "windowGeneration": second})).unwrap();
+        assert!(!draft("codex"), "Enter in the relaunched app clears the stale hold");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_stale_draft_requests_are_refused_and_wall_time_does_not_order_windows() {
+        let dir = socket_test_dir("amcr-generation-");
+        let harness = Harness::open(&dir);
+        harness.update(|s| { s.sessions.insert("agent".into(), Tracked { state: "idle".into(), ..Tracked::default() }); });
+        let open = |generation, clock| harness.control(&json!({"op": "window_opened", "windowGeneration": generation, "windowStarted": clock})).unwrap();
+        open(1, 10_000);
+        open(2, 5_000);
+        open(1, 10_000); // a late registration cannot become current again
+
+        let call = |op, generation, draft| harness.control(&json!({
+            "op": op, "id": "agent", "draft": draft, "since": 0, "windowGeneration": generation
+        }));
+        assert_eq!(call("operator_draft", 2, true).unwrap()["draft"], true);
+        for op in ["operator_input", "operator_draft", "clear_draft"] {
+            assert_eq!(call(op, 1, false).unwrap_err(), "The app window was replaced");
+        }
+        for op in ["hello", "board", "settings"] {
+            assert!(call(op, 1, false).is_ok(), "{op} is independent of the draft window");
+        }
+        assert_eq!(call("operator_draft", 2, false).unwrap()["draft"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operator_enter_releases_the_hold_while_idle_or_working() {
+        let dir = socket_test_dir("amcr-enter-");
+        let harness = Harness::open(&dir);
+        for profile in ["claude", "codex"] {
+            for state in ["idle", "working"] {
+                harness.update(|s| {
+                    s.sessions.insert("agent".into(), Tracked { profile: profile.into(), state: state.into(), draft: true,
+                        typed: now_ms() - HELD_SHOW_MS, ..Tracked::default() });
+                });
+                let started = Instant::now();
+                let out = harness.control(&json!({"op": "operator_input", "id": "agent", "draft": false})).unwrap();
+                assert_eq!(out["draft"], false, "{profile} while {state}");
+                assert!(started.elapsed() < Duration::from_secs(2));
+                let store = lock(&harness.store);
+                assert!(store.cockpit_facts(now_ms()).sessions["agent"].held.is_none());
+                assert_eq!(store.sessions["agent"].state, state);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cockpit_clears_only_the_hold_it_showed_without_writing_to_the_pty() {
+        let dir = socket_test_dir("amcr-clear-");
+        let harness = Harness::open(&dir);
+        let since = now_ms() - HELD_SHOW_MS;
+        *lock(&harness.typed) = Some(Vec::new());
+        harness.update(|s| {
+            s.sessions.insert("agent".into(), Tracked { profile: "codex".into(), state: "working".into(), draft: true,
+                typed: since, attention: Some(Attention { kind: "permission".into(), text: "Allow?".into(), ..Attention::default() }),
+                ..Tracked::default() });
+        });
+        let clear = |stamp| harness.control(&json!({"op": "clear_draft", "id": "agent", "since": stamp}));
+        assert!(clear(since - 1).is_err());
+        assert!(lock(&harness.store).sessions["agent"].draft);
+        clear(since).unwrap();
+        let t = lock(&harness.store).sessions["agent"].clone();
+        assert!(!t.draft);
+        assert_eq!(t.operator_sent, 0);
+        assert_eq!(t.attention.unwrap().kind, "permission");
+        assert!(lock(&harness.typed).as_ref().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn nothing_is_typed_into_a_session_while_the_operator_has_an_unsent_line() {
         // The pure part: an unsent line holds without a time limit, an emptied one for the quiet time
         let now = 10_000_000;
@@ -9237,9 +9453,9 @@ mod tests {
         harness.control(&json!({"op": "operator_input", "id": "notice"})).unwrap();
         assert!(!tracked("notice").draft);
         // Who waits can see the hold, and since when
+        assert_eq!(word("operator_draft", "notice", true), 1);
         harness.update(|s| {
-            let t = s.sessions.get_mut("notice").unwrap();
-            (t.draft, t.typed) = (true, now_ms() - 90_000);
+            s.sessions.get_mut("notice").unwrap().typed = now_ms() - 90_000;
         });
         let info = held_info(&serde_json::to_value(tracked("notice")).unwrap(), now_ms());
         assert_eq!((info["seconds"].as_u64(), info["note"].as_str()), (Some(90), Some(HELD_NOTE)));

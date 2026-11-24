@@ -61,6 +61,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
   const urgency = shownUrgency(a);
   // What the harness knows of the session, on this row: merged into a published one, or how long a line stood (MCR-118)
   const chips = harnessChips(a);
+  const heldSince = a.derived === 'held' ? a.since : a.live?.held;
   // What a click did, or why the service refused it: said on the row, in the service's words
   const [said, setSaid] = useState<{ text: string; bad: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -86,6 +87,14 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
       .catch(e => { if (alive.current) setSaid({ text: String(e), bad: true }); })
       .finally(() => { if (alive.current) setBusy(false); });
   };
+  const clearHold = () => {
+    if (!a.where?.session || !heldSince || busy) return;
+    setBusy(true); setSaid(null);
+    harnessApi.clearDraft(a.where.session, heldSince)
+      .then(() => { if (alive.current) setSaid({ text: 'Hold cleared.', bad: false }); })
+      .catch(e => { if (alive.current) setSaid({ text: String(e), bad: true }); })
+      .finally(() => { if (alive.current) setBusy(false); });
+  };
   // A risk the publisher declared adds caution. "reversible" is its claim and is not repeated as a comfort
   const caution = a.risk === 'irreversible' ? 'irreversible' : a.risk === 'spend' ? `spends ${a.amount ?? ''}`.trim() : '';
   // Where a choice lands: the session the action names, else its publisher's own box
@@ -105,6 +114,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         {caution && <span className="ck-risk caution">{caution}</span>}
       </div>
       {a.derived && a.detail && <p className="ck-fact">{a.derived === 'wait' ? 'It registered: ' : ''}{a.detail}</p>}
+      {a.where?.session && heldSince && <p className="ck-buttons"><button type="button" className="ck-do quiet" disabled={busy} onClick={clearHold}>Clear hold for empty input</button></p>}
       {!a.derived && a.live?.report && <p className="ck-fact">{at ? at.name : 'The session'} reported: {a.live.report.text}</p>}
       {!a.derived && a.live?.waits?.map(w => <p key={w.id} className="ck-fact">{at ? at.name : 'The session'} waits for you, past its time. It registered: {w.on}</p>)}
       {a.why && <p>{a.why}</p>}

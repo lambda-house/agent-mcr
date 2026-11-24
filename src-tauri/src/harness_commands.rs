@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
 use tauri::State;
 
@@ -220,9 +220,46 @@ fn call(req: Value) -> Result<Value, String> {
     Client::connect(&socket)?.call(req)
 }
 
+static WINDOW_GENERATION: OnceLock<Option<u64>> = OnceLock::new();
+
+// The clock is shared by app processes on this boot. Wall time can step back,
+// and Rust's Instant does not expose a value to compare across processes.
+#[cfg(unix)]
+fn monotonic_ticks() -> Option<u64> {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    (unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } == 0)
+        .then(|| time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64)
+}
+
+#[cfg(windows)]
+fn monotonic_ticks() -> Option<u64> {
+    use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
+    let mut ticks = 0;
+    (unsafe { QueryPerformanceCounter(&mut ticks) } != 0).then_some(ticks as u64)
+}
+
+fn with_window_generation(mut req: Value) -> Value {
+    if let Some(generation) = *WINDOW_GENERATION.get_or_init(monotonic_ticks) {
+        req["windowGeneration"] = json!(generation);
+    }
+    req
+}
+
+/// Tell a running harness as soon as this window starts. Opening the app does
+/// not start the background units. If the harness is away, its first ordinary
+/// draft request carries the same generation.
+pub fn window_opened() {
+    let req = with_window_generation(json!({"op": "window_opened"}));
+    std::thread::spawn(move || {
+        if let Ok(mut client) = config_dir().and_then(|dir| Client::connect(&harness::socket(&dir))) {
+            let _ = client.call(req);
+        }
+    });
+}
+
 /// Sessions, their state and resuming go through the harness service.
 fn service(req: Value) -> Result<Value, String> {
-    harness::call(&config_dir()?, req)
+    harness::call(&config_dir()?, with_window_generation(req))
 }
 
 #[tauri::command]
@@ -518,6 +555,22 @@ fn prune(drafts: &mut BTreeMap<String, Draft>, list: &Value) {
             drafts.remove(id);
         }
     }
+}
+
+/// Dismiss an empty-box hold the operator checked in the cockpit.
+#[tauri::command]
+pub async fn harness_clear_draft(id: String, since: u64, state: State<'_, HarnessState>) -> Result<(), String> {
+    valid_id(&id)?;
+    let drafts = state.drafts.clone();
+    blocking(move || {
+        let seen = runner::lock(&drafts).get(&id).map(|draft| draft.last_key);
+        service(json!({"op": "clear_draft", "id": id, "since": since}))?;
+        let mut drafts = runner::lock(&drafts);
+        if drafts.get(&id).map(|draft| draft.last_key) == seen {
+            drafts.remove(&id);
+        }
+        Ok(())
+    }).await
 }
 
 /// Earlier Claude and Codex sessions that can continue here (ids, folders, times).

@@ -506,6 +506,7 @@ export const harnessApi = {
     return invoke<number>('terminal_attach', { id, since, output });
   },
   input: (view: number, data: string) => invoke<void>('terminal_input', { view, data }),
+  clearDraft: (id: string, since: number) => invoke<void>('harness_clear_draft', { id, since }),
   detach: (view: number) => invoke<void>('terminal_detach', { view }),
   saveImage: (id: string, bytes: ArrayBuffer) => invoke<string>('terminal_save_image', bytes, { headers: { session: id } }),
 };

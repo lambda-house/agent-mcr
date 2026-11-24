@@ -1261,6 +1261,7 @@ fn main() {
         .plugin(navigation_guard())
         .setup(|app| {
             install_app_menu(app)?;
+            harness_commands::window_opened();
             session_analysis_commands::start_scanner(app.handle().clone());
             Ok(())
         })
@@ -1274,6 +1275,7 @@ fn main() {
             harness_commands::harness_background_allow,
             harness_commands::harness_background_stop,
             harness_commands::harness_list,
+            harness_commands::harness_clear_draft,
             harness_commands::harness_list_since,
             harness_commands::harness_spawn,
             harness_commands::harness_bind,
