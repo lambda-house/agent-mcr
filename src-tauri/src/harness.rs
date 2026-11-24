@@ -2981,43 +2981,20 @@ impl Harness {
         if !force && old["exit"].is_null() && old["harness"]["state"] == "working" {
             return Err("The session is in the middle of a turn; restarting would cut it off. Wait for it, or restart with force".into());
         }
-        let home = dirs::home_dir().ok_or("Home directory unavailable")?;
+        let home = self.launch_home()?;
         let resume = old["harness"]["agentSession"].as_str().filter(|c| find_resumable(&home, c).is_some()).map(str::to_owned);
-        self.update(|s| s.restarting.insert(id.to_string()));
-        let started = (|| {
-            if old["exit"].is_null() {
-                // Hangup, as when its terminal window closes; both agents save their conversation as they go
-                self.runner(json!({"op": "signal", "id": id, "signal": "HUP"}))?;
-                let ended = |wait: Duration| {
-                    let until = Instant::now() + wait;
-                    loop {
-                        if self.session(id).is_ok_and(|s| !s["exit"].is_null()) {
-                            return true;
-                        }
-                        if Instant::now() >= until {
-                            return false;
-                        }
-                        std::thread::sleep(Duration::from_millis(150));
-                    }
-                };
-                // Within the ten seconds a caller waits for an answer
-                if !ended(Duration::from_secs(5)) {
-                    self.runner(json!({"op": "signal", "id": id, "signal": "KILL"}))?;
-                    if !ended(Duration::from_secs(2)) {
-                        return Err("The session did not end".to_string());
-                    }
-                }
-            }
-            let mut req = json!({"cwd": old["cwd"], "cols": old["cols"], "rows": old["rows"]});
-            if old["harness"]["named"] == true {
-                req["name"] = old["harness"]["name"].clone();
-            }
-            match &resume {
-                Some(conversation) => req["resume"] = json!(conversation),
-                None => req["profile"] = json!(profile),
-            }
-            self.create_as(&req, old["meta"]["role"] == "supervisor", launch.clone())
-        })();
+        let mut req = json!({"cwd": old["cwd"], "cols": old["cols"], "rows": old["rows"]});
+        if old["harness"]["named"] == true {
+            req["name"] = old["harness"]["name"].clone();
+        }
+        match &resume {
+            Some(conversation) => req["resume"] = json!(conversation),
+            None => req["profile"] = json!(profile),
+        }
+        if !self.update(|s| s.restarting.insert(id.to_string())) {
+            return Err("That session is already being restarted".into());
+        }
+        let started = self.launch_as(&req, old["meta"]["role"] == "supervisor", launch, Some(id));
         let new = match started {
             Ok(new) => new,
             Err(e) => {
@@ -3082,14 +3059,49 @@ impl Harness {
         Ok(out)
     }
 
+    fn stop_for_restart(&self, id: &str) -> Result<(), String> {
+        // Both agents save their conversation as they go.
+        self.runner(json!({"op": "signal", "id": id, "signal": "HUP"}))?;
+        let ended = |wait: Duration| {
+            let until = Instant::now() + wait;
+            loop {
+                if self.session(id).is_ok_and(|s| !s["exit"].is_null()) {
+                    return true;
+                }
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        };
+        // Leave room in the ten-second control timeout for trust preparation.
+        if !ended(Duration::from_secs(5)) {
+            self.runner(json!({"op": "signal", "id": id, "signal": "KILL"}))?;
+            if !ended(Duration::from_secs(2)) {
+                return Err("The session did not end".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_home(&self) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        if let Some(home) = &self.launch_home {
+            return Ok(home.clone());
+        }
+        dirs::home_dir().ok_or_else(|| "Home directory unavailable".into())
+    }
+
     /// `pinned`: the agent profile to launch, settled by the caller (a
     /// restart's pin, an executor's lowered profile). Otherwise `profile` in
     /// `req` is an adapter id (a bare launch) or an agent profile id, taken
     /// as it is now (MCR-126 P2). Never profile text from a request.
     fn create_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>) -> Result<Value, String> {
-        let home = dirs::home_dir().ok_or("Home directory unavailable")?;
-        #[cfg(test)]
-        let home = self.launch_home.as_ref().cloned().unwrap_or(home);
+        self.launch_as(req, supervisor, pinned, None)
+    }
+
+    fn launch_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>, replacing: Option<&str>) -> Result<Value, String> {
+        let home = self.launch_home()?;
         let resume = req["resume"].as_str().filter(|s| !s.is_empty());
         let found = match resume {
             Some(id) => Some(find_resumable(&home, id).ok_or_else(|| format!("No Claude or Codex session {id} to resume"))?),
@@ -3121,11 +3133,13 @@ impl Harness {
             return Err(format!("Not a folder: {cwd}"));
         }
         let sessions = self.sessions()?;
-        if sessions.iter().filter(|s| s["exit"].is_null()).count() >= MAX_LIVE {
+        let live = sessions.iter().filter(|s| s["exit"].is_null());
+        let mut other_live = live.clone().filter(|s| replacing.is_none_or(|id| s["id"] != id));
+        if other_live.clone().count() >= MAX_LIVE {
             return Err(format!("{MAX_LIVE} sessions are running; end one first"));
         }
         if let Some(id) = resume {
-            if sessions.iter().any(|s| s["exit"].is_null() && s["harness"]["agentSession"] == id) {
+            if other_live.any(|s| s["harness"]["agentSession"] == id) {
                 return Err("That session is already running here".into());
             }
         }
@@ -3190,7 +3204,7 @@ impl Harness {
                 }
             }
         }
-        let auto_root = auto_mode::matching_root(&self.dir, &home, &dir, &profile, supervisor, chosen.as_ref().map(|c| &c.profile))?;
+        let auto_mode::RootMatch { root, mut rejected } = auto_mode::matching_root(&self.dir, &home, &dir, &profile, supervisor)?;
         let launch = Launch {
             supervisor,
             plugin: &plugin.display().to_string(),
@@ -3205,10 +3219,9 @@ impl Harness {
             task: if cfg!(windows) { None } else { task },
             own_hooks: lock(&self.store).codex_hooks,
             agent: chosen.as_ref().map(|c| &c.profile),
-            claude_auto_root: auto_root.as_deref(),
+            claude_auto_root: root.as_deref(),
         };
         let (argv, mut spawn_env) = launch_for(&launch)?;
-        let effective_mode = launch.effective_mode();
         // The text launched is kept, so a restart starts the same version (L5)
         if let Some(c) = &chosen {
             crate::profiles::pin(&self.dir, c)?;
@@ -3236,7 +3249,7 @@ impl Harness {
         if supervisor {
             meta["role"] = json!("supervisor");
         }
-        if auto_root.is_some() {
+        if launch.claude_uses_auto() {
             #[cfg(not(test))]
             let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from);
             #[cfg(test)]
@@ -3246,8 +3259,20 @@ impl Harness {
                 }
                 None
             };
-            let config = auto_mode::claude_config(&home, config_dir.as_deref())?;
-            auto_mode::trust_cwd(&config, &dir)?;
+            let trust = auto_mode::claude_config(&home, config_dir.as_deref())
+                .and_then(|config| auto_mode::trust_cwd(&config, &dir));
+            if let Err(reason) = trust {
+                if replacing.is_some() {
+                    return Err(format!("Restart refused before ending the session: {reason}"));
+                }
+                let note = format!("launched without recording Claude folder trust: {reason}");
+                eprintln!("harness: {note}");
+                rejected.push(note);
+            }
+        }
+        let effective_mode = launch.effective_mode(&rejected);
+        if let Some(id) = replacing.filter(|id| live.clone().any(|s| s["id"] == *id)) {
+            self.stop_for_restart(id)?;
         }
         self.runner(json!({
             "op": "spawn",
@@ -7243,8 +7268,12 @@ mod tests {
         }
         let validator = h.agent_tool(lead_id, "executor_create", &json!({"profile": "validator@claude-opus", "cwd": work.join("validator")})).unwrap();
         let effective_auto = "auto (root ~/work)";
-        let validator_auto = auto_mode::VALIDATORS_USE_AUTO_MODE;
-        assert_eq!(validator["effectiveMode"], if validator_auto { effective_auto } else { "acceptEdits (profile)" });
+        assert_eq!(validator["effectiveMode"], effective_auto);
+        let sre = h.tool("session_create", &json!({"profile": "sre@claude-sonnet", "cwd": checkout})).unwrap();
+        assert_eq!(sre["effectiveMode"], "manual (profile mode kept under root ~/work)");
+        std::fs::write(dir.join("auto-mode.json"), br#"{"roots":["~"]}"#).unwrap();
+        let guarded = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": checkout})).unwrap();
+        assert_eq!(guarded["effectiveMode"], "acceptEdits (profile, ignored auto-mode root \"~\" because it is the home folder or an ancestor)");
         assert_eq!(lead["effectiveMode"], effective_auto);
         assert_eq!(executor["effectiveMode"], effective_auto);
         let me = h.agent_tool(executor_id, "whoami", &json!({})).unwrap();
@@ -7256,8 +7285,8 @@ mod tests {
         assert_eq!(overview["sessions"][0]["executors"][0]["effectiveMode"], effective_auto);
 
         let spawned = lock(&spawned);
-        assert_eq!(spawned.len(), 5);
-        let modes = ["auto", "auto", "manual", "manual", if validator_auto { "auto" } else { "acceptEdits" }];
+        assert_eq!(spawned.len(), 7);
+        let modes = ["auto", "auto", "manual", "manual", "auto", "manual", "acceptEdits"];
         for ((req, trusted), mode) in spawned.iter().zip(modes) {
             let line = req["argv"].as_array().unwrap().last().unwrap().as_str().unwrap();
             let expected_auto = mode == "auto";
@@ -7280,6 +7309,83 @@ mod tests {
         for deny in crate::profiles::NO_DELIVERY_DENIES {
             assert!(validator_line.contains(deny), "{validator_line}");
         }
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_mode_prepares_trust_before_hangup_and_fresh_create_can_fall_back() {
+        let fixture = tempfile::Builder::new().prefix("mcr152-r-").tempdir_in("/tmp").unwrap();
+        let dir = dunce::canonicalize(fixture.path()).unwrap();
+        let home = dir.join("home");
+        let cwd = home.join("work");
+        let fresh = cwd.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let trust_config = home.join(".claude.json");
+        let config = trust_config.clone();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sessions = BTreeMap::<String, Value>::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": sessions.values().collect::<Vec<_>>()}),
+                    "spawn" => {
+                        sessions.insert(req["id"].as_str().unwrap().into(), req);
+                        json!({})
+                    }
+                    "signal" => {
+                        assert_eq!(req["signal"], "HUP");
+                        let old = sessions.get_mut(req["id"].as_str().unwrap()).unwrap();
+                        let trust: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+                        assert_eq!(trust["projects"][old["cwd"].as_str().unwrap()]["hasTrustDialogAccepted"], true);
+                        old["exit"] = json!(0);
+                        json!({})
+                    }
+                    "forget" => {
+                        sessions.remove(req["id"].as_str().unwrap());
+                        json!({})
+                    }
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let old = h.create_as(&json!({"profile": "lead@claude-opus", "cwd": cwd}), false, None).unwrap();
+        let id = old["id"].as_str().unwrap();
+        let settings = dir.join("auto-mode.json");
+        let trust_lock = home.join(".claude.json.lock");
+        std::fs::write(&settings, "{").unwrap();
+        assert!(h.restart(id, true, false).unwrap_err().contains("Invalid"));
+        assert!(h.session(id).unwrap()["exit"].is_null());
+
+        std::fs::write(&settings, br#"{"roots":["~/work"]}"#).unwrap();
+        std::fs::create_dir(&trust_lock).unwrap();
+        assert!(h.restart(id, true, false).unwrap_err().contains("Claude config lock was busy"));
+        assert!(h.session(id).unwrap()["exit"].is_null());
+        assert!(!lock(&h.store).restarting.contains(id));
+
+        let started = h.create_as(&json!({"profile": "implementer@claude-opus", "cwd": fresh}), false, None).unwrap();
+        let effective = started["effectiveMode"].as_str().unwrap();
+        assert!(effective.starts_with("auto (root ~/work, launched without recording Claude folder trust:"));
+        assert!(effective.contains("Claude config lock was busy"));
+        assert!(!trust_config.exists());
+        assert!(trust_lock.is_dir());
+        std::fs::remove_dir(trust_lock).unwrap();
+
+        let replacement = h.restart(id, true, false).unwrap();
+        assert_eq!(replacement["replaced"], id);
+        assert_eq!(replacement["effectiveMode"], "auto (root ~/work)");
+        assert_ne!(replacement["id"], id);
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();

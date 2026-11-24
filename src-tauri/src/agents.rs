@@ -272,27 +272,41 @@ pub struct Launch<'a> {
     pub claude_auto_root: Option<&'a str>,
 }
 
+// The root override may promote these Claude modes. This includes validators
+// in acceptEdits. Manual and plan retain their profile mode (MCR-152).
+const CLAUDE_AUTO_FROM_MODES: &[&str] = &["acceptEdits"];
+
 impl Launch<'_> {
     fn claude_mode(&self) -> &str {
-        if self.claude_auto_root.is_some() { "auto" } else { self.profile_mode().unwrap_or("acceptEdits") }
+        if self.claude_uses_auto() { "auto" } else { self.profile_mode().unwrap_or("acceptEdits") }
+    }
+
+    pub fn claude_uses_auto(&self) -> bool {
+        self.claude_auto_root.is_some()
+            && CLAUDE_AUTO_FROM_MODES.contains(&self.profile_mode().unwrap_or("acceptEdits"))
     }
 
     fn profile_mode(&self) -> Option<&str> {
         self.agent.and_then(|p| p.permissions.mode.as_deref())
     }
 
-    pub fn effective_mode(&self) -> Option<String> {
+    pub fn effective_mode(&self, notes: &[String]) -> Option<String> {
         let mode = match self.profile {
             "claude" => self.claude_mode(),
             "codex" => self.profile_mode().unwrap_or("workspace-write"),
             "antigravity" => "accept-edits",
             _ => return None,
         };
-        let reason = match self.claude_auto_root {
-            Some(root) => format!("root {root}"),
+        let mut reason = match self.claude_auto_root {
+            Some(root) if self.claude_uses_auto() => format!("root {root}"),
+            Some(root) => format!("profile mode kept under root {root}"),
             None if self.profile_mode().is_some() => "profile".into(),
             None => "adapter default".into(),
         };
+        for note in notes {
+            reason.push_str(", ");
+            reason.push_str(note);
+        }
         Some(format!("{mode} ({reason})"))
     }
 }
@@ -688,7 +702,7 @@ impl Claude {
             Some(p) => self.profile_launch_words(p, mode),
             None => vec!["--permission-mode".into(), mode.into()],
         };
-        if l.claude_auto_root.is_some() {
+        if l.claude_uses_auto() {
             if !l.agent.is_some_and(crate::profiles::AgentProfile::delivers) {
                 words.push("--allowedTools".into());
             }

@@ -1,6 +1,5 @@
 //! Operator-owned roots and the Claude Code workspace trust record (MCR-152).
 
-use crate::profiles::{AgentProfile, Role};
 use serde::Deserialize;
 use serde_json::value::{to_raw_value, RawValue};
 use std::collections::BTreeMap;
@@ -10,8 +9,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 const CONFIG: &str = "auto-mode.json";
-// MCR-152's owner decision allows validators under these roots.
-pub(crate) const VALIDATORS_USE_AUTO_MODE: bool = true;
 const ACCEPTED: &str = "hasTrustDialogAccepted";
 
 #[derive(Default, Deserialize)]
@@ -20,27 +17,35 @@ struct Settings {
     roots: Vec<String>,
 }
 
-/// `cwd` is the canonical path given to the runner. The matched root is
-/// returned in the operator's spelling for the launch record.
+#[derive(Default)]
+pub struct RootMatch {
+    pub root: Option<String>,
+    pub rejected: Vec<String>,
+}
+
+/// `cwd` is the canonical path given to the runner. Keep the operator's
+/// spelling and record rejected roots even if another root matches.
 pub fn matching_root(
     config_dir: &Path,
     home: &Path,
     cwd: &Path,
     adapter: &str,
     supervisor: bool,
-    profile: Option<&AgentProfile>,
-) -> Result<Option<String>, String> {
-    if adapter != "claude"
-        || supervisor
-        || (!VALIDATORS_USE_AUTO_MODE && profile.is_some_and(|p| p.role == Role::Validator))
-    {
-        return Ok(None);
+) -> Result<RootMatch, String> {
+    let mut matched = RootMatch::default();
+    if adapter != "claude" || supervisor {
+        return Ok(matched);
     }
     let path = config_dir.join(CONFIG);
     let Some(bytes) = read_config(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))? else {
-        return Ok(None);
+        return Ok(matched);
     };
     let settings: Settings = serde_json::from_slice(&bytes).map_err(|e| format!("Invalid {}: {e}", path.display()))?;
+    if settings.roots.is_empty() {
+        return Ok(matched);
+    }
+    let canonical_home = dunce::canonicalize(home).map_err(|e| format!("Cannot resolve home for auto-mode roots: {e}"))?;
+    let canonical_config = dunce::canonicalize(config_dir).map_err(|e| format!("Cannot resolve Agent MCR config directory for auto-mode roots: {e}"))?;
     for root in settings.roots {
         let as_path = Path::new(&root);
         let expanded = match as_path.strip_prefix("~") {
@@ -49,14 +54,28 @@ pub fn matching_root(
             Err(_) if as_path.is_absolute() => as_path.to_path_buf(),
             Err(_) => return Err(format!("Invalid root {root:?} in {CONFIG}: use an absolute path or ~/")),
         };
-        match dunce::canonicalize(&expanded) {
-            Ok(path) if path.is_dir() && cwd.starts_with(&path) => return Ok(Some(root)),
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        let path = match dunce::canonicalize(&expanded) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("Cannot resolve auto-mode root {root:?}: {e}")),
+        };
+        let reason = if canonical_home.starts_with(&path) {
+            Some("it is the home folder or an ancestor")
+        } else if canonical_config.starts_with(&path) {
+            Some("it contains the Agent MCR config directory")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let note = format!("ignored auto-mode root {root:?} because {reason}");
+            eprintln!("harness: {note}");
+            matched.rejected.push(note);
+        } else if matched.root.is_none() && cwd.starts_with(&path) {
+            matched.root = Some(root);
         }
     }
-    Ok(None)
+    Ok(matched)
 }
 
 pub fn claude_config(home: &Path, config_dir: Option<&Path>) -> Result<PathBuf, String> {
@@ -98,8 +117,12 @@ impl ConfigLock {
                     })?;
                     return Ok(Self { path, modified, since });
                 }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(25));
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "Claude config lock was busy for 2 seconds"));
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(25)));
                 }
                 Err(e) => return Err(e),
             }
@@ -132,14 +155,17 @@ fn read_config(config: &Path) -> io::Result<Option<Vec<u8>>> {
 }
 
 fn update_trust(config: &Path, key: &str) -> io::Result<()> {
+    // An atomic read is enough when the exact cwd is already trusted.
+    // A new entry still requires a fresh read under Claude's lock.
+    if read_config(config).is_ok_and(|bytes| {
+        trust_fields(bytes.as_deref(), key).is_ok_and(|(_, _, project)| trust_is_set(&project))
+    }) {
+        return Ok(());
+    }
     let lock = ConfigLock::acquire(config)?;
     let before = read_config(config)?;
-    // Raw values keep every other field intact, including large numbers and
-    // shapes from Claude versions the harness has never seen.
-    let mut all: Fields = serde_json::from_slice(before.as_deref().unwrap_or(b"{}"))?;
-    let mut projects = fields(&all, "projects")?;
-    let mut project = fields(&projects, key)?;
-    if project.get(ACCEPTED).is_some_and(|raw| raw.get() == "true") {
+    let (mut all, mut projects, mut project) = trust_fields(before.as_deref(), key)?;
+    if trust_is_set(&project) {
         return Ok(());
     }
     project.insert(ACCEPTED.into(), to_raw_value(&true)?);
@@ -165,6 +191,18 @@ fn update_trust(config: &Path, key: &str) -> io::Result<()> {
 
 type Fields = BTreeMap<String, Box<RawValue>>;
 
+fn trust_fields(bytes: Option<&[u8]>, key: &str) -> serde_json::Result<(Fields, Fields, Fields)> {
+    // Raw values preserve unknown fields and large numbers from Claude.
+    let all = serde_json::from_slice(bytes.unwrap_or(b"{}"))?;
+    let projects = fields(&all, "projects")?;
+    let project = fields(&projects, key)?;
+    Ok((all, projects, project))
+}
+
+fn trust_is_set(project: &Fields) -> bool {
+    project.get(ACCEPTED).is_some_and(|raw| raw.get() == "true")
+}
+
 fn fields(parent: &Fields, name: &str) -> serde_json::Result<Fields> {
     parent.get(name).map_or_else(|| Ok(Fields::new()), |raw| serde_json::from_str(raw.get()))
 }
@@ -181,7 +219,7 @@ mod tests {
         let outside = home.join("workshop");
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir(&outside).unwrap();
-        let root = |cwd: &Path| matching_root(&home, &home, cwd, "claude", false, None).unwrap();
+        let root = |cwd: &Path| matching_root(&home, &home, cwd, "claude", false).unwrap().root;
         assert_eq!(root(&cwd), None);
 
         let settings = home.join(CONFIG);
@@ -191,8 +229,8 @@ mod tests {
         assert_eq!(root(&cwd).as_deref(), Some("~/work"));
         assert_eq!(root(&home.join("work")).as_deref(), Some("~/work"));
         assert_eq!(root(&outside), None);
-        assert_eq!(matching_root(&home, &home, &cwd, "claude", true, None).unwrap(), None);
-        assert_eq!(matching_root(&home, &home, &cwd, "codex", false, None).unwrap(), None);
+        assert_eq!(matching_root(&home, &home, &cwd, "claude", true).unwrap().root, None);
+        assert_eq!(matching_root(&home, &home, &cwd, "codex", false).unwrap().root, None);
 
         #[cfg(unix)]
         {
@@ -201,6 +239,39 @@ mod tests {
             fs::write(&settings, br#"{"roots":["~/root-link"]}"#).unwrap();
             assert_eq!(root(&cwd).as_deref(), Some("~/root-link"));
             assert_eq!(root(&dunce::canonicalize(home.join("work/escape")).unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn rejects_home_its_ancestors_and_the_config_directory_tree() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(fixture.path()).unwrap();
+        let home = base.join("home");
+        let work = home.join("work");
+        let config_parent = home.join("config");
+        let config_dir = config_parent.join("agent-mcr");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let settings = config_dir.join(CONFIG);
+        fs::write(&settings, serde_json::json!({"roots": ["~", base, "~/config", "~/config/agent-mcr"]}).to_string()).unwrap();
+        let matching = matching_root(&config_dir, &home, &work, "claude", false).unwrap();
+        assert_eq!(matching.root, None);
+        assert_eq!(matching.rejected.len(), 4);
+        assert!(matching.rejected[..2].iter().all(|reason| reason.contains("the home folder or an ancestor")));
+        assert!(matching.rejected[2..].iter().all(|reason| reason.contains("contains the Agent MCR config directory")));
+
+        fs::write(&settings, br#"{"roots":["~/work","~/config"]}"#).unwrap();
+        let matching = matching_root(&config_dir, &home, &work, "claude", false).unwrap();
+        assert_eq!(matching.root.as_deref(), Some("~/work"));
+        assert_eq!(matching.rejected.len(), 1);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&home, home.join("home-link")).unwrap();
+            fs::write(&settings, br#"{"roots":["~/home-link"]}"#).unwrap();
+            let matching = matching_root(&config_dir, &home, &work, "claude", false).unwrap();
+            assert_eq!(matching.root, None);
+            assert!(matching.rejected[0].contains("the home folder or an ancestor"));
         }
     }
 
@@ -220,17 +291,30 @@ mod tests {
         let (executor, _) = crate::profiles::lower_of(&implementer, &lead.profile).unwrap();
         let validator = crate::profiles::choose(&home, "validator@claude-opus").unwrap();
         let (validator, _) = crate::profiles::lower_of(&validator, &lead.profile).unwrap();
-        for (profile, cwd, expect_auto, expect_delivery) in [
-            (Some(&lead.profile), &worktree, true, true),
-            (Some(&executor.profile), &worktree, true, false),
-            (None, &worktree, true, false),
-            (Some(&lead.profile), &outside, false, true),
-            (Some(&validator.profile), &worktree, VALIDATORS_USE_AUTO_MODE, false),
+        let sre = crate::profiles::choose(&home, "sre@claude-sonnet").unwrap();
+        let backlog = crate::profiles::choose(&home, "backlog@claude-opus").unwrap();
+        let custom = |mode| crate::profiles::parse(&format!("id = \"custom@mode\"\nversion = 1\nrole = \"custom\"\nadapter = \"claude\"\n[permissions]\nmode = \"{mode}\""), crate::profiles::Origin::Operator).unwrap();
+        let custom_plan = custom("plan");
+        let custom_edit = custom("acceptEdits");
+        for (profile, cwd, mode, expect_delivery) in [
+            (Some(&lead.profile), &worktree, "auto", true),
+            (Some(&executor.profile), &worktree, "auto", false),
+            (None, &worktree, "auto", false),
+            (Some(&lead.profile), &outside, "acceptEdits", true),
+            (Some(&validator.profile), &worktree, "auto", false),
+            (Some(&sre.profile), &worktree, "manual", false),
+            (Some(&backlog.profile), &worktree, "manual", false),
+            (Some(&custom_plan), &worktree, "plan", false),
+            (Some(&custom_edit), &worktree, "auto", false),
         ] {
-            let root = matching_root(&home, &home, cwd, "claude", false, profile).unwrap();
-            assert_eq!(root.is_some(), expect_auto);
-            let args = windows_args(&Launch { profile: "claude", agent: profile, claude_auto_root: root.as_deref(), settings: "claude-hooks.json", ..Default::default() }).unwrap();
-            assert_eq!(&args[1..3], ["--permission-mode", if expect_auto { "auto" } else { "acceptEdits" }]);
+            let matched = matching_root(&home, &home, cwd, "claude", false).unwrap();
+            assert_eq!(matched.root.is_some(), cwd == &worktree);
+            let launch = Launch { profile: "claude", agent: profile, claude_auto_root: matched.root.as_deref(), settings: "claude-hooks.json", ..Default::default() };
+            let args = windows_args(&launch).unwrap();
+            assert_eq!(&args[1..3], ["--permission-mode", mode]);
+            if matches!(mode, "manual" | "plan") {
+                assert_eq!(launch.effective_mode(&[]).unwrap(), format!("{mode} (profile mode kept under root ~/work)"));
+            }
             assert_eq!(args.iter().filter(|arg| *arg == "--permission-mode").count(), 1);
             let allowed: Vec<_> = args.iter().skip_while(|arg| *arg != "--allowedTools").skip(1)
                 .take_while(|arg| !arg.starts_with("--")).map(String::as_str).collect();
@@ -239,7 +323,7 @@ mod tests {
                 expected.extend(["Bash(git push origin *)", "Bash(gh pr merge --merge -- *)"]);
                 assert!(args.iter().any(|arg| arg == "Bash(git push * --exec*)"));
             }
-            if expect_auto {
+            if mode == "auto" {
                 expected.extend(["mcp__teob-memory", "mcp__teob-harness", "mcp__mcr-memory", "mcp__atlassian"]);
             }
             assert_eq!(allowed, expected);
@@ -271,8 +355,10 @@ mod tests {
         assert_eq!(executor["someFutureField"].get(), "[1,2]");
         assert_eq!(executor[ACCEPTED].get(), "true");
         assert_eq!(fields(&projects, "/work/lead").unwrap()[ACCEPTED].get(), "true");
+        let lock = ConfigLock::acquire(&config).unwrap();
         update_trust(&config, "/work/executor").unwrap();
         assert_eq!(fs::read(&config).unwrap(), bytes);
+        drop(lock);
         assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
     }
 
