@@ -595,11 +595,20 @@ impl Adapter for Claude {
             }
             w.extend(only.iter().cloned());
         }
-        if !p.tools.deny.is_empty() {
+        let delivers = p.delivers();
+        if delivers || !p.tools.deny.is_empty() {
             w.push("--disallowedTools".into());
             w.extend(p.tools.deny.iter().cloned());
+            if delivers {
+                // Apply the admin-merge denies to previously pinned profiles too.
+                for rule in ["Bash(gh pr merge --admin*)", "Bash(gh pr merge * --admin*)"] {
+                    if !p.tools.deny.iter().any(|deny| deny == rule) {
+                        w.push(rule.into());
+                    }
+                }
+            }
         }
-        if p.delivers() {
+        if delivers {
             w.extend(["--allowedTools", "Bash(git push:*)", "Bash(gh pr merge:*)"].map(String::from));
         }
         Ok(w)
@@ -747,9 +756,9 @@ impl Adapter for Codex {
     /// word without `"` or `%`, so it is the same on Windows
     ///
     /// Delivery keeps `on-request` (MCR-143). Codex's `prefix_rule` allows
-    /// commands outside the sandbox through shared config layers. A
-    /// `PermissionRequest` hook requires separate trust and only sees calls
-    /// that already need approval, so it cannot enforce the delivery denies.
+    /// commands outside the sandbox through shared config layers. The
+    /// harness's `PermissionRequest` hook reports the prompt. Only the
+    /// operator decides it (D6 in docs/AGENT_HARNESS_DESIGN.md).
     fn profile_words(&self, p: &crate::profiles::AgentProfile) -> Result<Vec<String>, String> {
         if p.inference.fallback_model.is_some() || !p.tools.deny.is_empty() || p.tools.only.is_some() {
             return Err("codex takes no fallback model and no tool lists".into());
@@ -1337,8 +1346,15 @@ mod tests {
                     // Each deny rule is one word, right after the flag and before the harness's own flags
                     if !p.tools.deny.is_empty() {
                         let at = words.iter().position(|w| w == "--disallowedTools").unwrap();
-                        assert_eq!(&words[at + 1..at + 1 + p.tools.deny.len()], &p.tools.deny[..]);
-                        assert!(words[at + 1 + p.tools.deny.len()].starts_with("--"));
+                        let end = at + 1 + p.tools.deny.len();
+                        assert_eq!(&words[at + 1..end], &p.tools.deny[..]);
+                        let end = if p.adapter == "claude" && p.delivers() {
+                            assert_eq!(&words[end..end + 2], ["Bash(gh pr merge --admin*)", "Bash(gh pr merge * --admin*)"]);
+                            end + 2
+                        } else {
+                            end
+                        };
+                        assert!(words[end].starts_with("--"));
                     }
                     if p.adapter == "codex" {
                         assert_eq!(words[words.iter().position(|w| w == "--ask-for-approval").unwrap() + 1], "on-request");
