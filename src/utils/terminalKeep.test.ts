@@ -23,6 +23,20 @@ describe('kept terminals (MCR-139)', () => {
     expect(keep.ids).toEqual(['a', 'c']);
   });
 
+  it('exempts all assigned panes from the four-terminal limit until the layout releases them', () => {
+    const dropped: string[] = [];
+    const keep = new TerminalKeep<string>(4, term => dropped.push(term));
+    const panes = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'];
+    keep.protect(new Set(panes));
+    for (const id of [...panes, 'a', 'b', 'c', 'd', 'e']) keep.put(id, { term: id, offset: 10 });
+    expect(keep.ids).toEqual([...panes, 'b', 'c', 'd', 'e']);
+    expect(dropped).toEqual(['a']);
+
+    keep.protect(new Set(panes.slice(2)));
+    expect(keep.ids).toEqual([...panes.slice(2), 'b', 'c', 'd', 'e']);
+    expect(dropped).toEqual(['a', 'p1', 'p2']);
+  });
+
   it('drops the terminals of sessions that left the list, and one it is told to forget', () => {
     const dropped: string[] = [];
     const keep = new TerminalKeep<string>(4, t => dropped.push(t));

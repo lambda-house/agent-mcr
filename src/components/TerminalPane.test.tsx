@@ -15,12 +15,14 @@ const screen = vi.hoisted(() => ({
   lines: [] as string[][], wrapped: new Set<number>(), provider: null as unknown, focused: 0, providers: 0,
   decorations: [] as Decoration[], render: (() => {}) as (start: number, end: number) => void, switchBuffer: () => {},
   resized: [] as ((size: { cols: number; rows: number }) => void)[], cellReads: 0, alternate: false,
+  setRevealOnScroll: vi.fn(),
   // MCR-139: terminals made, what each was written and how often it started over; the size a laid-out pane fits to
   made: 0, written: [] as string[][], resets: [] as number[], fitted: null as { cols: number; rows: number } | null,
 }));
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
     cols = 80; rows = 24; unicode = { activeVersion: '' };
+    _core = { _viewport: { _scrollableElement: { setRevealOnScroll: screen.setRevealOnScroll } } };
     buffer = { active: { viewportY: 0, baseY: 0, cursorY: 0, get type() { return screen.alternate ? 'alternate' : 'normal'; }, getLine: (y: number) => {
       const cells = screen.lines[y];
       return cells && { length: cells.length, isWrapped: screen.wrapped.has(y), translateToString: () => cells.map(c => c || ' ').join(''),
@@ -76,6 +78,12 @@ beforeEach(() => {
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); });
+
+it('disables output-driven scrollbar reveals on a fresh xterm', async () => {
+  screen.setRevealOnScroll.mockClear();
+  await act(async () => root.render(<TerminalPane id="scrollbar" active/>));
+  expect(screen.setRevealOnScroll.mock.calls).toEqual([[false]]);
+});
 
 describe('session pointers in a terminal', () => {
   const live = (id: string) => id === 'a27f56d8749b';
@@ -288,21 +296,20 @@ describe('a terminal is the view of one shown session (MCR-139)', () => {
     await act(async () => { views[1].on.start(7000); views[1].on.data(bytes('held\r\n')); }); await frame();
     expect(screen.resets[before]).toBe(0);
     expect(screen.written[before]).toEqual(['old\r\n']);
-    // A new terminal asks for everything and takes it
+    // A new terminal consumes the existing view's replay and live data.
     expect(screen.made).toBe(before + 2);
-    expect(views[2].since).toBeNull();
-    act(() => { views[2].on.start(7000); views[2].on.data(bytes('held\r\n')); });
-    expect(screen.written[before + 1]).toEqual(['held\r\n']);
+    expect(views).toHaveLength(2);
+    act(() => views[1].on.data(bytes('live\r\n')));
+    expect(screen.written[before + 1]).toEqual(['held\r\n', 'live\r\n']);
     await hide(); await show();
-    expect(views[3].since).toBe(7006);
+    expect(views[2].since).toBe(7012);
     // A runner before MCR-139 does not say: a new terminal again, and next time ask for everything
-    await act(async () => { views[3].on.start(null); }); await frame();
+    await act(async () => { views[2].on.start(null); views[2].on.data(bytes('all\r\n')); }); await frame();
     expect(screen.made).toBe(before + 3);
-    expect(views[4].since).toBeNull();
-    act(() => { views[4].on.start(null); views[4].on.data(bytes('all\r\n')); });
+    expect(views).toHaveLength(3);
     expect(screen.written[before + 2]).toEqual(['all\r\n']);
     await hide(); await show();
-    expect(views[5].since).toBeNull();
+    expect(views[3].since).toBeNull();
   });
 
   it('keeps no more than MAX_KEPT hidden terminals; one pushed out comes back with the runner replay (review 17086)', async () => {

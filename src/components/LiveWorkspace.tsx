@@ -168,7 +168,54 @@ const LiveSessionRow = memo(function LiveSessionRow({
 });
 
 function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot: (id: string, el: HTMLElement | null) => void }) {
-  const ref = useCallback((el: HTMLElement | null) => registerSlot(sessionId, el), [sessionId, registerSlot]);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let observing = true;
+    let live = true;
+    const intersection = new IntersectionObserver(entries => {
+      if (!live || document.hidden || !observing) return;
+      const entry = entries[entries.length - 1];
+      const shown = entry?.isIntersecting
+        && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0;
+      registerSlot(sessionId, shown ? el : null);
+    }, { threshold: [0, Number.EPSILON] });
+    const resize = new ResizeObserver(([entry]) => {
+      if (!live || document.hidden || !entry) return;
+      const { width, height } = entry.contentRect;
+      const sized = width > 0 && height > 0;
+      if (sized === observing) return;
+      observing = sized;
+      if (sized) intersection.observe(el);
+      else {
+        intersection.unobserve(el);
+        registerSlot(sessionId, null);
+      }
+    });
+    const stop = () => {
+      resize.disconnect();
+      intersection.disconnect();
+      intersection.takeRecords();
+    };
+    const watch = () => {
+      stop();
+      // Background WebKit can report an empty viewport. Preserve the last
+      // visible geometry and ask for fresh observations when it comes back.
+      if (document.hidden) return;
+      observing = true;
+      intersection.observe(el);
+      resize.observe(el);
+    };
+    document.addEventListener('visibilitychange', watch);
+    watch();
+    return () => {
+      live = false;
+      document.removeEventListener('visibilitychange', watch);
+      stop();
+      registerSlot(sessionId, null);
+    };
+  }, [sessionId, registerSlot]);
   return <div className="hs-pane-slot" ref={ref}/>;
 }
 
@@ -208,12 +255,23 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const [selected, setSelected] = useState('');
   const [opened, setOpened] = useState<string[]>([]);
   const [layout, setLayout] = useState<PaneNode>(() => createInitialLayout());
+  const leaves = useMemo(() => listLeaves(layout), [layout]);
+  const assignedSessions = useMemo(() => new Set(leaves.flatMap(({ item }) => item?.kind === 'session' && item.id ? [item.id] : [])), [leaves]);
+  useLayoutEffect(() => { keep.protect(assignedSessions); }, [assignedSessions]);
+  useLayoutEffect(() => () => keep.protect(new Set()), []);
   const [focusedPane, setFocusedPane] = useState('p1');
+  const focusedItem = leaves.find(leaf => leaf.id === focusedPane)?.item;
   const paneSeq = useRef(2);
   const splitSeq = useRef(1);
-  const [slotEls, setSlotEls] = useState<Record<string, HTMLElement | null>>({});
+  const [slotEls, setSlotEls] = useState(() => new Map<string, HTMLElement>());
   const registerSlot = useCallback((key: string, el: HTMLElement | null) => {
-    setSlotEls(prev => prev[key] === el ? prev : { ...prev, [key]: el });
+    setSlotEls(prev => {
+      if ((prev.get(key) ?? null) === el) return prev;
+      const next = new Map(prev);
+      if (el) next.set(key, el);
+      else next.delete(key);
+      return next;
+    });
   }, []);
   const [profile, setProfile] = useState('claude');
   const [cwd, setCwd] = useState('');
@@ -948,9 +1006,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     {newAgentOverride ? newAgentOverride({ open: newAgentOpen, onClose: closeNewAgent, controller, defaultRender: defaultNewAgent }) : defaultNewAgent()}
     <main className="hs-terminals">
       {(() => {
-        const leaves = listLeaves(layout);
         const multiPane = leaves.length > 1;
-        const visibleSessions = new Set(leaves.map(l => l.item?.kind === 'session' && l.item.id ? l.item.id : null).filter((x): x is string => !!x));
         const emptyActions = pluginRegistry.getEmptyActions();
         const emptyPaneOverride = pluginRegistry.getOverride('live:empty-pane');
         const renderNode = (node: PaneNode): React.ReactNode => {
@@ -968,7 +1024,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
           const pluginKind = node.item ? (node.item.kind === 'custom' ? node.item.type : node.item.kind) : '';
           const pluginPane = !h && pluginKind ? pluginRegistry.getPaneType(pluginKind) : undefined;
           const isFocused = node.id === focusedPane;
-          const pickCandidates = hosted.filter(x => !x.exit && !visibleSessions.has(x.id));
+          const pickCandidates = hosted.filter(x => !x.exit && !assignedSessions.has(x.id));
           const defaultEmptyRender = () => (
             <>
               <header className="hs-pane-title hs-pane-title--empty">
@@ -1146,17 +1202,15 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
             {leaves.length === 1 && !leaves[0].item
               ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
               : <div className="hs-layout-root">{renderNode(layout)}</div>}
-            {/* A terminal only for a session a pane shows while the Live view is shown
-                (MCR-139). A hidden one detaches from the runner and goes to the keep
-                (TerminalPane's `keep`): shown again, it takes only what it missed. A
-                terminal kept attached for every session ever opened parsed all their
-                output for good, and one mounted hidden told the agent 80×24 */}
-            {opened.filter(id => active && visibleSessions.has(id)).map(id => {
+            {/* Only visible slots attach. The Cockpit can push a slot offscreen
+                or squeeze it to zero height even when its session stays selected. */}
+            {opened.filter(id => active && assignedSessions.has(id)).map(id => {
               const h = hosted.find(x => x.id === id);
               if (!h) return null;
-              const el = slotEls[id];
+              const el = slotEls.get(id);
               if (!el) return null;
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              const selectedPane = selected === id && focusedItem?.kind === 'session' && focusedItem.id === id;
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );
