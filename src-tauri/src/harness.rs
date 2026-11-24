@@ -944,6 +944,8 @@ pub struct Tracked {
     /// app's word (`operator_draft`, MCR-85): nothing is typed into it meanwhile
     pub draft: bool,
     /// Which app's local key count began the current hold, if known.
+    /// A monotonic generation is boot-scoped. After a service restart the
+    /// saved hold stays, and a local key count alone cannot release it.
     #[serde(skip)]
     draft_generation: Option<u64>,
     /// When the app last said that `draft` changed
@@ -3391,7 +3393,7 @@ impl Harness {
     /// action as the panel showed it, `act` what was clicked. Nothing of the
     /// request is text that is typed, opened or copied: that comes from the
     /// stored action, checked again here. `root` is the Supervisor session.
-    fn cockpit_act(&self, root: Option<String>, by: &str, id: &str, updated: u64, act: cockpit::Act, generation: Option<u64>) -> Result<Value, String> {
+    fn cockpit_act(&self, root: Option<String>, by: &str, id: &str, updated: u64, act: cockpit::Act) -> Result<Value, String> {
         let deed = {
             let store = lock(&self.store);
             let mut facts = store.cockpit_facts(now_ms());
@@ -3402,7 +3404,7 @@ impl Harness {
             cockpit::Deed::Link(link) => Ok(json!({ "link": link })),
             cockpit::Deed::Copy(text) => Ok(json!({ "copy": text })),
             cockpit::Deed::Type { session, text } => {
-                self.place(&session, &text, generation)?;
+                self.place(&session, &text)?;
                 Ok(json!({ "placed": session }))
             }
         }
@@ -3445,7 +3447,7 @@ impl Harness {
     /// added: the operator presses it. The line counts as their unsent line
     /// from before it is written (`Tracked.draft`, MCR-85), so no notice and
     /// no task is typed into it.
-    fn place(&self, session: &str, text: &str, generation: Option<u64>) -> Result<(), String> {
+    fn place(&self, session: &str, text: &str) -> Result<(), String> {
         let refuse = |why: &str| Err(format!("Refused: {why}."));
         cockpit::placeable(text).or_else(|why| refuse(&format!("the line {why}")))?;
         // Not while the harness types there itself: its Enter would send this line too
@@ -3468,7 +3470,7 @@ impl Harness {
             None => {
                 let t = s.sessions.get_mut(session).ok_or("that session has ended or is gone")?;
                 (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
-                t.draft_generation = generation;
+                t.draft_generation = None;
                 Ok(())
             }
         });
@@ -4979,9 +4981,10 @@ impl Harness {
                 // cannot know that; it says so again when the person types on
                 let asks = |t: &Tracked| t.attention.as_ref().is_some_and(|a| a.kind == "permission");
                 let draft = req["draft"].as_bool().unwrap_or(false) && !lock(&self.store).sessions.get(id).is_some_and(|t| !t.draft && asks(t));
-                // Backspacing to zero in a new app's key count says nothing
-                // about inherited text or a line placed by the cockpit.
-                let may_clear = |t: &Tracked| enter || t.draft_generation == generation;
+                // Keep the legacy app's key count working for holds it starts.
+                // None belongs to holds no app can clear by counting keys.
+                let owner = Some(generation.unwrap_or(0));
+                let may_clear = |t: &Tracked| enter || t.draft_generation == owner;
                 if draft {
                     lock(&self.draft_words).insert(id.to_string(), now_ms());
                 }
@@ -5007,7 +5010,7 @@ impl Harness {
                             if t.draft != draft || (enter && draft) {
                                 if draft {
                                     (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
-                                    t.draft_generation = generation;
+                                    t.draft_generation = owner;
                                 } else if may_clear(t) {
                                     clear_draft(t, now_ms());
                                     lock(&self.draft_words).remove(id);
@@ -5046,7 +5049,7 @@ impl Harness {
                     _ => return Err("act is place, choose, ask, link or copy".into()),
                 };
                 let root = Self::root_of(&self.sessions()?);
-                self.cockpit_act(root, req["by"].as_str().ok_or("by is required")?, req["id"].as_str().ok_or("id is required")?, req["updated"].as_u64().ok_or("updated is required")?, act, generation)
+                self.cockpit_act(root, req["by"].as_str().ok_or("by is required")?, req["id"].as_str().ok_or("id is required")?, req["updated"].as_u64().ok_or("updated is required")?, act)
             }
             // The human left a note for the sessions: for one folder, or for all
             "note_post" => {
@@ -8906,7 +8909,7 @@ mod tests {
     /// idle Claude sessions at an empty input box, and `lead`'s cockpit part:
     /// a typed word for `ex`, a decision and a command.
     fn clickable(name: &str) -> (PathBuf, Harness, u64) {
-        let dir = std::env::temp_dir().join(format!("agent-mcr-{name}-{}", runner::random_id()));
+        let dir = socket_test_dir(&format!("mcr-{name}-"));
         let harness = Harness::open(&dir);
         *lock(&harness.typed) = Some(Vec::new());
         let stamp = now_ms();
@@ -8939,7 +8942,7 @@ mod tests {
     #[test]
     fn a_click_places_the_stored_line_unsent_and_it_counts_as_the_operators_line() {
         let (dir, harness, stamp) = clickable("place");
-        let out = harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place, None).unwrap();
+        let out = harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place).unwrap();
         assert_eq!(out, json!({"placed": "ex"}));
         // One write: the stored line as a bracketed paste. No Enter, in this write or after it
         assert_eq!(typed_so_far(&harness), [("ex".to_string(), "\x1b[200~merge MCR-97\x1b[201~".to_string())]);
@@ -8954,7 +8957,7 @@ mod tests {
         harness.pump("ex");
         assert_eq!(typed_so_far(&harness).len(), 1, "{:?}", typed_so_far(&harness));
         // A second click there is refused while the line stands, and so is anything a supervisor would write
-        assert!(harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place, None).unwrap_err().contains("unsent line"));
+        assert!(harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place).unwrap_err().contains("unsent line"));
         let refused = harness.tool("terminal_write", &json!({"session": "ex", "input": "\r"})).unwrap_err();
         assert!(refused.starts_with("Refused: ") && refused.contains("unsent line"), "{refused}");
         assert!(harness.tool("terminal_write", &json!({"session": "ex", "input": "more", "submit": true})).unwrap_err().contains("unsent line"));
@@ -8963,10 +8966,10 @@ mod tests {
         harness.control(&json!({"op": "operator_input", "id": "ex"})).unwrap();
         assert!(!lock(&harness.store).sessions["ex"].draft);
         // A decision goes to its publisher's own box, in the service's frame; the command and the link are only handed out
-        assert_eq!(harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(1), None).unwrap(), json!({"placed": "lead"}));
+        assert_eq!(harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(1)).unwrap(), json!({"placed": "lead"}));
         assert_eq!(typed_so_far(&harness).last().unwrap(), &("lead".to_string(), "\x1b[200~Decision pick: Drop it\x1b[201~".to_string()));
-        assert_eq!(harness.cockpit_act(None, "lead", "look", stamp, cockpit::Act::Copy, None).unwrap(), json!({"copy": "cargo test"}));
-        let link = harness.cockpit_act(None, "lead", "pr", stamp, cockpit::Act::Link, None).unwrap();
+        assert_eq!(harness.cockpit_act(None, "lead", "look", stamp, cockpit::Act::Copy).unwrap(), json!({"copy": "cargo test"}));
+        let link = harness.cockpit_act(None, "lead", "pr", stamp, cockpit::Act::Link).unwrap();
         assert_eq!((link["link"]["href"].as_str(), link["link"]["host"].as_str(), link["link"]["path"].as_str(), link["link"]["query"].as_str(), link["link"]["known"].as_bool()), (Some("https://github.com/x/y/pull/1?a=b"), Some("github.com"), Some("/x/y/pull/1"), Some("a=b"), Some(true)));
         assert_eq!(typed_so_far(&harness).len(), 2);
         // No agent can click: there is no such tool on either server, and none that places
@@ -8981,7 +8984,7 @@ mod tests {
     #[test]
     fn a_line_is_placed_only_into_an_idle_agent_at_an_empty_input_box_with_nothing_on_its_way() {
         let (dir, harness, stamp) = clickable("refuse");
-        let click = || harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place, None);
+        let click = || harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place);
         // Each way it is not so, put back before the next
         type Change = Box<dyn Fn(&mut Store)>;
         let cases: Vec<(&str, Change, Change)> = vec![
@@ -9014,7 +9017,7 @@ mod tests {
         }
         lock(&harness.shown).insert("ex".into(), claude_idle_screen());
         // The action was published again since the panel showed it
-        assert!(harness.cockpit_act(None, "lead", "word", stamp + 1, cockpit::Act::Place, None).unwrap_err().contains("published again"));
+        assert!(harness.cockpit_act(None, "lead", "word", stamp + 1, cockpit::Act::Place).unwrap_err().contains("published again"));
         // Nothing was typed by any of these, and no line is held
         assert!(typed_so_far(&harness).is_empty());
         assert!(!lock(&harness.store).sessions["ex"].draft);
@@ -9023,7 +9026,7 @@ mod tests {
         assert_eq!(typed_so_far(&harness).len(), 1);
         // A write that fails leaves no held line behind
         *lock(&harness.typed) = None;
-        assert!(harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(0), None).is_err());
+        assert!(harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(0)).is_err());
         assert!(!lock(&harness.store).sessions["lead"].draft);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9032,7 +9035,7 @@ mod tests {
     fn a_line_is_never_placed_between_the_harnesss_own_text_and_its_enter() {
         let (dir, harness, stamp) = clickable("race");
         let harness = Arc::new(harness);
-        let click = |h: &Harness| h.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place, None);
+        let click = |h: &Harness| h.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place);
         // The harness types a task into `ex`: the text, a quarter of a second, the Enter
         let typing = { let h = harness.clone(); std::thread::spawn(move || h.submit("ex", "a task of the harness")) };
         let begun = Instant::now() + Duration::from_secs(5);
@@ -9180,6 +9183,47 @@ mod tests {
     }
 
     #[test]
+    fn a_placed_decision_stays_held_after_a_key_is_typed_and_deleted() {
+        let (dir, harness, stamp) = clickable("placed-decision");
+        std::fs::create_dir(&dir).unwrap();
+        let listener = Listener::bind(runner_socket(&dir)).unwrap();
+        let runner = std::thread::spawn(move || {
+            let sessions: Vec<_> = ["lead", "ex", "other"].map(|id| json!({"id": id})).into();
+            for (op, answer) in [("hello", json!({"protocol": runner::PROTOCOL})), ("list", json!({"sessions": sessions}))] {
+                let mut stream = listener.incoming().next().unwrap().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["op"], op);
+                writeln!(stream, "{answer}").unwrap();
+            }
+        });
+        let generation = 1;
+        harness.control(&json!({"op": "window_opened", "windowGeneration": generation})).unwrap();
+        let placed = harness.control(&json!({
+            "op": "cockpit_act", "by": "lead", "id": "pick", "updated": stamp,
+            "act": "choose", "option": 1, "windowGeneration": generation,
+        })).unwrap();
+        runner.join().unwrap();
+        assert_eq!(placed, json!({"placed": "lead"}));
+
+        for draft in [true, false] {
+            let answer = harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": draft, "windowGeneration": generation})).unwrap();
+            assert_eq!(answer["draft"], true);
+        }
+        assert_eq!(harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": false})).unwrap()["draft"], true);
+        lock(&harness.shown).insert("lead".into(), claude_idle_screen().replace("❯\n", "❯ Decision pick: Drop it\n"));
+        harness.update(|s| {
+            s.sessions.get_mut("lead").unwrap().typed = now_ms() - DRAFT_QUIET_MS;
+            s.post(Message { to: "lead".into(), text: "hello".into(), ..Message::default() });
+        });
+        harness.nudge("lead");
+        assert_eq!(typed_so_far(&harness), [("lead".to_string(), "\x1b[200~Decision pick: Drop it\x1b[201~".to_string())]);
+        let enter = harness.control(&json!({"op": "operator_input", "id": "lead", "draft": false, "windowGeneration": generation})).unwrap();
+        assert_eq!(enter["draft"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_reopened_window_keeps_real_drafts_and_can_clear_empty_input_boxes() {
         let (dir, harness, stamp) = clickable("window-drafts");
         std::fs::create_dir(&dir).unwrap();
@@ -9189,7 +9233,7 @@ mod tests {
             h.control(&json!({"op": "operator_draft", "id": id, "draft": draft, "windowGeneration": generation})).unwrap()
         };
         report(&harness, "lead", true, first);
-        harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place, Some(first)).unwrap();
+        harness.cockpit_act(None, "lead", "word", stamp, cockpit::Act::Place).unwrap();
         harness.update(|s| {
             s.sessions.insert("codex".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });
         });
@@ -9215,6 +9259,9 @@ mod tests {
         drop(harness);
 
         let harness = Harness::open(&dir);
+        // Reconnecting the same app after a service restart cannot prove its
+        // local count describes the persisted line.
+        assert_eq!(report(&harness, "lead", false, first)["draft"], true);
         open(&harness);
         *lock(&harness.typed) = Some(Vec::new());
         let draft = |id: &str| lock(&harness.store).sessions[id].draft;
@@ -9406,9 +9453,9 @@ mod tests {
         harness.control(&json!({"op": "operator_input", "id": "notice"})).unwrap();
         assert!(!tracked("notice").draft);
         // Who waits can see the hold, and since when
+        assert_eq!(word("operator_draft", "notice", true), 1);
         harness.update(|s| {
-            let t = s.sessions.get_mut("notice").unwrap();
-            (t.draft, t.typed) = (true, now_ms() - 90_000);
+            s.sessions.get_mut("notice").unwrap().typed = now_ms() - 90_000;
         });
         let info = held_info(&serde_json::to_value(tracked("notice")).unwrap(), now_ms());
         assert_eq!((info["seconds"].as_u64(), info["note"].as_str()), (Some(90), Some(HELD_NOTE)));

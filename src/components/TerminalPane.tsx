@@ -135,6 +135,8 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   // The terminal let go had the keyboard: the new one takes it (review 17090)
   const refocus = useRef(false);
   const pendingEnter = useRef<{ id: string; retry: boolean } | null>(null);
+  // Keep track across a view replacement: the next Enter may belong to lost keys.
+  const inputLost = useRef(false);
   const [notice, setNotice] = useState('');
   // Copy as task (MCR-125 v0): the right-click menu on a selection, and the dialog with its passage
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -157,6 +159,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
 
   useEffect(() => () => {
     if (pendingEnter.current?.id === id) pendingEnter.current = null;
+    inputLost.current = false;
     if (replacement.current?.id === id) {
       replacement.current.view.dispose();
       replacement.current = null;
@@ -338,20 +341,42 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     // This terminal is not to be kept or used again: the runner could not go on where it left off
     let discard = false;
     let reconnecting = false;
-    const sendInput = (handle: number, data: string, retryEnter: boolean) => {
-      void harnessApi.input(handle, data).catch(error => {
+    let inputWrites = Promise.resolve();
+    let pendingKeys = 0;
+    const loseInput = () => {
+      inputLost.current = true;
+      pendingEnter.current = null;
+    };
+    const sendInput = (handle: number, data: string, reconnect: boolean) => {
+      const enter = data === '\r';
+      if (!enter) pendingKeys++;
+      // A submit must wait for the preceding writes, including their errors.
+      inputWrites = inputWrites.then(async () => {
         if (disposed || discard || reconnecting) return;
-        const message = err(error);
-        // A detached view did not write this one-byte Enter. Retry it once
-        // after a new attach, with the existing replay and focus handling.
-        if (retryEnter && data === '\r' && message.startsWith('The terminal is detached') && shown.current) {
-          reconnecting = true;
-          pendingEnter.current = { id, retry: false };
-          refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
-          setFresh(n => n + 1);
+        if (enter && inputLost.current) {
+          inputLost.current = false;
           return;
         }
-        setNotice(message);
+        try {
+          await harnessApi.input(handle, data);
+        } catch (error) {
+          if (disposed || discard) return;
+          const message = err(error);
+          if (!enter) loseInput();
+          if (reconnect && message.startsWith('The terminal is detached') && shown.current) {
+            reconnecting = true;
+            // The replacement will also drop any keys still in this queue.
+            if (pendingKeys) loseInput();
+            if (enter && !inputLost.current) pendingEnter.current = { id, retry: false };
+            else setNotice(message);
+            refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
+            setFresh(n => n + 1);
+          } else {
+            setNotice(message);
+          }
+        }
+      }).finally(() => {
+        if (!enter) pendingKeys--;
       });
     };
     view.listen({
@@ -364,6 +389,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
         // terminal, including any frames that arrive before React replaces it.
         if (kept && (from === null || from !== kept.offset)) {
           discard = true;
+          if (pendingKeys) loseInput();
           refocus.current = !!document.activeElement && !!t.element?.contains(document.activeElement);
           view.pause();
           replacement.current = { id, view };
@@ -398,9 +424,14 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     if (!transferred) view.open(id, offset);
 
     const typed = t.onData(data => {
-      if (disposed || discard || reconnecting) return;
-      if (view.handle !== null) sendInput(view.handle, data, true);
-      else if (data === '\r' && shown.current) pendingEnter.current = { id, retry: true };
+      if (disposed) return;
+      if (!discard && !reconnecting && view.handle !== null) sendInput(view.handle, data, true);
+      else if (shown.current) {
+        if (data !== '\r') loseInput();
+        else if (!discard && !reconnecting && !inputLost.current) {
+          pendingEnter.current = { id, retry: true };
+        }
+      }
     });
     const resized = t.onResize(({ cols, rows }) => { void sendSize(cols, rows); });
 

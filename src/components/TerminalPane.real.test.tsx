@@ -83,12 +83,63 @@ describe('Enter in a visible terminal with no attached input stream', () => {
     expect(harnessApi.input).toHaveBeenCalledExactlyOnceWith(17, '\r');
   });
 
+  it('drops Down Down Enter together while attaching', async () => {
+    let attached!: (handle: number) => void;
+    vi.mocked(harnessApi.attach).mockImplementationOnce(() => new Promise(resolve => { attached = resolve; }));
+    await show('opening');
+    await act(async () => {
+      last().input('\x1b[B', true);
+      last().input('\x1b[B', true);
+      last().input('\r', true);
+    });
+    await act(async () => { attached(17); });
+    expect(harnessApi.input).not.toHaveBeenCalled();
+  });
+
   it('reaches the session when the input stream was detached', async () => {
     await show('detached');
     vi.mocked(harnessApi.input).mockRejectedValueOnce('The terminal is detached');
     await act(async () => { last().input('\r', true); });
     expect(views.map(view => view.id)).toEqual(['detached', 'detached']);
     expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\r'], [2, '\r']]);
+  });
+
+  it('drops Enter when a preceding key failed on the detached stream', async () => {
+    await show('detached');
+    let lost!: (error: string) => void;
+    vi.mocked(harnessApi.input).mockImplementationOnce(() => new Promise((_, reject) => { lost = reject; }));
+    await act(async () => {
+      last().input('\x1b[B', true);
+      last().input('\r', true);
+    });
+    await act(async () => { lost('The terminal is detached'); });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\x1b[B']]);
+  });
+
+  it('guards the replacement Enter when reconnect drops a queued key', async () => {
+    await show('detached');
+    let lost!: (error: string) => void;
+    vi.mocked(harnessApi.input).mockImplementationOnce(() => new Promise((_, reject) => { lost = reject; }));
+    await act(async () => {
+      last().input('\r', true);
+      last().input('\x1b[B', true);
+    });
+    await act(async () => { lost('The terminal is detached'); });
+    expect(views.map(view => view.id)).toEqual(['detached', 'detached']);
+    await act(async () => { last().input('\r', true); });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\r']]);
+    await act(async () => { last().input('\r', true); });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\r'], [2, '\r']]);
+  });
+
+  it('retries Enter when the preceding key reached the session', async () => {
+    await show('detached');
+    vi.mocked(harnessApi.input).mockResolvedValueOnce(undefined).mockRejectedValueOnce('The terminal is detached');
+    await act(async () => {
+      last().input('\x1b[B', true);
+      last().input('\r', true);
+    });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\x1b[B'], [1, '\r'], [2, '\r']]);
   });
 
   it('does not keep retrying Enter if the replacement stream is detached', async () => {
