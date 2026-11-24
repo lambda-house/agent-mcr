@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from 'react';
-import { Activity, FileQuestion, FileText } from 'lucide-react';
+import { Activity, Bot, FileQuestion, FileText } from 'lucide-react';
 import { EmptyState } from '@lambda-house/ui';
 import { LayoutView, usePaneTypes, type Layout, type PaneZoom, type Plugin } from '@lambda-house/workbench';
 import { useStore, panelShown, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH, type ZoomPanel } from './store';
@@ -76,7 +76,7 @@ export const documentsPlugin: Plugin = {
     api.contribute('workbench:pane-type', {
       view: 'documents',
       type: {
-        type: 'agent-docs', label: 'agent documents', title: 'Agent documents', singleton: true, collapsible: true,
+        type: 'agent-docs', label: 'agent documents', title: 'Agent documents', icon: <Bot size={14} />, singleton: true, collapsible: true,
         min: { w: PANEL_MIN_WIDTH }, max: { w: PANEL_MAX_WIDTH }, zoom: zoomOf('files'),
         render: () => <AgentPanel />,
       },
