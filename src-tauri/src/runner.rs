@@ -14,8 +14,10 @@
 //!   byte sent in all the session's output so far. With `"since":N` the
 //!   scrollback starts at that offset when the runner still holds it, so a view
 //!   that keeps what it showed takes only what it missed (MCR-139); otherwise
-//!   it is the whole scrollback, and `from` says so. A runner before this
-//!   answers without `from`. Bytes the client sends are typed
+//!   `from` describes the replay sent to a fresh terminal. An optional
+//!   `"replayBytes":N` bounds that fresh replay, without limiting an exact
+//!   continuation or the `snapshot` operation. Older runners ignore it.
+//!   A runner before MCR-139 answers without `from`. Bytes the client sends are typed
 //!   into the terminal. A view that falls too far behind is disconnected and
 //!   reattaches (at most once per view; the child never waits for a viewer).
 //! - `{"op":"watch"}` → `{"ok":true}`, then one JSON event per line.
@@ -690,7 +692,7 @@ impl Runner {
         }
     }
 
-    fn attach(&self, id: &str, since: Option<u64>, mut stream: Stream) -> std::io::Result<()> {
+    fn attach(&self, id: &str, since: Option<u64>, replay_bytes: Option<usize>, mut stream: Stream) -> std::io::Result<()> {
         let session = match self.get(id) {
             Ok(s) => s,
             Err(e) => return writeln!(stream, "{}", json!({ "error": e })),
@@ -703,7 +705,7 @@ impl Runner {
             if !out.closed {
                 out.views.push((view, tx));
             }
-            let (from, skip) = replay_from(out.total, out.ring.len(), since);
+            let (from, skip) = view_replay(out.total, &out.ring, since, replay_bytes);
             (view, from, out.ring.iter().skip(skip).copied().collect())
         };
         // However this view ends, a failed handshake included, its sender leaves the session (review 17086)
@@ -810,7 +812,10 @@ impl Runner {
             }
             match req["op"].as_str() {
                 // Both turn the connection into a stream; nothing was read past the line
-                Some("attach") => return self.attach(req["id"].as_str().unwrap_or(""), req["since"].as_u64(), writer),
+                Some("attach") => {
+                    let replay_bytes = req["replayBytes"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|&n| n > 0);
+                    return self.attach(req["id"].as_str().unwrap_or(""), req["since"].as_u64(), replay_bytes, writer);
+                }
                 Some("watch") => return self.watch(writer),
                 Some("snapshot") => return self.snapshot(req["id"].as_str().unwrap_or(""), writer),
                 _ => {
@@ -942,7 +947,25 @@ pub fn replay_from(total: u64, held: usize, since: Option<u64>) -> (u64, usize) 
     }
 }
 
-/// A session's scrollback bytes (what a new view would be replayed).
+fn view_replay(total: u64, ring: &VecDeque<u8>, since: Option<u64>, limit: Option<usize>) -> (u64, usize) {
+    let (from, skip) = replay_from(total, ring.len(), since);
+    let cut = ring.len().saturating_sub(limit.unwrap_or(ring.len()));
+    if cut == 0 || since == Some(from) {
+        return (from, skip);
+    }
+    if ring[cut - 1] == b'\n' {
+        return (from + cut as u64, cut);
+    }
+    // Prefer a nearby line start for a fresh parser. Some TUIs write long
+    // stretches without a line feed, so keep their tail at a UTF-8 boundary.
+    let advance = ring.iter().skip(cut).take(4096).position(|&b| b == b'\n')
+        .map(|n| n + 1)
+        .unwrap_or_else(|| ring.iter().skip(cut).take(3).take_while(|&&b| b & 0xc0 == 0x80).count());
+    let skip = cut + advance;
+    (from + skip as u64, skip)
+}
+
+/// A session's full raw scrollback bytes.
 pub fn snapshot(socket: &Path, id: &str) -> Result<Vec<u8>, String> {
     let (mut reader, _stream) = open_stream(socket, json!({"op": "snapshot", "id": id}))?;
     let mut bytes = Vec::new();
@@ -1537,6 +1560,19 @@ mod tests {
         assert_eq!(replay_from(500, 100, Some(450)), (450, 50));
     }
 
+    #[test]
+    fn fresh_replay_cap_keeps_exact_continuations_and_old_requests_intact() {
+        let ring: VecDeque<_> = b"one\r\ntwo\r\nthree\r\n".iter().copied().collect();
+        let total = 100 + ring.len() as u64;
+        assert_eq!(view_replay(total, &ring, None, None), (100, 0));
+        assert_eq!(view_replay(total, &ring, Some(102), Some(10)), (102, 2));
+        assert_eq!(view_replay(total, &ring, Some(99), Some(10)), (110, 10));
+        assert_eq!(view_replay(total, &ring, None, Some(12)), (105, 5));
+        assert_eq!(view_replay(total, &ring, None, Some(8)), (110, 10));
+        let ring = "ab🦀cd".bytes().collect();
+        assert_eq!(view_replay(8, &ring, None, Some(5)), (6, 6));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_view_whose_client_went_away_ends_on_a_quiet_session() {
@@ -1548,7 +1584,7 @@ mod tests {
             let (done, ended) = std::sync::mpsc::channel();
             let r = runner.clone();
             std::thread::spawn(move || {
-                let _ = r.attach("q1", None, server);
+                let _ = r.attach("q1", None, None, server);
                 let _ = done.send(());
             });
             let mut reader = BufReader::new(client.try_clone().unwrap());
@@ -1578,7 +1614,7 @@ mod tests {
             // The client is gone before the runner answers: the reply cannot be written
             server.shutdown(std::net::Shutdown::Write).unwrap();
             drop(client);
-            assert!(runner.attach("h1", None, server).is_err());
+            assert!(runner.attach("h1", None, None, server).is_err());
             assert_eq!(lock(&session.output).views.len(), 0, "a sender stays in the session");
         }
         runner.control(&json!({"op": "signal", "id": "h1", "signal": "KILL"})).unwrap();
@@ -1610,6 +1646,11 @@ mod tests {
         assert_eq!(reply["from"], 0);
         let all = read_until(&mut whole, "two");
         assert!(all.contains("one"), "{all:?}");
+        // A new client can request a capped fresh replay on the same protocol.
+        let (mut capped, _w, reply) = open_stream_reply(&socket, json!({"op": "attach", "id": "s1", "since": had + 1_000_000, "replayBytes": missed.len()})).unwrap();
+        assert_eq!(reply["from"], had);
+        assert_eq!(read_until(&mut capped, "two"), missed);
+        assert!(String::from_utf8_lossy(&snapshot(&socket, "s1").unwrap()).contains("one"));
         control.call(json!({"op": "signal", "id": "s1", "signal": "KILL"})).unwrap();
     }
 

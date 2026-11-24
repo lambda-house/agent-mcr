@@ -956,7 +956,7 @@ pub async fn terminal_attach(id: String, since: Option<u64>, output: Channel<Inv
     let (mut reader, writer, reply) = blocking(move || {
         let socket = socket()?;
         runner::ensure(&socket)?;
-        let mut req = json!({"op": "attach", "id": id});
+        let mut req = json!({"op": "attach", "id": id, "replayBytes": TERMINAL_REPLAY_BYTES});
         if let Some(since) = since {
             req["since"] = json!(since);
         }
@@ -993,6 +993,10 @@ pub async fn terminal_attach(id: String, since: Option<u64>, output: Channel<Inv
     });
     Ok(handle)
 }
+
+/// A fresh pane needs a recent tail of the raw output. The runner still keeps
+/// its full ring for exact continuations and terminal snapshots.
+const TERMINAL_REPLAY_BYTES: usize = 1024 * 1024;
 
 /// Output that arrives this soon after the first part of it goes to the web view with it.
 const GATHER: std::time::Duration = std::time::Duration::from_millis(6);

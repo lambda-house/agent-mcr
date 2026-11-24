@@ -20,6 +20,7 @@ let linkTo = '';
 const givenIsSession: unknown[] = [];
 const focused: string[] = [];
 const mounts: string[] = [];
+const unmounts: string[] = [];
 // Every render of a terminal stand-in: a list poll that changed nothing renders none (MCR-139)
 const renders: string[] = [];
 // The keep of hidden terminals (MCR-139): what the view tells it to retain
@@ -28,7 +29,7 @@ vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
   return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
     renders.push(id);
-    useEffect(() => { mounts.push(id); }, [id]);
+    useEffect(() => { mounts.push(id); return () => { unmounts.push(id); }; }, [id]);
     useEffect(() => { givenIsSession.push(isSession); }, [isSession]);
     useEffect(() => { if (focusAt) { focused.push(id); onFocused?.(); } }, [focusAt]); // eslint-disable-line react-hooks/exhaustive-deps
     return <div data-terminal={id} data-focus-at={focusAt ?? ''} data-links={['r1', 'e1', 's1', 'nobody'].filter(x => isSession?.(x)).join(' ')}><button aria-label={`quit ${id}`} onClick={onQuit}/><button aria-label={`link in ${id}`} onClick={() => onSession?.(linkTo)}/></div>;
@@ -41,9 +42,32 @@ const ended: Hosted = { ...running, id: 'e1', started: 1, title: '', exit: { cod
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
 const button = (label: string) => host.querySelector(`button[aria-label="${label}"]`) as HTMLButtonElement;
+let slotHeight: number;
+let intersectionHeight: number;
+const intersections = new Map<Element, () => void>();
+const resizes = new Set<() => void>();
 
 beforeEach(() => {
   vi.resetAllMocks();
+  slotHeight = intersectionHeight = 400;
+  vi.stubGlobal('ResizeObserver', class {
+    constructor(private callback: (entries: Partial<ResizeObserverEntry>[]) => void) {}
+    private notify = () => this.callback([{ contentRect: new DOMRect(0, 0, 600, slotHeight) }]);
+    observe() { resizes.add(this.notify); this.notify(); }
+    disconnect() { resizes.delete(this.notify); }
+  });
+  vi.stubGlobal('IntersectionObserver', class {
+    private target?: Element;
+    constructor(private callback: (entries: Partial<IntersectionObserverEntry>[]) => void) {}
+    observe(target: Element) {
+      this.target = target;
+      const notify = () => this.callback([{ isIntersecting: true, intersectionRect: new DOMRect(0, 0, 600, Math.min(slotHeight, intersectionHeight)) }]);
+      intersections.set(target, notify);
+      notify();
+    }
+    unobserve(target: Element) { intersections.delete(target); }
+    disconnect() { if (this.target) this.unobserve(this.target); }
+  });
   localStorage.removeItem('hs-dirs');
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
@@ -55,10 +79,45 @@ beforeEach(() => {
   useStore.setState({ liveList: DEFAULT_LIVE_LIST });
   vi.spyOn(document, 'hasFocus').mockReturnValue(true);
 });
-afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
+afterEach(async () => { await act(async () => root.unmount()); host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 const rows = () => [...host.querySelectorAll('.hs-dir > ul > li')];
 const folders = () => [...host.querySelectorAll('.hs-dir')];
+
+it('attaches only when the selected slot has visible area and the page is shown', async () => {
+  slotHeight = 0;
+  await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
+  await act(async () => rows().find(row => row.textContent?.includes('Fixing tests'))?.querySelector('button')?.click());
+  const terminal = () => host.querySelector('[data-terminal="r1"]');
+  expect(terminal()).toBeNull();
+
+  const resize = async (height: number) => {
+    slotHeight = height;
+    await act(async () => resizes.forEach(notify => notify()));
+  };
+  const intersect = async (height: number) => {
+    intersectionHeight = height;
+    await act(async () => intersections.forEach(notify => notify()));
+  };
+  intersectionHeight = 0;
+  await resize(400);
+  expect(terminal()).toBeNull();
+  await intersect(400);
+  expect(terminal()).not.toBeNull();
+  await resize(0);
+  expect(terminal()).toBeNull();
+  expect(unmounts[unmounts.length - 1]).toBe('r1');
+  await resize(400);
+  expect(terminal()).not.toBeNull();
+  const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+  await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+  expect(terminal()).toBeNull();
+  hidden.mockReturnValue(false);
+  await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+  expect(terminal()).not.toBeNull();
+  await intersect(0);
+  expect(terminal()).toBeNull();
+});
 
 describe('hiding folders and cleaning up (MCR-107)', () => {
   const label = (path: string) => `[aria-label="Folder ${path}"]`;

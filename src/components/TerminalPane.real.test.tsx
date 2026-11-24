@@ -46,17 +46,13 @@ const show = async (id: string) => { await act(async () => root.render(<Terminal
 const hide = async () => { await act(async () => root.render(<div/>)); };
 const lines = (t: Headless) => { const b = t.buffer.active; const out: string[] = []; for (let y = 0; y < b.length; y++) { const l = b.getLine(y)?.translateToString(true) ?? ''; if (l) out.push(l); } return out; };
 const last = () => made.terms[made.terms.length - 1] as Headless;
-/**
- * The runner's answer to the pane's latest view: it starts at `from` and sends
- * `text`. A pane that lets its terminal go on that answer opens a new view,
- * which the runner answers the same way.
- */
-const answer = async (text: string, from: number) => {
-  const first = views[views.length - 1];
-  await act(async () => { first.on.start(from); first.on.data(bytes(text)); });
+/** The replacement must accept the first replay without another attach. */
+const answer = async (text: string, from: number | null) => {
+  const count = views.length;
+  const { on } = views[count - 1];
+  await act(async () => { on.start(from); on.data(bytes(text)); });
   await frame();
-  const now = views[views.length - 1];
-  if (now !== first) await act(async () => { now.on.start(from); now.on.data(bytes(text)); });
+  expect(views).toHaveLength(count);
   await parsed();
 };
 
@@ -128,6 +124,30 @@ describe('a pane on a real terminal (review 17086)', () => {
     await answer('new line\r\n', 5_000_000);
     // Not "ew line": no unfinished sequence of the old terminal eats the replay's first bytes
     expect(lines(last())).toEqual(['new line']);
+  });
+
+  it('hands a legacy replay without an offset to a fresh terminal on the same view', async () => {
+    await show('a');
+    act(() => { views[0].on.start(null); views[0].on.data(bytes('old line\r\n')); });
+    await hide(); await parsed();
+    await show('a');
+    await answer('old line\r\nnew line\r\n', null);
+    expect(lines(last())).toEqual(['old line', 'new line']);
+  });
+
+  it('detaches a transferred view if the pane closes before using its replay', async () => {
+    await show('a');
+    act(() => { views[0].on.start(0); views[0].on.data(bytes('old line\r\n')); });
+    await hide(); await parsed();
+    await show('a');
+    vi.mocked(harnessApi.detach).mockClear();
+    await act(async () => {
+      views[1].on.start(5_000_000);
+      root.render(<div/>);
+      views[1].on.data(bytes('on its way\r\n'));
+    });
+    expect(views).toHaveLength(2);
+    expect(vi.mocked(harnessApi.detach).mock.calls).toEqual([[2]]);
   });
 
   it('gives the keyboard to the new terminal when it replaces one that had it (review 17090)', async () => {
