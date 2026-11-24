@@ -4,7 +4,7 @@ import { formatUntil, harnessApi, openReports, reportGroups, shortPath, tildePat
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
-import { keepSame } from '@lambda-house/ui';
+import { Button, Segmented, keepSame } from '@lambda-house/ui';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const KIND = { needs_human: 'Needs you', done: 'Done', status: 'Status' } as const;
@@ -107,16 +107,15 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
       <header className="hs-board-head">
         <h2>Reports</h2>
         <small>What sessions told you. Click one to open its session</small>
-        <span className="hs-board-filter" role="group" aria-label="Kind of report">
-          {(['all', 'needs_human', 'done', 'status'] as Filter[]).map(f => <button key={f} type="button" aria-pressed={filter === f} onClick={() => setFilter(f)}>{f === 'all' ? 'All' : KIND[f]}</button>)}
-        </span>
+        <Segmented kind="choice" className="hs-board-filter" label="Kind of report" value={filter} onChange={setFilter}
+          options={(['all', 'needs_human', 'done', 'status'] as Filter[]).map(f => ({ value: f, label: f === 'all' ? 'All' : KIND[f] }))}/>
       </header>
       <p className="hs-board-help">A <b>Needs you</b> report waits until you type into its session; a <b>Done</b> one until you open the session. A <b>Status</b> report notifies nobody: it says where a session and its executors stood, and the session's next one replaces it.</p>
       {board && !groups.length && <p className="hs-empty">{board.reports.length ? 'No reports of this kind.' : 'No reports yet. A session reports when it cannot go on without you, when a piece of work is complete, or to say where it stands.'}</p>}
       {groups.map(g => <div key={g.session || 'alone'} className="hs-board-group" role="group" aria-label={g.session ? `Reports of ${g.name} and its executors` : 'Reports of sessions without a supervisor'}>
         {(g.session || groups.length > 1) && <h3 className="hs-board-group-head">
           {g.session ? <><strong>{g.name}</strong><small>and its executors{g.live ? '' : ' · session ended'}</small></> : <small>Sessions without a supervisor</small>}
-          {g.session && g.live && <button type="button" title="Show this session in Live" onClick={() => onOpen(g.session)}>Open<ArrowRight size={11}/></button>}
+          {g.session && g.live && <Button variant="ghost" size="xs" className="hs-board-open" title="Show this session in Live" onClick={() => onOpen(g.session)}>Open<ArrowRight size={11}/></Button>}
         </h3>}
         <ul className="hs-board-reports">
           {g.rows.map(({ report: r, depth }) => <li key={r.id} className={`${open.has(r.id) ? 'open' : ''}${r.kind === 'status' ? ' status' : ''}`.trim()} style={depth ? { paddingLeft: depth * 16 } : undefined}>
@@ -142,7 +141,7 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
           <select value={hours} aria-label="How long it stays" onChange={e => setHours(Number(e.target.value))}>
             {LASTS.map(([label, h]) => <option key={h} value={h}>for {label}</option>)}
           </select>
-          <button type="submit" disabled={!draft.trim() || posting}>Post</button>
+          <Button type="submit" variant="primary" size="xs" className="hs-board-post-go" disabled={!draft.trim() || posting}>Post</Button>
         </div>
       </form>
       {board && !notes.length && <p className="hs-empty">No notes. Sessions, and you, post here what the others in a folder should know: a file being edited, a step nobody should run.</p>}

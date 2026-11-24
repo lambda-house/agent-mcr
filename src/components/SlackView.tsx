@@ -4,7 +4,7 @@ import { harnessApi, hostedLabel, isSupervisor, slackApi, SLACK_POSTING, type Ho
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import '../styles/harness.css';
-import { keepSame } from '@lambda-house/ui';
+import { Button, keepSame } from '@lambda-house/ui';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const LINK: Record<SlackStatus['link'], string> = { off: 'Off', connecting: 'Connecting…', connected: 'Connected', reconnecting: 'Reconnecting…', refused: 'Refused by Slack' };
@@ -30,12 +30,12 @@ function Waiting({ post, busy, onDecide, onOpen, live }: { post: SlackPost; busy
           ? <span className="hs-slack-actions">
               <input aria-label="Why (told to the session)" placeholder="Why? The session is told (optional)" value={reason} maxLength={500} autoFocus onChange={e => setReason(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') onDecide(false, undefined, reason); if (e.key === 'Escape') setDenying(false); }}/>
-              <button type="button" disabled={busy} onClick={() => onDecide(false, undefined, reason)}>Deny</button>
-              <button type="button" onClick={() => setDenying(false)}>Back</button>
+              <Button variant="destructive" size="xs" disabled={busy} onClick={() => onDecide(false, undefined, reason)}>Deny</Button>
+              <Button variant="secondary" size="xs" onClick={() => setDenying(false)}>Back</Button>
             </span>
           : <span className="hs-slack-actions">
-              <button type="button" className="primary" disabled={busy || !text.trim()} onClick={() => onDecide(true, edited ? text : undefined)}>{edited ? 'Approve as changed' : 'Approve'}</button>
-              <button type="button" disabled={busy} onClick={() => setDenying(true)}>Deny…</button>
+              <Button variant="primary" size="xs" disabled={busy || !text.trim()} onClick={() => onDecide(true, edited ? text : undefined)}>{edited ? 'Approve as changed' : 'Approve'}</Button>
+              <Button variant="secondary" size="xs" disabled={busy} onClick={() => setDenying(true)}>Deny…</Button>
               {live && <button type="button" className="hs-slack-link" onClick={onOpen}>Open session <ArrowRight size={11}/></button>}
             </span>}
       </span>
@@ -177,7 +177,7 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         <label>Bot token<input type="password" autoComplete="off" spellCheck={false} placeholder="xoxb-…" value={bot} onChange={e => setBot(e.target.value)}/></label>
         <label>App-level token<input type="password" autoComplete="off" spellCheck={false} placeholder="xapp-… (scope connections:write)" value={appToken} onChange={e => setAppToken(e.target.value)}/></label>
         <label>Your member ID<input autoComplete="off" spellCheck={false} placeholder="U… (your Slack profile: ⋮ > Copy member ID)" value={operator} onChange={e => setOperator(e.target.value)}/></label>
-        <div><button type="submit" disabled={busy || !bot.trim() || !appToken.trim() || !operator.trim()}>{busy ? 'Checking…' : 'Connect…'}</button></div>
+        <div><Button type="submit" variant="primary" size="xs" disabled={busy || !bot.trim() || !appToken.trim() || !operator.trim()}>{busy ? 'Checking…' : 'Connect…'}</Button></div>
       </form> : <>
         <div className="hs-slack-state">
           <span className={`hs-dot ${status.link === 'connected' ? 'idle' : status.link === 'off' ? 'past' : status.link === 'refused' ? 'failed' : 'working'}`} aria-hidden/>
@@ -201,8 +201,8 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         <label className="hs-slack-toggle"><input type="checkbox" checked={c.approveInSlack} disabled={busy} onChange={e => run(() => slackApi.approval(e.target.checked))}/>
           Approve in Slack too <small>Off unless you switch it on: posts are approved here. When on, the bot sends {c.operatorName || c.operator} a direct message with Approve and Deny for every post that waits. Its text is then in that direct message, also when you deny it</small></label>
         <div className="hs-slack-actions">
-          <button type="button" disabled={busy} onClick={() => run(slackApi.refresh)} title="Read again which channels the bot is a member of"><RefreshCw size={11}/> Channels</button>
-          <button type="button" disabled={busy} onClick={() => run(slackApi.disconnect)}>Disconnect…</button>
+          <Button variant="ghost" size="xs" icon={<RefreshCw size={11}/>} disabled={busy} onClick={() => run(slackApi.refresh)} title="Read again which channels the bot is a member of">Channels</Button>
+          <Button variant="ghost" size="xs" disabled={busy} onClick={() => run(slackApi.disconnect)}>Disconnect…</Button>
         </div>
         <p className={`hs-slack-counts${alarm ? ' alarm' : ''}`} title="These must stay at zero">
           Sent without approval: <b>{counts.sentWithoutApproval}</b> · approvals refused: <b>{counts.refusedApprovals}</b> · delivered from senders off the list: <b>{counts.deliveredFromStrangers}</b>

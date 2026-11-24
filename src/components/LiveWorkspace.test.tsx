@@ -676,7 +676,9 @@ describe('Live workspace', () => {
     expect(host.textContent).toContain('2 tasks');
     expect(host.querySelector('.hs-dot.waiting')?.getAttribute('aria-label')).toBe('waiting for you');
     // One row per session, in start order: the waiting one says why, with no second card for it
-    expect(host.querySelector('.hs-notifications')?.textContent).toContain('Notifications · 1');
+    // The list's header counts the notifications
+    expect(button('Notifications').closest('.ui-pane__header')).not.toBeNull();
+    expect(button('Notifications').textContent).toBe('1');
     expect(rows()).toHaveLength(2);
     expect(rows()[0].className).toContain('needs-you');
     expect(rows()[0].textContent).toContain('reviewer');

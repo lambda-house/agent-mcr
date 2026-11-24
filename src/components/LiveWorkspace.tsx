@@ -1,7 +1,7 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
-import { Button, ConfirmDialog, Dialog, Menu, keepSame } from '@lambda-house/ui';
+import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, FolderPlus, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
+import { Button, ConfirmDialog, Dialog, Menu, PaneFrame, keepSame } from '@lambda-house/ui';
 import { LayoutView, isPx, type Layout, type LayoutNode } from '@lambda-house/workbench';
 import TerminalPane, { keep } from './TerminalPane';
 import AgentMark from './AgentMark';
@@ -40,15 +40,20 @@ const storedWidth = (): number | null => {
 interface Action { label: string; icon: React.ReactNode; run: () => void; title?: string }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
-function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false, wrapItems = false }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean; wrapItems?: boolean }) {
+function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false, wrapItems = false, tool }: { label: string; actions: Action[]; icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean; wrapItems?: boolean;
+  /** A pane header's tool: a ghost button with `icon` and this text after it (none: the icon alone) */
+  tool?: { text?: string } }) {
   const [at, setAt] = useState<{ top: number; right: number } | null>(null);
   const wrap = useRef<HTMLSpanElement>(null);
+  const toggle = (e: React.MouseEvent<HTMLButtonElement>) => {
+    // Fixed position: the list scrolls and would clip a menu placed inside it
+    const box = e.currentTarget.getBoundingClientRect();
+    setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
+  };
   return <span className={className} ref={wrap}>
-    <button type="button" className={buttonClassName} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={e => {
-      // Fixed position: the list scrolls and would clip a menu placed inside it
-      const box = e.currentTarget.getBoundingClientRect();
-      setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
-    }}>{icon ?? <MoreHorizontal size={14}/>}</button>
+    {tool
+      ? <Button variant="ghost" size="xs" icon={icon} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={toggle}>{tool.text || undefined}</Button>
+      : <button type="button" className={buttonClassName} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={toggle}>{icon ?? <MoreHorizontal size={14}/>}</button>}
     {at && <Menu label={label} at={at} anchorRef={wrap} wrap={wrapItems} onClose={() => setAt(null)}
       items={actions.map(a => ({ key: a.label, label: a.label, title: a.title, icon: a.icon, onSelect: a.run }))}/>}
   </span>;
@@ -566,7 +571,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
             ? <><optgroup label="This folder">{choices.here.map(x => choice(x, false))}</optgroup><optgroup label="Other folders">{choices.elsewhere.map(x => choice(x, true))}</optgroup></>
             : [...choices.here.map(x => choice(x, false)), ...choices.elsewhere.map(x => choice(x, true))]}
         </select>
-        <button type="button" onClick={() => setBinding('')}>Cancel</button>
+        <Button variant="secondary" size="xs" onClick={() => setBinding('')}>Cancel</Button>
       </form>}
       {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
         {shells.map(sh => {
@@ -608,9 +613,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const defaultNewAgent = () => (
     <Dialog open={newAgentOpen} onClose={closeNewAgent} title="New agent" size="lg" footerLayout="spread" footer={<>
       <Button variant="ghost" size="sm" onClick={closeNewAgent}>Cancel</Button>
-      <button type="button" className="hs-start hs-start--solid" disabled={!status || (!selectedResume && !status.profiles.some(p => p.id === profile)) || (!cwd && !selectedResume) || starting} onClick={() => void start(profile, cwd, selectedResume?.id ?? '')}>
-        <Play size={12}/> {starting ? 'Starting…' : selectedResume ? `Resume ${selectedResume.agent === 'claude' ? 'Claude' : 'Codex'}` : `Start ${(status?.profiles ?? []).find(p => p.id === profile)?.label ?? profile}`}
-      </button>
+      <Button variant="primary" size="sm" icon={<Play size={12}/>} disabled={!status || (!selectedResume && !status.profiles.some(p => p.id === profile)) || (!cwd && !selectedResume) || starting} onClick={() => void start(profile, cwd, selectedResume?.id ?? '')}>
+        {starting ? 'Starting…' : selectedResume ? `Resume ${selectedResume.agent === 'claude' ? 'Claude' : 'Codex'}` : `Start ${(status?.profiles ?? []).find(p => p.id === profile)?.label ?? profile}`}
+      </Button>
     </>}>
       <div className="hs-modal-body">
         <div className="hs-palette-search">
@@ -624,7 +629,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
               else if (isAbsolutePath(q)) selectProjectCwd(q);
             }
           }} placeholder="Filter projects or paste a folder path…" aria-label="Filter projects"/>
-          <button type="button" className="hs-palette-browse" onClick={async () => { try { const dir = await pickDirectory(); if (dir) { selectProjectCwd(dir); setProjectFilter(''); } } catch (e) { setError(err(e)); } }}><FolderOpen size={13}/> Browse…</button>
+          <Button variant="secondary" size="sm" icon={<FolderOpen size={13}/>} onClick={async () => { try { const dir = await pickDirectory(); if (dir) { selectProjectCwd(dir); setProjectFilter(''); } } catch (e) { setError(err(e)); } }}>Browse…</Button>
         </div>
         <div className="hs-split-picker">
           <div className="hs-split-col">
@@ -690,12 +695,17 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   );
 
   const defaultSidebar = () => (
-    <aside className="hs-list" aria-label="Hosted sessions">
+    <PaneFrame as="aside" className="hs-list" aria-label="Hosted sessions" title="Sessions" tools={<>
+      <Button variant="ghost" size="xs" icon={<FolderPlus size={14}/>} aria-label="Add project" title="Add a project: choose a folder to work in" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}/>
+      <RowMenu className="hs-notifications-wrap" tool={{ text: waiting.length ? String(waiting.length) : '' }} wrapItems label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
+        icon={<BellRing size={14}/>} actions={waiting.map(h => ({ label: `${sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
+    </>}>
       <div className="hs-list-resizer" role="separator" aria-orientation="vertical" aria-label="Session list width"
         title="Drag to resize the list, double-click for the default width"
         onPointerDown={e => { if (e.button === 0) { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); } }}
         onPointerMove={e => { if (e.currentTarget.hasPointerCapture(e.pointerId)) resizeList(e.clientX, e.currentTarget); }}
         onDoubleClick={() => resizeList(null)}/>
+      <div className="hs-list-body">
       {error && <div className="hs-error" role="alert">{error}</div>}
       {status?.storeNotice && (() => {
         const notice = status.storeNotice;
@@ -704,7 +714,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
           <div className="hs-error hs-store-notice" role="alert">
             <p>{lines.what}</p>
             <p>{lines.kept}</p>
-            {!notice.frozen && <button type="button" onClick={() => { void harnessApi.storeNoticeSeen().then(left => { if (mounted.current) setStatus(s => s && { ...s, storeNotice: left }); }).catch(e => setError(String(e))); }}>Dismiss</button>}
+            {!notice.frozen && <Button variant="ghost" size="xs" onClick={() => { void harnessApi.storeNoticeSeen().then(left => { if (mounted.current) setStatus(s => s && { ...s, storeNotice: left }); }).catch(e => setError(String(e))); }}>Dismiss</Button>}
           </div>
         );
       })()}
@@ -726,12 +736,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
         </button>
         {supervisor && <RowMenu label="Actions for the supervisor" actions={actions(supervisor)}/>}
       </div>
-      <div className="hs-add">
-        <Button variant="ghost" size="sm" title="Choose a folder to work in" aria-label="Add project" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}><Plus size={14}/> Add project</Button>
-      </div>
-      <RowMenu className="hs-notifications-wrap" buttonClassName="hs-notifications" wrapItems label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
-        icon={<><BellRing size={14}/> Notifications{waiting.length > 0 && ` · ${waiting.length}`}</>}
-        actions={waiting.map(h => ({ label: `${sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
       {gate && <BackgroundGate stopped={gate === 'stopped'} onAllowed={connect}/>}
       <ul className="hs-dirs">
         {shown.map(d => {
@@ -794,7 +798,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
         <p>Their terminal output in Agent MCR goes with them. Their conversations stay on disk with Claude Code and Codex: you find them under their folder's Earlier sessions and in Journal, and can resume them.</p>
       </ConfirmDialog>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
-    </aside>
+      </div>
+    </PaneFrame>
   );
 
   const sidebarController: LiveControllerContext = {
@@ -966,7 +971,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                     <span title={h.cwd}>{h.cwd}</span>
                     <ProgramLine hosted={h} compact/>
                     <div className="hs-pane-tools">
-                      <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>
+                      <Button variant="ghost" size="xs" icon={<BarChart3 size={13}/>} aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}>Usage</Button>
                       {paneTools?.({ leafId: node.id, multiPane, controller })}
                     </div>
                   </header>

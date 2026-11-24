@@ -4,7 +4,9 @@
 .hs-live-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; overflow: hidden; background: var(--canvas); }
 .hs-live { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: clamp(256px, 23%, 310px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); background: var(--canvas); }
 
-.hs-list { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; padding: 10px 8px 8px 10px; background: var(--canvas); gap: 6px; }
+.hs-list { position: relative; overflow: hidden; background: var(--canvas); }
+/* Under the list's header (a PaneFrame): the search, the supervisor and the folders */
+.hs-list-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; padding: 10px 8px 8px 10px; overflow: hidden; }
 
 .hs-search-icon { color: var(--text-faint); flex-shrink: 0; }
 
@@ -22,9 +24,6 @@
 .hs-supervisor-open .hs-item-text strong { font-size: 12.5px; font-weight: 500; color: var(--text); }
 .hs-item-text strong .hs-mark { vertical-align: -2px; margin-right: 3px; }
 
-.hs-start--solid { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--accent); background: var(--accent); color: var(--text-inverse); font-size: 12px; font-weight: 600; flex-shrink: 0; cursor: pointer; }
-.hs-start--solid:hover:not(:disabled) { filter: brightness(1.08); }
-.hs-start--solid:disabled { opacity: .45; cursor: not-allowed; }
 
 .hs-modal-body { display: flex; flex-direction: column; gap: 18px; }
 
@@ -35,8 +34,6 @@
 .hs-palette-search { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 8px 0 12px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line); }
 .hs-palette-search:focus-within { border-color: var(--accent); }
 .hs-palette-search input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--text); font-size: 13px; outline: none; }
-.hs-palette-browse { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--line); background: var(--input); color: var(--text); font-size: 11.5px; cursor: pointer; }
-.hs-palette-browse:hover { color: var(--text); border-color: var(--line-strong); }
 .hs-pills { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; padding: 4px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line); }
 .hs-pill { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: var(--text-muted); font-size: 12px; font-weight: 500; cursor: pointer; min-width: 0; }
 .hs-pill:hover { color: var(--text); background: var(--input); }
@@ -68,7 +65,6 @@
 
 .hs-error { margin: 4px 0; padding: 7px 9px; border: 1px solid var(--danger-line); border-radius: 8px; background: var(--danger-bg); color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
 .hs-store-notice p { margin: 0 0 4px; }
-.hs-store-notice button { height: 22px; padding: 0 8px; border: 1px solid var(--danger-line); border-radius: 6px; background: transparent; color: inherit; font-size: 11px; }
 .hs-list ul { list-style: none; margin: 0; padding: 2px 0; overflow-x: hidden; overflow-y: auto; flex: 1; min-width: 0; scrollbar-width: none; }
 .hs-list ul::-webkit-scrollbar { display: none; }
 .hs-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; border-radius: 8px; min-width: 0; max-width: 100%; transition: background .12s ease; }
@@ -186,8 +182,6 @@
 
 /* Usage of the selected session, beside its terminal */
 .hs-pane-body { flex: 1; min-width: 0; min-height: 0; display: flex; }
-.session-cockpit .hs-stats-toggle { margin-left: auto; flex: 0 0 auto; padding: 2px 7px; gap: 5px; font-size: 11px; color: var(--text-muted); }
-.session-cockpit .hs-stats-toggle[aria-pressed='true'] { color: var(--accent); border-color: var(--accent); }
 .hs-stats { flex: 0 0 clamp(210px, 24%, 280px); min-height: 0; overflow: auto; padding: 8px 12px 12px; border-left: 1px solid var(--line); background: var(--surface-1); font-size: 12px; }
 .hs-stats section { padding: 6px 0 10px; border-bottom: 1px solid var(--line); }
 .hs-stats h4 { margin: 0 0 6px; font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--text-muted); }
@@ -218,8 +212,6 @@
 .hs-shells li.quiet .hs-item-text strong, .hs-shells li.stopped .hs-item-text strong { color: var(--text-muted); }
 
 /* Add a folder: one line above the sections */
-.hs-add { display: flex; justify-content: flex-end; padding: 6px 0 0; margin-bottom: -6px; }
-.session-cockpit .hs-add button { color: var(--text-muted); height: 22px; padding: 0 6px; font-size: 11px; gap: 4px; }
 /* A folder: a bracket on the left and a line on top, with the folder's path set into the line */
 .hs-list li.hs-dir, .ss-dir { display: block; margin: 14px 0 6px 2px; padding: 0 0 2px 3px; border-left: 2px solid var(--line); border-top: 1px solid var(--line); border-radius: 6px 0 0 6px; min-width: 0; max-width: none; }
 .hs-list li.hs-dir.live { border-color: var(--accent); border-top-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
@@ -262,7 +254,7 @@
 .hs-gate p { margin: 0; color: var(--text-muted); }
 .hs-gate b { font-weight: 600; color: var(--text); }
 .hs-gate code { font-size: 11px; }
-.session-cockpit .hs-gate button { align-self: flex-start; margin-top: 2px; }
+.hs-gate-go { align-self: flex-start; margin-top: 2px; }
 .hs-background { padding: 8px 10px; border-top: 1px solid var(--line); background: var(--surface-2); font-size: 11px; line-height: 1.4; }
 .hs-background p { margin: 0 0 6px; color: var(--text-muted); }
 .hs-background dl { margin: 0; display: flex; flex-direction: column; gap: 6px; }
@@ -270,8 +262,6 @@
 .hs-background dd { margin: 0 0 0 14px; color: var(--text-muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .hs-background-file { font-family: "SF Mono", Menlo, monospace; font-size: 10px; }
 .hs-background-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-.session-cockpit .hs-background-actions button { height: 22px; padding: 0 8px; font-size: 11px; }
-.session-cockpit .hs-background-actions button:hover { border-color: var(--danger); color: var(--danger); }
 
 /* Session telemetry stays readable independently of the activity dot. */
 .hs-metrics { display: flex; align-items: center; gap: 7px; margin: 3px 0 1px; overflow: hidden; color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; line-height: 1.5; }
@@ -331,16 +321,11 @@
 .hs-cache-cold .hs-stats-big { color: var(--text-muted); }
 
 /* Sidebar actions share one visual hierarchy. */
-.session-cockpit .hs-add { justify-content: stretch; padding: 0; margin: 0; }
-.session-cockpit .hs-add button, .session-cockpit .hs-notifications, .session-cockpit .hs-supervisor-open, .session-cockpit .cmd-trigger-btn { width: 100%; min-height: 36px; justify-content: flex-start; gap: 8px; padding: 6px 8px; font-size: 12px; }
+.session-cockpit .hs-supervisor-open, .session-cockpit .cmd-trigger-btn { width: 100%; min-height: 36px; justify-content: flex-start; gap: 8px; padding: 6px 8px; font-size: 12px; }
 .session-cockpit .hs-supervisor-open { min-height: 34px; }
 .session-cockpit .hs-supervisor-open .hs-item-text strong { font-size: 12px; }
-.hs-list :is(.hs-add button, .hs-notifications, .hs-supervisor-open, .cmd-trigger-btn) > svg { width: 16px; height: 16px; flex: 0 0 16px; }
-.session-cockpit .hs-notifications { display: flex; align-items: center; text-align: left; }
-/* Add project and Notifications: no fill or border at rest, like an idle Supervisor */
-.session-cockpit :is(.hs-add button, .hs-notifications) { border: 1px solid transparent; background: transparent; box-shadow: none; }
-.session-cockpit :is(.hs-add button, .hs-notifications):hover:not(:disabled) { background: var(--surface-2); }
-.hs-notifications-wrap { display: block; }
+.hs-list :is(.hs-supervisor-open, .cmd-trigger-btn) > svg { width: 16px; height: 16px; flex: 0 0 16px; }
+.hs-notifications-wrap { display: inline-flex; }
 /* Board: reports to the person, and the notes sessions left for each other */
 .hs-board { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 0; overflow: hidden; }
 .hs-board > .hs-error { grid-column: 1 / -1; }
@@ -349,9 +334,7 @@
 .hs-board-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: baseline; gap: 8px; padding: 10px 0 6px; background: var(--canvas); }
 .hs-board-head h2 { font-size: 12px; font-weight: 600; }
 .hs-board-head small { color: var(--text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hs-board-filter { margin-left: auto; display: inline-flex; gap: 2px; flex-shrink: 0; }
-.session-cockpit .hs-board-filter button { height: 20px; padding: 0 7px; border: 0; background: transparent; color: var(--text-muted); font-size: 11px; }
-.session-cockpit .hs-board-filter button[aria-pressed='true'] { color: var(--text); background: var(--surface-2); }
+.hs-board-filter { margin-left: auto; flex-shrink: 0; }
 .hs-board ul { list-style: none; margin: 0; padding: 0; }
 .hs-board li { border-bottom: 1px solid var(--line); }
 .session-cockpit .hs-board-row { display: flex; align-items: flex-start; gap: 8px; width: 100%; padding: 6px 4px; border: 0; border-radius: 0; background: transparent; text-align: left; }
@@ -368,8 +351,7 @@
 .hs-board-group-head { display: flex; align-items: baseline; gap: 6px; margin: 0; padding: 6px 4px 4px; border-bottom: 1px solid var(--line); font-size: 11px; font-weight: 400; }
 .hs-board-group-head strong { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hs-board-group-head small { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
-.session-cockpit .hs-board-group-head button { margin-left: auto; height: 18px; padding: 0 4px; border: 0; background: transparent; color: var(--text-muted); font-size: 11px; gap: 3px; }
-.session-cockpit .hs-board-group-head button:hover { color: var(--accent); }
+.hs-board-open { margin-left: auto; }
 .hs-dot.status { background: transparent; border: 1.5px solid var(--text-muted); }
 .hs-board-execs { display: flex; flex-direction: column; gap: 1px; margin: 2px 0; padding-left: 8px; border-left: 2px solid var(--line); color: var(--text-muted); font-size: 11px; line-height: 1.45; }
 .hs-board-execs > span { display: flex; align-items: flex-start; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
@@ -385,7 +367,7 @@
 .hs-board-post > div { display: flex; gap: 5px; }
 .session-cockpit .hs-board-post select { min-width: 0; height: 22px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-1); color: var(--text); font-size: 11px; }
 .hs-board-post select:first-child { flex: 1; }
-.session-cockpit .hs-board-post button { height: 22px; padding: 0 10px; margin-left: auto; font-size: 11px; }
+.hs-board-post-go { margin-left: auto; }
 .session-cockpit .hs-board-remove { flex-shrink: 0; height: 20px; padding: 0 5px; border: 0; background: transparent; color: var(--text-muted); font-size: 11px; }
 .session-cockpit .hs-board-remove.sure { color: var(--danger); border: 1px solid var(--danger); }
 @media (max-width: 820px) {
@@ -403,12 +385,9 @@
 .hs-slack-waiting { background: color-mix(in srgb, var(--warn) 7%, transparent); }
 .hs-slack-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin: 4px 0; }
 .hs-slack-actions input { flex: 1; }
-.session-cockpit .hs-slack-actions button { height: 22px; padding: 0 10px; font-size: 11px; gap: 4px; }
-.session-cockpit .hs-slack-actions button.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--text-on-accent); }
 .session-cockpit .hs-slack button.hs-slack-link { height: auto; padding: 0; border: 0; background: transparent; color: var(--accent); font-size: inherit; display: inline-flex; align-items: center; gap: 3px; }
 .hs-slack-connect, .hs-slack-channel { display: flex; flex-direction: column; gap: 5px; padding: 6px 0 8px; }
 .hs-slack-connect label, .hs-slack-channel label { display: grid; grid-template-columns: 96px minmax(0, 1fr); align-items: center; gap: 6px; color: var(--text-muted); font-size: 11px; }
-.session-cockpit .hs-slack-connect button { height: 22px; padding: 0 10px; font-size: 11px; }
 .hs-slack-channel strong { font-size: 12px; font-weight: 600; }
 .hs-slack-channel strong em { margin-left: 8px; font-style: normal; font-size: 10px; color: var(--warn); }
 .hs-slack-senders { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
@@ -438,7 +417,6 @@
 .hs-under { color: var(--text-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hs-bind { flex: 0 0 100%; display: flex; gap: 5px; padding: 2px 6px 6px 22px; box-sizing: border-box; }
 .session-cockpit .hs-bind select { flex: 1; min-width: 0; height: 22px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-1); color: var(--text); font-size: 11px; }
-.session-cockpit .hs-bind button { height: 22px; padding: 0 8px; font-size: 11px; }
 
 /* What a session registered that it waits for; a mark for parts that ship as a preview */
 .hs-wait { display: inline-flex; align-items: center; gap: 4px; color: var(--text-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -545,10 +523,6 @@
 .ck-say code, .ck-from code { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .ck-buttons { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .ck-choices { align-items: stretch; }
-.session-cockpit .ck-do, .ck-do { height: auto; min-height: 22px; padding: 2px 9px; border: 1px solid var(--accent); border-radius: 6px; background: transparent; color: var(--text); font-size: 12px; text-align: left; white-space: normal; overflow-wrap: anywhere; cursor: pointer; }
-.ck-do:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 18%, transparent); }
-.ck-do:disabled { opacity: .5; cursor: default; }
-.ck-do.quiet { border-color: var(--line); color: var(--text-muted); }
 .ck-more { margin: 2px 0 6px; }
 .ck-from { color: var(--text-muted); font-size: 11px; }
 .ck-risk.caution { padding: 0 6px; border: 1px solid var(--danger-line); border-radius: 8px; color: var(--danger); font-size: 10.5px; font-weight: 600; }
