@@ -9,7 +9,7 @@ import { excerptFromSelection } from '../utils/taskCopy';
 import { isCopyKey, isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
 import TaskCopyDialog from './TaskCopyDialog';
 import { MAX_KEPT, TerminalKeep } from '../utils/terminalKeep';
-import { tryWebgl } from '../utils/terminalRenderer';
+import { disableOutputScrollbarReveal, tryWebgl } from '../utils/terminalRenderer';
 
 /** How long the pane's size must stay the same before the terminal is fitted to it. */
 export const RESIZE_SETTLE_MS = 200;
@@ -36,8 +36,6 @@ function theme(element: HTMLElement) {
 
 /** Hidden terminals kept with what they showed (MCR-139); see utils/terminalKeep.ts */
 export const keep = new TerminalKeep<{ term: Terminal; fit: FitAddon }>(MAX_KEPT, ({ term }) => term.dispose());
-/** Sessions a pane shows now: a terminal let go while its session is shown again is not kept */
-const mountedIds = new Set<string>();
 
 type ViewReceiver = {
   start: (from: number | null) => void;
@@ -103,8 +101,10 @@ class TerminalView {
  * with no text is saved and its path typed. Ctrl-V reaches the agent as ^V
  * (Claude Code reads the clipboard image itself).
  */
-export default function TerminalPane({ id, name, active, onQuit, isSession, onSession, focusAt, onFocused }: {
+export default function TerminalPane({ id, name, active, focusOnMount = false, onQuit, isSession, onSession, focusAt, onFocused }: {
   id: string; active: boolean;
+  /** The selected pane may take the keyboard when it mounts. */
+  focusOnMount?: boolean;
   /** Its name in the Live list, for the Copy as task dialog (MCR-125) */
   name?: string;
   /** The session ended right after the person pressed keys in it: they quit the agent themselves */
@@ -150,6 +150,8 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
   // Only a terminal that is shown answers the app's command: never one left behind in another pane
   const shown = useRef(active);
   shown.current = active;
+  const takeFocus = useRef(focusOnMount);
+  takeFocus.current = focusOnMount;
   const copyText = (text: string) => { harnessApi.copyText(text).catch(e => setNotice(err(e))); };
 
   useEffect(() => () => {
@@ -165,7 +167,6 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     // A session shown a moment ago comes back with the terminal it had: every
     // line it showed, and only what it missed from the runner (MCR-139)
     const kept = keep.take(id);
-    mountedIds.add(id);
     let t: Terminal, f: FitAddon;
     if (kept) {
       ({ term: t, fit: f } = kept.term);
@@ -185,11 +186,14 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       t.loadAddon(new Unicode11Addon());
       t.unicode.activeVersion = '11';
       t.open(element);
-      // xterm 6 has no public option for this. Keep hover/drag revealing the
-      // scrollbar, without rearming its hide timer on every PTY repaint.
-      const browser = t as Terminal & { _core?: { _viewport?: { _scrollableElement?: { setRevealOnScroll?: (on: boolean) => void } } } };
-      browser._core?._viewport?._scrollableElement?.setRevealOnScroll?.(false);
-      if (refocus.current) { refocus.current = false; requestAnimationFrame(() => { if (term.current === t) t.focus(); }); }
+      disableOutputScrollbarReveal(t);
+      if (refocus.current) {
+        refocus.current = false;
+        requestAnimationFrame(() => {
+          const focused = document.activeElement;
+          if (!document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) t.focus();
+        });
+      }
     }
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
@@ -430,22 +434,17 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
       if (replacement.current?.view !== view) view.dispose();
       // Kept, not disposed: shown again it takes only what it missed
       t.element?.remove();
-      mountedIds.delete(id);
-      // Kept once xterm has parsed every byte given to it, so that a kept
-      // terminal holds exactly what its offset says (review 17086). Shown again
-      // before that, the session gets a new terminal and this one goes
-      if (discard) { t.dispose(); } else {
-        const kept = { term: { term: t, fit: f }, offset };
-        // A session removed from the list meanwhile is not taken back (`put` refuses it, review 17088)
-        t.write(new Uint8Array(0), () => { if (mountedIds.has(id)) t.dispose(); else keep.put(id, kept); });
-      }
+      // The same xterm retains its pending writes. A quick reattach can append
+      // the continuation behind them without waiting for the parser or replaying.
+      if (discard) t.dispose();
+      else keep.put(id, { term: { term: t, fit: f }, offset });
       term.current = null; fit.current = null; resend.current = () => {};
     };
   }, [id, fresh]);
 
   useEffect(() => {
-    // MCR-139 measured higher graphics memory with WebGL. Enable it on a
-    // trial build via VITE_TERMINAL_WEBGL=1 until measured on this lifecycle.
+    // WebGL uses more memory in the Mac demos. Enable it on a trial build
+    // with VITE_TERMINAL_WEBGL=1.
     if (active && term.current && import.meta.env.VITE_TERMINAL_WEBGL === '1') return tryWebgl(term.current);
   }, [active, id, fresh]);
 
@@ -456,8 +455,15 @@ export default function TerminalPane({ id, name, active, onQuit, isSession, onSe
     if (!active) return;
     // Shown again: fit, and tell the agent the size even when it did not change here
     // (the session may have been resized from elsewhere while this pane was hidden)
-    requestAnimationFrame(() => { try { fit.current?.fit(); } catch { /* hidden */ } resend.current(); term.current?.refresh(0, term.current.rows - 1); term.current?.focus(); });
-  }, [active]);
+    const frame = requestAnimationFrame(() => {
+      if (document.hidden || !term.current) return;
+      try { fit.current?.fit(); } catch { /* hidden */ }
+      resend.current();
+      term.current.refresh(0, term.current.rows - 1);
+      if (takeFocus.current) term.current.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [active, id]);
 
   useEffect(() => {
     if (!focusAt) return;

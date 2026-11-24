@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { beforeEach, expect, it, vi } from 'vitest';
+import { createRequire } from 'node:module';
 import type { Terminal } from '@xterm/xterm';
-import { tryWebgl } from './terminalRenderer';
+import { disableOutputScrollbarReveal, tryWebgl } from './terminalRenderer';
 
 const renderer = vi.hoisted(() => ({
   lost: undefined as (() => void) | undefined,
@@ -28,6 +29,30 @@ function terminal(unavailable = false) {
 }
 
 beforeEach(() => { vi.clearAllMocks(); renderer.lost = undefined; });
+
+it('uses the real installed xterm viewport hook after open', () => {
+  const { Terminal: InstalledTerminal } = createRequire(import.meta.url)('@xterm/xterm') as typeof import('@xterm/xterm');
+  const host = document.body.appendChild(document.createElement('div'));
+  const term = new InstalledTerminal();
+  try {
+    term.open(host);
+    const { _core: { _viewport: { _scrollableElement: scrollable } } } = term as unknown as {
+      _core: { _viewport: { _scrollableElement: { _revealOnScroll: boolean } } };
+    };
+    expect(scrollable._revealOnScroll).toBe(true);
+    disableOutputScrollbarReveal(term);
+    expect(scrollable._revealOnScroll).toBe(false);
+  } finally {
+    term.dispose();
+    host.remove();
+  }
+});
+
+it('leaves the scrollbar alone when xterm does not expose a callable hook', () => {
+  for (const term of [{}, { _core: { _viewport: { _scrollableElement: { setRevealOnScroll: true } } } }]) {
+    expect(() => disableOutputScrollbarReveal(term as unknown as Terminal)).not.toThrow();
+  }
+});
 
 it('disposes the addon on context loss and releases its canvas context once', async () => {
   const { term, loadAddon, loseContext } = terminal();

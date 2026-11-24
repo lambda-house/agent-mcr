@@ -1,5 +1,5 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, ArrowRight, BarChart3, BellRing, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Trash2, Unlink, X } from 'lucide-react';
 import { Button, Dialog } from '@/ui';
@@ -72,14 +72,14 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
     let observing = true;
     let live = true;
     const intersection = new IntersectionObserver(entries => {
-      if (!live || !observing) return;
+      if (!live || document.hidden || !observing) return;
       const entry = entries[entries.length - 1];
       const shown = entry?.isIntersecting
         && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0;
       registerSlot(sessionId, shown ? el : null);
     }, { threshold: [0, Number.EPSILON] });
     const resize = new ResizeObserver(([entry]) => {
-      if (!live || !entry) return;
+      if (!live || document.hidden || !entry) return;
       const { width, height } = entry.contentRect;
       const sized = width > 0 && height > 0;
       if (sized === observing) return;
@@ -90,12 +90,26 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
         registerSlot(sessionId, null);
       }
     });
-    resize.observe(el);
-    intersection.observe(el);
-    return () => {
-      live = false;
+    const stop = () => {
       resize.disconnect();
       intersection.disconnect();
+      intersection.takeRecords();
+    };
+    const watch = () => {
+      stop();
+      // Background WebKit can report an empty viewport. Preserve the last
+      // visible geometry and ask for fresh observations when it comes back.
+      if (document.hidden) return;
+      observing = true;
+      intersection.observe(el);
+      resize.observe(el);
+    };
+    document.addEventListener('visibilitychange', watch);
+    watch();
+    return () => {
+      live = false;
+      document.removeEventListener('visibilitychange', watch);
+      stop();
       registerSlot(sessionId, null);
     };
   }, [sessionId, registerSlot]);
@@ -137,7 +151,12 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const [selected, setSelected] = useState('');
   const [opened, setOpened] = useState<string[]>([]);
   const [layout, setLayout] = useState<PaneNode>(() => createInitialLayout());
+  const leaves = useMemo(() => listLeaves(layout), [layout]);
+  const assignedSessions = useMemo(() => new Set(leaves.flatMap(({ item }) => item?.kind === 'session' && item.id ? [item.id] : [])), [leaves]);
+  useLayoutEffect(() => { keep.protect(assignedSessions); }, [assignedSessions]);
+  useLayoutEffect(() => () => keep.protect(new Set()), []);
   const [focusedPane, setFocusedPane] = useState('p1');
+  const focusedItem = leaves.find(leaf => leaf.id === focusedPane)?.item;
   const paneSeq = useRef(2);
   const splitSeq = useRef(1);
   const [slotEls, setSlotEls] = useState(() => new Map<string, HTMLElement>());
@@ -149,13 +168,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       else next.delete(key);
       return next;
     });
-  }, []);
-  const [pageVisible, setPageVisible] = useState(() => !document.hidden);
-  useEffect(() => {
-    const changed = () => setPageVisible(!document.hidden);
-    document.addEventListener('visibilitychange', changed);
-    changed();
-    return () => document.removeEventListener('visibilitychange', changed);
   }, []);
   const [profile, setProfile] = useState('claude');
   const [cwd, setCwd] = useState('');
@@ -876,9 +888,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     {newAgentOverride ? newAgentOverride({ open: newAgentOpen, onClose: closeNewAgent, controller, defaultRender: defaultNewAgent }) : defaultNewAgent()}
     <main className="hs-terminals">
       {(() => {
-        const leaves = listLeaves(layout);
         const multiPane = leaves.length > 1;
-        const visibleSessions = new Set(leaves.map(l => l.item?.kind === 'session' && l.item.id ? l.item.id : null).filter((x): x is string => !!x));
         const emptyActions = pluginRegistry.getEmptyActions();
         const emptyPaneOverride = pluginRegistry.getOverride('live:empty-pane');
         const renderNode = (node: PaneNode): React.ReactNode => {
@@ -896,7 +906,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
           const pluginKind = node.item ? (node.item.kind === 'custom' ? node.item.type : node.item.kind) : '';
           const pluginPane = !h && pluginKind ? pluginRegistry.getPaneType(pluginKind) : undefined;
           const isFocused = node.id === focusedPane;
-          const pickCandidates = hosted.filter(x => !x.exit && !visibleSessions.has(x.id));
+          const pickCandidates = hosted.filter(x => !x.exit && !assignedSessions.has(x.id));
           const defaultEmptyRender = () => (
             <>
               <header className="hs-pane-title hs-pane-title--empty">
@@ -1076,12 +1086,13 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
               : <div className="hs-layout-root">{renderNode(layout)}</div>}
             {/* Only visible slots attach. The Cockpit can push a slot offscreen
                 or squeeze it to zero height even when its session stays selected. */}
-            {opened.filter(id => active && pageVisible && visibleSessions.has(id)).map(id => {
+            {opened.filter(id => active && assignedSessions.has(id)).map(id => {
               const h = hosted.find(x => x.id === id);
               if (!h) return null;
               const el = slotEls.get(id);
               if (!el) return null;
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              const selectedPane = selected === id && focusedItem?.kind === 'session' && focusedItem.id === id;
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane} onQuit={() => { closing.current.add(id); void refresh(); }} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );

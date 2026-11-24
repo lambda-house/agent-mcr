@@ -24,7 +24,7 @@ const unmounts: string[] = [];
 // Every render of a terminal stand-in: a list poll that changed nothing renders none (MCR-139)
 const renders: string[] = [];
 // The keep of hidden terminals (MCR-139): what the view tells it to retain
-const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); } }));
+const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); }, protect: vi.fn() }));
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
   return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
@@ -67,6 +67,7 @@ beforeEach(() => {
     }
     unobserve(target: Element) { intersections.delete(target); }
     disconnect() { if (this.target) this.unobserve(this.target); }
+    takeRecords() { return []; }
   });
   localStorage.removeItem('hs-dirs');
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -84,7 +85,7 @@ afterEach(async () => { await act(async () => root.unmount()); host.remove(); vi
 const rows = () => [...host.querySelectorAll('.hs-dir > ul > li')];
 const folders = () => [...host.querySelectorAll('.hs-dir')];
 
-it('attaches only when the selected slot has visible area and the page is shown', async () => {
+it('detaches a clipped slot in a visible window and keeps it attached when the window hides', async () => {
   slotHeight = 0;
   await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
   await act(async () => rows().find(row => row.textContent?.includes('Fixing tests'))?.querySelector('button')?.click());
@@ -104,6 +105,7 @@ it('attaches only when the selected slot has visible area and the page is shown'
   expect(terminal()).toBeNull();
   await intersect(400);
   expect(terminal()).not.toBeNull();
+  expect(kept.protect).toHaveBeenLastCalledWith(new Set(['r1']));
   await resize(0);
   expect(terminal()).toBeNull();
   expect(unmounts[unmounts.length - 1]).toBe('r1');
@@ -111,8 +113,11 @@ it('attaches only when the selected slot has visible area and the page is shown'
   expect(terminal()).not.toBeNull();
   const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
   await act(async () => document.dispatchEvent(new Event('visibilitychange')));
-  expect(terminal()).toBeNull();
+  await resize(0);
+  await intersect(0);
+  expect(terminal()).not.toBeNull();
   hidden.mockReturnValue(false);
+  slotHeight = intersectionHeight = 400;
   await act(async () => document.dispatchEvent(new Event('visibilitychange')));
   expect(terminal()).not.toBeNull();
   await intersect(0);

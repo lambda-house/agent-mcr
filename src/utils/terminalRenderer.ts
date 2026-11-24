@@ -1,6 +1,15 @@
 import type { IDisposable, Terminal } from '@xterm/xterm';
 import type { WebglAddon } from '@xterm/addon-webgl';
 
+/** xterm 6's scrollbar can still reveal on hover and drag without a timer per output repaint. */
+export function disableOutputScrollbarReveal(terminal: Terminal) {
+  const browser = terminal as Terminal & {
+    _core?: { _viewport?: { _scrollableElement?: { setRevealOnScroll?: unknown } } };
+  };
+  const scrollable = browser._core?._viewport?._scrollableElement;
+  if (typeof scrollable?.setRevealOnScroll === 'function') scrollable.setRevealOnScroll(false);
+}
+
 /** Try WebGL on a shown terminal. Disposing the addon restores xterm's DOM renderer. */
 export function tryWebgl(terminal: Terminal): () => void {
   let stopped = false;
