@@ -4,8 +4,8 @@
 # It delivers its track (MCR-136, owner's decision of 2026-11-23): it pushes
 # and merges a commit an independent validator approved, under the delivery
 # contract of its role guide, so merge and push are not owner words for it.
-# The launcher allows bare `git push` and `gh pr merge` for delivery leads
-# and denies `gh pr merge --admin` (MCR-143). Denies take precedence.
+# The launcher allows `git push origin <branch>` and
+# `gh pr merge --merge -- <PR>` (MCR-143). Denies take precedence.
 # Force pushes, a mirror push and deleting main are denied, best-effort
 # (M2; FORCE_PUSH_DENIES in profiles.rs, which check() requires). A rule
 # matches text, not words, so each one starts its flag at a word, and none

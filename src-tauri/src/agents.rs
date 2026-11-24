@@ -622,12 +622,14 @@ impl Adapter for Claude {
                     "Bash(git push --e *)",
                     "Bash(git push * --e *)",
                     // An explicit ext destination names a command when the transport is enabled.
-                    "Bash(git push ext::*)",
-                    "Bash(git push * ext::*)",
-                    "Bash(git push --repo=ext::*)",
-                    "Bash(git push * --repo=ext::*)",
-                    "Bash(git push --rep=ext::*)",
-                    "Bash(git push * --rep=ext::*)",
+                    // End in two wildcards so Claude keeps both literal colons
+                    // instead of treating the last colon and star as `:*`.
+                    "Bash(git push ext::**)",
+                    "Bash(git push * ext::**)",
+                    "Bash(git push --repo=ext::**)",
+                    "Bash(git push * --repo=ext::**)",
+                    "Bash(git push --rep=ext::**)",
+                    "Bash(git push * --rep=ext::**)",
                 ] {
                     if !p.tools.deny.iter().any(|deny| deny == rule) {
                         w.push(rule.into());
@@ -636,7 +638,9 @@ impl Adapter for Claude {
             }
         }
         if delivers {
-            w.extend(["--allowedTools", "Bash(git push:*)", "Bash(gh pr merge:*)"].map(String::from));
+            // The merge wildcard follows the end of option parsing. It can
+            // supply a PR selector but cannot supply a flag to gh.
+            w.extend(["--allowedTools", "Bash(git push origin *)", "Bash(gh pr merge --merge -- *)"].map(String::from));
         }
         Ok(w)
     }
@@ -1354,7 +1358,7 @@ mod tests {
                     if p.adapter == "claude" && p.delivers() {
                         assert_eq!(refused, ["--allowedTools"], "{}", p.id);
                         let at = words.iter().position(|w| w == "--allowedTools").unwrap();
-                        assert_eq!(&words[at + 1..at + 3], ["Bash(git push:*)", "Bash(gh pr merge:*)"]);
+                        assert_eq!(&words[at + 1..at + 3], ["Bash(git push origin *)", "Bash(gh pr merge --merge -- *)"]);
                         assert_eq!(words[at + 3], "--mcp-config");
                     } else {
                         assert!(refused.is_empty(), "{}: {refused:?}", p.id);
@@ -1380,7 +1384,7 @@ mod tests {
                             let added_denies = &words[end..allow];
                             for (command, arguments) in [
                                 ("gh pr merge", &["--admin", "-F", "--body-file"][..]),
-                                ("git push", &["--receive-pack", "--exec", "--rece", "--ex", "--e=", "--e ", "ext::", "--repo=ext::", "--rep=ext::"][..]),
+                                ("git push", &["--receive-pack", "--exec", "--rece", "--ex", "--e=", "--e ", "ext::*", "--repo=ext::*", "--rep=ext::*"][..]),
                             ] {
                                 for argument in arguments {
                                     for position in ["", "* "] {
