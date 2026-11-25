@@ -1403,18 +1403,20 @@ mod tests {
         // the title bar 14 + y tall, AppKit keeps them 9 px above its bottom)
         let lights = mac.remove("trafficLightPosition").unwrap();
         let (x, y) = (lights["x"].as_f64().unwrap(), lights["y"].as_f64().unwrap());
-        // Their centre is the top row's: --titlebar-height less its 1 px bottom border, halved
-        let css = include_str!("../../src/styles/index.css");
+        // Their centre is the top row's: --titlebar-height less its 1 px bottom border, halved.
+        // The top bar is the shared workbench's, its height a shared token (packages/, from mdviewer-mj)
+        let css = include_str!("../../packages/tokens/tokens.css");
         let row: f64 = css
             .split("--titlebar-height:")
             .nth(1)
             .and_then(|rest| rest.split("px;").next())
             .map(|n| n.trim().parse().unwrap())
-            .unwrap();
+            .expect("packages/tokens/tokens.css defines --titlebar-height in px");
         assert_eq!(y - 2.0, (row - 1.0) / 2.0);
-        // The row leaves them x + 60 + x (utils/windowChrome.ts, TRAFFIC_LIGHT_INSET; its test pins 88)
-        let chrome = include_str!("../../src/utils/windowChrome.ts");
-        assert!(chrome.contains(&format!("export const TRAFFIC_LIGHT_X = {x};")));
+        // The row leaves them x + 60 + x (the workbench's titleBar.ts, TRAFFIC_LIGHT_INSET;
+        // utils/windowChrome.test.ts pins 88)
+        let chrome = include_str!("../../packages/workbench/src/titleBar.ts");
+        assert!(chrome.contains(&format!("export const TRAFFIC_LIGHT_X = {x};")), "packages/workbench/src/titleBar.ts sets TRAFFIC_LIGHT_X to {x}");
         // trafficLightPosition needs the system's decorations
         assert_eq!(mac.get("decorations"), Some(&serde_json::json!(true)));
         assert_eq!(mac, main);
