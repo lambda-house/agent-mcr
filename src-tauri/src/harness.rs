@@ -952,15 +952,15 @@ pub struct Tracked {
     draft_generation: Option<u64>,
     /// When the app last said that `draft` changed
     pub typed: u64,
-    /// Which cockpit click placed the unsent line `draft` counts (MCR-154),
-    /// so a refused click can name it: the entry's id and the choice's
-    /// number (`placed_label`), never the line, whose text an agent wrote
-    /// and a credential the detector does not know could be in. Forgotten
-    /// at the operator's Enter, when the hold ends or when they begin a line
-    /// of their own. In memory only: not in the store or a session list;
-    /// after a service restart a refusal says "an unsent line" without it
+    /// That a cockpit click placed the unsent line `draft` counts (MCR-154),
+    /// so a refused click can name it: what kind of line and when, both the
+    /// service's own (`Placed`). Never the line or the entry's id: an agent
+    /// wrote those, and a credential the detector does not know could be in
+    /// them. Forgotten at the operator's Enter, when the hold ends or when
+    /// they begin a line of their own. In memory only: not in the store or a
+    /// session list; after a service restart a refusal says "an unsent line"
     #[serde(skip)]
-    placed: Option<String>,
+    placed: Option<Placed>,
     /// The operator was told that something waits for this draft (once per draft)
     pub held_told: bool,
     /// When the operator last pressed Enter in its terminal, by the app's
@@ -2316,17 +2316,37 @@ fn answered(tracked: &mut Tracked, now: u64) {
     }
 }
 
-/// How a refusal names the line a click placed (MCR-154): by the clicked
-/// entry's id, which `cockpit` holds to a-z, 0-9, `-` and `_` (`ident`; a
-/// derived entry adds `:`), and the choice's number. No text an agent wrote
-/// is repeated: an id of another shape is not named either.
-fn placed_label(id: &str, act: cockpit::Act) -> String {
-    let plain = !id.is_empty() && id.len() <= 80 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_:/".contains(&b));
-    let entry = if plain { format!("cockpit entry {id}") } else { "a cockpit entry".to_string() };
-    match act {
-        cockpit::Act::Choose(n) => format!("{entry}, choice {}", n + 1),
-        cockpit::Act::Ask => format!("{entry}, Ask more"),
-        _ => entry,
+/// The line a cockpit click placed, as a refusal names it (MCR-154): only
+/// what the service knows of its own, the kind of click and when. No text
+/// and no id an agent wrote.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placed {
+    /// "the decision line", "the Ask more line" or "the line"
+    what: &'static str,
+    at: u64,
+}
+
+impl Placed {
+    /// For a click that resolved to a line to type (`Deed::Type`)
+    fn of(act: cockpit::Act, at: u64) -> Placed {
+        let what = match act {
+            cockpit::Act::Choose(_) => "the decision line",
+            cockpit::Act::Ask => "the Ask more line",
+            _ => "the line",
+        };
+        Placed { what, at }
+    }
+
+    /// "the decision line an earlier click placed there 3 minutes ago"
+    fn told(&self, now: u64) -> String {
+        let minutes = now.saturating_sub(self.at) / 60_000;
+        let ago = match minutes {
+            0 => "a moment ago".to_string(),
+            1 => "a minute ago".to_string(),
+            2..=119 => format!("{minutes} minutes ago"),
+            _ => format!("{} hours ago", minutes / 60),
+        };
+        format!("{} an earlier click placed there {ago}", self.what)
     }
 }
 
@@ -3562,7 +3582,6 @@ impl Harness {
     /// request is text that is typed, opened or copied: that comes from the
     /// stored action, checked again here. `root` is the Supervisor session.
     fn cockpit_act(&self, root: Option<String>, by: &str, id: &str, updated: u64, act: cockpit::Act) -> Result<Value, String> {
-        let label = placed_label(id, act);
         let deed = {
             let store = lock(&self.store);
             let mut facts = store.cockpit_facts(now_ms());
@@ -3573,7 +3592,8 @@ impl Harness {
             cockpit::Deed::Link(link) => Ok(json!({ "link": link })),
             cockpit::Deed::Copy(text) => Ok(json!({ "copy": text })),
             cockpit::Deed::Type { session, text } => {
-                self.place(&session, &text, &label)?;
+                // Named after the action resolved: nothing of the request is taken before (review 17271)
+                self.place(&session, &text, Placed::of(act, now_ms()))?;
                 Ok(json!({ "placed": session }))
             }
         }
@@ -3584,8 +3604,8 @@ impl Harness {
     /// nothing, has no line of the operator's, and has nothing on its way.
     fn place_refusal(store: &Store, session: &str, now: u64) -> Option<Cow<'static, str>> {
         Self::place_obstacle(store, session, now).map(|why| match store.sessions.get(session).filter(|_| why == UNSENT) {
-            // What the operator can do about it, with the line itself when the cockpit placed it (MCR-154)
-            Some(Tracked { placed: Some(label), .. }) => Cow::Owned(format!("an unsent line is in its input box: the line an earlier click placed for {label}. Press Enter in that session to send it, or delete it there (with an empty box, an Enter there ends the hold), then click again")),
+            // What the operator can do about it, and that the cockpit placed the line (MCR-154)
+            Some(Tracked { placed: Some(placed), .. }) => Cow::Owned(format!("an unsent line is in its input box: {}. Press Enter in that session to send it, or delete it there (with an empty box, an Enter there ends the hold), then click again", placed.told(now))),
             _ => Cow::Borrowed(why),
         })
     }
@@ -3624,7 +3644,7 @@ impl Harness {
     /// added: the operator presses it. The line counts as their unsent line
     /// from before it is written (`Tracked.draft`, MCR-85), so no notice and
     /// no task is typed into it.
-    fn place(&self, session: &str, text: &str, label: &str) -> Result<(), String> {
+    fn place(&self, session: &str, text: &str, placed: Placed) -> Result<(), String> {
         let refuse = |why: &str| Err(format!("Refused: {why}."));
         cockpit::placeable(text).or_else(|why| refuse(&format!("the line {why}")))?;
         // Not while the harness types there itself: its Enter would send this line too
@@ -3650,7 +3670,7 @@ impl Harness {
                 let t = s.sessions.get_mut(session).ok_or(Cow::Borrowed("that session has ended or is gone"))?;
                 (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
                 t.draft_generation = None;
-                t.placed = Some(label.to_string());
+                t.placed = Some(placed);
                 Ok(())
             }
         });
@@ -9552,10 +9572,14 @@ mod tests {
         };
         // The owner's case of MCR-154: a decision placed in the lead's box and not sent, then another click for that box
         assert_eq!(place(1), json!({"placed": "lead"}));
+        // What is kept of it is the service's own and stays out of the store and the session lists
+        assert!(lock(&harness.store).sessions["lead"].placed.is_some());
+        let saved = serde_json::to_value(&lock(&harness.store).sessions["lead"]).unwrap();
+        assert!(saved.get("placed").is_none() && !saved.to_string().contains("decision line"), "{saved}");
         let err = refusal(0);
-        assert_eq!(err, format!("Refused: an unsent line is in its input box: the line an earlier click placed for cockpit entry pick, choice 2. {fix}."));
-        // Named by ids only: the line itself, which an agent wrote, is not repeated
-        assert!(!err.contains("Drop it") && !err.contains("Ctrl"), "{err}");
+        assert_eq!(err, format!("Refused: an unsent line is in its input box: the decision line an earlier click placed there a moment ago. {fix}."));
+        // Nothing an agent wrote is repeated: not the line, not the entry's id
+        assert!(!err.contains("Drop it") && !err.contains("pick") && !err.contains("Ctrl"), "{err}");
         // Nothing went into the box that holds the line
         assert_eq!(typed_so_far(&harness).len(), 1);
         // The operator's Enter sends it and the line is forgotten; a line they begin themselves is never named
@@ -9563,25 +9587,53 @@ mod tests {
         assert!(lock(&harness.store).sessions["lead"].placed.is_none());
         harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": true})).unwrap();
         let err = refusal(0);
-        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("cockpit entry") && err.contains("an Enter there ends the hold"), "{err}");
+        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("earlier click") && err.contains("an Enter there ends the hold"), "{err}");
         // A placed line the operator types on is still named: the app's key says nothing about it
         harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
         place(0);
         harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": true})).unwrap();
-        assert!(refusal(1).contains("cockpit entry pick, choice 1."));
+        assert!(refusal(1).contains("the decision line an earlier click placed there"));
         // An Enter told together with a new line (the app's worker reads the draft when it calls):
         // the placed line was sent, the new one is held and is not named as the placed one
         harness.control(&json!({"op": "operator_input", "id": "lead", "draft": true})).unwrap();
         let t = lock(&harness.store).sessions["lead"].clone();
         assert!(t.draft && t.placed.is_none());
         let err = refusal(1);
-        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("cockpit entry"), "{err}");
+        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("earlier click"), "{err}");
         assert_eq!(typed_so_far(&harness).len(), 2);
-        // Nothing of the click is in the store or a session list
-        assert!(!serde_json::to_string(&lock(&harness.store).sessions["lead"]).unwrap().contains("pick"));
-        // An id of another shape is not repeated
-        assert_eq!(placed_label("Some Text", cockpit::Act::Place), "a cockpit entry");
-        assert_eq!(placed_label("need:root/q1", cockpit::Act::Ask), "cockpit entry need:root/q1, Ask more");
+        // A choice the action does not have is refused as such, whatever its number, before anything is named
+        harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        harness.update(|s| s.sessions.get_mut("lead").unwrap().typed = 0);
+        for n in [2, usize::MAX] {
+            assert!(refusal(n).contains("no such option"));
+        }
+        // How long ago, in the service's words
+        assert_eq!(Placed::of(cockpit::Act::Ask, 0).told(3 * 60_000 + 5), "the Ask more line an earlier click placed there 3 minutes ago");
+        assert_eq!(Placed::of(cockpit::Act::Place, 0).told(60_000), "the line an earlier click placed there a minute ago");
+        assert_eq!(Placed::of(cockpit::Act::Place, 0).told(3 * 3_600_000), "the line an earlier click placed there 3 hours ago");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refusal_never_repeats_an_entry_id_that_looks_like_a_credential() {
+        let (dir, harness, stamp) = clickable("secret-id");
+        // A fake token, put together at run time: it passes `ident` and the detector knows its shape
+        let id = ["gh", "p_", "abcdefghij0123456789abcdef"].concat();
+        assert!(cockpit::looks_secret(&id) && id.len() <= 40 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+        harness.update(|s| {
+            let facts = s.cockpit_facts(stamp);
+            s.cockpit.publish(&cockpit::Who { id: "ex", root: false }, &facts, &json!({
+                "tracks": [{"id": "own", "title": "Own", "lead": "ex", "state": "waiting_human"}],
+                "actions": [{"id": id, "track": "own", "title": "Say it", "kind": "typed_word", "where": {"session": "ex"}, "say": "looks fine", "risk": "reversible"}],
+            }), stamp).unwrap();
+        });
+        // A typed word places its `say` alone, which passed the detector: the id is in no line
+        assert_eq!(harness.cockpit_act(None, "ex", &id, stamp, cockpit::Act::Place).unwrap(), json!({"placed": "ex"}));
+        assert_eq!(typed_so_far(&harness), [("ex".to_string(), "\x1b[200~looks fine\x1b[201~".to_string())]);
+        lock(&harness.wrote).clear();
+        let err = harness.cockpit_act(None, "ex", &id, stamp, cockpit::Act::Place).unwrap_err();
+        assert!(err.contains("the line an earlier click placed there"), "{err}");
+        assert!(!err.contains(&id) && !cockpit::looks_secret(&err), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
