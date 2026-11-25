@@ -1916,6 +1916,7 @@ mod tests {
         assert_eq!(list["sessions"][0]["exit"]["code"], 3);
         control.call(json!({"op": "forget", "id": "t1"})).unwrap();
         assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
+        assert!(snapshot(&socket, "t1").is_err(), "forget removes the scrollback along with the ended session");
     }
 
     #[cfg(unix)]

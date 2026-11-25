@@ -14,7 +14,7 @@ vi.mock('../utils/sessions', async importOriginal => ({ ...await importOriginal<
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 // The Live view connects to the runner; these tests are about History.
-vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(() => new Promise(() => {})), listSince: vi.fn() } }));
+vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(() => new Promise(() => {})), listSince: vi.fn(), spawn: vi.fn() } }));
 const session: Session = { id:'a',provider:'codex',parentId:null,name:'root',cwd:'/work/demo',title:'Fix CORE-123',model:'model-a',effort:'high',started:'2026-01-01T00:00:00Z',updated:'2026-01-01T00:00:00Z',modified:Date.now(),status:'working',usage:{input:100,cached:70,cacheWrite:0,output:20,reasoning:5},usageKnown:true,models:{},tools:{shell:2},tickets:['CORE-123'],memoryRefs:[],events:[{seq:1,at:'2026-01-01T00:00:00Z',kind:'assistant',text:'<script>untrusted()</script>',tool:null}],eventCount:1,malformedLines:0,source:'/fake/session.jsonl',turnId:'turn'};
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve,0)); }); };
@@ -130,6 +130,21 @@ describe('Sessions workspace', () => {
     // Selecting it still opens the conversation in the Journal
     await act(async () => (row as HTMLElement).click());
     expect(row.classList.contains('selected')).toBe(true);
+  });
+  it('shows an ended hosted conversation in Journal and selects the new session when resumed', async () => {
+    const ended: Hosted = { id: 'old', pid: 42, argv: ['codex'], cwd: session.cwd, started: 1, cols: 120, rows: 32, title: '',
+      exit: { code: 0, signal: null, at: 2 }, meta: { profile: 'codex' }, harness: { profile: 'codex', agentSession: session.id } as Hosted['harness'] };
+    vi.mocked(harnessApi.listSince).mockResolvedValue({ stamp: 'ended', sessions: [ended] });
+    vi.mocked(harnessApi.spawn).mockResolvedValue({ ...ended, id: 'resumed', exit: null });
+    const selected = vi.spyOn(pluginRegistry, 'emitEvent');
+    try {
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+      expect(host.querySelector('.ss-results .hs-resume')?.textContent).toContain(session.title);
+      await act(async () => button('resume in live').click()); await flush();
+      expect(harnessApi.spawn).toHaveBeenCalledWith('', '', 120, 32, session.id);
+      expect(button('live').getAttribute('aria-current')).toBe('page');
+      expect(selected).toHaveBeenCalledWith('session:selected', { id: 'resumed' });
+    } finally { selected.mockRestore(); }
   });
   it('mounts the global overlays only while Sessions is shown, so their keys stay free over Documents', async () => {
     const onKey = vi.fn();

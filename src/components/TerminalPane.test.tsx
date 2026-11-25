@@ -239,6 +239,13 @@ describe('a terminal is the view of one shown session (MCR-139)', () => {
   const hide = async () => { await act(async () => root.render(<div/>)); };
   afterEach(() => { vi.mocked(harnessApi.attach).mockImplementation(() => new Promise(() => {})); });
 
+  it('shows that the session ended when the output stream finishes', async () => {
+    runner();
+    await show();
+    await act(async () => views[0].on.data(new Uint8Array(0)));
+    expect(host.querySelector('.hs-terminal-notice')?.textContent).toBe('The session ended.');
+  });
+
   it('keeps every line it showed: hidden, it detaches; shown again, it takes only the bytes it missed, on the same terminal', async () => {
     runner(); screen.fitted = { cols: 132, rows: 40 };
     const before = screen.made;
