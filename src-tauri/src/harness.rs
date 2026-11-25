@@ -774,8 +774,8 @@ pub struct Subagent {
 /// assistant message, or the acknowledgement of its report to the caller (the
 /// wording depends on the Claude Code version; when it isn't recognised the
 /// subagent shows as quiet, not finished). Only the last record is looked at.
-fn subagent_finished(path: &Path) -> bool {
-    let Some(last) = last_record(path) else { return false };
+fn subagent_finished(file: &mut std::fs::File) -> bool {
+    let Some(last) = last_record(file) else { return false };
     match serde_json::from_str::<Value>(&last) {
         Ok(v) if v["type"] == "assistant" => v["message"]["stop_reason"] == "end_turn",
         Ok(v) if v["type"] == "user" => last.contains("Report delivered to your caller"),
@@ -783,21 +783,26 @@ fn subagent_finished(path: &Path) -> bool {
     }
 }
 
-/// The last complete record of a transcript, read from its tail only.
-fn last_record(path: &Path) -> Option<String> {
+/// The last complete record of an opened transcript, read from its tail only.
+fn last_record(file: &mut std::fs::File) -> Option<String> {
     use std::io::{Seek, SeekFrom};
-    let mut file = crate::sessions::open_regular(path).ok()?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let _ = file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)));
+    file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024))).ok()?;
     let mut tail = Vec::new();
     let _ = file.take(256 * 1024).read_to_end(&mut tail);
     String::from_utf8_lossy(&tail).lines().rev().find(|l| !l.trim().is_empty()).map(str::to_owned)
 }
 
+/// A time of an opened file in milliseconds; 0 when it is not known.
+fn file_ms(time: std::io::Result<std::time::SystemTime>) -> u64 {
+    time.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64)
+}
+
 /// Subagents a Codex conversation started that wrote something since `since`,
 /// newest first: the transcripts whose head names it as their parent thread.
 /// Only the head (who started it, its name) and the type of the last record
-/// are read, never what it said.
+/// are read, never what it said. Each file is opened once, confined to the
+/// real transcript folder (`open_confined`), and its times come from the handle.
 pub fn codex_subagents(home: &Path, thread: &str, since: u64) -> Vec<Subagent> {
     if !is_uuid(thread) {
         return Vec::new();
@@ -809,17 +814,29 @@ pub fn codex_subagents(home: &Path, thread: &str, since: u64) -> Vec<Subagent> {
     let mut out: Vec<Subagent> = files
         .iter()
         .filter_map(|path| {
-            let last_activity = modified_ms(path);
-            if last_activity < since || crate::agents::head_value(path, "parent_thread_id", 8192).as_deref() != Some(thread) {
+            // Old rollouts are passed over by the listing's own look, without opening them
+            if file_ms(std::fs::symlink_metadata(path).and_then(|m| m.modified())) < since {
+                return None;
+            }
+            let mut file = crate::transcript_stats::open_confined(&root, path.strip_prefix(&root).ok()?).ok()?;
+            let meta = file.metadata().ok()?;
+            let last_activity = file_ms(meta.modified());
+            if last_activity < since {
+                return None;
+            }
+            let mut head = Vec::new();
+            (&mut file).take(8192).read_to_end(&mut head).ok()?;
+            let value = |key: &str| crate::agents::value_in(&head, key);
+            if value("parent_thread_id").as_deref() != Some(thread) {
                 return None;
             }
             let stem = path.file_stem()?.to_str()?;
             let id = stem.get(stem.len().checked_sub(36)?..)?.to_string();
             // What it is for is the last part of its path (/root/belief_details); its nickname is how Codex shows it
-            let task = crate::agents::head_value(path, "agent_path", 8192).unwrap_or_default();
-            let nickname = crate::agents::head_value(path, "agent_nickname", 8192).unwrap_or_default();
-            let created = std::fs::metadata(path).and_then(|m| m.created()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
-            let finished = last_record(path)
+            let task = value("agent_path").unwrap_or_default();
+            let nickname = value("agent_nickname").unwrap_or_default();
+            let created = Some(file_ms(meta.created())).filter(|&ms| ms > 0);
+            let finished = last_record(&mut file)
                 .and_then(|l| serde_json::from_str::<Value>(&l).ok())
                 .is_some_and(|v| ["task_complete", "task_completed", "turn_aborted"].contains(&v["payload"]["type"].as_str().unwrap_or("")));
             Some(Subagent {
@@ -843,7 +860,10 @@ const MAX_SUBAGENTS: usize = 20;
 /// Subagents of the Claude session with this transcript that wrote something
 /// since `since`, newest first. Claude Code keeps them next to the transcript,
 /// in `<session id>/subagents/agent-<id>.jsonl` with a `.meta.json`. Only the
-/// meta file is read (what it is for, its kind and model), never what it said.
+/// meta file is read (what it is for, its kind and model) and the last record
+/// of the transcript, never what it said. Every file is opened confined to the
+/// real location of Claude's transcript folder (`open_confined`), so a folder
+/// swapped for a link after the listing leads nowhere.
 pub fn subagents(home: &Path, transcript: &str, since: u64) -> Vec<Subagent> {
     let transcript = Path::new(transcript);
     if transcript.extension().is_none_or(|e| e != "jsonl") || transcript.components().any(|c| c == std::path::Component::ParentDir) {
@@ -852,33 +872,31 @@ pub fn subagents(home: &Path, transcript: &str, since: u64) -> Vec<Subagent> {
     // Only inside the real location of Claude's transcript folder, however the
     // reported path or a folder in it is linked (MCR-149 review)
     let (Some(root), Ok(dir)) = (real_root(home, ".claude/projects"), dunce::canonicalize(transcript.with_extension("").join("subagents"))) else { return Vec::new() };
-    if !dir.starts_with(&root) {
-        return Vec::new();
-    }
+    let Ok(rel) = dir.strip_prefix(&root).map(Path::to_path_buf) else { return Vec::new() };
+    let open = |name: &str| crate::transcript_stats::open_confined(&root, &rel.join(name)).ok();
     let mut out: Vec<Subagent> = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|entry| {
-            let path = entry.path();
-            let id = path.file_name()?.to_str()?.strip_prefix("agent-")?.strip_suffix(".jsonl")?.to_string();
-            let last_activity = modified_ms(&path);
+            let name = entry.file_name().to_str()?.to_string();
+            let id = name.strip_prefix("agent-")?.strip_suffix(".jsonl")?.to_string();
+            let mut file = open(&name)?;
+            let last_activity = file_ms(file.metadata().and_then(|m| m.modified()));
             if last_activity < since {
                 return None;
             }
-            let meta_path = dir.join(format!("agent-{id}.meta.json"));
             // A regular file, opened without waiting: a pipe here would hold every session list
-            let meta: Value = crate::sessions::open_inside(&root, &meta_path)
-                .ok()
-                .and_then(|f| serde_json::from_reader(f.take(64 * 1024)).ok())
-                .unwrap_or(Value::Null);
+            let meta_file = open(&format!("agent-{id}.meta.json"));
+            let meta_ms = meta_file.as_ref().map_or(0, |f| file_ms(f.metadata().and_then(|m| m.modified())));
+            let meta: Value = meta_file.and_then(|f| serde_json::from_reader(f.take(64 * 1024)).ok()).unwrap_or(Value::Null);
             let field = |key: &str| meta[key].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(120).collect::<String>();
-            let started = match modified_ms(&meta_path) {
+            let started = match meta_ms {
                 0 => last_activity,
                 at => at.min(last_activity),
             };
-            let finished = subagent_finished(&path);
+            let finished = subagent_finished(&mut file);
             Some(Subagent { id, description: field("description"), agent_type: field("agentType"), model: field("model"), started, last_activity, finished })
         })
         .collect();
@@ -1879,7 +1897,7 @@ fn short_text(text: &str, chars: usize) -> String {
 }
 
 /// What the context figures of a session say they are (MCR-149).
-const CONTEXT_NOTE: &str = "context: from the agent's transcript, its own usage records, deduplicated; times are what the files say, not a live process. cacheLikelyWarm is an estimate from the recorded cache lifetime (Codex records none: one hour is assumed); tokensEstimated means the size was estimated from a compaction summary. unattributedTurns are responses the harness cannot put in a round it knows (before a restart, or before the first task): the round figures and reasons leave them out. complete false: the transcript was not read to its end in this request, and the other figures are null. freshRecommended applies comms contract rules 11 and 13 to executors (not leads) with fixed limits.";
+const CONTEXT_NOTE: &str = "context: from the agent's transcript, its own usage records, deduplicated; times are what the files say, not a live process. cacheLikelyWarm is an estimate from the recorded cache lifetime (Codex records none: one hour is assumed); tokensEstimated means the size was estimated from a compaction summary. unattributedTurns are responses the harness cannot put in a round it knows (before a restart, or before the first task): the round figures and reasons leave them out. complete false: the transcript was not read to its end within this request: the figures are those of its last full read, readAgeSeconds ago, and freshRecommended is null; before any full read only rounds is given. freshRecommended applies comms contract rules 11 and 13 to executors (not leads) with fixed limits.";
 
 /// The limits of comms contract rules 11 and 13 that `freshRecommended`
 /// applies: reuse an executor only within 45 minutes of its last turn, for at
@@ -1897,43 +1915,10 @@ const CODEX_CACHE_MS: u64 = 60 * 60 * 1000;
 /// that round: the task's start and the transcript's clock can differ a little.
 const ROUND_LEAD_MS: u64 = 5_000;
 
-/// How long all transcript reading for one request may take; what is not
-/// read by then is read at the next request, and the figures say `complete: false`.
+/// How long a request waits for the worker that reads transcripts
+/// (`transcript_stats::Contexts`); what it has not read to the end by then is
+/// shown from its last full read, with `complete: false`.
 const CONTEXT_BUDGET: Duration = Duration::from_millis(1500);
-
-/// How long a session whose transcript was not found is not looked for again.
-const TRANSCRIPT_LOOK_AGAIN: Duration = Duration::from_secs(30);
-
-/// A session's transcript as the context figures follow it: found for the
-/// conversation and reported path it was looked up with.
-struct Followed {
-    key: (Option<String>, Option<String>),
-    /// When the transcript was last looked for; `None`: not yet
-    looked: Option<Instant>,
-    follow: Option<Box<crate::sessions::Follow>>,
-    /// A request has taken it out to read it: the map's lock is never held
-    /// while files are looked up or read
-    busy: bool,
-}
-
-/// A session's context figures as one request read them, and what goes
-/// back into the map: `back` is `None` when the request took nothing out.
-struct ContextRead {
-    id: String,
-    back: Option<Option<Box<crate::sessions::Follow>>>,
-    looked: bool,
-    figures: Value,
-}
-
-/// What one request does for one session's context figures.
-enum Step {
-    /// Another request is reading its transcript
-    Busy,
-    /// Read the transcript it follows (`None`: none was found, and it is not looked for again yet)
-    Read(Option<Box<crate::sessions::Follow>>),
-    /// Look for its transcript, then read it
-    Look,
-}
 
 /// What the context figures need of a session from the store.
 struct Seat {
@@ -1947,92 +1932,33 @@ struct Seat {
     rounds: Vec<(u64, u64)>,
 }
 
-/// What looking for a session's transcript found.
-#[derive(Debug, PartialEq)]
-enum Found {
-    /// The real location of its agent's transcript folder, and the transcript in it
-    At(PathBuf, PathBuf),
-    Nothing,
-    /// The request's time ran out while looking
-    Unfinished,
-}
-
-/// The transcript of a hosted session. It must name the session's
-/// conversation (its file name ends with the conversation id) and lie inside
-/// the real location of its agent's transcript folder: the path its hooks
-/// reported when it does, else the file found there by the conversation id,
-/// in a walk that follows no symlink and stops at `deadline`. The file is
-/// opened later through `sessions::open_inside`, which looks again.
-fn transcript_for(home: &Path, profile: &str, reported: Option<&str>, conversation: Option<&str>, deadline: Instant) -> Found {
-    let (Some((folder, depth)), Some(id)) = (adapter(profile).transcripts(), conversation.filter(|c| is_uuid(c))) else { return Found::Nothing };
-    let Some(root) = real_root(home, folder) else { return Found::Nothing };
-    let names = |p: &Path| p.extension().is_some_and(|e| e == "jsonl") && p.file_stem().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(id));
-    if let Some(path) = reported.map(Path::new).filter(|p| names(p) && !p.components().any(|c| c == std::path::Component::ParentDir)) {
-        let real = path.parent().and_then(|d| dunce::canonicalize(d).ok()).filter(|d| d.starts_with(&root)).zip(path.file_name()).map(|(d, n)| d.join(n));
-        if let Some(real) = real {
-            return Found::At(root, real);
-        }
-    }
-    let mut files = Vec::new();
-    if !jsonl_files_until(&root, depth, &mut files, deadline) {
-        return Found::Unfinished;
-    }
-    files.into_iter().find(|p| names(p)).map_or(Found::Nothing, |p| Found::At(root, p))
-}
-
-/// The real location of an agent's transcript folder under the home folder,
-/// when no part of it below the home folder is a symlink: a folder linked
-/// elsewhere is not the agent's folder for the harness (MCR-149 review).
-pub fn real_root(home: &Path, folder: &str) -> Option<PathBuf> {
-    let root = dunce::canonicalize(home).ok()?.join(folder);
-    (dunce::canonicalize(&root).ok()? == root).then_some(root)
-}
-
-/// `jsonl_files` that gives up at `deadline`: false when it did.
-fn jsonl_files_until(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, deadline: Instant) -> bool {
-    if Instant::now() >= deadline {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else { return true };
-    for entry in entries.flatten() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_dir() && depth > 0 {
-            if !jsonl_files_until(&path, depth - 1, out, deadline) {
-                return false;
-            }
-        } else if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
-            out.push(path);
-        }
-    }
-    true
-}
+/// The real location of an agent's transcript folder (see `transcript_stats::real_root`).
+use crate::transcript_stats::real_root;
 
 /// Where a session stands for a lead's choice between reusing it and
 /// starting a fresh one (MCR-149): the context it re-reads at every turn,
 /// how long ago its last model response was recorded (the prompt cache lives
 /// that long past it), its rounds (tasks it was given) and its token use so
 /// far in input-token equivalents. `rounds` are its started tasks, in order.
-fn context_figures(f: &crate::sessions::Follow, rounds: &[(u64, u64)], executor: bool, now: u64) -> Value {
-    let c = f.context();
-    let claude = f.claude();
+/// `current`: read to the end after the request asked; otherwise these are
+/// the figures of the last read that was, `read_at` (ms), and say
+/// `complete: false` with no recommendation either way.
+fn context_figures(c: &crate::transcript_stats::Figures, rounds: &[(u64, u64)], executor: bool, now: u64, current: bool, read_at: u64) -> Value {
+    let claude = c.claude;
     // Responses go to the round whose task had started when they were recorded.
     // Earlier ones (before a restart, or typed by the operator before any task)
     // cannot be put in a round the harness knows: they are counted as such, never merged into the first
     let mut per_round = vec![0usize; rounds.len()];
     // Responses whose time was dropped to bound what is kept are in no round either
-    let mut before = f.turns_dropped() as usize;
-    for &at in f.turns() {
+    let mut before = c.turns_dropped as usize;
+    for &at in &c.turns {
         match rounds.iter().rposition(|&(start, _)| at > 0 && at + ROUND_LEAD_MS >= start) {
             Some(round) => per_round[round] += 1,
             None => before += 1,
         }
     }
     let durations: Vec<u64> = rounds.iter().map(|&(start, end)| if end > 0 { end } else { now }.saturating_sub(start)).collect();
-    let idle = (c.cache_at > 0).then(|| now.saturating_sub(c.cache_at));
+    let idle = (c.last_turn_at > 0).then(|| now.saturating_sub(c.last_turn_at));
     let (ttl, ttl_from) = match (c.cache_ttl, claude) {
         (0, true) => (None, Value::Null),
         (0, false) => (Some(CODEX_CACHE_MS), json!("assumed")),
@@ -2040,7 +1966,7 @@ fn context_figures(f: &crate::sessions::Follow, rounds: &[(u64, u64)], executor:
     };
     let most_turns = per_round.iter().copied().max().unwrap_or(0);
     let longest = durations.iter().copied().max().unwrap_or(0);
-    let fresh: Value = if executor {
+    let fresh: Value = if executor && current {
         let mut why = Vec::new();
         if rounds.len() >= REUSE_ROUNDS {
             why.push(format!("it has run {} rounds; another would be over {REUSE_ROUNDS} (rule 11)", rounds.len()));
@@ -2076,23 +2002,24 @@ fn context_figures(f: &crate::sessions::Follow, rounds: &[(u64, u64)], executor:
         "roundAgeSeconds": durations.last().map(|ms| ms / 1000),
         "maxRoundTurns": most_turns,
         "maxRoundSeconds": longest / 1000,
-        "turns": f.turns().len() as u64 + f.turns_dropped(),
+        "turns": c.turns.len() as u64 + c.turns_dropped,
         "unattributedTurns": before,
-        "inputEquivalent": f.usage().input_equivalent(claude),
+        "inputEquivalent": c.input_equivalent,
         "freshRecommended": fresh,
-        "complete": true,
+        "complete": current,
+        "readAgeSeconds": now.saturating_sub(read_at) / 1000,
     })
 }
 
-/// The context figures of a session whose transcript was not read to its
-/// end in this request: only the rounds, which come from the store. Partial
-/// figures, and an empty `freshRecommended`, would read as final.
+/// The context figures of a session whose transcript was never read to its
+/// end: only the rounds, which come from the store. Partial figures, and an
+/// empty `freshRecommended`, would read as final.
 fn unread_figures(rounds: &[(u64, u64)]) -> Value {
     json!({
         "tokens": null, "tokensEstimated": null, "window": null, "peakTokens": null, "compactions": null, "lastTurnAgeSeconds": null,
         "cacheTtlSeconds": null, "cacheTtlFrom": null, "cacheLikelyWarm": null, "rounds": rounds.len(),
         "roundTurns": null, "roundAgeSeconds": null, "maxRoundTurns": null, "maxRoundSeconds": null, "turns": null,
-        "unattributedTurns": null, "inputEquivalent": null, "freshRecommended": null, "complete": false,
+        "unattributedTurns": null, "inputEquivalent": null, "freshRecommended": null, "complete": false, "readAgeSeconds": null,
     })
 }
 
@@ -2814,9 +2741,9 @@ pub struct Harness {
     /// (`operator_draft` says so again while the person types): kept here,
     /// not in the store, which is written only when the draft changes
     draft_words: Mutex<BTreeMap<String, u64>>,
-    /// Per session, its transcript as read so far for the context figures
-    /// (MCR-149), in memory only
-    contexts: Mutex<BTreeMap<String, Followed>>,
+    /// The transcripts followed for the context figures (MCR-149), numbers
+    /// only and in memory only, read by their own worker thread
+    contexts: Arc<crate::transcript_stats::Contexts>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -2967,7 +2894,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -5547,7 +5474,8 @@ impl Harness {
 
     /// The context figures of these sessions (MCR-149), null for a session
     /// whose agent keeps no transcript the harness can read or whose
-    /// transcript was not found. The store is not locked while files are read.
+    /// transcript was not found. No file is read here: the worker of
+    /// `self.contexts` reads them, and this waits for it at most `CONTEXT_BUDGET`.
     fn contexts(&self, ids: &[&str]) -> BTreeMap<String, Value> {
         let (seats, known): (BTreeMap<String, Seat>, BTreeSet<String>) = {
             let store = lock(&self.store);
@@ -5562,67 +5490,24 @@ impl Harness {
             (seats, store.sessions.iter().filter(|(_, t)| t.state != ENDED).map(|(id, _)| id.clone()).collect())
         };
         let Ok(home) = self.launch_home() else { return BTreeMap::new() };
-        // What is followed is taken out of the map, and put back after
-        let steps: Vec<(String, Seat, Step)> = {
-            let mut followed = lock(&self.contexts);
-            followed.retain(|id, _| known.contains(id));
-            seats.into_iter().map(|(id, seat)| {
-                let key = (seat.conversation.clone(), seat.transcript.clone());
-                let step = match followed.get_mut(&id) {
-                    Some(f) if f.busy => Step::Busy,
-                    Some(f) if f.key == key && (f.follow.is_some() || f.looked.is_some_and(|at| at.elapsed() < TRANSCRIPT_LOOK_AGAIN)) => {
-                        f.busy = true;
-                        Step::Read(f.follow.take())
-                    }
-                    _ => {
-                        followed.insert(id.clone(), Followed { key, looked: None, follow: None, busy: true });
-                        Step::Look
-                    }
-                };
-                (id, seat, step)
-            }).collect()
-        };
-        // Every step stops at the request's deadline: what it did not check is shown as unread
-        let deadline = Instant::now() + CONTEXT_BUDGET;
-        let now = now_ms();
-        let mut done: Vec<ContextRead> = steps.into_iter().map(|(id, seat, step)| {
-            let unread = |back, looked| ContextRead { id: id.clone(), back, looked, figures: unread_figures(&seat.rounds) };
-            let (follow, looked) = match step {
-                Step::Busy => return unread(None, false),
-                Step::Look => match transcript_for(&home, &seat.profile, seat.transcript.as_deref(), seat.conversation.as_deref(), deadline) {
-                    Found::Unfinished => return unread(Some(None), false),
-                    Found::Nothing => (None, true),
-                    Found::At(root, path) => {
-                        let kind = if adapter(&seat.profile).id() == "codex" { "codex" } else { "claude" };
-                        (Some(Box::new(crate::sessions::Follow::new(&root, &path, kind))), true)
-                    }
-                },
-                Step::Read(follow) => (follow, false),
-            };
-            let Some(mut follow) = follow else { return ContextRead { id, back: Some(None), looked, figures: Value::Null } };
-            let figures = match follow.read(deadline) {
-                Ok(true) => context_figures(&follow, &seat.rounds, seat.executor, now),
-                Ok(false) => unread_figures(&seat.rounds),
-                // Gone, replaced or refused: dropped, and looked for again after a while
-                Err(e) => {
-                    eprintln!("harness: context of {id}: {e}");
-                    return ContextRead { id, back: Some(None), looked: true, figures: Value::Null };
-                }
-            };
-            ContextRead { id, back: Some(Some(follow)), looked, figures }
+        // A session is followed only with a conversation id and an agent that keeps transcripts
+        let wants: Vec<(String, crate::transcript_stats::Want)> = seats.iter().filter_map(|(id, seat)| {
+            let (folder, depth) = adapter(&seat.profile).transcripts()?;
+            let conversation = seat.conversation.clone().filter(|c| is_uuid(c))?;
+            let claude = adapter(&seat.profile).id() != "codex";
+            Some((id.clone(), crate::transcript_stats::Want { home: home.clone(), folder, depth, conversation, reported: seat.transcript.clone(), claude }))
         }).collect();
-        let mut followed = lock(&self.contexts);
-        // Asked for, but ended or forgotten: no figures, and nothing kept
-        done.extend(ids.iter().filter(|id| !known.contains(**id)).map(|id| ContextRead { id: id.to_string(), back: None, looked: false, figures: Value::Null }));
-        done.into_iter().map(|ContextRead { id, back, looked, figures }| {
-            if let (Some(back), Some(f)) = (back, followed.get_mut(&id)) {
-                f.follow = back;
-                f.busy = false;
-                if looked {
-                    f.looked = Some(Instant::now());
-                }
-            }
-            (id, figures)
+        let mut answers = self.contexts.ask(wants, |id| known.contains(id), CONTEXT_BUDGET);
+        let now = now_ms();
+        ids.iter().map(|id| {
+            use crate::transcript_stats::Answer;
+            let figures = match (seats.get(*id), answers.remove(*id)) {
+                (Some(seat), Some(Answer::Current(Some(f)))) => context_figures(&f, &seat.rounds, seat.executor, now, true, now),
+                (Some(seat), Some(Answer::Behind(Some((f, at))))) => context_figures(&f, &seat.rounds, seat.executor, now, false, at),
+                (Some(seat), Some(Answer::Behind(None))) => unread_figures(&seat.rounds),
+                _ => Value::Null,
+            };
+            (id.to_string(), figures)
         }).collect()
     }
 
@@ -11252,7 +11137,7 @@ mod tests {
             s.sessions.remove("lead");
         });
         h.contexts(&[]);
-        assert!(!lock(&h.contexts).contains_key("lead"));
+        assert!(!h.contexts.follows("lead") && h.contexts.follows("ex"));
     }
 
     /// MCR-149: a Codex transcript is found by its thread id, a repeated
@@ -11335,9 +11220,10 @@ mod tests {
         let at = 1_800_000_000_000;
         append_rows(&transcript, &[claude_response("m1", at, 10, 0, 0, 1)]);
         let root = real_root(&home, ".claude/projects").unwrap();
-        let mut f = crate::sessions::Follow::new(&root, &dunce::canonicalize(&transcript).unwrap(), "claude");
-        assert!(f.read(Instant::now() + Duration::from_secs(5)).unwrap());
-        let idle = |ms: u64| context_figures(&f, &[], true, at + ms)["freshRecommended"].as_array().unwrap().len();
+        let mut f = crate::transcript_stats::Follow::new(&root, Path::new(&format!("-w/{conversation}.jsonl")), true);
+        assert!(f.read(Duration::from_secs(5)).unwrap());
+        let figures = f.stats.figures();
+        let idle = |ms: u64| context_figures(&figures, &[], true, at + ms, true, at + ms)["freshRecommended"].as_array().unwrap().len();
         assert_eq!((idle(REUSE_IDLE_MS - 1), idle(REUSE_IDLE_MS)), (0, 1));
 
         let mut h = Harness::open(&dir);
@@ -11346,27 +11232,58 @@ mod tests {
             s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
         });
         assert!(h.contexts(&["ex"])["ex"]["complete"].as_bool().unwrap());
-        assert!(lock(&h.contexts).contains_key("ex"));
+        assert!(h.contexts.follows("ex"));
         h.update(|s| s.sessions.get_mut("ex").unwrap().state = ENDED.into());
         assert_eq!(h.contexts(&["ex"])["ex"], Value::Null);
-        assert!(!lock(&h.contexts).contains_key("ex"));
+        assert!(!h.contexts.follows("ex"));
     }
 
-    /// MCR-149 round 2: a transcript another request is reading, or one
-    /// not read to its end, gives no figures that look final: only the rounds,
-    /// with `complete: false` and no recommendation either way.
+    /// MCR-149 round 3: transcripts are read by the worker, never on the
+    /// request's thread, so a read that stalls cannot hold the answer past
+    /// `CONTEXT_BUDGET`. Before any read to the end there are only the rounds;
+    /// after one, its figures with `complete: false`, their age and no
+    /// recommendation either way, never figures of a part of the file.
     #[test]
-    fn figures_not_read_to_the_end_are_not_shown_as_final() {
+    fn a_stalled_transcript_read_does_not_delay_the_figures() {
         let dir = state_dir(None);
-        let h = Harness::open(&dir);
+        let home = dir.join("home");
+        let conversation = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{conversation}.jsonl"));
+        let base = now_ms() - 3 * 3600 * 1000;
+        append_rows(&transcript, &[claude_response("m1", base, 10, 0, 0, 1)]);
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home);
         h.update(|s| {
-            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), ..Tracked::default() });
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), ..Tracked::default() });
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
         });
-        lock(&h.contexts).insert("ex".into(), Followed { key: (None, None), looked: None, follow: None, busy: true });
-        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        let timed = |h: &Harness| {
+            let began = Instant::now();
+            let c = h.contexts(&["ex"]).remove("ex").unwrap();
+            (c, began.elapsed())
+        };
+        let limit = CONTEXT_BUDGET + Duration::from_millis(1_000);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *h.contexts.stall.lock().unwrap() = Some(("ex".into(), rx));
+        let (c, took) = timed(&h);
+        assert!(took < limit, "the request waited {took:?} on a stalled read");
         assert_eq!((c["complete"].as_bool(), c["rounds"].as_u64(), c["tokens"].is_null(), c["freshRecommended"].is_null()), (Some(false), Some(0), true, true));
-        // The request that has it puts it back; this one changed nothing
-        assert!(lock(&h.contexts)["ex"].busy);
+        drop(tx);
+
+        let (c, _) = timed(&h);
+        assert_eq!((c["complete"].as_bool(), c["tokens"].as_u64(), c["readAgeSeconds"].as_u64()), (Some(true), Some(10), Some(0)));
+        assert_eq!(c["freshRecommended"].as_array().map(Vec::len), Some(1));
+
+        append_rows(&transcript, &[claude_response("m2", now_ms(), 20, 0, 0, 1)]);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *h.contexts.stall.lock().unwrap() = Some(("ex".into(), rx));
+        let (c, took) = timed(&h);
+        assert!(took < limit, "the request waited {took:?} on a stalled read");
+        assert_eq!((c["complete"].as_bool(), c["tokens"].as_u64(), c["turns"].as_u64(), c["freshRecommended"].is_null()), (Some(false), Some(10), Some(1), true));
+        assert!(c["readAgeSeconds"].is_u64());
+        drop(tx);
+        let (c, _) = timed(&h);
+        assert_eq!((c["complete"].as_bool(), c["tokens"].as_u64(), c["turns"].as_u64()), (Some(true), Some(20), Some(2)));
     }
 
     /// MCR-149 round 2: a named pipe at the reported transcript path is not
@@ -11394,9 +11311,8 @@ mod tests {
         });
         let c = rx.recv_timeout(Duration::from_secs(5)).expect("the figures waited on the pipe");
         assert_eq!(c, Some(Value::Null));
-        // And the next request is not held up either; the refused file is not kept
-        let kept = &lock(&h.contexts)["ex"];
-        assert!(!kept.busy && kept.follow.is_none() && kept.looked.is_some());
+        // And the next request is not held up either
+        assert_eq!(h.contexts(&["ex"]).remove("ex"), Some(Value::Null));
     }
 
     /// MCR-149: a transcript is read only when it names the session's
@@ -11405,6 +11321,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_transcript_outside_the_agents_folder_or_of_another_conversation_is_not_read() {
+        use crate::transcript_stats::{locate, open_confined, Found, Want};
         let home = dunce::canonicalize(state_dir(None)).unwrap();
         let soon = || Instant::now() + Duration::from_secs(5);
         let id = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
@@ -11412,35 +11329,45 @@ mod tests {
         let root = home.join(".claude/projects");
         let inside = root.join(format!("-w/{id}.jsonl"));
         append_rows(&inside, &[]);
-        let at = Found::At(root.clone(), inside.clone());
-        let found = |reported: Option<&str>, conversation: Option<&str>| transcript_for(&home, "claude", reported, conversation, soon());
-        assert_eq!(found(Some(&inside.display().to_string()), Some(id)), at);
+        let at = Found::At(root.clone(), PathBuf::from(format!("-w/{id}.jsonl")));
+        let want = |home: &Path, reported: Option<&str>, conversation: &str| Want { home: home.to_path_buf(), folder: ".claude/projects", depth: 1, conversation: conversation.into(), reported: reported.map(str::to_owned), claude: true };
+        let found = |reported: Option<&str>, conversation: &str| locate(&want(&home, reported, conversation), soon());
+        assert_eq!(found(Some(&inside.display().to_string()), id), at);
         // A reported path that does not name the conversation is not taken; the conversation's own file is
         let another = root.join(format!("-w/{other}.jsonl"));
         append_rows(&another, &[]);
-        assert_eq!(found(Some(&another.display().to_string()), Some(id)), at);
-        assert_eq!(found(Some(&home.join(format!(".claude/projects/../../etc/{id}.jsonl")).display().to_string()), Some(id)), at);
-        assert_eq!(found(Some(&format!("/etc/{id}.jsonl")), Some(id)), at);
+        assert_eq!(found(Some(&another.display().to_string()), id), at);
+        assert_eq!(found(Some(&home.join(format!(".claude/projects/../../etc/{id}.jsonl")).display().to_string()), id), at);
+        assert_eq!(found(Some(&format!("/etc/{id}.jsonl")), id), at);
         // Without a conversation nothing is read, not even a path inside
-        assert_eq!(found(Some(&inside.display().to_string()), None), Found::Nothing);
-        assert_eq!(found(None, Some("../x")), Found::Nothing);
-        assert_eq!(transcript_for(&home, "shell", None, Some(id), soon()), Found::Nothing);
+        assert_eq!(found(Some(&inside.display().to_string()), ""), Found::Nothing);
+        assert_eq!(found(None, "../x"), Found::Nothing);
         // A symlinked folder below the root that leads out: neither the reported path nor the walk follows it
         let third = "2b8c9630-d8ae-4b6f-a765-44266a0929e0";
         let elsewhere = home.join("elsewhere");
         append_rows(&elsewhere.join(format!("{third}.jsonl")), &[]);
         std::os::unix::fs::symlink(&elsewhere, root.join("-link")).unwrap();
-        assert_eq!(found(Some(&root.join(format!("-link/{third}.jsonl")).display().to_string()), Some(third)), Found::Nothing);
-        assert!(crate::sessions::open_inside(&root, &root.join(format!("-link/{third}.jsonl"))).unwrap_err().contains("outside"));
+        assert_eq!(found(Some(&root.join(format!("-link/{third}.jsonl")).display().to_string()), third), Found::Nothing);
+        assert!(open_confined(&root, Path::new(&format!("-link/{third}.jsonl"))).is_err());
         // A symlinked transcript folder is not the agent's folder
         let codex_home = dunce::canonicalize(state_dir(None)).unwrap();
         let real_sessions = codex_home.join("real-sessions/2026/11/25");
         append_rows(&real_sessions.join(format!("rollout-2026-11-25T10-00-00-{id}.jsonl")), &[]);
         std::fs::create_dir_all(codex_home.join(".codex")).unwrap();
         std::os::unix::fs::symlink(codex_home.join("real-sessions"), codex_home.join(".codex/sessions")).unwrap();
-        assert_eq!(transcript_for(&codex_home, "codex", None, Some(id), soon()), Found::Nothing);
+        let codex = Want { folder: ".codex/sessions", depth: 3, claude: false, ..want(&codex_home, None, id) };
+        assert_eq!(locate(&codex, soon()), Found::Nothing);
         // A walk past its deadline says so
-        assert_eq!(transcript_for(&home, "claude", None, Some(third), Instant::now()), Found::Unfinished);
+        assert_eq!(locate(&want(&home, None, third), Instant::now()), Found::Unfinished);
+        // A shell keeps no transcript: no figures, nothing followed
+        let dir = state_dir(None);
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        h.update(|s| {
+            s.sessions.insert("sh".into(), Tracked { profile: "shell".into(), state: "idle".into(), agent_session: Some(id.into()), ..Tracked::default() });
+        });
+        assert_eq!(h.contexts(&["sh"])["sh"], Value::Null);
+        assert!(!h.contexts.follows("sh"));
     }
 
     /// MCR-149 review: a named pipe among a Claude session's subagent files
@@ -11458,12 +11385,27 @@ mod tests {
             let c_path = std::ffi::CString::new(dir.join(name).display().to_string()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         }
+        // A meta file that links out of Claude's folder is not read through the confined open
+        let outside = home.join("outside.json");
+        std::fs::write(&outside, r#"{"description":"read through a link"}"#).unwrap();
+        append_rows(&dir.join("agent-a2.jsonl"), &[json!({"type": "assistant", "message": {"stop_reason": "end_turn"}})]);
+        std::os::unix::fs::symlink(&outside, dir.join("agent-a2.meta.json")).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let t = transcript.display().to_string();
+        let h2 = home.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(subagents(&home, &t, 0));
+            let _ = tx.send(subagents(&h2, &t, 0));
         });
         let found = rx.recv_timeout(Duration::from_secs(5)).expect("the subagents waited on a pipe");
-        assert_eq!(found.iter().map(|a| (a.id.as_str(), a.finished, a.description.as_str())).collect::<Vec<_>>(), [("a1", true, "")]);
+        let mut seen: Vec<_> = found.iter().map(|a| (a.id.as_str(), a.finished, a.description.as_str())).collect();
+        seen.sort();
+        assert_eq!(seen, [("a1", true, ""), ("a2", true, "")]);
+        // The subagents folder replaced by a link out of Claude's folder: nothing is listed or opened
+        let elsewhere = home.join("elsewhere/subagents");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        append_rows(&elsewhere.join("agent-x1.jsonl"), &[]);
+        std::fs::rename(&dir, home.join("old-subagents")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert!(subagents(&home, &transcript.display().to_string(), 0).is_empty());
     }
 }

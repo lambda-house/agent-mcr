@@ -46,7 +46,12 @@ pub fn modified_ms(path: &Path) -> u64 {
 pub fn head_value(path: &Path, key: &str, limit: u64) -> Option<String> {
     let mut head = Vec::new();
     // A regular file only: a named pipe in an agent's folder would wait for good
-    crate::sessions::open_regular(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
+    crate::transcript_stats::open_regular(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
+    value_in(&head, key)
+}
+
+/// The first JSON string value of `key` in these bytes of a transcript's head.
+pub fn value_in(head: &[u8], key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let at = head.windows(needle.len()).position(|w| w == needle.as_bytes())? + needle.len() - 1;
     serde_json::Deserializer::from_slice(&head[at..]).into_iter::<String>().next()?.ok()
@@ -104,7 +109,7 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
         }
     }
 
-    let Ok(file) = crate::sessions::open_regular(path) else { return TranscriptSummary::default() };
+    let Ok(file) = crate::transcript_stats::open_regular(path) else { return TranscriptSummary::default() };
     let mut reader = std::io::BufReader::new(file.take(192 * 1024));
     let mut line = String::new();
     let mut custom = None;
