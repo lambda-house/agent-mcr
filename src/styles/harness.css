@@ -2,7 +2,8 @@
 
 /* Nothing in the Live view may spill into the scrolling Sessions area: a scroll bar that comes and goes there changes the terminal's size, which refits it, which brings the bar back */
 .hs-live-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; overflow: hidden; background: var(--canvas); }
-.hs-live { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: clamp(256px, 23%, 310px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); background: var(--canvas); }
+/* Live is one workbench layout: the list, the panes sessions open in and any panel (sessionsLayout.ts) */
+.hs-live { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; background: var(--canvas); }
 
 .hs-list { position: relative; overflow: hidden; background: var(--canvas); }
 /* Under the list's header (a PaneFrame): the search, the supervisor and the folders */
@@ -70,8 +71,6 @@
 .hs-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; border-radius: 8px; min-width: 0; max-width: 100%; transition: background .12s ease; }
 .hs-list li:not(.hs-group):hover { background: var(--surface-2); }
 /* The list's right edge: drag to resize */
-.hs-list-resizer { position: absolute; z-index: 3; top: 0; bottom: 0; right: 0; width: 6px; cursor: col-resize; touch-action: none; }
-.hs-list-resizer:hover, .hs-list-resizer:active { background: color-mix(in srgb, var(--accent) 45%, transparent); }
 /* Idle and ended sessions step back; the selected one and one that needs the person never do */
 .hs-list li.idle:not(.selected) > .hs-item { opacity: .62; }
 .hs-list li.idle:not(.selected):hover > .hs-item { opacity: .92; }
@@ -110,20 +109,12 @@
 .session-cockpit .hs-actions > button:hover { color: var(--text); }
 .hs-empty { padding: 10px 8px; color: var(--text-muted); font-size: 12px; }
 
-/* Flush beside the list (shared UI spec §4.2): a 1 px line, no margin or radius */
-.hs-terminals { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--surface-1); overflow: hidden; }
-/* The pane toolbar: Back and Forward (MCR-108), then the Layouts plugin's bar */
-.hs-pane-toolbar { flex: 0 0 auto; display: flex; align-items: stretch; border-bottom: 1px solid var(--line); background: var(--surface-1); }
-.hs-history { display: flex; align-items: center; gap: 2px; padding: 4px 6px 4px 10px; }
-.hs-pane-toolbar .hs-layout-bar { border-bottom: 0; padding-left: 6px; }
-.session-cockpit .hs-history .hs-layout-btn:disabled { opacity: .35; cursor: default; background: transparent; }
-.hs-layout-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 4px 10px; border-bottom: 1px solid var(--line); background: var(--surface-1); }
-.hs-layout-label { font-size: 11px; color: var(--text-muted); margin-right: 4px; }
-.session-cockpit .hs-layout-btn { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 22px; padding: 0; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-muted); cursor: pointer; }
-.session-cockpit .hs-layout-btn:hover { background: var(--surface-2); color: var(--text); }
-.session-cockpit .hs-layout-btn.active { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-line, var(--line)); }
-.hs-layout-root { flex: 1; min-width: 0; min-height: 0; display: flex; }
-.hs-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
+/* Live's tools in the window's top bar: Back and Forward (MCR-108), then the Layouts plugin's presets */
+.hs-history { display: flex; align-items: center; gap: 4px; }
+.hs-live-tools .wb-tool:disabled { opacity: .35; cursor: default; background: transparent; color: var(--text-muted); }
+.hs-live-layout, .hs-layout-root { flex: 1; min-width: 0; min-height: 0; display: flex; }
+/* Flush beside the list and each other (shared UI spec §4.2): the 1 px line is the handle's (.hs-panes) */
+.hs-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; background: var(--surface-1); }
 /* The terminal carries the name its session has in the list */
 /* A pane's header is 40 px, as every pane's (shared UI spec §4.2) */
 .hs-pane-title { flex: 0 0 auto; display: flex; align-items: center; gap: 7px; height: 40px; padding: 0 12px; border-bottom: 1px solid var(--line); background: var(--surface-1); font-size: 12px; min-width: 0; }
@@ -131,8 +122,6 @@
 .hs-pane-title strong { font-weight: 600; white-space: nowrap; }
 .hs-pane-title > span[title], .hs-pane-title > span:not(.hs-dot) { min-width: 0; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hs-pane-tools { margin-left: auto; flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
-.session-cockpit .hs-pane-btn { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; }
-.session-cockpit .hs-pane-btn:hover { background: var(--surface-2); color: var(--text); border-color: var(--line); }
 .hs-pane[hidden] { display: none; }
 .hs-pane-empty { flex: 1; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center; padding: 24px; }
 .hs-pane-title--empty strong { color: var(--text-muted); font-weight: 500; }
@@ -165,6 +154,8 @@
 .hs-pick-state { margin-left: auto; flex-shrink: 0; font-size: 11px; color: var(--text-muted); background: var(--input); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
 .hs-pick-state--working { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-line); }
 .hs-pick-state--stale { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-line); }
+.hs-empty-panels { display: flex; flex-direction: column; gap: 8px; }
+.hs-empty-panels h4 { margin: 0; font-size: 11px; font-weight: 600; color: var(--text-muted); }
 .hs-empty-none { margin: 0; padding: 12px; text-align: center; font-size: 12px; color: var(--text-muted); border: 1px dashed var(--line); border-radius: 10px; }
 
 .hs-terminal-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }

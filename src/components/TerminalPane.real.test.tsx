@@ -10,6 +10,7 @@ import LiveWorkspace from './LiveWorkspace';
 import TerminalPane, { keep } from './TerminalPane';
 import { harnessApi, type Hosted } from '../utils/harness';
 import { MAX_KEPT } from '../utils/terminalKeep';
+import { useSessionsLayout } from '../sessionsLayout';
 
 const made = vi.hoisted(() => ({ terms: [] as unknown[] }));
 vi.mock('@xterm/xterm', async () => {
@@ -65,6 +66,8 @@ beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   if (!('ResizeObserver' in globalThis)) Object.assign(globalThis, { ResizeObserver: class { observe() {} disconnect() {} } });
   keep.protect(new Set()); keep.retain(new Set()); made.terms = []; views = [];
+  // Live's layout is kept per viewer: each test starts from the first one
+  useSessionsLayout.getState().reset('live');
   vi.mocked(harnessApi.input).mockReset().mockResolvedValue(undefined);
   let handle = 0;
   vi.mocked(harnessApi.attach).mockImplementation((id, since, on) => { views.push({ id, since, on }); return Promise.resolve(++handle); });

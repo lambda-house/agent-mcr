@@ -1,25 +1,21 @@
+import { findLeaf, findPaneOfType, isPx, leaves, normalize, parentOf, placePane, setPane, type LayoutNode, type Leaf, type PaneRef, type Size } from '@lambda-house/workbench';
+import { EMPTY_PANE, LIST_WIDTH, LIVE_LIST, LIVE_LIST_LEAF } from '../sessionsLayout';
+
+// Live's panes on its workbench layout (sessionsLayout.ts): what a pane shows
+// (a hosted session, a plugin's pane, or nothing yet: the empty pane), where
+// a session opens, and the presets. Pure functions over the layout tree; the
+// list and the panels (Board's, Slack's) are panes of the same layout.
+
 export type PaneItem =
   | { kind: 'session'; id: string }
   | { kind: 'custom'; type: string; key: string; payload?: unknown };
 
-export interface PaneLeaf {
-  kind: 'leaf';
-  id: string;
-  item: PaneItem | null;
-}
-
-export interface PaneSplit {
-  kind: 'split';
-  id: string;
-  dir: 'row' | 'col';
-  ratio: number;
-  a: PaneNode;
-  b: PaneNode;
-}
-
-export type PaneNode = PaneLeaf | PaneSplit;
-
 export type LayoutPreset = '1' | '2-col' | '2x2';
+
+/** A hosted session's pane, kept alive while it moves (its terminal). */
+export const SESSION_PANE = 'session';
+/** A plugin's pane (`registerPaneType`). */
+export const CUSTOM_PANE = 'custom';
 
 export function samePaneItem(a: PaneItem | null | undefined, b: PaneItem | null | undefined): boolean {
   if (!a || !b) return a === b;
@@ -29,153 +25,86 @@ export function samePaneItem(a: PaneItem | null | undefined, b: PaneItem | null 
   return false;
 }
 
-export function createInitialLayout(): PaneLeaf {
-  return { kind: 'leaf', id: 'p1', item: null };
+let counter = 0;
+/** An id for a new leaf, split or empty pane. */
+export const newPaneId = (prefix: string) => `${prefix}-${Date.now().toString(36)}${(++counter).toString(36)}`;
+
+/** The pane that shows an item; with none, an empty pane. */
+export function paneOf(item: PaneItem | null): PaneRef {
+  if (!item) return { type: EMPTY_PANE, key: newPaneId(EMPTY_PANE) };
+  return item.kind === 'session'
+    ? { type: SESSION_PANE, key: `session:${item.id}`, state: item }
+    : { type: CUSTOM_PANE, key: `custom:${item.type}:${item.key}`, state: item };
 }
 
-export function listLeaves(node: PaneNode): PaneLeaf[] {
-  if (node.kind === 'leaf') return [node];
-  return [...listLeaves(node.a), ...listLeaves(node.b)];
+/** What a pane shows: a session or a plugin's pane; null for an empty pane, the list or a panel. */
+export function itemOf(pane: PaneRef | null | undefined): PaneItem | null {
+  return pane && (pane.type === SESSION_PANE || pane.type === CUSTOM_PANE) ? (pane.state as PaneItem | undefined) ?? null : null;
 }
 
-export function findLeaf(node: PaneNode, id: string): PaneLeaf | null {
-  if (node.kind === 'leaf') return node.id === id ? node : null;
-  return findLeaf(node.a, id) ?? findLeaf(node.b, id);
+/** A leaf a session can open in: a session's, a plugin's or an empty pane (not the list, not a panel). */
+export function isSlot(leaf: Leaf): boolean {
+  const type = leaf.pane?.type;
+  return !type || type === SESSION_PANE || type === CUSTOM_PANE || type === EMPTY_PANE;
 }
 
-export function findLeafByItem(node: PaneNode, item: PaneItem): PaneLeaf | null {
-  if (node.kind === 'leaf') return samePaneItem(node.item, item) ? node : null;
-  return findLeafByItem(node.a, item) ?? findLeafByItem(node.b, item);
+export const slotsOf = (root: LayoutNode): Leaf[] => leaves(root).filter(isSlot);
+
+export function findLeafByItem(root: LayoutNode, item: PaneItem): Leaf | undefined {
+  return leaves(root).find(leaf => samePaneItem(itemOf(leaf.pane), item));
 }
 
-export function splitLeaf(
-  node: PaneNode,
-  leafId: string,
-  dir: 'row' | 'col',
-  newLeafId: string,
-  splitId: string,
-  newItem: PaneItem | null = null,
-): PaneNode {
-  if (node.kind === 'leaf') {
-    if (node.id !== leafId) return node;
-    return {
-      kind: 'split',
-      id: splitId,
-      dir,
-      ratio: 0.5,
-      a: node,
-      b: { kind: 'leaf', id: newLeafId, item: newItem },
-    };
-  }
-  const a = splitLeaf(node.a, leafId, dir, newLeafId, splitId, newItem);
-  const b = splitLeaf(node.b, leafId, dir, newLeafId, splitId, newItem);
-  return a === node.a && b === node.b ? node : { ...node, a, b };
+/** Show an item in a leaf, or empty it (null). */
+export function setLeafItem(root: LayoutNode, leafId: string, item: PaneItem | null): LayoutNode {
+  const leaf = findLeaf(root, leafId);
+  if (!leaf) return root;
+  if (item ? samePaneItem(itemOf(leaf.pane), item) : leaf.pane?.type === EMPTY_PANE) return root;
+  return setPane(root, leafId, paneOf(item));
 }
 
-export function closeLeaf(node: PaneNode, leafId: string): PaneNode {
-  if (node.kind === 'leaf') {
-    return node.id === leafId ? { ...node, item: null } : node;
-  }
-  if (node.a.kind === 'leaf' && node.a.id === leafId) return node.b;
-  if (node.b.kind === 'leaf' && node.b.id === leafId) return node.a;
-  const a = closeLeaf(node.a, leafId);
-  const b = closeLeaf(node.b, leafId);
-  return a === node.a && b === node.b ? node : { ...node, a, b };
+/** Every pane showing an item that matches is emptied. */
+export function clearItems(root: LayoutNode, predicate: (item: PaneItem) => boolean): LayoutNode {
+  return leaves(root).reduce((tree, leaf) => {
+    const item = itemOf(leaf.pane);
+    return item && predicate(item) ? setPane(tree, leaf.id, paneOf(null)) : tree;
+  }, root);
 }
 
-export function setLeafItem(node: PaneNode, leafId: string, item: PaneItem | null): PaneNode {
-  if (node.kind === 'leaf') {
-    if (node.id !== leafId || samePaneItem(node.item, item)) return node;
-    return { ...node, item };
-  }
-  const a = setLeafItem(node.a, leafId, item);
-  const b = setLeafItem(node.b, leafId, item);
-  return a === node.a && b === node.b ? node : { ...node, a, b };
+export const removeSessionFromLayout = (root: LayoutNode, sessionId: string): LayoutNode =>
+  clearItems(root, item => item.kind === 'session' && item.id === sessionId);
+
+/** A restarted session (a new id) takes its old pane. */
+export function replaceSessionInLayout(root: LayoutNode, oldId: string, newId: string): LayoutNode {
+  const leaf = findLeafByItem(root, { kind: 'session', id: oldId });
+  return leaf ? setPane(root, leaf.id, paneOf({ kind: 'session', id: newId })) : root;
 }
 
-export function removeSessionFromLayout(node: PaneNode, sessionId: string): PaneNode {
-  if (node.kind === 'leaf') {
-    return node.item?.kind === 'session' && node.item.id === sessionId ? { ...node, item: null } : node;
-  }
-  const a = removeSessionFromLayout(node.a, sessionId);
-  const b = removeSessionFromLayout(node.b, sessionId);
-  return a === node.a && b === node.b ? node : { ...node, a, b };
+/** Where no pane can take a session (all are panels): a new one beside the list, or beside the first pane. */
+export function addSlot(root: LayoutNode, leafId: string, item: PaneItem | null): LayoutNode {
+  const beside = findPaneOfType(root, LIVE_LIST) ?? leaves(root)[0];
+  return placePane(root, beside.id, 'after', { kind: 'leaf', id: leafId, pane: paneOf(item) }, { fr: 1 });
 }
 
-export function replaceSessionInLayout(node: PaneNode, oldId: string, newId: string): PaneNode {
-  if (node.kind === 'leaf') {
-    return node.item?.kind === 'session' && node.item.id === oldId
-      ? { ...node, item: { kind: 'session', id: newId } }
-      : node;
-  }
-  const a = replaceSessionInLayout(node.a, oldId, newId);
-  const b = replaceSessionInLayout(node.b, oldId, newId);
-  return a === node.a && b === node.b ? node : { ...node, a, b };
+/** The list's width where it is: its pixels in a row, else the default. */
+function listSize(root: LayoutNode, list: Leaf): Size {
+  const place = parentOf(root, list.id);
+  const size = place?.split.dir === 'row' ? place.split.sizes[place.index] : undefined;
+  return size && isPx(size) ? size : { px: LIST_WIDTH };
 }
 
-export function setSplitRatio(node: PaneNode, splitId: string, ratio: number): PaneNode {
-  const clamped = Math.max(0.15, Math.min(0.85, ratio));
-  if (node.kind === 'leaf') return node;
-  if (node.id === splitId) {
-    return node.ratio === clamped ? node : { ...node, ratio: clamped };
-  }
-  const a = setSplitRatio(node.a, splitId, clamped);
-  const b = setSplitRatio(node.b, splitId, clamped);
-  return a === node.a && b === node.b ? node : { ...node, a, b };
-}
-
-export function applyLayoutPreset(
-  preset: LayoutPreset,
-  items: PaneItem[],
-  nextLeafId: () => string,
-  nextSplitId: () => string,
-): { layout: PaneNode; focusedPane: string } {
-  const p1 = nextLeafId();
-  if (preset === '1') {
-    return {
-      layout: { kind: 'leaf', id: p1, item: items[0] ?? null },
-      focusedPane: p1,
-    };
-  }
-  const p2 = nextLeafId();
-  if (preset === '2-col') {
-    return {
-      layout: {
-        kind: 'split',
-        id: nextSplitId(),
-        dir: 'row',
-        ratio: 0.5,
-        a: { kind: 'leaf', id: p1, item: items[0] ?? null },
-        b: { kind: 'leaf', id: p2, item: items[1] ?? null },
-      },
-      focusedPane: p1,
-    };
-  }
-  const p3 = nextLeafId();
-  const p4 = nextLeafId();
-  return {
-    layout: {
-      kind: 'split',
-      id: nextSplitId(),
-      dir: 'col',
-      ratio: 0.5,
-      a: {
-        kind: 'split',
-        id: nextSplitId(),
-        dir: 'row',
-        ratio: 0.5,
-        a: { kind: 'leaf', id: p1, item: items[0] ?? null },
-        b: { kind: 'leaf', id: p2, item: items[1] ?? null },
-      },
-      b: {
-        kind: 'split',
-        id: nextSplitId(),
-        dir: 'row',
-        ratio: 0.5,
-        a: { kind: 'leaf', id: p3, item: items[2] ?? null },
-        b: { kind: 'leaf', id: p4, item: items[3] ?? null },
-      },
-    },
-    focusedPane: p1,
-  };
+/**
+ * A preset: the list (as it was, or back at its width) beside one pane, two
+ * columns or a 2×2 grid, filled with `items` in order. Panels in Live go.
+ */
+export function presetLayout(root: LayoutNode, preset: LayoutPreset, items: PaneItem[]): { root: LayoutNode; focused: string } {
+  const count = preset === '1' ? 1 : preset === '2-col' ? 2 : 4;
+  const panes: Leaf[] = Array.from({ length: count }, (_, i) => ({ kind: 'leaf', id: newPaneId('p'), pane: paneOf(items[i] ?? null) }));
+  const row = (children: Leaf[]): LayoutNode => ({ kind: 'split', id: newPaneId('s'), dir: 'row', children, sizes: children.map(() => ({ fr: 1 })) });
+  const grid: LayoutNode = preset === '1' ? panes[0]
+    : preset === '2-col' ? row(panes)
+    : { kind: 'split', id: newPaneId('s'), dir: 'col', children: [row(panes.slice(0, 2)), row(panes.slice(2))], sizes: [{ fr: 1 }, { fr: 1 }] };
+  const old = findPaneOfType(root, LIVE_LIST);
+  const list: Leaf = old ?? { kind: 'leaf', id: LIVE_LIST_LEAF, pane: { type: LIVE_LIST, key: LIVE_LIST } };
+  const size = old ? listSize(root, old) : { px: LIST_WIDTH };
+  return { root: normalize({ kind: 'split', id: 'live', dir: 'row', children: [list, grid], sizes: [size, { fr: 1 }] }), focused: panes[0].id };
 }

@@ -1,9 +1,9 @@
 import type React from 'react';
 import { createElement } from 'react';
 import { Puzzle } from 'lucide-react';
-import { PluginRegistry, useSurfaceShown, type PaletteProvider, type PluginApi as WorkbenchPluginApi, type WorkbenchView } from '@lambda-house/workbench';
+import { PluginRegistry, useSurfaceShown, type LayoutNode, type PaletteProvider, type PluginApi as WorkbenchPluginApi, type WorkbenchView } from '@lambda-house/workbench';
 import { SESSIONS_VIEWS } from '../sessionsView';
-import type { LayoutPreset, PaneItem, PaneNode } from '../utils/paneLayout';
+import type { LayoutPreset, PaneItem } from '../utils/paneLayout';
 import type { HarnessStatus, Hosted, Resumable } from '../utils/harness';
 import type { Session } from '../utils/sessions';
 
@@ -57,7 +57,9 @@ export interface LiveControllerContext {
   hosted: Hosted[];
   opened: string[];
   selected: string;
-  layout: PaneNode;
+  /** Live's layout: the list, the panes sessions open in (session, custom and empty panes) and any panel. */
+  layout: LayoutNode;
+  /** The pane a session opens in. */
   focusedPane: string;
   setFocusedPane: (leafId: string) => void;
   openItem: (item: PaneItem) => void;
