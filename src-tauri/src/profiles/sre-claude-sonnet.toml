@@ -2,8 +2,9 @@
 # cluster rests on a read-only kube credential (RBAC) and the read-only
 # Kubernetes MCP, not on the deny list below, which is best-effort (M2).
 # Stated read-only allow set (L8): routine polls go only through the MCP
-# servers in mcp.require, which the operator's own allow rules cover; a Bash
-# kubectl is a one-off the operator approves.
+# servers in mcp.require, which the operator's own allow rules cover.
+# The operator approves each Bash kubectl outside an auto-mode root. Under a
+# root, Bash kubectl runs in auto, subject to RBAC and Claude's classifier.
 id = "sre@claude-sonnet"
 version = 1
 role = "sre"

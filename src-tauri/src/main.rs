@@ -27,6 +27,7 @@ mod cockpit;
 mod secret_shape;
 mod task_copy;
 mod harness;
+mod auto_mode;
 mod harness_preferences;
 mod profiles;
 mod harness_commands;
@@ -1176,6 +1177,7 @@ fn main() {
     // The runner owns agent terminals and outlives the app (started by launchd).
     // Like the MCP bridge, it must branch before any AppKit/Tauri initialization.
     if std::env::args().nth(1).as_deref() == Some("--runner") {
+        runner::note_open_files("runner");
         let result = get_config_dir()
             .map_err(|e| e.message)
             .and_then(|dir| runner::serve(&dir.join("runner.sock")));
@@ -1188,6 +1190,9 @@ fn main() {
     // The harness service, the supervisor's MCP bridge and the agents' hook reporter
     match std::env::args().nth(1).as_deref() {
         Some(flag @ ("--harness" | "--supervise" | "--harness-mcp" | "--memory-mcp")) => {
+            if flag == "--harness" {
+                runner::note_open_files("harness service");
+            }
             let result = get_config_dir().map_err(|e| e.message).and_then(|dir| match flag {
                 "--harness" => harness::serve(&dir),
                 "--supervise" => harness::supervise_bridge(&dir),
@@ -1261,6 +1266,7 @@ fn main() {
         .plugin(navigation_guard())
         .setup(|app| {
             install_app_menu(app)?;
+            harness_commands::window_opened();
             session_analysis_commands::start_scanner(app.handle().clone());
             Ok(())
         })
@@ -1274,6 +1280,7 @@ fn main() {
             harness_commands::harness_background_allow,
             harness_commands::harness_background_stop,
             harness_commands::harness_list,
+            harness_commands::harness_clear_draft,
             harness_commands::harness_list_since,
             harness_commands::harness_spawn,
             harness_commands::harness_bind,

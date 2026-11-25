@@ -45,6 +45,17 @@ const VIEW_QUEUE: usize = 2048;
 /// Exit when nothing runs and nobody is connected for this long.
 const IDLE_EXIT: Duration = Duration::from_secs(600);
 const MAX_REQUEST: u64 = 1024 * 1024;
+/// How long an ended session's output is still read (`Drained`).
+#[cfg(unix)]
+const EXIT_DRAIN: Duration = Duration::from_secs(3);
+/// How often a reader with nothing to read looks whether it has drained.
+#[cfg(unix)]
+const READ_LOOK: Duration = Duration::from_millis(250);
+/// The soft limit on open files the runner and the service ask for (MCR-151):
+/// each live session holds three pty descriptors in the runner and its views
+/// three sockets each, and launchd starts both with a soft limit of 256.
+#[cfg(unix)]
+const OPEN_FILES: libc::rlim_t = 8192;
 const MAX_OSC: usize = 4096;
 
 pub fn now_ms() -> u64 {
@@ -228,7 +239,7 @@ fn handle_dsr(
     dsr: &mut DsrScanner,
     chunk: &[u8],
     has_views: bool,
-    writer: &Mutex<Option<Box<dyn Write + Send>>>,
+    writer: &Mutex<Option<impl Write>>,
 ) {
     let count = dsr.feed(chunk);
     if count > 0 && !has_views {
@@ -237,6 +248,99 @@ fn handle_dsr(
                 let _ = w.write_all(b"\x1b[1;1R");
             }
             let _ = w.flush();
+        }
+    }
+}
+
+/// What types into a terminal. On unix it is the runner's own copy of the
+/// master, not portable-pty's writer: that one's destructor writes a newline
+/// and an end-of-file into the terminal and waits for room to do so, which a
+/// job that keeps an ended session's terminal open without reading it never
+/// makes (review 17215). Closing this one is a plain close.
+#[cfg(unix)]
+type Writer = std::fs::File;
+#[cfg(not(unix))]
+type Writer = Box<dyn Write + Send>;
+
+/// A copy of a pty master that the runner owns (unix), close-on-exec like it.
+#[cfg(unix)]
+fn dup_master(master: &(dyn MasterPty + Send)) -> Result<std::fs::File, String> {
+    use std::os::fd::FromRawFd;
+    let fd = master.as_raw_fd().ok_or("The terminal has no descriptor")?;
+    // SAFETY: duplicates a descriptor the master owns
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(format!("Cannot use the terminal: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `copy` is a fresh descriptor owned by nothing else
+    Ok(unsafe { std::fs::File::from_raw_fd(copy) })
+}
+
+/// Makes the master non-blocking (unix). The flag is on the open file, which
+/// the master, the reader and the writer share: neither a read nor a write
+/// then waits inside the kernel, and both wait in `poll`, where they look
+/// whether the session has ended (`Drained`, `Session::type_in`).
+#[cfg(unix)]
+fn nonblocking(file: &std::fs::File) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: plain fcntl calls on a descriptor we own
+    let ok = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("Cannot use the terminal: {}", std::io::Error::last_os_error()))
+    }
+}
+
+/// Waits up to `READ_LOOK` for `events` on `fd` (unix): whether it came, or the
+/// error. An interrupted wait counts as a wait that saw nothing.
+#[cfg(unix)]
+fn wait_for(fd: std::os::fd::RawFd, events: libc::c_short) -> std::io::Result<bool> {
+    let mut ready = libc::pollfd { fd, events, revents: 0 };
+    // SAFETY: one valid pollfd
+    let n = unsafe { libc::poll(&mut ready, 1, READ_LOOK.as_millis() as libc::c_int) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
+    }
+    if ready.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // Ready, a hangup or an error: the read or write that follows says which
+    Ok(n > 0)
+}
+
+/// The terminal's output as the pump reads it (unix). Once the session's
+/// process has ended, output is read for `EXIT_DRAIN` more and then the reader
+/// ends: something the agent left running in the background that kept the
+/// terminal open (a job that ignores hangup) would otherwise hold the reader's
+/// descriptor, the pty and the pump's thread for as long as it lives (MCR-151).
+#[cfg(unix)]
+struct Drained {
+    file: std::fs::File,
+    session: Arc<Session>,
+}
+
+#[cfg(unix)]
+impl Read for Drained {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        loop {
+            // A monotonic clock: a wall clock set back would keep the reader on (review 17215)
+            if lock(&self.session.ended).is_some_and(|at| at.elapsed() >= EXIT_DRAIN) {
+                return Ok(0);
+            }
+            if !wait_for(self.file.as_raw_fd(), libc::POLLIN)? {
+                continue;
+            }
+            match self.file.read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                other => return other,
+            }
         }
     }
 }
@@ -258,12 +362,70 @@ struct Output {
 struct Session {
     info: Mutex<Info>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    writer: Mutex<Option<Writer>>,
+    /// When the wait thread saw the process end, on a monotonic clock. Its
+    /// lock is held only for a moment: by the exit to publish it, and by
+    /// `type_in` around its last look and one non-blocking write, so no byte
+    /// is typed once the end is published (review 17220)
+    ended: Mutex<Option<Instant>>,
     #[cfg(windows)]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     #[cfg(windows)]
     job: Mutex<Option<WinJob>>,
     output: Mutex<Output>,
+}
+
+impl Session {
+    /// Types `bytes` into the terminal: all of them, or an error. On unix a
+    /// write waits for room in `poll`, never in the kernel, and gives up when
+    /// the process has ended, so a full input queue that nobody reads any more
+    /// cannot hold the writer's lock, and with it the end of the session
+    /// (review 17215).
+    fn type_in(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let ended = || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "The session has ended");
+        let mut writer = lock(&self.writer);
+        let Some(writer) = writer.as_mut() else {
+            return Err(ended());
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                if lock(&self.ended).is_some() {
+                    return Err(ended());
+                }
+                if !wait_for(writer.as_raw_fd(), libc::POLLOUT)? {
+                    continue;
+                }
+                // The session may have ended while `poll` waited: the last look
+                // and the write are one step against the end's publication. The
+                // write cannot block (the master is non-blocking)
+                let wrote = {
+                    let gate = lock(&self.ended);
+                    if gate.is_some() {
+                        return Err(ended());
+                    }
+                    writer.write(rest)
+                };
+                match wrote {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(n) => rest = &rest[n..],
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+        // Windows writes block; the exit takes the writer first and waits for one under way
+        #[cfg(not(unix))]
+        {
+            if lock(&self.ended).is_some() {
+                return Err(ended());
+            }
+            writer.write_all(bytes).and_then(|_| writer.flush())
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -358,6 +520,69 @@ pub fn random_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The soft limit on open files to ask for, or none when it is high enough:
+/// `OPEN_FILES`, never above the hard limit or the per-process ceiling the
+/// system names (macOS: `OPEN_MAX` and `kern.maxfilesperproc`).
+#[cfg(unix)]
+fn open_files_target(soft: libc::rlim_t, hard: libc::rlim_t, ceiling: Option<libc::rlim_t>) -> Option<libc::rlim_t> {
+    let target = OPEN_FILES.min(hard).min(ceiling.unwrap_or(libc::RLIM_INFINITY));
+    (target > soft).then_some(target)
+}
+
+/// Raises this process's soft limit on open files toward the hard limit (MCR-151:
+/// launchd's 256 let a runner with some forty sessions refuse to start the next
+/// one). Returns the limit before and after.
+#[cfg(unix)]
+pub fn raise_open_files() -> Result<(libc::rlim_t, libc::rlim_t), String> {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: plain syscall into a local struct
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    #[cfg(target_os = "macos")]
+    let ceiling = {
+        let mut per_process: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: reads one int into a local of that size
+        let read = unsafe {
+            libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&mut per_process as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        // OPEN_MAX: setrlimit refuses more on macOS
+        let open_max: libc::rlim_t = 10240;
+        Some(if read && per_process > 0 { open_max.min(per_process as libc::rlim_t) } else { open_max })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let ceiling = None;
+    let before = limit.rlim_cur;
+    let Some(target) = open_files_target(before, limit.rlim_max, ceiling) else {
+        return Ok((before, before));
+    };
+    limit.rlim_cur = target;
+    // SAFETY: plain syscall with the struct read above
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(format!("{} (asked {target})", std::io::Error::last_os_error()));
+    }
+    Ok((before, target))
+}
+
+/// `raise_open_files` for a unit's start, written to its log (its stderr).
+pub fn note_open_files(unit: &str) {
+    #[cfg(unix)]
+    match raise_open_files() {
+        Ok((before, after)) if before == after => eprintln!("{unit}: open files limit {after}"),
+        Ok((before, after)) => eprintln!("{unit}: open files limit raised from {before} to {after}"),
+        Err(e) => eprintln!("{unit}: open files limit not raised: {e}"),
+    }
+    #[cfg(not(unix))]
+    let _ = unit;
+}
+
 pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A panicking reader thread must not take every other session down with it
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -425,8 +650,17 @@ impl Runner {
                 return Err(e);
             }
         };
-        let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let (reader, writer) = {
+            let reader = dup_master(pair.master.as_ref())?;
+            nonblocking(&reader)?;
+            (reader, dup_master(pair.master.as_ref())?)
+        };
+        #[cfg(not(unix))]
+        let (reader, writer) = (
+            pair.master.try_clone_reader().map_err(|e| e.to_string())?,
+            pair.master.take_writer().map_err(|e| e.to_string())?,
+        );
         let info = Info {
             id: id.clone(),
             pid: child.process_id(),
@@ -445,6 +679,7 @@ impl Runner {
             info: Mutex::new(info.clone()),
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
+            ended: Mutex::new(None),
             #[cfg(windows)]
             killer: Mutex::new(killer),
             #[cfg(windows)]
@@ -465,6 +700,8 @@ impl Runner {
 
         let runner = self.clone();
         let reading = session.clone();
+        #[cfg(unix)]
+        let reader: Box<dyn Read + Send> = Box::new(Drained { file: reader, session: session.clone() });
         std::thread::spawn(move || runner.pump(&reading, reader));
 
         let runner = self.clone();
@@ -479,7 +716,36 @@ impl Runner {
                 info.exit = Some(exit.clone());
                 info.program.exited();
             }
-            runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
+            *lock(&session.ended) = Some(Instant::now());
+            // Nothing is typed into or resized in an ended terminal: its master
+            // and the writer's copy are closed now, not when the session is
+            // forgotten, which may be days later or never (MCR-151). The reader
+            // keeps its own copy until the output is drained (`Drained`).
+            //
+            // Unix: the master's lock is held only for an ioctl; the end is told
+            // before the writer's lock is taken, which a write under way holds
+            // until it sees the end (at most `READ_LOOK`, review 17215). Closing
+            // the master is a plain close.
+            #[cfg(unix)]
+            {
+                lock(&session.master).take();
+                runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
+                lock(&session.writer).take();
+            }
+            // Windows: the writer goes first. Dropping the master calls
+            // ClosePseudoConsole, which before Windows 11 24H2 waits until the
+            // console host has drained its output; while the synchronous input
+            // writer is still open, the pump can block in a DSR answer on that
+            // writer (`handle_dsr`) and stop draining, and the close would wait
+            // for good (review 17220). No test pins this order or the hang it
+            // avoids; CI's Windows job runs the Windows tests, which end their
+            // sessions through it.
+            #[cfg(not(unix))]
+            {
+                lock(&session.writer).take();
+                lock(&session.master).take();
+                runner.broadcast(json!({"event": "exited", "id": id, "exit": exit}));
+            }
         });
         Ok(info)
     }
@@ -598,11 +864,7 @@ impl Runner {
         }
         match name {
             "INT" => {
-                let mut writer = lock(&session.writer);
-                let Some(writer) = writer.as_mut() else {
-                    return Err("The session has ended".into());
-                };
-                writer.write_all(&[0x03]).and_then(|_| writer.flush()).map_err(|e| e.to_string())
+                session.type_in(&[0x03]).map_err(|e| e.to_string())
             }
             "TERM" | "HUP" | "KILL" => {
                 // Close ConPTY handles and terminate the entire job tree; fail if TerminateJobObject fails.
@@ -666,11 +928,7 @@ impl Runner {
             "write" => {
                 let session = self.get(id()?)?;
                 let data = req["data"].as_str().ok_or("Missing data")?;
-                let mut writer = lock(&session.writer);
-                let Some(writer) = writer.as_mut() else {
-                    return Err("The session has ended".into());
-                };
-                writer.write_all(data.as_bytes()).and_then(|_| writer.flush()).map_err(|e| e.to_string())?;
+                session.type_in(data.as_bytes()).map_err(|e| e.to_string())?;
                 Ok(json!({}))
             }
             "signal" => {
@@ -724,11 +982,7 @@ impl Runner {
                 if n == 0 {
                     break;
                 }
-                let mut writer = lock(&typing.writer);
-                let Some(writer) = writer.as_mut() else {
-                    break;
-                };
-                if writer.write_all(&buf[..n]).and_then(|_| writer.flush()).is_err() {
+                if typing.type_in(&buf[..n]).is_err() {
                     break;
                 }
             }
@@ -1654,6 +1908,321 @@ mod tests {
         assert_eq!(list["sessions"][0]["exit"]["code"], 3);
         control.call(json!({"op": "forget", "id": "t1"})).unwrap();
         assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_files_limit_is_raised_toward_the_hard_limit_and_capped() {
+        let inf = libc::RLIM_INFINITY;
+        assert_eq!(open_files_target(256, inf, None), Some(OPEN_FILES), "launchd's 256 against an unlimited hard limit");
+        assert_eq!(open_files_target(256, inf, Some(10240)), Some(OPEN_FILES));
+        assert_eq!(open_files_target(256, inf, Some(4096)), Some(4096), "never above the per-process ceiling");
+        assert_eq!(open_files_target(256, 1024, None), Some(1024), "never above the hard limit");
+        assert_eq!(open_files_target(256, 256, None), None, "nothing to raise");
+        assert_eq!(open_files_target(65536, inf, None), None, "a higher limit is never lowered");
+        // This process: at least as high as asked afterwards, and asking again changes nothing
+        let (_, after) = raise_open_files().unwrap();
+        let (before, again) = raise_open_files().unwrap();
+        assert_eq!((before, again), (after, after));
+    }
+
+    /// What a fixture leaves running, ended also when an assertion fails
+    /// first: the release file lets its shell end, and the background job whose
+    /// pid it wrote is killed (review 17220).
+    #[cfg(unix)]
+    struct Leftover {
+        release: Option<PathBuf>,
+        pidfile: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Leftover {
+        fn job(&self) -> Option<i32> {
+            std::fs::read_to_string(&self.pidfile).ok()?.trim().parse().ok().filter(|&pid| pid > 0)
+        }
+
+        fn alive(&self) -> bool {
+            // SAFETY: signal 0 only asks whether the process exists
+            self.job().is_some_and(|job| unsafe { libc::kill(job, 0) } == 0)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Leftover {
+        fn drop(&mut self) {
+            if let Some(release) = &self.release {
+                let _ = std::fs::write(release, "");
+            }
+            if let Some(job) = self.job() {
+                // SAFETY: our own child's child, by the pid it wrote itself
+                unsafe { libc::kill(job, libc::SIGKILL) };
+            }
+            // Killed once: a later drop must not hit a reused pid
+            let _ = std::fs::remove_file(&self.pidfile);
+        }
+    }
+
+    /// A session around a terminal the test holds, with nothing running in it.
+    #[cfg(unix)]
+    fn bare_session(writer: std::fs::File) -> Session {
+        Session {
+            info: Mutex::new(Info {
+                id: "bare".into(),
+                pid: None,
+                argv: Vec::new(),
+                cwd: "/".into(),
+                started: 0,
+                cols: 80,
+                rows: 24,
+                title: String::new(),
+                last_output: 0,
+                exit: None,
+                meta: BTreeMap::new(),
+                program: Program::default(),
+            }),
+            master: Mutex::new(None),
+            writer: Mutex::new(Some(writer)),
+            ended: Mutex::new(None),
+            output: Mutex::new(Output {
+                ring: VecDeque::new(),
+                total: 0,
+                views: Vec::new(),
+                next_view: 0,
+                scanner: Scanner::default(),
+                last_bell: 0,
+                last_query: 0,
+                closed: false,
+            }),
+        }
+    }
+
+    /// Review 17220: a write waiting for room in a full input queue when the
+    /// end is published types nothing more once room comes, and fails.
+    #[cfg(unix)]
+    #[test]
+    fn no_byte_is_typed_once_the_end_is_published() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty fills two descriptors; the rest may be null
+        let opened = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: fresh descriptors, each owned once
+        let (master, mut slave) = unsafe { (std::fs::File::from_raw_fd(master), std::fs::File::from_raw_fd(slave)) };
+        // Raw: the input queue fills without a line, and nothing is echoed back
+        // SAFETY: termios calls on our own terminal
+        unsafe {
+            let mut mode: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut mode), 0);
+            libc::cfmakeraw(&mut mode);
+            assert_eq!(libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &mode), 0);
+        }
+        nonblocking(&master).unwrap();
+        nonblocking(&slave).unwrap();
+        let drain = |slave: &mut std::fs::File| {
+            let (mut total, mut buf) = (0, [0u8; 65536]);
+            while let Ok(n @ 1..) = slave.read(&mut buf) {
+                total += n;
+            }
+            total
+        };
+
+        let session = Arc::new(bare_session(master));
+        let typing = {
+            let session = session.clone();
+            std::thread::spawn(move || session.type_in(&vec![b'x'; 1 << 20]))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!typing.is_finished(), "the terminal's input did not fill up");
+        // The end is published while the write waits in poll; then room comes
+        *lock(&session.ended) = Some(Instant::now());
+        assert!(drain(&mut slave) > 0, "nothing was queued before the end");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !typing.is_finished() {
+            assert!(Instant::now() < deadline, "the write did not see the end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(typing.join().unwrap().is_err(), "a write cut short by the end reports it");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(drain(&mut slave), 0, "bytes were typed after the end was published");
+        // And a write that starts after the end types nothing at all
+        assert!(session.type_in(b"late").is_err());
+        assert_eq!(drain(&mut slave), 0);
+    }
+
+    /// Descriptors this process has open: all of them, and those on a pty master.
+    #[cfg(unix)]
+    fn open_descriptors() -> (usize, usize) {
+        let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
+        let fds: Vec<i32> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        // Linux with its own devpts instance names the multiplexer /dev/pts/ptmx
+        let ptmx = fds
+            .iter()
+            .filter(|&&fd| matches!(descriptor_path(fd).as_deref(), Some("/dev/ptmx" | "/dev/pts/ptmx")))
+            .count();
+        (fds.len(), ptmx)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn descriptor_path(fd: i32) -> Option<String> {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0)?;
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn descriptor_path(fd: i32) -> Option<String> {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok().map(|p| p.display().to_string())
+    }
+
+    /// MCR-151: the runner held an ended session's pty master and the writer's
+    /// copy until the session was forgotten, and the reader's copy for as long
+    /// as anything kept the terminal open. Counting descriptors needs a process
+    /// of its own (other tests open and close theirs meanwhile), so this test
+    /// runs itself again alone and the copy does the counting.
+    #[cfg(unix)]
+    #[test]
+    fn an_ended_session_gives_back_every_descriptor() {
+        const PROBE: &str = "AMCR_FD_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["runner::tests::an_ended_session_gives_back_every_descriptor", "--exact", "--test-threads=1", "--nocapture"])
+                .env(PROBE, "1")
+                .output()
+                .unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success(), "the probe failed:\n{text}");
+            assert!(text.contains("1 passed"), "the probe did not run:\n{text}");
+            return;
+        }
+        let socket = temp_socket("fds");
+        let path = socket.clone();
+        std::thread::spawn(move || serve(&path).unwrap());
+        // The first connection that gets through is kept and counted in the
+        // baseline: a throwaway one would still be closing on the runner's side
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut control = loop {
+            if let Ok(client) = Client::connect(&socket) {
+                break client;
+            }
+            assert!(Instant::now() < deadline, "runner did not listen");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(control.call(json!({"op": "hello"})).unwrap()["protocol"], PROTOCOL);
+        let (mut events, keep) = open_stream(&socket, json!({"op": "watch"})).unwrap();
+        keep.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        let settle = |want: (usize, usize), what: &str| {
+            let deadline = Instant::now() + EXIT_DRAIN + Duration::from_secs(10);
+            loop {
+                let now = open_descriptors();
+                if now == want {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{what}: open (all, ptmx) {now:?}, expected {want:?}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        // Within `wait`, or the test fails instead of hanging the suite
+        let exited = |events: &mut BufReader<Stream>, id: &str, wait: Duration| {
+            let needle = format!("\"id\":\"{id}\"");
+            let deadline = Instant::now() + wait;
+            let mut line = Vec::new();
+            loop {
+                assert!(Instant::now() < deadline, "no exited event for {id} within {wait:?}");
+                match events.read_until(b'\n', &mut line) {
+                    Ok(0) => panic!("the event stream ended"),
+                    Ok(_) if line.ends_with(b"\n") => {
+                        let text = String::from_utf8_lossy(&line);
+                        if text.contains("\"exited\"") && text.contains(&needle) {
+                            return;
+                        }
+                        line.clear();
+                    }
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        };
+        let quick = Duration::from_secs(10);
+        let base = open_descriptors();
+
+        // A session with a view: three pty descriptors while it runs (the master,
+        // the reader's copy and the writer's copy), all back when it has ended
+        control
+            .call(json!({"op": "spawn", "id": "f1", "argv": ["/bin/sh", "-c", "printf 'ready\\n'; read line; exit 0"], "cwd": "/tmp", "cols": 80, "rows": 24}))
+            .unwrap();
+        let (mut out, mut input) = open_stream(&socket, json!({"op": "attach", "id": "f1"})).unwrap();
+        // `read_until` gives up at its deadline only if a read returns
+        input.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        read_until(&mut out, "ready");
+        assert_eq!(open_descriptors().1, base.1 + 3, "a live session's pty descriptors");
+        input.write_all(b"bye\n").unwrap();
+        exited(&mut events, "f1", quick);
+        drop((out, input));
+        settle(base, "after an ended session, not forgotten");
+
+        // A session that leaves a job behind holding its terminal: the job
+        // ignores hangup and outlives the session
+        let leftover = Leftover { release: None, pidfile: socket.with_file_name("job.pid") };
+        let script = format!("trap '' HUP; sleep 60 & echo $! > {}; exit 0", leftover.pidfile.display());
+        control.call(json!({"op": "spawn", "id": "f2", "argv": ["/bin/sh", "-c", script], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
+        exited(&mut events, "f2", quick);
+        let alive = leftover.alive();
+        settle(base, "after an ended session whose job keeps the terminal");
+        drop(leftover);
+        assert!(alive, "the left-behind job was still running while the descriptors were counted");
+
+        // Typing that cannot go on: nobody reads the terminal's input, it is
+        // full and a write is pending when the session ends, while a job that
+        // ignores hangup keeps the terminal open. The end is still told at once,
+        // the pending write fails, and every descriptor comes back (review 17215)
+        let go = socket.with_file_name("full.go");
+        let leftover = Leftover { release: Some(go.clone()), pidfile: socket.with_file_name("full.pid") };
+        // The shell waits for the release file at most about 15 s
+        let script = format!(
+            "trap '' HUP; stty raw -echo; sleep 60 & echo $! > {}; printf 'ready\\n'; i=0; while [ ! -e {} ] && [ $i -lt 300 ]; do sleep 0.05; i=$((i+1)); done; exit 0",
+            leftover.pidfile.display(),
+            go.display()
+        );
+        control.call(json!({"op": "spawn", "id": "f3", "argv": ["/bin/sh", "-c", script], "cwd": "/tmp", "cols": 80, "rows": 24})).unwrap();
+        let (mut out, input) = open_stream(&socket, json!({"op": "attach", "id": "f3"})).unwrap();
+        input.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        read_until(&mut out, "ready");
+        drop((out, input));
+        let typing_socket = socket.clone();
+        let typing = std::thread::spawn(move || {
+            let mut client = Client::connect(&typing_socket).unwrap();
+            client.call(json!({"op": "write", "id": "f3", "data": "x".repeat(512 * 1024)}))
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!typing.is_finished(), "the terminal's input did not fill up");
+        std::fs::write(&go, "").unwrap();
+        exited(&mut events, "f3", Duration::from_secs(3));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !typing.is_finished() {
+            assert!(Instant::now() < deadline, "the pending write outlived the session");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(typing.join().unwrap().is_err(), "a write into an ended session reports it");
+        let alive = leftover.alive();
+        settle(base, "after an ended session with a full input queue");
+        drop(leftover);
+        assert!(alive, "the left-behind job was still running while the descriptors were counted");
+
+        // Forgetting them changes nothing more
+        for id in ["f1", "f2", "f3"] {
+            control.call(json!({"op": "forget", "id": id})).unwrap();
+        }
+        settle(base, "after forgetting");
     }
 
     #[cfg(windows)]
