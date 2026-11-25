@@ -822,14 +822,7 @@ impl Indexed {
         if self.parser_version != PARSER_VERSION {
             self.restart(path);
         }
-        if fs::symlink_metadata(path)
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_symlink()
-        {
-            return Err("Transcript replaced by a symlink".into());
-        }
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let mut file = open_regular(path)?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         let modified = meta
             .modified()
@@ -935,8 +928,10 @@ impl Indexed {
 }
 /// One hosted session's transcript, read by the harness service (MCR-149)
 /// with the index's own parser and usage deduplication, in memory only and
-/// without the database. No text is kept: the events go after every read.
-/// What it tells is what the files say, not a live process.
+/// without the database. The events go after every read; the parser's short
+/// summary fields (the title, ticket keys, tool names, folder, model) stay in
+/// memory while it follows and are never returned. What it tells is what the
+/// files say, not a live process.
 pub struct Follow {
     indexed: Indexed,
     path: PathBuf,
@@ -965,10 +960,6 @@ impl Follow {
             }
         }
     }
-    /// It was read up to the last whole record the last time
-    pub fn caught_up(&self) -> bool {
-        self.indexed.caught_up
-    }
     pub fn context(&self) -> &Context {
         &self.indexed.session.context
     }
@@ -980,6 +971,32 @@ impl Follow {
     pub fn turns(&self) -> &[u64] {
         self.indexed.turns.as_deref().unwrap_or(&[])
     }
+}
+/// A transcript, opened only when it is a regular file: a symlink is
+/// refused, and so is a named pipe or device, whose opening or reading could
+/// wait for good (MCR-149: a hosted agent can report any path in its folder).
+/// On unix it is opened non-blocking, so a file swapped for a pipe between
+/// the look and the open does not wait either, and checked again once open.
+fn open_regular(path: &Path) -> Result<File, String> {
+    let kind = fs::symlink_metadata(path).map_err(|e| e.to_string())?.file_type();
+    if kind.is_symlink() {
+        return Err("Transcript replaced by a symlink".into());
+    }
+    if !kind.is_file() {
+        return Err("Transcript is not a regular file".into());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Transcript is not a regular file".into());
+    }
+    Ok(file)
 }
 fn recorded_exit(text: &str) -> Option<i64> {
     if let Ok(v) = serde_json::from_str::<Value>(text) {

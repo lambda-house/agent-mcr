@@ -1900,8 +1900,31 @@ const TRANSCRIPT_LOOK_AGAIN: Duration = Duration::from_secs(30);
 /// conversation and reported path it was looked up with.
 struct Followed {
     key: (Option<String>, Option<String>),
-    looked: Instant,
-    follow: Option<crate::sessions::Follow>,
+    /// When the transcript was last looked for; `None`: not yet
+    looked: Option<Instant>,
+    follow: Option<Box<crate::sessions::Follow>>,
+    /// A request has taken it out to read it: the map's lock is never held
+    /// while files are looked up or read
+    busy: bool,
+}
+
+/// A session's context figures as one request read them, and what goes
+/// back into the map: `back` is `None` when the request took nothing out.
+struct ContextRead {
+    id: String,
+    back: Option<Option<Box<crate::sessions::Follow>>>,
+    looked: bool,
+    figures: Value,
+}
+
+/// What one request does for one session's context figures.
+enum Step {
+    /// Another request is reading its transcript
+    Busy,
+    /// Read the transcript it follows (`None`: none was found, and it is not looked for again yet)
+    Read(Option<Box<crate::sessions::Follow>>),
+    /// Look for its transcript, then read it
+    Look,
 }
 
 /// What the context figures need of a session from the store.
@@ -1909,6 +1932,8 @@ struct Seat {
     profile: String,
     transcript: Option<String>,
     conversation: Option<String>,
+    /// It works for another session and leads none: rules 11 and 13 are
+    /// about executors (a lead works for the root Supervisor too)
     executor: bool,
     /// Its tasks that were started: when, and when they ended (0: still open)
     rounds: Vec<(u64, u64)>,
@@ -1935,14 +1960,18 @@ fn transcript_for(home: &Path, profile: &str, reported: Option<&str>, conversati
 /// how long ago its last model response was recorded (the prompt cache lives
 /// that long past it), its rounds (tasks it was given) and its token use so
 /// far in input-token equivalents. `rounds` are its started tasks, in order.
-fn context_figures(f: &crate::sessions::Follow, rounds: &[(u64, u64)], executor: bool, complete: bool, now: u64) -> Value {
+fn context_figures(f: &crate::sessions::Follow, rounds: &[(u64, u64)], executor: bool, now: u64) -> Value {
     let c = f.context();
     let claude = f.claude();
-    // Responses go to the round whose task had started when they were recorded; earlier ones to the first
-    let mut per_round = vec![0usize; rounds.len().max(1)];
+    // Responses go to the round whose task had started when they were recorded.
+    // Earlier ones (before a restart, or typed by the operator before any task) are in no round
+    let mut per_round = vec![0usize; rounds.len()];
+    let mut before = 0usize;
     for &at in f.turns() {
-        let round = rounds.iter().rposition(|&(start, _)| at > 0 && at + ROUND_LEAD_MS >= start).unwrap_or(0);
-        per_round[round] += 1;
+        match rounds.iter().rposition(|&(start, _)| at > 0 && at + ROUND_LEAD_MS >= start) {
+            Some(round) => per_round[round] += 1,
+            None => before += 1,
+        }
     }
     let durations: Vec<u64> = rounds.iter().map(|&(start, end)| if end > 0 { end } else { now }.saturating_sub(start)).collect();
     let idle = (c.cache_at > 0).then(|| now.saturating_sub(c.cache_at));
@@ -1984,14 +2013,27 @@ fn context_figures(f: &crate::sessions::Follow, rounds: &[(u64, u64)], executor:
         "cacheTtlFrom": ttl_from,
         "cacheLikelyWarm": idle.zip(ttl).map(|(idle, ttl)| idle < ttl),
         "rounds": rounds.len(),
-        "roundTurns": per_round.last().copied().unwrap_or(0),
+        "roundTurns": per_round.last(),
         "roundAgeSeconds": durations.last().map(|ms| ms / 1000),
         "maxRoundTurns": most_turns,
         "maxRoundSeconds": longest / 1000,
         "turns": f.turns().len(),
+        "turnsBeforeRounds": before,
         "inputEquivalent": f.usage().input_equivalent(claude),
         "freshRecommended": fresh,
-        "complete": complete,
+        "complete": true,
+    })
+}
+
+/// The context figures of a session whose transcript was not read to its
+/// end in this request: only the rounds, which come from the store. Partial
+/// figures, and an empty `freshRecommended`, would read as final.
+fn unread_figures(rounds: &[(u64, u64)]) -> Value {
+    json!({
+        "tokens": null, "window": null, "peakTokens": null, "compactions": null, "lastTurnAgeSeconds": null,
+        "cacheTtlSeconds": null, "cacheTtlFrom": null, "cacheLikelyWarm": null, "rounds": rounds.len(),
+        "roundTurns": null, "roundAgeSeconds": null, "maxRoundTurns": null, "maxRoundSeconds": null, "turns": null,
+        "turnsBeforeRounds": null, "inputEquivalent": null, "freshRecommended": null, "complete": false,
     })
 }
 
@@ -5440,34 +5482,67 @@ impl Harness {
                 let t = store.sessions.get(*id)?;
                 let mut rounds: Vec<(u64, u64)> = store.tasks.values().filter(|k| k.session == *id && k.started > 0).map(|k| (k.started, k.finished)).collect();
                 rounds.sort_unstable();
-                Some((id.to_string(), Seat { profile: t.profile.clone(), transcript: t.transcript.clone(), conversation: t.agent_session.clone(), executor: t.supervisor.is_some(), rounds }))
+                let leads = t.agent_profile.as_ref().is_some_and(|p| p.role == "lead" || p.role == "supervisor") || !store.executors(id).is_empty();
+                Some((id.to_string(), Seat { profile: t.profile.clone(), transcript: t.transcript.clone(), conversation: t.agent_session.clone(), executor: t.supervisor.is_some() && !leads, rounds }))
             }).collect();
             (seats, store.sessions.keys().cloned().collect())
         };
         let Ok(home) = self.launch_home() else { return BTreeMap::new() };
+        // What is followed is taken out of the map, and put back after
+        let steps: Vec<(String, Seat, Step)> = {
+            let mut followed = lock(&self.contexts);
+            followed.retain(|id, _| known.contains(id));
+            seats.into_iter().map(|(id, seat)| {
+                let key = (seat.conversation.clone(), seat.transcript.clone());
+                let step = match followed.get_mut(&id) {
+                    Some(f) if f.busy => Step::Busy,
+                    Some(f) if f.key == key && (f.follow.is_some() || f.looked.is_some_and(|at| at.elapsed() < TRANSCRIPT_LOOK_AGAIN)) => {
+                        f.busy = true;
+                        Step::Read(f.follow.take())
+                    }
+                    _ => {
+                        followed.insert(id.clone(), Followed { key, looked: None, follow: None, busy: true });
+                        Step::Look
+                    }
+                };
+                (id, seat, step)
+            }).collect()
+        };
         let began = Instant::now();
         let now = now_ms();
-        let mut followed = lock(&self.contexts);
-        followed.retain(|id, _| known.contains(id));
-        seats.into_iter().map(|(id, seat)| {
-            let key = (seat.conversation.clone(), seat.transcript.clone());
-            let stale = followed.get(&id).is_none_or(|f| f.key != key || (f.follow.is_none() && f.looked.elapsed() >= TRANSCRIPT_LOOK_AGAIN));
-            if stale {
-                let path = transcript_for(&home, &seat.profile, seat.transcript.as_deref(), seat.conversation.as_deref());
-                let kind = if adapter(&seat.profile).id() == "codex" { "codex" } else { "claude" };
-                followed.insert(id.clone(), Followed { key, looked: Instant::now(), follow: path.map(|p| crate::sessions::Follow::new(&p, kind)) });
-            }
-            let Some(follow) = followed.get_mut(&id).and_then(|f| f.follow.as_mut()) else { return (id, Value::Null) };
-            // Once the request's time is spent, the rest show what was read before
-            let left = CONTEXT_BUDGET.saturating_sub(began.elapsed());
-            let read = if left.is_zero() { Ok(follow.caught_up()) } else { follow.read(left) };
-            let figures = match read {
-                Ok(complete) => context_figures(follow, &seat.rounds, seat.executor, complete, now),
+        let done: Vec<ContextRead> = steps.into_iter().map(|(id, seat, step)| {
+            let spent = || began.elapsed() >= CONTEXT_BUDGET;
+            let (follow, looked) = match step {
+                Step::Busy => return ContextRead { id, back: None, looked: false, figures: unread_figures(&seat.rounds) },
+                Step::Look if spent() => return ContextRead { id, back: Some(None), looked: false, figures: unread_figures(&seat.rounds) },
+                Step::Look => {
+                    let kind = if adapter(&seat.profile).id() == "codex" { "codex" } else { "claude" };
+                    let path = transcript_for(&home, &seat.profile, seat.transcript.as_deref(), seat.conversation.as_deref());
+                    (path.map(|p| Box::new(crate::sessions::Follow::new(&p, kind))), true)
+                }
+                Step::Read(follow) => (follow, false),
+            };
+            let Some(mut follow) = follow else { return ContextRead { id, back: Some(None), looked, figures: Value::Null } };
+            // Once the request's time is spent, the rest are not read: their figures say so
+            let figures = match if spent() { Ok(false) } else { follow.read(CONTEXT_BUDGET.saturating_sub(began.elapsed())) } {
+                Ok(true) => context_figures(&follow, &seat.rounds, seat.executor, now),
+                Ok(false) => unread_figures(&seat.rounds),
                 Err(e) => {
                     eprintln!("harness: context of {id}: {e}");
                     Value::Null
                 }
             };
+            ContextRead { id, back: Some(Some(follow)), looked, figures }
+        }).collect();
+        let mut followed = lock(&self.contexts);
+        done.into_iter().map(|ContextRead { id, back, looked, figures }| {
+            if let (Some(back), Some(f)) = (back, followed.get_mut(&id)) {
+                f.follow = back;
+                f.busy = false;
+                if looked {
+                    f.looked = Some(Instant::now());
+                }
+            }
             (id, figures)
         }).collect()
     }
@@ -11090,7 +11165,7 @@ mod tests {
         // Not an executor: the figures without a recommendation, in an overview tree too
         let tree = h.with_contexts(json!({"sessions": [{"id": "lead", "executors": [{"id": "ex", "executors": []}]}]}));
         assert_eq!(tree["sessions"][0]["context"]["freshRecommended"], Value::Null);
-        assert_eq!(tree["sessions"][0]["context"]["turns"], 3);
+        assert_eq!((tree["sessions"][0]["context"]["turns"].as_u64(), tree["sessions"][0]["context"]["turnsBeforeRounds"].as_u64()), (Some(3), Some(3)));
         assert!(tree["sessions"][0]["executors"][0]["context"]["freshRecommended"].is_array());
         assert!(tree["contextNote"].as_str().unwrap().contains("not a live process"));
         // Forgotten sessions are no longer followed
@@ -11125,10 +11200,95 @@ mod tests {
             s.sessions.insert("cx".into(), Tracked { profile: "codex".into(), state: "idle".into(), supervisor: Some("lead".into()), agent_session: Some(thread.into()), ..Tracked::default() });
         });
         let c = h.contexts(&["cx"]).remove("cx").unwrap();
-        assert_eq!((c["tokens"].as_u64(), c["window"].as_u64(), c["turns"].as_u64(), c["rounds"].as_u64(), c["roundTurns"].as_u64()), (Some(200), Some(258_400), Some(2), Some(0), Some(2)));
+        assert_eq!((c["tokens"].as_u64(), c["window"].as_u64(), c["turns"].as_u64(), c["rounds"].as_u64(), c["roundTurns"].as_u64(), c["turnsBeforeRounds"].as_u64()), (Some(200), Some(258_400), Some(2), Some(0), None, Some(2)));
         // (300 − 230) + 0.1×230 + 8×30
         assert_eq!(c["inputEquivalent"], 333);
         assert_eq!((c["cacheTtlFrom"].as_str(), c["cacheLikelyWarm"].as_bool()), (Some("assumed"), Some(true)));
+    }
+
+    /// MCR-149 round 2: a lead is no executor for rules 11 and 13, by its
+    /// profile or because it leads sessions itself; turns from before its
+    /// first round (a restart, the operator typing) are in no round.
+    #[test]
+    fn leads_get_no_recommendation_and_earlier_turns_are_in_no_round() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let base = now_ms() - 3 * 3600 * 1000;
+        let ids = ["0b8c9630-d8ae-4b6f-a765-44266a0929e0", "1b8c9630-d8ae-4b6f-a765-44266a0929e0", "2b8c9630-d8ae-4b6f-a765-44266a0929e0"];
+        let path = |i: usize| home.join(format!(".claude/projects/-w/{}.jsonl", ids[i]));
+        for i in 0..3 {
+            // 70 responses before the round, one in it
+            let mut rows: Vec<Value> = (0..70).map(|n| claude_response(&format!("old{n}"), base + n * 1000, 1, 0, 0, 1)).collect();
+            rows.push(claude_response("new", base + 3_600_000, 1, 0, 0, 1));
+            append_rows(&path(i), &rows);
+        }
+        let lead_ref = crate::profiles::ProfileRef { id: "lead@claude-opus".into(), role: "lead".into(), ..Default::default() };
+        h.update(|s| {
+            let tracked = |i: usize, supervisor: &str| Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some(supervisor.into()), transcript: Some(path(i).display().to_string()), agent_session: Some(ids[i].into()), ..Tracked::default() };
+            s.sessions.insert("lead".into(), Tracked { agent_profile: Some(lead_ref.clone()), ..tracked(0, "root") });
+            s.sessions.insert("bare-lead".into(), tracked(1, "root"));
+            s.sessions.insert("ex".into(), tracked(2, "bare-lead"));
+            for (n, id) in ["lead", "bare-lead", "ex"].iter().enumerate() {
+                let task = format!("t{n}");
+                s.tasks.insert(task.clone(), Task { id: task, session: (*id).into(), text: String::new(), state: "completed".into(), created: base + 3_500_000, started: base + 3_500_000, finished: base + 3_700_000, result: None, by: String::new(), told: false });
+            }
+        });
+        let all = h.contexts(&["lead", "bare-lead", "ex"]);
+        assert_eq!(all["lead"]["freshRecommended"], Value::Null);
+        assert_eq!(all["bare-lead"]["freshRecommended"], Value::Null);
+        let ex = &all["ex"];
+        assert_eq!((ex["turns"].as_u64(), ex["turnsBeforeRounds"].as_u64(), ex["roundTurns"].as_u64(), ex["maxRoundTurns"].as_u64()), (Some(71), Some(70), Some(1), Some(1)));
+        // Idle for long, but no round over 60 turns
+        let why: Vec<&str> = ex["freshRecommended"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(why.len() == 1 && why[0].contains("minutes ago"), "{why:?}");
+    }
+
+    /// MCR-149 round 2: a transcript another request is reading, or one
+    /// not read to its end, gives no figures that look final: only the rounds,
+    /// with `complete: false` and no recommendation either way.
+    #[test]
+    fn figures_not_read_to_the_end_are_not_shown_as_final() {
+        let dir = state_dir(None);
+        let h = Harness::open(&dir);
+        h.update(|s| {
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), ..Tracked::default() });
+        });
+        lock(&h.contexts).insert("ex".into(), Followed { key: (None, None), looked: None, follow: None, busy: true });
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        assert_eq!((c["complete"].as_bool(), c["rounds"].as_u64(), c["tokens"].is_null(), c["freshRecommended"].is_null()), (Some(false), Some(0), true, true));
+        // The request that has it puts it back; this one changed nothing
+        assert!(lock(&h.contexts)["ex"].busy);
+    }
+
+    /// MCR-149 round 2: a named pipe at the reported transcript path is not
+    /// opened, so no context read waits on it (it would wait for a writer).
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_reported_as_the_transcript_does_not_hang_the_figures() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let id = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let pipe = home.join(format!(".claude/projects/-w/{id}.jsonl"));
+        std::fs::create_dir_all(pipe.parent().unwrap()).unwrap();
+        let c_path = std::ffi::CString::new(pipe.display().to_string()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home);
+        h.update(|s| {
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), transcript: Some(pipe.display().to_string()), agent_session: Some(id.into()), ..Tracked::default() });
+        });
+        let h = Arc::new(h);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = h.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reader.contexts(&["ex"]).remove("ex"));
+        });
+        let c = rx.recv_timeout(Duration::from_secs(5)).expect("the figures waited on the pipe");
+        assert_eq!(c, Some(Value::Null));
+        // And the next request is not held up either
+        assert!(!lock(&h.contexts)["ex"].busy);
     }
 
     /// MCR-149: only a file under the agent's own transcript folder is read.
