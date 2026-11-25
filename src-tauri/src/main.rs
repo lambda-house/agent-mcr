@@ -28,6 +28,7 @@ mod secret_shape;
 mod task_copy;
 mod harness;
 mod auto_mode;
+#[cfg(target_os = "macos")]
 mod codex_sockets;
 mod harness_preferences;
 mod profiles;
@@ -1232,12 +1233,11 @@ fn main() {
             return;
         }
         // The harness's launch check for the Codex socket profile, run inside
-        // `codex sandbox` (MCR-162): prints one line, exits
+        // `codex sandbox` (MCR-162, macOS only): prints one line, exits
+        #[cfg(target_os = "macos")]
         Some(codex_sockets::PROBE_FLAG) => {
-            #[cfg(unix)]
-            std::process::exit(codex_sockets::probe_main(&std::env::args().nth(2).unwrap_or_default(), &std::env::args().nth(3).unwrap_or_default()));
-            #[cfg(not(unix))]
-            std::process::exit(1);
+            let arg = |n| std::env::args().nth(n).unwrap_or_default();
+            std::process::exit(codex_sockets::probe_main(&arg(2), &arg(3), &arg(4)));
         }
         Some("--harness-hook") => {
             harness::hook_bridge(&std::env::args().nth(2).unwrap_or_default(), std::env::args().nth(3));

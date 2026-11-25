@@ -40,10 +40,13 @@ pub fn matching_root(
         return Ok(matched);
     }
     let path = config_dir.join(CONFIG);
-    let Some(bytes) = read_config(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))? else {
+    // What goes back is fixed text (MCR-162 review 17282): a launch's error
+    // and a session's effectiveMode never repeat the file. The details go to
+    // the service's own log
+    let Some(bytes) = read_config(&path).map_err(|e| told(CANNOT_READ, &e))? else {
         return Ok(matched);
     };
-    let settings: Settings = serde_json::from_slice(&bytes).map_err(|e| format!("Invalid {}: {e}", path.display()))?;
+    let settings: Settings = serde_json::from_slice(&bytes).map_err(|e| told(INVALID, &e))?;
     if settings.roots.is_empty() {
         return Ok(matched);
     }
@@ -55,13 +58,13 @@ pub fn matching_root(
             Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
             Ok(rest) => home.join(rest),
             Err(_) if as_path.is_absolute() => as_path.to_path_buf(),
-            Err(_) => return Err(format!("Invalid root {root:?} in {CONFIG}: use an absolute path or ~/")),
+            Err(_) => return Err(told(RELATIVE_ROOT, &"a root that is neither absolute nor ~/")),
         };
         let path = match dunce::canonicalize(&expanded) {
             Ok(path) if path.is_dir() => path,
             Ok(_) => continue,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("Cannot resolve auto-mode root {root:?}: {e}")),
+            Err(e) => return Err(told(UNRESOLVED_ROOT, &e)),
         };
         let reason = if canonical_home.starts_with(&path) {
             Some("it is the home folder or an ancestor")
@@ -79,6 +82,16 @@ pub fn matching_root(
         }
     }
     Ok(matched)
+}
+
+pub const CANNOT_READ: &str = "Cannot read auto-mode.json";
+pub const INVALID: &str = "Invalid auto-mode.json: it must be {\"roots\": [paths]}";
+pub const RELATIVE_ROOT: &str = "Invalid root in auto-mode.json: use an absolute path or ~/";
+pub const UNRESOLVED_ROOT: &str = "Cannot resolve a root in auto-mode.json";
+
+fn told(message: &str, detail: &dyn std::fmt::Display) -> String {
+    eprintln!("harness: {message} ({detail})");
+    message.to_string()
 }
 
 pub fn claude_config(home: &Path, config_dir: Option<&Path>) -> Result<PathBuf, String> {

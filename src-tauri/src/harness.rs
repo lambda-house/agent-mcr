@@ -285,8 +285,12 @@ fn login_argv(cmd: String) -> Vec<String> {
     if cmd.is_empty() { vec![shell, "-l".into()] } else { vec![shell, "-l".into(), "-i".into(), "-c".into(), cmd] }
 }
 
+/// What the Codex socket check gives a launch (MCR-162): ports or not, with
+/// the fixed reason for none, or the fixed reason for refusing the profile
+type SocketsVerdict = Result<(bool, Option<&'static str>), &'static str>;
+
 #[cfg(test)]
-type SocketsCheck = Box<dyn Fn() -> crate::codex_sockets::Verdict + Send>;
+type SocketsCheck = Box<dyn Fn() -> SocketsVerdict + Send>;
 
 /// Claude hook command string for the current platform.
 pub fn claude_hook_command(exe: &str, event: &str, windows: bool) -> String {
@@ -3136,25 +3140,28 @@ impl Harness {
         Ok(())
     }
 
-    /// Runs `codex_sockets::check` for a Codex launch in `dir` (MCR-162)
-    fn codex_sockets_check(&self, exe: &str, dir: &Path) -> crate::codex_sockets::Verdict {
+    /// Runs `codex_sockets::check` for a Codex launch in `dir`, with the
+    /// variables its terminal will have (MCR-162)
+    fn codex_sockets_check(&self, exe: &str, dir: &Path, env: &[(String, String)]) -> SocketsVerdict {
         #[cfg(test)]
         {
-            let _ = (exe, dir);
+            let _ = (exe, dir, env);
             match &*lock(&self.sockets_check) {
                 Some(check) => check(),
-                None => Err("not checked in tests".into()),
+                None => Err("not checked in tests"),
             }
         }
-        #[cfg(all(unix, not(test)))]
+        #[cfg(all(target_os = "macos", not(test)))]
         {
             let nonce = runner::random_id()[..16].to_string();
-            crate::codex_sockets::check(&login_argv(crate::codex_sockets::command(exe, dir, &nonce)), &nonce)
+            let mut all: Vec<(String, String)> = runner::pty_env().into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+            all.extend(env.iter().cloned());
+            crate::codex_sockets::check(login_argv, exe, dir, &all, &nonce).map(|grant| (grant.ports, grant.no_ports))
         }
-        #[cfg(all(not(unix), not(test)))]
+        #[cfg(all(not(target_os = "macos"), not(test)))]
         {
-            let _ = (exe, dir);
-            Err("not on this system".into())
+            let _ = (exe, dir, env);
+            Err("not on this system")
         }
     }
 
@@ -3300,11 +3307,22 @@ impl Harness {
         // The socket profile only after Codex itself showed its policy for
         // this folder (review 17269 P1); decided here, before a restart hangs
         // up the session it replaces
-        let sockets_refused = match &root {
-            Some(_) if codex_could => self.codex_sockets_check(&exe, &dir).err(),
-            _ => None,
+        // The session's id and its own variables are chosen first, so the
+        // check runs with what the session's terminal will have
+        let id = runner::random_id()[..12].to_string();
+        let own_env = [
+            ("AGENT_MCR_PROFILE".to_string(), profile.clone()),
+            ("AGENT_MCR_SESSION".to_string(), id.clone()),
+            ("AGENT_MCR_HARNESS".to_string(), socket(&self.dir).display().to_string()),
+        ];
+        let (sockets_refused, codex_ports, ports_refused) = match &root {
+            Some(_) if codex_could => match self.codex_sockets_check(&exe, &dir, &own_env) {
+                Ok((ports, why)) => (None, ports, why),
+                Err(why) => (Some(why), false, None),
+            },
+            _ => (None, false, None),
         };
-        if let Some(reason) = &sockets_refused {
+        if let Some(reason) = sockets_refused {
             eprintln!("harness: Codex unix sockets refused in {}: {reason}", dir.display());
         }
         let launch = Launch {
@@ -3322,7 +3340,9 @@ impl Harness {
             own_hooks: lock(&self.store).codex_hooks,
             agent: chosen.as_ref().map(|c| &c.profile),
             auto_root: root.as_deref(),
-            sockets_refused: sockets_refused.as_deref(),
+            sockets_refused,
+            codex_ports,
+            ports_refused,
         };
         let (argv, mut spawn_env) = launch_for(&launch)?;
         // The text launched is kept, so a restart starts the same version (L5)
@@ -3345,10 +3365,7 @@ impl Harness {
             // separate turn before the supervisor has assigned its next task.
             spawn_env.insert("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(), "false".into());
         }
-        spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
-        let id = runner::random_id()[..12].to_string();
-        spawn_env.insert("AGENT_MCR_SESSION".into(), id.clone());
-        spawn_env.insert("AGENT_MCR_HARNESS".into(), socket(&self.dir).display().to_string());
+        spawn_env.extend(own_env);
         let name: String = req["name"].as_str().unwrap_or("").trim().chars().filter(|c| !c.is_control()).take(80).collect();
         let mut meta = json!({ "profile": profile, "label": label });
         if !name.is_empty() {
@@ -7654,15 +7671,15 @@ mod tests {
         let (spawned, server) = codex_root_runner(&dir, events.clone());
         let mut h = Harness::open(&dir);
         h.launch_home = Some(home.clone());
-        let verdict = Arc::new(Mutex::new(Ok::<(), String>(())));
+        let verdict: Arc<Mutex<SocketsVerdict>> = Arc::new(Mutex::new(Ok((true, None))));
         let (told, answer) = (events.clone(), verdict.clone());
         *lock(&h.sockets_check) = Some(Box::new(move || {
             lock(&told).push("check".into());
-            lock(&answer).clone()
+            *lock(&answer)
         }));
         let checks = || lock(&events).iter().filter(|e| *e == "check").count();
         let macos = std::env::consts::OS == crate::agents::CODEX_SOCKETS_OS;
-        let under = if macos { "workspace-write + unix sockets (root ~/work)" } else { "workspace-write (root ~/work, unix sockets are passed on macos only)" };
+        let under = if macos { "workspace-write + unix sockets + ports (root ~/work, macOS firewall on)" } else { "workspace-write (root ~/work, unix sockets are passed on macos only)" };
 
         let lead = h.tool("session_create", &json!({"profile": "lead@codex", "cwd": "~/work"})).unwrap();
         let lead_id = lead["id"].as_str().unwrap().to_string();
@@ -7689,10 +7706,16 @@ mod tests {
         assert_eq!(replacement["effectiveMode"], under);
         let replacement_id = replacement["id"].as_str().unwrap().to_string();
 
-        // The check refuses: plain workspace-write, said with the reason
+        // The firewall is off: Unix sockets without ports, said with the reason
+        *lock(&verdict) = Ok((false, Some("the macOS firewall is off")));
+        let no_ports = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
+        let sockets_only = if macos { "workspace-write + unix sockets (root ~/work, no ports: the macOS firewall is off)" } else { under };
+        assert_eq!(no_ports["effectiveMode"], sockets_only);
+
+        // The check refuses: workspace-write with the network off, said with the reason
         let reason = "Codex's managed network proxy is not running";
-        *lock(&verdict) = Err(reason.into());
-        let refused = if macos { format!("workspace-write (root ~/work, unix sockets refused: {reason})") } else { under.to_string() };
+        *lock(&verdict) = Err(reason);
+        let refused = if macos { format!("workspace-write (root ~/work, network off, unix sockets refused: {reason})") } else { under.to_string() };
         let fallback = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
         assert_eq!(fallback["effectiveMode"], refused.as_str());
         // A restart decides before it hangs up, and still restarts
@@ -7711,18 +7734,22 @@ mod tests {
         let spawned = lock(&spawned);
         let line = |i: usize| spawned[i]["argv"].as_array().unwrap().last().unwrap().as_str().unwrap().to_string();
         let profile = format!("'default_permissions=\"{}\"'", crate::agents::CODEX_SOCKET_PROFILE);
-        // 0 lead, 1 executor, 2 bare, 3 and 4 outside, 5 Claude, 6 restart, 7 refused, 8 refused restart
-        for (i, widened) in [(0, macos), (1, macos), (2, macos), (3, false), (4, false), (6, macos), (7, false), (8, false)] {
+        // 0 lead, 1 executor, 2 bare, 3 and 4 outside, 5 Claude, 6 restart,
+        // 7 no ports, 8 refused, 9 refused restart
+        for (i, widened, ports) in [(0, macos, true), (1, macos, true), (2, macos, true), (3, false, false), (4, false, false), (6, macos, true), (7, macos, false), (8, false, false), (9, false, false)] {
             let line = line(i);
             assert_eq!(line.contains(&profile), widened, "{line}");
             assert_eq!(line.contains("'--enable' 'network_proxy'"), widened, "{line}");
-            assert!(!line.contains("allow_local_binding=true"), "{line}");
+            assert_eq!(line.contains("allow_local_binding=true"), widened && ports, "{line}");
+            assert_eq!(line.contains("allow_local_binding=false"), widened && !ports, "{line}");
             assert_eq!(line.contains("workspace-write"), !widened, "{line}");
+            assert_eq!(line.contains("network_access=false"), macos && i >= 8, "{line}");
             assert_eq!(line.matches("on-request").count(), 1, "{line}");
         }
         assert!(line(2).starts_with("exec codex '--enable' 'network_proxy'") == macos, "{}", line(2));
-        for i in [3, 7] {
-            assert!(line(i).starts_with("exec codex --sandbox workspace-write --ask-for-approval on-request "), "{}", line(i));
+        assert!(line(3).starts_with("exec codex --sandbox workspace-write --ask-for-approval on-request "), "{}", line(3));
+        if macos {
+            assert!(line(8).starts_with("exec codex '--sandbox' 'workspace-write' '-c' 'sandbox_workspace_write.network_access=false' '--ask-for-approval' 'on-request' "), "{}", line(8));
         }
         assert!(!line(5).contains("network_proxy") && !line(5).contains("default_permissions"), "{}", line(5));
         drop(spawned);
@@ -7760,8 +7787,8 @@ mod tests {
         crate::profiles::approve(&dir, "ro.toml", 1).unwrap();
         let macos = std::env::consts::OS == crate::agents::CODEX_SOCKETS_OS;
         let plain = "exec codex --sandbox workspace-write --ask-for-approval on-request ";
-        for (broken, kind) in [(&b"{\"roots\":"[..], "Invalid"), (&b"{\"roots\":[\"~/work\"],\"more\":1}"[..], "Invalid"), (&b""[..], "Cannot read")] {
-            if kind == "Cannot read" {
+        for (broken, kind) in [(&b"{\"roots\":"[..], auto_mode::INVALID), (&b"{\"roots\":[\"~/work\"],\"more\":1}"[..], auto_mode::INVALID), (&b"{\"roots\":[\"work\"]}"[..], auto_mode::RELATIVE_ROOT), (&b""[..], auto_mode::CANNOT_READ)] {
+            if kind == auto_mode::CANNOT_READ {
                 std::fs::remove_file(&config).unwrap();
                 std::fs::create_dir(&config).unwrap();
             } else {
@@ -7772,7 +7799,8 @@ mod tests {
                 let bare = h.tool("session_create", &json!({"profile": "codex", "cwd": cwd})).unwrap();
                 let mode = bare["effectiveMode"].as_str().unwrap();
                 if macos {
-                    assert!(mode.starts_with(&format!("workspace-write (adapter default, auto-mode roots not used: {kind}")), "{mode}");
+                    // Fixed words: nothing of the file, its path or the parser's diagnosis
+                    assert_eq!(mode, format!("workspace-write (adapter default, auto-mode roots not used: {kind})"));
                 } else {
                     assert_eq!(mode, "workspace-write (adapter default)");
                 }
@@ -7782,7 +7810,7 @@ mod tests {
             let read_only = h.tool("session_create", &json!({"profile": "custom@codex-ro", "cwd": work.join("validate")})).unwrap();
             assert_eq!(read_only["effectiveMode"], "read-only (profile)");
             let claude = h.tool("session_create", &json!({"profile": "claude", "cwd": work.clone()}));
-            assert!(claude.is_err(), "{claude:?}");
+            assert_eq!(claude.unwrap_err(), kind);
             let spawned = lock(&spawned);
             let lines: Vec<String> = spawned[first..].iter().map(|s| s["argv"].as_array().unwrap().last().unwrap().as_str().unwrap().to_string()).collect();
             assert_eq!(lines.len(), 5);

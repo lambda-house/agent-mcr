@@ -274,8 +274,14 @@ pub struct Launch<'a> {
     /// Why the Codex socket profile is not passed although a root matched:
     /// the harness's launch check (`codex_sockets::check`) could not
     /// establish its policy, so the session gets plain workspace-write with
-    /// its network off (MCR-162 review 17269 P1)
+    /// its network explicitly off (MCR-162 reviews 17269 P1, 17282 P1). A
+    /// fixed message, never text from the check
     pub sockets_refused: Option<&'a str>,
+    /// With the socket profile: commands may also listen on TCP, because
+    /// the macOS firewall was on at the check (owner's decision 17284)
+    pub codex_ports: bool,
+    /// With the socket profile and no ports: the fixed reason why not
+    pub ports_refused: Option<&'a str>,
 }
 
 // The root override promotes acceptEdits and manual. Plan keeps its mode (MCR-160).
@@ -344,16 +350,19 @@ impl Launch<'_> {
     fn effective_mode_on(&self, notes: &[String], os: &str) -> Option<String> {
         let mode = match self.profile {
             "claude" => self.claude_mode(),
+            "codex" if self.codex_sockets_on(os) && self.codex_ports => "workspace-write + unix sockets + ports",
             "codex" if self.codex_sockets_on(os) => "workspace-write + unix sockets",
             "codex" => self.profile_mode().unwrap_or("workspace-write"),
             "antigravity" => "accept-edits",
             _ => return None,
         };
         let mut reason = match self.auto_root {
-            Some(root) if self.claude_uses_auto() || self.codex_sockets_on(os) => format!("root {root}"),
+            Some(root) if self.codex_sockets_on(os) && self.codex_ports => format!("root {root}, macOS firewall on"),
+            Some(root) if self.codex_sockets_on(os) => format!("root {root}, no ports: {}", self.ports_refused.unwrap_or("not checked")),
+            Some(root) if self.claude_uses_auto() => format!("root {root}"),
             Some(root) if self.codex_sockets() => format!("root {root}, unix sockets are passed on {CODEX_SOCKETS_OS} only"),
             Some(root) if self.profile == "codex" && self.codex_mode() == "workspace-write" && self.sockets_refused.is_some() => {
-                format!("root {root}, unix sockets refused: {}", self.sockets_refused.unwrap_or(""))
+                format!("root {root}, network off, unix sockets refused: {}", self.sockets_refused.unwrap_or(""))
             }
             Some(root) => format!("profile mode kept under root {root}"),
             None if self.profile_mode().is_some() => "profile".into(),
@@ -776,7 +785,7 @@ impl Adapter for Codex {
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
         let worded;
-        let flags = if l.agent.is_some() || l.codex_sockets_on(std::env::consts::OS) {
+        let flags = if l.agent.is_some() || l.codex_sockets_on(std::env::consts::OS) || l.sockets_refused.is_some() {
             worded = self.sandbox_words(l, std::env::consts::OS)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ");
             worded.as_str()
         } else {
@@ -927,6 +936,9 @@ impl Adapter for Codex {
     }
 }
 
+/// What a refused check adds after `--sandbox workspace-write` (MCR-162)
+pub const CODEX_NETWORK_OFF: [&str; 2] = ["-c", "sandbox_workspace_write.network_access=false"];
+
 /// The bare Codex line's sandbox and approvals (its `Profile.command` after the program)
 const CODEX_BARE: [&str; 4] = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"];
 
@@ -940,12 +952,15 @@ impl Codex {
             Some(p) => self.profile_words(p)?,
             None => CODEX_BARE.map(str::to_owned).to_vec(),
         };
+        let at = words.windows(2).position(|w| w[0] == "--sandbox" && w[1] == "workspace-write");
         if l.codex_sockets_on(os) {
-            let at = words
-                .windows(2)
-                .position(|w| w[0] == "--sandbox" && w[1] == "workspace-write")
-                .ok_or("The Codex line has no workspace-write sandbox to give Unix sockets")?;
-            words.splice(at..at + 2, codex_socket_words());
+            let at = at.ok_or("The Codex line has no workspace-write sandbox to give Unix sockets")?;
+            words.splice(at..at + 2, codex_socket_words(l.codex_ports));
+        } else if let (Some(at), Some(_), Some(_)) = (at, l.auto_root, l.sockets_refused) {
+            // The check refused: workspace-write with its network off, whatever
+            // `[sandbox_workspace_write].network_access` a config layer says
+            // (review 17282 P1)
+            words.splice(at + 2..at + 2, CODEX_NETWORK_OFF.map(str::to_owned));
         }
         one_sandbox(&words)?;
         Ok(words)
@@ -981,12 +996,14 @@ fn one_sandbox(words: &[String]) -> Result<(), String> {
 /// `codex_sockets::check` before every such launch and falls back to plain
 /// workspace-write when it fails.
 ///
-/// No TCP: `allow_local_binding` would give Seatbelt's `network-bind (local
-/// ip "*:*")`, and a listener on `0.0.0.0` then answered a connection to the
-/// Mac's en0 address (review 17269 P2, measured 25 Nov). It is false here,
-/// with the two `dangerously_*` switches, so a lower config layer cannot set
-/// them for this profile.
-pub fn codex_socket_words() -> Vec<String> {
+/// TCP listening (`ports`) only while the macOS firewall is on: Seatbelt's
+/// `network-bind (local ip "*:*")` is the only grant there is, and a
+/// listener on `0.0.0.0` answered a connection to the Mac's en0 address
+/// (review 17269 P2, measured 25 Nov); the owner accepts that with the
+/// firewall as the mitigation (17284). Without it, `allow_local_binding` is
+/// false. Both ways it is set here, with the two `dangerously_*` switches
+/// false, so a lower config layer cannot set them for this profile.
+pub fn codex_socket_words(ports: bool) -> Vec<String> {
     let p = CODEX_SOCKET_PROFILE;
     [
         "--enable".to_owned(),
@@ -1000,7 +1017,7 @@ pub fn codex_socket_words() -> Vec<String> {
         "-c".to_owned(),
         format!("permissions.{p}.network.enabled=true"),
         "-c".to_owned(),
-        format!("permissions.{p}.network.allow_local_binding=false"),
+        format!("permissions.{p}.network.allow_local_binding={ports}"),
         "-c".to_owned(),
         format!("permissions.{p}.network.dangerously_allow_all_unix_sockets=false"),
         "-c".to_owned(),
@@ -1656,9 +1673,10 @@ mod tests {
 
     /// MCR-162: under an auto-mode root, a Codex session in workspace-write
     /// gets the socket profile in place of `--sandbox workspace-write` on
-    /// macOS, profile or bare, new or resumed; `on-request` stays. Read-only,
-    /// outside a root, a refused launch check and the Windows path keep
-    /// today's words. No TCP binding (review 17269 P2).
+    /// macOS, profile or bare, new or resumed, with ports only when the
+    /// check found the firewall on; `on-request` stays. A refused check gives
+    /// workspace-write with its network explicitly off (review 17282 P1).
+    /// Read-only, outside a root and the Windows path keep today's words.
     #[test]
     fn codex_under_a_root_gets_unix_sockets_on_macos_only() {
         let loaded = crate::profiles::load(Path::new("/nonexistent-config-dir"));
@@ -1668,38 +1686,43 @@ mod tests {
         let mut read_only = implementer.clone();
         read_only.permissions.mode = Some("read-only".into());
         let resume = "019a3c48-7d0e-7d61-b1f5-6a1f0c6d2b3e";
-        let sockets = codex_socket_words();
-        assert_eq!(sockets[..4], ["--enable", "network_proxy", "-c", "default_permissions=\"agent-mcr-sockets\""]);
-        let filesystem = &sockets[5];
-        for rule in [r#"":root"="read""#, r#""."="write""#, r#"".git"="read""#, r#"".codex"="read""#, r#"".agents"="read""#, r#"":slash_tmp"="write""#, r#"":tmpdir"="write""#] {
-            assert!(filesystem.contains(rule), "{filesystem}");
+        for ports in [false, true] {
+            let sockets = codex_socket_words(ports);
+            assert_eq!(sockets[..4], ["--enable", "network_proxy", "-c", "default_permissions=\"agent-mcr-sockets\""]);
+            let filesystem = &sockets[5];
+            for rule in [r#"":root"="read""#, r#""."="write""#, r#"".git"="read""#, r#"".codex"="read""#, r#"".agents"="read""#, r#"":slash_tmp"="write""#, r#"":tmpdir"="write""#] {
+                assert!(filesystem.contains(rule), "{filesystem}");
+            }
+            for word in ["network.enabled=true".to_owned(), format!("network.allow_local_binding={ports}"), "network.dangerously_allow_all_unix_sockets=false".into(), "network.dangerously_allow_non_loopback_proxy=false".into()] {
+                assert!(sockets.contains(&format!("permissions.agent-mcr-sockets.{word}")), "{word}");
+            }
+            assert_eq!(sockets.last().unwrap(), &format!("permissions.agent-mcr-sockets.network.unix_sockets={{\"{CODEX_SOCKETS}\"=\"allow\"}}"));
+            assert!(sockets.iter().all(|w| !w.contains("network_access") && !w.contains("domains") && !w.contains('\'') && !w.contains("--sandbox")));
+            assert_eq!(sockets.iter().filter(|w| w.ends_with("=true")).count(), 1 + usize::from(ports));
+            // The two never stand together on a line
+            assert!(one_sandbox(&sockets).is_ok());
+            let mut both = sockets.clone();
+            both.extend(["--sandbox".to_owned(), "workspace-write".to_owned()]);
+            assert!(one_sandbox(&both).unwrap_err().contains("both"));
+            both.truncate(sockets.len());
+            both.push("--sandbox=workspace-write".into());
+            assert!(one_sandbox(&both).is_err());
         }
-        for word in ["network.enabled=true", "network.allow_local_binding=false", "network.dangerously_allow_all_unix_sockets=false", "network.dangerously_allow_non_loopback_proxy=false"] {
-            assert!(sockets.contains(&format!("permissions.agent-mcr-sockets.{word}")), "{word}");
-        }
-        assert_eq!(sockets.last().unwrap(), &format!("permissions.agent-mcr-sockets.network.unix_sockets={{\"{CODEX_SOCKETS}\"=\"allow\"}}"));
-        assert!(sockets.iter().all(|w| !w.contains("network_access") && !w.contains("domains") && !w.contains('\'') && !w.contains("--sandbox")));
-        assert_eq!(sockets.iter().filter(|w| w.ends_with("=true")).count(), 1, "only network.enabled is switched on");
         #[cfg(unix)]
         assert_eq!(CODEX_SOCKETS, format!("/private{}", crate::ipc::TEST_SOCKETS));
-        // The two never stand together on a line
-        assert!(one_sandbox(&sockets).is_ok());
-        let mut both = sockets.clone();
-        both.extend(["--sandbox".to_owned(), "workspace-write".to_owned()]);
-        assert!(one_sandbox(&both).unwrap_err().contains("both"));
-        both.truncate(sockets.len());
-        both.push("--sandbox=workspace-write".into());
-        assert!(one_sandbox(&both).is_err());
 
         let refusal = "Codex's managed network proxy is not running";
+        let firewall_off = "the macOS firewall is off";
         for agent in [None, Some(&implementer), Some(&lead), Some(&validator), Some(&read_only)] {
             let mode = agent.and_then(|p| p.permissions.mode.as_deref()).unwrap_or("workspace-write");
             for root in [None, Some("~/work")] {
-                for refused in [None, Some(refusal)] {
+                for (refused, ports) in [(None, false), (None, true), (Some(refusal), false)] {
                     for resumed in [None, Some(resume)] {
-                        let l = Launch { profile: "codex", exe: "/x", agent, auto_root: root, sockets_refused: refused, resume: resumed, ..Default::default() };
+                        let ports_refused = (refused.is_none() && !ports).then_some(firewall_off);
+                        let l = Launch { profile: "codex", exe: "/x", agent, auto_root: root, sockets_refused: refused, codex_ports: ports, ports_refused, resume: resumed, ..Default::default() };
                         let eligible = root.is_some() && mode == "workspace-write";
                         let widened = eligible && refused.is_none();
+                        let fallback = eligible && refused.is_some();
                         assert_eq!(l.codex_sockets(), widened);
                         // Whether the harness reads the roots and runs the check at all
                         assert_eq!(l.codex_could_take_sockets("macos"), mode == "workspace-write");
@@ -1712,41 +1735,54 @@ mod tests {
                             Some(p) => Codex.profile_words(p).unwrap(),
                             None => CODEX_BARE.map(str::to_owned).to_vec(),
                         };
-                        assert_eq!(linux, plain);
-                        assert_eq!(windows, plain);
+                        let mut off = plain.clone();
+                        if fallback {
+                            off.splice(2..2, CODEX_NETWORK_OFF.map(str::to_owned));
+                        }
+                        // A refusal is only ever set on macOS; the words would hold elsewhere too
+                        assert_eq!(linux, off);
+                        assert_eq!(windows, off);
                         if widened {
-                            let mut expected = sockets.clone();
+                            let mut expected = codex_socket_words(ports);
                             expected.extend(plain[2..].iter().cloned());
                             assert_eq!(mac, expected);
                             assert!(!mac.contains(&"--sandbox".to_owned()));
                         } else {
-                            assert_eq!(mac, plain);
+                            assert_eq!(mac, off);
                             assert!(!mac.iter().any(|w| w.contains("network_proxy") || w.contains("default_permissions")));
                         }
+                        assert_eq!(mac.contains(&"sandbox_workspace_write.network_access=false".to_owned()), fallback);
                         assert_eq!(mac.windows(2).filter(|w| w[0] == "--ask-for-approval" && w[1] == "on-request").count(), 1);
                         // What each says of itself
                         let reason = match (root, agent) {
-                            (Some(_), _) if widened => "root ~/work".to_owned(),
-                            (Some(_), _) if eligible => format!("root ~/work, unix sockets refused: {refusal}"),
+                            (Some(_), _) if widened && ports => "root ~/work, macOS firewall on".to_owned(),
+                            (Some(_), _) if widened => format!("root ~/work, no ports: {firewall_off}"),
+                            (Some(_), _) if eligible => format!("root ~/work, network off, unix sockets refused: {refusal}"),
                             (Some(_), _) => "profile mode kept under root ~/work".to_owned(),
                             (None, Some(_)) => "profile".to_owned(),
                             (None, None) => "adapter default".to_owned(),
                         };
-                        let on_mac = if widened { "workspace-write + unix sockets".to_owned() } else { mode.to_owned() };
+                        let on_mac = match (widened, ports) {
+                            (true, true) => "workspace-write + unix sockets + ports".to_owned(),
+                            (true, false) => "workspace-write + unix sockets".to_owned(),
+                            _ => mode.to_owned(),
+                        };
                         assert_eq!(l.effective_mode_on(&[], "macos").unwrap(), format!("{on_mac} ({reason})"));
                         let elsewhere = if widened { "root ~/work, unix sockets are passed on macos only".to_owned() } else { reason };
                         assert_eq!(l.effective_mode_on(&[], "windows").unwrap(), format!("{mode} ({elsewhere})"));
-                        // The launch paths: Unix as this system does it, Windows never
+                        // The launch paths: Unix as this system does it
                         let line = command_line(&l).unwrap();
                         let here = std::env::consts::OS == CODEX_SOCKETS_OS && widened;
                         assert_eq!(line.contains("'default_permissions=\"agent-mcr-sockets\"'"), here, "{line}");
                         assert_eq!(line.contains("network_proxy"), here, "{line}");
+                        assert_eq!(line.contains("allow_local_binding=true"), here && ports, "{line}");
                         assert_eq!(line.contains("workspace-write"), mode == "workspace-write" && !here, "{line}");
+                        assert_eq!(line.contains("network_access=false"), fallback, "{line}");
                         assert_eq!(line.starts_with("exec codex resume "), resumed.is_some(), "{line}");
                         assert_eq!(line.ends_with(&format!(" {resume}")), resumed.is_some(), "{line}");
                         let args = windows_args(&l).unwrap();
                         let at = if resumed.is_some() { 2 } else { 1 };
-                        assert_eq!(args[at..at + 4], plain[..4]);
+                        assert_eq!(args[at..at + off.len()], off[..]);
                         assert!(!args.iter().any(|a| a.contains("network_proxy") || a.contains("default_permissions")), "{args:?}");
                     }
                 }
