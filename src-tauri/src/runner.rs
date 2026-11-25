@@ -1596,12 +1596,7 @@ mod tests {
 
     fn temp_socket(name: &str) -> std::path::PathBuf {
         // Socket paths are limited to ~100 bytes; keep them short
-        let root = if cfg!(unix) {
-            std::path::PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        let dir = root.join(format!("amcr-{}-{name}", std::process::id()));
+        let dir = crate::ipc::test_socket_dir(&format!("amcr-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("r.sock")
     }

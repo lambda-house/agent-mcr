@@ -1,4 +1,5 @@
 //! Operator-owned roots and the Claude Code workspace trust record (MCR-152).
+//! A root also gives Codex sessions loopback sockets (MCR-162).
 
 use serde::Deserialize;
 use serde_json::value::{to_raw_value, RawValue};
@@ -24,7 +25,9 @@ pub struct RootMatch {
 }
 
 /// `cwd` is the canonical path given to the runner. Keep the operator's
-/// spelling and record rejected roots even if another root matches.
+/// spelling and record rejected roots even if another root matches. Claude
+/// and Codex sessions match (what a match does is the adapter's, in
+/// `agents::Launch`); the root Supervisor and other agents never do.
 pub fn matching_root(
     config_dir: &Path,
     home: &Path,
@@ -33,7 +36,7 @@ pub fn matching_root(
     supervisor: bool,
 ) -> Result<RootMatch, String> {
     let mut matched = RootMatch::default();
-    if adapter != "claude" || supervisor {
+    if !matches!(adapter, "claude" | "codex") || supervisor {
         return Ok(matched);
     }
     let path = config_dir.join(CONFIG);
@@ -230,7 +233,10 @@ mod tests {
         assert_eq!(root(&home.join("work")).as_deref(), Some("~/work"));
         assert_eq!(root(&outside), None);
         assert_eq!(matching_root(&home, &home, &cwd, "claude", true).unwrap().root, None);
-        assert_eq!(matching_root(&home, &home, &cwd, "codex", false).unwrap().root, None);
+        assert_eq!(matching_root(&home, &home, &cwd, "codex", false).unwrap().root.as_deref(), Some("~/work"));
+        assert_eq!(matching_root(&home, &home, &cwd, "codex", true).unwrap().root, None);
+        assert_eq!(matching_root(&home, &home, &cwd, "shell", false).unwrap().root, None);
+        assert_eq!(matching_root(&home, &home, &cwd, "antigravity", false).unwrap().root, None);
 
         #[cfg(unix)]
         {
@@ -311,7 +317,7 @@ mod tests {
         ] {
             let matched = matching_root(&home, &home, cwd, "claude", false).unwrap();
             assert_eq!(matched.root.is_some(), cwd == &worktree);
-            let launch = Launch { profile: "claude", agent: profile, claude_auto_root: matched.root.as_deref(), settings: "claude-hooks.json", ..Default::default() };
+            let launch = Launch { profile: "claude", agent: profile, auto_root: matched.root.as_deref(), settings: "claude-hooks.json", ..Default::default() };
             let args = windows_args(&launch).unwrap();
             assert_eq!(&args[1..3], ["--permission-mode", mode]);
             let reason = match mode {

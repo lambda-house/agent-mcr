@@ -3259,7 +3259,7 @@ impl Harness {
             task: if cfg!(windows) { None } else { task },
             own_hooks: lock(&self.store).codex_hooks,
             agent: chosen.as_ref().map(|c| &c.profile),
-            claude_auto_root: root.as_deref(),
+            auto_root: root.as_deref(),
         };
         let (argv, mut spawn_env) = launch_for(&launch)?;
         // The text launched is kept, so a restart starts the same version (L5)
@@ -6262,8 +6262,7 @@ mod tests {
     /// A folder for a test that listens on a socket in it: `/tmp` on Unix, where
     /// the macOS temp folder would make the path too long for `sun_path`.
     fn socket_test_dir(prefix: &str) -> PathBuf {
-        let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
-        base.join(format!("{prefix}{}", runner::random_id()))
+        crate::ipc::test_socket_dir(&format!("{prefix}{}", runner::random_id()))
     }
 
     /// MCR-129: a bridge that connected while the service could not tell who
@@ -7333,7 +7332,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn auto_mode_trusts_promoted_claude_sessions_before_spawn() {
-        let fixture = tempfile::Builder::new().prefix("mcr152-").tempdir_in("/tmp").unwrap();
+        let fixture = tempfile::Builder::new().prefix("mcr152-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let dir = dunce::canonicalize(fixture.path()).unwrap();
         let home = dir.join("home");
         let work = home.join("work");
@@ -7444,7 +7443,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn auto_mode_prepares_trust_before_hangup_and_fresh_create_can_fall_back() {
-        let fixture = tempfile::Builder::new().prefix("mcr152-r-").tempdir_in("/tmp").unwrap();
+        let fixture = tempfile::Builder::new().prefix("mcr152-r-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let dir = dunce::canonicalize(fixture.path()).unwrap();
         let home = dir.join("home");
         let cwd = home.join("work");
@@ -7514,6 +7513,104 @@ mod tests {
         assert_eq!(replacement["replaced"], id);
         assert_eq!(replacement["effectiveMode"], "auto (root ~/work)");
         assert_ne!(replacement["id"], id);
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+    }
+
+    /// MCR-162: a Codex session under an auto-mode root gets loopback sockets
+    /// in place of plain workspace-write, as a profile launch, a bare launch,
+    /// an executor and after a restart; whoami, executor_create and overview
+    /// say so. Outside the root, and on a system other than macOS, the line is
+    /// today's. A Claude session's line is not touched by the Codex override.
+    #[test]
+    #[cfg(unix)]
+    fn codex_under_a_root_gets_loopback_and_outside_stays_plain() {
+        let fixture = tempfile::Builder::new().prefix("mcr162-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
+        let dir = dunce::canonicalize(fixture.path()).unwrap();
+        let home = dir.join("home");
+        let work = home.join("work");
+        let worktree = work.join("wt/new");
+        let elsewhere = home.join("elsewhere");
+        for cwd in [&worktree, &elsewhere, &work.join("repo")] {
+            std::fs::create_dir_all(cwd).unwrap();
+        }
+        std::fs::write(dir.join("auto-mode.json"), br#"{"roots":["~/work"]}"#).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let spawned = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen = spawned.clone();
+        let server = std::thread::spawn(move || {
+            let mut sessions = BTreeMap::<String, Value>::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": sessions.values().collect::<Vec<_>>()}),
+                    "spawn" => {
+                        lock(&seen).push(req.clone());
+                        sessions.insert(req["id"].as_str().unwrap().into(), req);
+                        json!({})
+                    }
+                    "signal" => {
+                        sessions.get_mut(req["id"].as_str().unwrap()).unwrap()["exit"] = json!(0);
+                        json!({})
+                    }
+                    "forget" => {
+                        sessions.remove(req["id"].as_str().unwrap());
+                        json!({})
+                    }
+                    "write" => json!({}),
+                    "snapshot" => json!({"data": ""}),
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let macos = std::env::consts::OS == crate::agents::CODEX_LOOPBACK_OS;
+        let under = if macos { "workspace-write + loopback (root ~/work)" } else { "workspace-write (root ~/work, loopback is passed on macos only)" };
+
+        let lead = h.tool("session_create", &json!({"profile": "lead@codex", "cwd": "~/work"})).unwrap();
+        let lead_id = lead["id"].as_str().unwrap().to_string();
+        assert_eq!(lead["effectiveMode"], under);
+        let executor = h.agent_tool(&lead_id, "executor_create", &json!({"profile": "implementer@codex", "cwd": worktree})).unwrap();
+        assert_eq!(executor["effectiveMode"], under);
+        let executor_id = executor["id"].as_str().unwrap();
+        let me = h.agent_tool(executor_id, "whoami", &json!({})).unwrap();
+        assert_eq!(me["effectiveMode"], under);
+        let overview = h.agent_tool(&lead_id, "overview", &json!({})).unwrap();
+        assert_eq!(overview["sessions"][0]["executors"][0]["effectiveMode"], under);
+        let bare = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
+        assert_eq!(bare["effectiveMode"], under);
+        let outside = h.tool("session_create", &json!({"profile": "codex", "cwd": elsewhere})).unwrap();
+        assert_eq!(outside["effectiveMode"], "workspace-write (adapter default)");
+        let outside_profile = h.tool("session_create", &json!({"profile": "implementer@codex", "cwd": elsewhere})).unwrap();
+        assert_eq!(outside_profile["effectiveMode"], "workspace-write (profile)");
+        let claude = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": worktree})).unwrap();
+        assert!(claude["effectiveMode"].as_str().unwrap().starts_with("auto (root ~/work"), "{claude}");
+        let replacement = h.tool("session_restart", &json!({"session": executor_id, "force": true})).unwrap();
+        assert_eq!(replacement["replaced"], executor_id);
+        assert_eq!(replacement["effectiveMode"], under);
+
+        let spawned = lock(&spawned);
+        let line = |i: usize| spawned[i]["argv"].as_array().unwrap().last().unwrap().as_str().unwrap().to_string();
+        let loopback = format!("'default_permissions=\"{}\"'", crate::agents::CODEX_LOOPBACK);
+        for (i, widened) in [(0, macos), (1, macos), (2, macos), (3, false), (4, false), (6, macos)] {
+            let line = line(i);
+            assert_eq!(line.contains(&loopback), widened, "{line}");
+            assert_eq!(line.contains("'--enable' 'network_proxy'"), widened, "{line}");
+            assert_eq!(line.contains("workspace-write"), !widened, "{line}");
+            assert_eq!(line.matches("on-request").count(), 1, "{line}");
+        }
+        assert!(line(2).starts_with("exec codex '--enable' 'network_proxy'") == macos, "{}", line(2));
+        assert!(line(3).starts_with("exec codex --sandbox workspace-write --ask-for-approval on-request "), "{}", line(3));
+        assert!(!line(5).contains("network_proxy") && !line(5).contains("default_permissions"), "{}", line(5));
+        drop(spawned);
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
@@ -8288,7 +8385,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn executor_end_accepts_a_completed_task_with_an_open_done_mark() {
-        let dir = tempfile::Builder::new().prefix("mcr158-").tempdir_in("/tmp").unwrap();
+        let dir = tempfile::Builder::new().prefix("mcr158-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let harness = Harness::open(dir.path());
         let report = harness.update(|s| {
             s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
@@ -8868,7 +8965,7 @@ mod tests {
 
     #[test]
     fn memory_bridge_replays_the_handshake_to_a_restarted_service() {
-        let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
+        let dir = crate::ipc::test_socket_dir(&format!("mcr-b-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
         let listener = Listener::bind(&path).unwrap();
@@ -8896,7 +8993,7 @@ mod tests {
 
     #[test]
     fn bridge_survives_a_service_restart() {
-        let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
+        let dir = crate::ipc::test_socket_dir(&format!("mcr-b-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
         let listener = Listener::bind(&path).unwrap();

@@ -485,11 +485,7 @@ mod socket_tests {
     fn short_temp_dir(tag: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        #[cfg(unix)]
-        let base = PathBuf::from("/tmp");
-        #[cfg(not(unix))]
-        let base = std::env::temp_dir();
-        base.join(format!("amcr-{tag}-{}-{n}", std::process::id()))
+        crate::ipc::test_socket_dir(&format!("amcr-{tag}-{}-{n}", std::process::id()))
     }
 
     fn stream_pair(dir: &Path) -> (Stream, Stream) {

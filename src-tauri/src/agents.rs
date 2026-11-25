@@ -268,12 +268,30 @@ pub struct Launch<'a> {
     /// the command line only through the adapter's fixed mapping
     /// (`profile_words`). None: today's line (a bare launch)
     pub agent: Option<&'a crate::profiles::AgentProfile>,
-    /// Set only by the harness after matching an operator-configured root.
-    pub claude_auto_root: Option<&'a str>,
+    /// Set only by the harness after matching an operator-configured root
+    /// (MCR-152 for Claude, MCR-162 for Codex).
+    pub auto_root: Option<&'a str>,
 }
 
 // The root override promotes acceptEdits and manual. Plan keeps its mode (MCR-160).
 const CLAUDE_AUTO_FROM_MODES: &[&str] = &["acceptEdits", "manual"];
+
+/// The only system where the Codex loopback profile is passed (MCR-162):
+/// verified there against Seatbelt with codex-cli 0.172. Elsewhere a Codex
+/// session under a root keeps plain workspace-write.
+pub const CODEX_LOOPBACK_OS: &str = "macos";
+
+/// The permission profile a Codex session under a root runs in, defined on
+/// its command line. A name of our own, so it does not take the operator's.
+pub const CODEX_LOOPBACK: &str = "agent-mcr-loopback";
+
+/// The one folder where a Codex session under a root may bind and connect
+/// Unix sockets (MCR-162). The canonical path: Codex refuses `/tmp` for a
+/// folder that does not exist yet. The tests put their sockets below it
+/// (`ipc::test_socket_dir`), so `cargo test` needs no prompt there. The other
+/// sockets in `/tmp` and `$TMPDIR` (a browser's, an agent daemon's, a JVM's)
+/// stay closed.
+pub const CODEX_SOCKETS: &str = "/private/tmp/agent-mcr-sockets";
 
 impl Launch<'_> {
     fn claude_mode(&self) -> &str {
@@ -281,8 +299,20 @@ impl Launch<'_> {
     }
 
     pub fn claude_uses_auto(&self) -> bool {
-        self.claude_auto_root.is_some()
+        self.profile == "claude"
+            && self.auto_root.is_some()
             && CLAUDE_AUTO_FROM_MODES.contains(&self.profile_mode().unwrap_or("acceptEdits"))
+    }
+
+    /// A Codex session under a root in workspace-write gets loopback sockets
+    /// (MCR-162); read-only keeps its mode
+    pub fn codex_loopback(&self) -> bool {
+        self.profile == "codex" && self.auto_root.is_some() && self.profile_mode().unwrap_or("workspace-write") == "workspace-write"
+    }
+
+    /// Whether the loopback profile reaches the command line on `os`
+    fn codex_loopback_on(&self, os: &str) -> bool {
+        self.codex_loopback() && os == CODEX_LOOPBACK_OS
     }
 
     fn profile_mode(&self) -> Option<&str> {
@@ -290,14 +320,20 @@ impl Launch<'_> {
     }
 
     pub fn effective_mode(&self, notes: &[String]) -> Option<String> {
+        self.effective_mode_on(notes, std::env::consts::OS)
+    }
+
+    fn effective_mode_on(&self, notes: &[String], os: &str) -> Option<String> {
         let mode = match self.profile {
             "claude" => self.claude_mode(),
+            "codex" if self.codex_loopback_on(os) => "workspace-write + loopback",
             "codex" => self.profile_mode().unwrap_or("workspace-write"),
             "antigravity" => "accept-edits",
             _ => return None,
         };
-        let mut reason = match self.claude_auto_root {
-            Some(root) if self.claude_uses_auto() => format!("root {root}"),
+        let mut reason = match self.auto_root {
+            Some(root) if self.claude_uses_auto() || self.codex_loopback_on(os) => format!("root {root}"),
+            Some(root) if self.codex_loopback() => format!("root {root}, loopback is passed on {CODEX_LOOPBACK_OS} only"),
             Some(root) => format!("profile mode kept under root {root}"),
             None if self.profile_mode().is_some() => "profile".into(),
             None => "adapter default".into(),
@@ -527,7 +563,7 @@ impl Adapter for Claude {
     }
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
-        let mut cmd = if l.agent.is_some() || l.claude_auto_root.is_some() {
+        let mut cmd = if l.agent.is_some() || l.auto_root.is_some() {
             format!("exec {} {}", base.split(' ').next().unwrap_or(base), self.launch_words(l).iter().map(|w| sh(w)).collect::<Vec<_>>().join(" "))
         } else {
             format!("exec {base}")
@@ -718,13 +754,12 @@ impl Adapter for Codex {
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
-        let profiled;
-        let flags = match l.agent {
-            Some(p) => {
-                profiled = self.profile_words(p)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ");
-                profiled.as_str()
-            }
-            None => flags,
+        let worded;
+        let flags = if l.agent.is_some() || l.codex_loopback_on(std::env::consts::OS) {
+            worded = self.sandbox_words(l, std::env::consts::OS)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ");
+            worded.as_str()
+        } else {
+            flags
         };
         let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
         // The harness tools and the memory server, for this launch only (values are TOML; a JSON string is one)
@@ -869,6 +904,65 @@ impl Adapter for Codex {
     fn takes_mcp(&self) -> bool {
         true
     }
+}
+
+/// The bare Codex line's sandbox and approvals (its `Profile.command` after the program)
+const CODEX_BARE: [&str; 4] = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"];
+
+impl Codex {
+    /// The sandbox and approval words of a launch: the profile's, or the bare
+    /// line's. Under an auto-mode root on `CODEX_LOOPBACK_OS` the loopback
+    /// profile takes the place of `--sandbox workspace-write` (MCR-162);
+    /// `--ask-for-approval on-request` and everything else stay
+    fn sandbox_words(&self, l: &Launch, os: &str) -> Result<Vec<String>, String> {
+        let mut words = match l.agent {
+            Some(p) => self.profile_words(p)?,
+            None => CODEX_BARE.map(str::to_owned).to_vec(),
+        };
+        if l.codex_loopback_on(os) {
+            let at = words
+                .windows(2)
+                .position(|w| w[0] == "--sandbox" && w[1] == "workspace-write")
+                .ok_or("The Codex line has no workspace-write sandbox to widen to loopback")?;
+            words.splice(at..at + 2, codex_loopback_words());
+        }
+        Ok(words)
+    }
+}
+
+/// Codex's workspace-write with loopback sockets (MCR-162; codex-cli 0.172).
+///
+/// A command-line `--sandbox` wins over `default_permissions`, which is then
+/// ignored without a word, so it is left out: `default_permissions` names a
+/// permission profile defined here. Its filesystem is workspace-write's as
+/// Codex renders it (read everywhere; write the folder, `/tmp` and `$TMPDIR`;
+/// the folder's `.git`, `.codex`, `.agents` and `.aws` read-only): the
+/// built-in `:workspace` leaves `.git` and `.codex` writable. Its network
+/// runs through Codex's managed proxy (the `network_proxy` feature, still
+/// experimental in 0.172; `--enable` fails at start on a name Codex does not
+/// know) with no allowed domain, so anything outside goes to the operator as
+/// before; `allow_local_binding` lets commands bind and reach loopback ports,
+/// and Unix sockets only below `CODEX_SOCKETS`. Without the proxy,
+/// `network.enabled` would be the whole network: keep the two together.
+fn codex_loopback_words() -> Vec<String> {
+    let p = CODEX_LOOPBACK;
+    [
+        "--enable".to_owned(),
+        "network_proxy".to_owned(),
+        "-c".to_owned(),
+        format!("default_permissions=\"{p}\""),
+        "-c".to_owned(),
+        format!(
+            "permissions.{p}.filesystem={{\":root\"=\"read\", \":project_roots\"={{\".\"=\"write\", \".git\"=\"read\", \".codex\"=\"read\", \".agents\"=\"read\", \".aws\"=\"read\"}}, \":slash_tmp\"=\"write\", \":tmpdir\"=\"write\"}}"
+        ),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.enabled=true"),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.allow_local_binding=true"),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.unix_sockets={{\"{CODEX_SOCKETS}\"=\"allow\"}}"),
+    ]
+    .to_vec()
 }
 
 impl Adapter for Shell {
@@ -1029,10 +1123,9 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
             if l.resume.is_some() {
                 args.push("resume".into());
             }
-            args.extend(match l.agent {
-                Some(p) => agent.profile_words(p)?,
-                None => ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"].map(str::to_owned).to_vec(),
-            });
+            // The Windows sandbox is not Seatbelt and its managed network is
+            // not verified: under a root it keeps plain workspace-write (MCR-162)
+            args.extend(Codex.sandbox_words(l, "windows")?);
             let exe_lit = toml_literal(l.exe)?;
             args.extend(["-c".into(), format!("notify=[{exe_lit},'--harness-hook','codex-notify']")]);
             args.extend(["-c".into(), "tui.notifications=true".into()]);
@@ -1513,5 +1606,89 @@ mod tests {
         // The supervisor profile is for the root only, and the root takes no other
         check(&loaded.get("supervisor@claude-opus").unwrap().profile, "claude", false);
         check(&loaded.get("implementer@claude-opus").unwrap().profile, "claude", true);
+    }
+
+    /// MCR-162: under an auto-mode root, a Codex session in workspace-write
+    /// gets the loopback profile in place of `--sandbox workspace-write` on
+    /// macOS, profile or bare, new or resumed; `on-request` stays. Read-only,
+    /// outside a root, and the Windows path keep today's words.
+    #[test]
+    fn codex_under_a_root_gets_loopback_on_macos_only() {
+        let loaded = crate::profiles::load(Path::new("/nonexistent-config-dir"));
+        let implementer = loaded.get("implementer@codex").unwrap().profile.clone();
+        let lead = loaded.get("lead@codex").unwrap().profile.clone();
+        let validator = loaded.get("validator@codex").unwrap().profile.clone();
+        let mut read_only = implementer.clone();
+        read_only.permissions.mode = Some("read-only".into());
+        let resume = "019a3c48-7d0e-7d61-b1f5-6a1f0c6d2b3e";
+        let loopback = codex_loopback_words();
+        assert_eq!(loopback[..4], ["--enable", "network_proxy", "-c", "default_permissions=\"agent-mcr-loopback\""]);
+        let filesystem = &loopback[5];
+        for rule in [r#"":root"="read""#, r#""."="write""#, r#"".git"="read""#, r#"".codex"="read""#, r#"".agents"="read""#, r#"":slash_tmp"="write""#, r#"":tmpdir"="write""#] {
+            assert!(filesystem.contains(rule), "{filesystem}");
+        }
+        assert!(loopback.contains(&"permissions.agent-mcr-loopback.network.enabled=true".to_owned()));
+        assert!(loopback.contains(&"permissions.agent-mcr-loopback.network.allow_local_binding=true".to_owned()));
+        assert_eq!(loopback.last().unwrap(), &format!("permissions.agent-mcr-loopback.network.unix_sockets={{\"{CODEX_SOCKETS}\"=\"allow\"}}"));
+        assert!(loopback.iter().all(|w| !w.contains("network_access") && !w.contains("danger") && !w.contains("domains") && !w.contains('\'')));
+        #[cfg(unix)]
+        assert_eq!(CODEX_SOCKETS, format!("/private{}", crate::ipc::TEST_SOCKETS));
+
+        for agent in [None, Some(&implementer), Some(&lead), Some(&validator), Some(&read_only)] {
+            let mode = agent.and_then(|p| p.permissions.mode.as_deref()).unwrap_or("workspace-write");
+            for root in [None, Some("~/work")] {
+                for resumed in [None, Some(resume)] {
+                    let l = Launch { profile: "codex", exe: "/x", agent, auto_root: root, resume: resumed, ..Default::default() };
+                    let widened = root.is_some() && mode == "workspace-write";
+                    assert_eq!(l.codex_loopback(), widened);
+                    // The words on each system
+                    let mac = Codex.sandbox_words(&l, "macos").unwrap();
+                    let linux = Codex.sandbox_words(&l, "linux").unwrap();
+                    let windows = Codex.sandbox_words(&l, "windows").unwrap();
+                    let plain = match agent {
+                        Some(p) => Codex.profile_words(p).unwrap(),
+                        None => CODEX_BARE.map(str::to_owned).to_vec(),
+                    };
+                    assert_eq!(linux, plain);
+                    assert_eq!(windows, plain);
+                    if widened {
+                        let mut expected = loopback.clone();
+                        expected.extend(plain[2..].iter().cloned());
+                        assert_eq!(mac, expected);
+                        assert!(!mac.contains(&"--sandbox".to_owned()));
+                    } else {
+                        assert_eq!(mac, plain);
+                    }
+                    assert_eq!(mac.windows(2).filter(|w| w[0] == "--ask-for-approval" && w[1] == "on-request").count(), 1);
+                    // What each says of itself
+                    let reason = match (root, agent) {
+                        (Some(_), _) if widened => "root ~/work".to_owned(),
+                        (Some(_), _) => "profile mode kept under root ~/work".to_owned(),
+                        (None, Some(_)) => "profile".to_owned(),
+                        (None, None) => "adapter default".to_owned(),
+                    };
+                    let on_mac = if widened { "workspace-write + loopback".to_owned() } else { mode.to_owned() };
+                    assert_eq!(l.effective_mode_on(&[], "macos").unwrap(), format!("{on_mac} ({reason})"));
+                    let elsewhere = if widened { "root ~/work, loopback is passed on macos only".to_owned() } else { reason };
+                    assert_eq!(l.effective_mode_on(&[], "windows").unwrap(), format!("{mode} ({elsewhere})"));
+                    // The launch paths: Unix as this system does it, Windows never
+                    let line = command_line(&l).unwrap();
+                    let here = std::env::consts::OS == CODEX_LOOPBACK_OS && widened;
+                    assert_eq!(line.contains("'default_permissions=\"agent-mcr-loopback\"'"), here, "{line}");
+                    assert_eq!(line.contains("workspace-write"), mode == "workspace-write" && !here, "{line}");
+                    assert_eq!(line.starts_with("exec codex resume "), resumed.is_some(), "{line}");
+                    assert_eq!(line.ends_with(&format!(" {resume}")), resumed.is_some(), "{line}");
+                    let args = windows_args(&l).unwrap();
+                    let at = if resumed.is_some() { 2 } else { 1 };
+                    assert_eq!(args[at..at + 4], plain[..4]);
+                    assert!(!args.iter().any(|a| a.contains("network_proxy") || a.contains("default_permissions")), "{args:?}");
+                }
+            }
+        }
+        // A Claude launch under a root is not a Codex one
+        let claude = Launch { profile: "claude", auto_root: Some("~/work"), settings: "/s", ..Default::default() };
+        assert!(!claude.codex_loopback() && claude.claude_uses_auto());
+        let codex = Launch { profile: "codex", auto_root: Some("~/work"), ..Default::default() };
+        assert!(!codex.claude_uses_auto());
     }
 }
