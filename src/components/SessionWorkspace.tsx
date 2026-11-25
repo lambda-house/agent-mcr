@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo } from 'react';
 import { ClipboardList, History, MessageSquare, Terminal } from 'lucide-react';
 import { useStore as useZustand } from 'zustand';
 import { JournalProvider, JournalView, errorText, formatSessionTitle, refreshJournal, type Journal } from '@lambda-house/journal';
@@ -13,8 +13,8 @@ import { HostedByConversation, JournalRow, useHostedByConversation } from './Ses
 import { harnessApi, slackApi, type Hosted } from '../utils/harness';
 import { SESSIONS_VIEWS, useSessionsView } from '../sessionsView';
 import LiveWorkspace from './LiveWorkspace';
-import BoardView from './BoardView';
-import SlackView from './SlackView';
+import PanesView from './PanesView';
+import { setSlackWaiting, useSlack } from './SlackView';
 
 /** How often the snapshot of the index is read while Live is shown: it names earlier sessions there, nothing more (MCR-139) */
 export const LIVE_SNAPSHOT_MS = 60_000;
@@ -32,9 +32,6 @@ interface Sessions {
   live: Map<string, Hosted>;
   /** The journal whose sessions resume in Live. */
   withResume: Journal;
-  /** Slack posts that wait for the person's approval. */
-  slackWaiting: number;
-  setSlackWaiting: (count: number) => void;
 }
 
 const SessionsContext = createContext<Sessions | null>(null);
@@ -60,18 +57,9 @@ function JournalViewBody() {
   </HostedByConversation.Provider>;
 }
 
-function BoardViewBody() {
-  const { active } = useSessions();
-  return <BoardView active={active} onOpen={useSessionsView.getState().openLive}/>;
-}
-
-function SlackViewBody() {
-  const { active, setSlackWaiting } = useSessions();
-  return <SlackView active={active} onOpen={useSessionsView.getState().openLive} onWaiting={setSlackWaiting}/>;
-}
-
+/** Slack posts that wait for the person's approval, on the Slack tab from every view. */
 function SlackLabel() {
-  const { slackWaiting } = useSessions();
+  const slackWaiting = useSlack(s => s.waiting);
   return <>Slack <small className="hs-preview">Preview</small>{slackWaiting > 0 && <span className="hs-slack-badge" aria-label={`${slackWaiting} waiting for your approval`}>{slackWaiting}</span>}</>;
 }
 
@@ -82,9 +70,9 @@ export const sessionViews: WorkbenchView[] = [
   { surface: 'sessions', id: 'history', order: SESSIONS_VIEWS.history, label: 'Journal', icon: <History size={13}/>, title: 'Find an earlier session: by text, folder, agent or time', keepMounted: 'always',
     render: () => <JournalViewBody/> },
   { surface: 'sessions', id: 'board', order: SESSIONS_VIEWS.board, label: 'Board', icon: <ClipboardList size={13}/>, title: 'What sessions reported to you, and the notes they left for each other',
-    render: () => <BoardViewBody/> },
+    render: () => <PanesView view="board"/> },
   { surface: 'sessions', id: 'slack', order: SESSIONS_VIEWS.slack, label: <SlackLabel/>, icon: <MessageSquare size={13}/>, title: 'Slack: what is listened to, what sessions may post, and posts that wait for your approval',
-    render: () => <SlackViewBody/> },
+    render: () => <PanesView view="slack"/> },
 ];
 
 /**
@@ -99,8 +87,7 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
   const globalOverlays = pluginRegistry.getGlobalOverlays();
   const view = useSessionsView(s => s.view);
   const { show, openLive } = useSessionsView.getState();
-  // Posts that wait for the person's approval: shown on the Slack tab from every view; Slack itself reports them while shown
-  const [slackWaiting, setSlackWaiting] = useState(0);
+  // Posts that wait for the person's approval: shown on the Slack tab from every view; Slack's panes read them while shown
   const showingSlack = view === 'slack';
   useEffect(() => {
     if (!active || showingSlack || !isTauri()) return;
@@ -128,7 +115,7 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
   const live = useHostedByConversation(active && view === 'history' && !!enabled, 5000);
   const searchFolder = (path: string) => { setDirectory(path); show('history'); };
   const recentDirectories = useMemo(() => [...new Set([...sessions].sort((a, b) => b.modified - a.modified).map(s => s.cwd).filter(Boolean))].slice(0, 30), [sessions]);
-  const shared: Sessions = { active, enabled: !!enabled, titles, recentDirectories, searchFolder, live, withResume, slackWaiting, setSlackWaiting };
+  const shared: Sessions = { active, enabled: !!enabled, titles, recentDirectories, searchFolder, live, withResume };
   return <section className="session-cockpit">
     <SessionsContext.Provider value={shared}>
       {/* The view switch goes into the window's top bar, and each view's tools while it is shown */}

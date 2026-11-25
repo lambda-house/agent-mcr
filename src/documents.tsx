@@ -11,12 +11,17 @@ import { AgentPane } from '@lambda-house/agents';
 import { agents } from './agents';
 import { shortPath } from './utils/harness';
 import SessionWorkspace, { sessionViews } from './components/SessionWorkspace';
+import { boardPanes } from './components/BoardView';
+import { slackPanes } from './components/SlackView';
+import { emptyPane } from './components/PanesView';
+import { PANES_VIEWS } from './sessionsLayout';
 import { appSettingsTabs } from './components/SettingsTabs';
 
 // Agent MCR's own part of the window, as a plugin: the Documents surface (the
 // agents' Markdown: the agent documents beside the reader's document groups
 // and contents), the Sessions surface and its views (Live, the journal, the
-// board, Slack), and its Settings tabs. A memory reader window has Documents only, with its
+// board, Slack), the panels of Board and Slack in every view of Sessions with
+// panes, and its Settings tabs. A memory reader window has Documents only, with its
 // one document and no list.
 
 /** An empty document group: how to open a document here. */
@@ -77,6 +82,10 @@ export const documentsPlugin: Plugin = {
     if (!documentWindowPath) {
       api.contribute('workbench:surface', { id: 'sessions', label: 'Sessions', icon: <Activity size={13} />, order: 20, render: () => <Sessions /> });
       for (const view of sessionViews) api.contribute('workbench:view', view);
+      // Board's and Slack's panels, and the empty pane that asks for one, in Live, Board and Slack
+      for (const view of PANES_VIEWS) {
+        for (const type of [...boardPanes, ...slackPanes, emptyPane]) api.contribute('workbench:pane-type', { view, type });
+      }
     }
     api.contribute('workbench:pane-type', {
       view: 'documents',

@@ -1,10 +1,22 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowRight, ExternalLink, RefreshCw } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ArrowRight, ExternalLink, Inbox, MessageSquareShare, PlugZap, RefreshCw, Send } from 'lucide-react';
+import { create } from 'zustand';
+import { Pane, usePane, useSurfaceShown, type PaneType } from '@lambda-house/workbench';
+import { Button, keepSame } from '@lambda-house/ui';
 import { harnessApi, hostedLabel, isSupervisor, slackApi, SLACK_POSTING, type Hosted, type SlackChannel, type SlackPolicy, type SlackPost, type SlackPosting, type SlackStatus } from '../utils/harness';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
+import { sharedPoll } from '../utils/sharedPoll';
+import { useSessionsView } from '../sessionsView';
+import { PANEL_MIN } from './BoardView';
 import '../styles/harness.css';
-import { Button, keepSame } from '@lambda-house/ui';
+
+// The Slack connector as four panes of Sessions' layouts: posts that wait for
+// the person, the posts sessions asked for, what was received, and the
+// connection with the policy of each channel. Text here is written by agents
+// and by people in Slack: it is shown, never acted on. The panes show one
+// state, read every few seconds while one of them is on screen; a change is
+// made one at a time, and its answer is the new state.
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const LINK: Record<SlackStatus['link'], string> = { off: 'Off', connecting: 'Connecting…', connected: 'Connected', reconnecting: 'Reconnecting…', refused: 'Refused by Slack' };
@@ -12,6 +24,72 @@ const STATE: Record<SlackPost['state'], string> = {
   waiting: 'waiting for you', approved: 'allowed, being sent', sending: 'being sent', sent: 'sent', denied: 'denied', cancelled: 'cancelled', failed: 'not sent', unknown: 'outcome unknown, being looked up',
 };
 const ALLOWED_BY: Record<string, string> = { app: 'you, in the app', slack: 'you, in Slack', 'policy:auto': "the channel's policy", 'policy:thread': "the channel's policy for thread replies" };
+
+interface SlackFeed {
+  status: SlackStatus | null;
+  hosted: Hosted[];
+  error: string;
+  /** A change is on its way. */
+  busy: boolean;
+  /** Posts that wait for the person's approval: on the Slack tab from every view. */
+  waiting: number;
+}
+
+export const useSlack = create<SlackFeed>(() => ({ status: null, hosted: [], error: '', busy: false, waiting: 0 }));
+// A status read before a change was made must not undo its answer
+let statusVersion = 0;
+let changing = false;
+
+const show = (s: SlackStatus | null) => {
+  if (s) useSlack.setState(held => ({ status: keepSame(held.status, s), waiting: s.counts.waiting }));
+};
+
+export async function refreshSlack(): Promise<void> {
+  const failed = (e: unknown) => useSlack.setState({ error: err(e) });
+  const version = ++statusVersion;
+  await Promise.all([
+    slackApi.status().then(s => { if (!changing && version === statusVersion) show(s); }).catch(failed),
+    harnessApi.list().then(list => useSlack.setState(held => ({ hosted: keepSame(held.hosted, list) }))).catch(failed),
+  ]);
+}
+
+/** One change at a time; the answer is the new state. */
+function run(work: () => Promise<SlackStatus | null>) {
+  if (changing) return;
+  changing = true;
+  useSlack.setState({ busy: true, error: '' });
+  work().then(show).catch(e => useSlack.setState({ error: err(e) })).finally(() => {
+    statusVersion++;
+    changing = false;
+    useSlack.setState({ busy: false });
+  });
+}
+
+/** What the person decided elsewhere (the Slack tab's count, read while no Slack pane is shown). */
+export const setSlackWaiting = (waiting: number) => useSlack.setState({ waiting });
+
+const useSlackPoll = sharedPoll(refreshSlack, 3000);
+
+/** The Slack state while this pane is on screen. */
+function useSlackFeed(): SlackFeed {
+  const pane = usePane();
+  const shown = useSurfaceShown() && (pane?.visible ?? true);
+  useEffect(() => { if (!isTauri()) useSlack.setState({ error: 'Open the desktop app to use Slack.' }); }, []);
+  useSlackPoll(shown && isTauri());
+  return useSlack();
+}
+
+/** A Slack pane: its line under the title, the error, and what it shows once the state is read. */
+function SlackPane({ label, title, about, children }: { label: string; title: string; about: React.ReactNode; children: (status: SlackStatus) => React.ReactNode }) {
+  const { status, error } = useSlackFeed();
+  return <Pane as="section" className="hs-board hs-slack" aria-label={label} title={title}>
+    <div className="hs-panel-body">
+      <header className="hs-board-head"><small>{about}</small></header>
+      {error && <div className="hs-error" role="alert">{error}</div>}
+      {status ? children(status) : !error && <p className="hs-empty">Loading…</p>}
+    </div>
+  </Pane>;
+}
 
 /** A post that waits: the exact text, which the person may change before approving. */
 function Waiting({ post, busy, onDecide, onOpen, live }: { post: SlackPost; busy: boolean; live: boolean; onDecide: (approve: boolean, text?: string, reason?: string) => void; onOpen: () => void }) {
@@ -41,6 +119,62 @@ function Waiting({ post, busy, onDecide, onOpen, live }: { post: SlackPost; busy
       </span>
     </div>
   </li>;
+}
+
+/** Posts that wait for the person: sent only after the person approves their exact text. */
+export function SlackWaitingPanel() {
+  const { status, hosted, busy } = useSlack();
+  const c = status?.connection;
+  const running = useMemo(() => new Set(hosted.filter(h => !h.exit).map(h => h.id)), [hosted]);
+  const waiting = useMemo(() => [...status?.posts ?? []].filter(p => p.state === 'waiting').reverse(), [status]);
+  const onOpen = useSessionsView.getState().openLive;
+  return <SlackPane label="Waiting for you" title="Waiting for you" about={`A post is sent only after you approve its exact text${c?.approveInSlack ? ', here or in your direct messages with the bot' : ''}`}>
+    {() => <>
+      {!waiting.length && <p className="hs-empty">{c ? 'Nothing waits. A session asks here when it wants to post where the channel’s policy says "Ask me each time".' : 'Connect Slack first.'}</p>}
+      <ul>{waiting.map(p => <Waiting key={p.id} post={p} busy={busy} live={running.has(p.session)} onOpen={() => onOpen(p.session)}
+        onDecide={(approve, text, reason) => run(() => slackApi.decide(p.id, approve, text, reason))}/>)}</ul>
+    </>}
+  </SlackPane>;
+}
+
+/** What sessions asked to post, newest first, and what became of it. */
+export function SlackPostsPanel() {
+  const status = useSlack(s => s.status);
+  const earlier = useMemo(() => (status?.posts ?? []).filter(p => p.state !== 'waiting').slice(0, 30), [status]);
+  const openLink = (url: string) => { void import('@tauri-apps/api/core').then(({ invoke }) => invoke('open_external', { url })).catch(e => useSlack.setState({ error: err(e) })); };
+  return <SlackPane label="Posts" title="Posts" about="What sessions asked to post, newest first">
+    {() => <>
+      {!earlier.length && <p className="hs-empty">No posts yet.</p>}
+      <ul>{earlier.map(p => <li key={p.id}><div className="hs-board-row">
+        <span className={`hs-dot ${p.state === 'sent' ? 'idle' : p.state === 'failed' || p.state === 'denied' ? 'failed' : 'working'} past`} aria-hidden/>
+        <span className="hs-item-text">
+          <strong>{p.sessionName} → #{p.channelName}<em>{STATE[p.state] ?? p.state}</em></strong>
+          <span className="hs-board-text">{p.text}</span>
+          <small>{formatAge(p.created)}{p.allowedBy && p.state !== 'denied' ? ` · allowed by ${ALLOWED_BY[p.allowedBy] ?? p.allowedBy}` : ''}{p.reason ? ` · ${p.reason}` : ''}
+            {p.link && <> · <button type="button" className="hs-slack-link" onClick={() => openLink(p.link!)}>Open in Slack <ExternalLink size={10}/></button></>}</small>
+        </span>
+      </div></li>)}</ul>
+    </>}
+  </SlackPane>;
+}
+
+/** Messages from listened channels, and where each went. */
+export function SlackReceivedPanel() {
+  const hosted = useSlack(s => s.hosted);
+  const sessionName = (id?: string | null) => { const h = hosted.find(x => x.id === id); return h ? hostedLabel(h) : 'a session that ended'; };
+  return <SlackPane label="Received" title="Received" about="Messages from listened channels, and where they went">
+    {status => <>
+      {!status.received.length && <p className="hs-empty">Nothing received yet. Set a channel to listen, then write there.</p>}
+      <ul>{status.received.slice(0, 40).map(r => <li key={r.key} className={r.held ? '' : 'open'}><div className="hs-board-row">
+        <span className={`hs-dot ${r.held ? 'failed past' : 'idle'}`} aria-hidden/>
+        <span className="hs-item-text">
+          <strong>#{r.channelName} · {r.userName || r.user}{r.held ? <em>not delivered</em> : null}</strong>
+          <span className="hs-board-text">{r.text}</span>
+          <small>{formatAge(r.at)}{r.caughtUp ? ' · read back after a gap' : ''}{r.cut ? ' · a long text, cut here' : ''} · {r.held ?? `delivered to ${sessionName(r.session)}`}</small>
+        </span>
+      </div></li>)}</ul>
+    </>}
+  </SlackPane>;
 }
 
 function ChannelPolicy({ channel, status, sessions, busy, onChange }: { channel: SlackChannel; status: SlackStatus; sessions: Hosted[]; busy: boolean; onChange: (policy: SlackPolicy) => void }) {
@@ -91,97 +225,18 @@ function ChannelPolicy({ channel, status, sessions, busy, onChange }: { channel:
   </li>;
 }
 
-/**
- * The Slack connector: connection, the policy of each channel, posts that wait
- * for the person, and what was received. Text here is written by agents and by
- * people in Slack: it is shown, never acted on.
- */
-export default function SlackView({ active, onOpen, onWaiting }: { active: boolean; onOpen: (id: string) => void; onWaiting?: (count: number) => void }) {
-  const [status, setStatus] = useState<SlackStatus | null>(null);
-  const [hosted, setHosted] = useState<Hosted[]>([]);
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
+/** The connection: its tokens, its state, the switches, the channels' policies and the audit. */
+export function SlackConnectionPanel() {
+  const { status, hosted, busy } = useSlack();
   const [bot, setBot] = useState(''); const [appToken, setAppToken] = useState(''); const [operator, setOperator] = useState('');
-  const mounted = useRef(true);
-  const statusVersion = useRef(0);
-  const changing = useRef(false);
-
-  const show = useCallback((s: SlackStatus | null) => { if (s && mounted.current) { setStatus(held => keepSame(held, s)); onWaiting?.(s.counts.waiting); } }, [onWaiting]);
-  const refresh = useCallback(async () => {
-    const failed = (e: unknown) => { if (mounted.current) setError(err(e)); };
-    const version = ++statusVersion.current;
-    await Promise.all([
-      slackApi.status().then(s => { if (!changing.current && version === statusVersion.current) show(s); }).catch(failed),
-      harnessApi.list().then(list => { if (mounted.current) setHosted(held => keepSame(held, list)); }).catch(failed),
-    ]);
-  }, [show]);
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  useEffect(() => {
-    if (!isTauri()) { setError('Open the desktop app to use Slack.'); return; }
-    if (!active) return;
-    void refresh();
-    const timer = setInterval(() => { if (!document.hidden) void refresh(); }, 3000);
-    return () => clearInterval(timer);
-  }, [active, refresh]);
-
-  /** One change at a time; the answer is the new state */
-  const run = (work: () => Promise<SlackStatus | null>) => {
-    if (changing.current) return;
-    changing.current = true;
-    setBusy(true); setError('');
-    work().then(show).catch(e => { if (mounted.current) setError(err(e)); }).finally(() => {
-      statusVersion.current++;
-      changing.current = false;
-      if (mounted.current) setBusy(false);
-    });
-  };
   const live = useMemo(() => hosted.filter(h => !h.exit), [hosted]);
-  const running = useMemo(() => new Set(live.map(h => h.id)), [live]);
-  const waiting = useMemo(() => [...status?.posts ?? []].filter(p => p.state === 'waiting').reverse(), [status]);
-  const earlier = useMemo(() => (status?.posts ?? []).filter(p => p.state !== 'waiting').slice(0, 30), [status]);
   const channels = useMemo(() => [...status?.channels ?? []].sort((a, b) => Number(b.member) - Number(a.member) || a.name.localeCompare(b.name)), [status]);
-  const sessionName = (id?: string | null) => { const h = hosted.find(x => x.id === id); return h ? hostedLabel(h) : 'a session that ended'; };
-
-  if (!status) return <div className="hs-board">{error ? <div className="hs-error" role="alert">{error}</div> : <p className="hs-empty">Loading…</p>}</div>;
-  const c = status.connection;
-  const counts = status.counts;
-  const alarm = counts.sentWithoutApproval + counts.refusedApprovals + counts.deliveredFromStrangers;
-
-  return <div className="hs-board hs-slack">
-    {error && <div className="hs-error" role="alert">{error}</div>}
-    <section aria-label="Slack posts and messages">
-      <header className="hs-board-head"><h2>Waiting for you</h2><small>A post is sent only after you approve its exact text{c?.approveInSlack ? ', here or in your direct messages with the bot' : ''}</small></header>
-      {!waiting.length && <p className="hs-empty">{c ? 'Nothing waits. A session asks here when it wants to post where the channel’s policy says "Ask me each time".' : 'Connect Slack first.'}</p>}
-      <ul>{waiting.map(p => <Waiting key={p.id} post={p} busy={busy} live={running.has(p.session)} onOpen={() => onOpen(p.session)}
-        onDecide={(approve, text, reason) => run(() => slackApi.decide(p.id, approve, text, reason))}/>)}</ul>
-
-      <header className="hs-board-head"><h2>Posts</h2><small>What sessions asked to post, newest first</small></header>
-      {!earlier.length && <p className="hs-empty">No posts yet.</p>}
-      <ul>{earlier.map(p => <li key={p.id}><div className="hs-board-row">
-        <span className={`hs-dot ${p.state === 'sent' ? 'idle' : p.state === 'failed' || p.state === 'denied' ? 'failed' : 'working'} past`} aria-hidden/>
-        <span className="hs-item-text">
-          <strong>{p.sessionName} → #{p.channelName}<em>{STATE[p.state] ?? p.state}</em></strong>
-          <span className="hs-board-text">{p.text}</span>
-          <small>{formatAge(p.created)}{p.allowedBy && p.state !== 'denied' ? ` · allowed by ${ALLOWED_BY[p.allowedBy] ?? p.allowedBy}` : ''}{p.reason ? ` · ${p.reason}` : ''}
-            {p.link && <> · <button type="button" className="hs-slack-link" onClick={() => { void import('@tauri-apps/api/core').then(({ invoke }) => invoke('open_external', { url: p.link })).catch(e => setError(err(e))); }}>Open in Slack <ExternalLink size={10}/></button></>}</small>
-        </span>
-      </div></li>)}</ul>
-
-      <header className="hs-board-head"><h2>Received</h2><small>Messages from listened channels, and where they went</small></header>
-      {!status.received.length && <p className="hs-empty">Nothing received yet. Set a channel to listen, then write there.</p>}
-      <ul>{status.received.slice(0, 40).map(r => <li key={r.key} className={r.held ? '' : 'open'}><div className="hs-board-row">
-        <span className={`hs-dot ${r.held ? 'failed past' : 'idle'}`} aria-hidden/>
-        <span className="hs-item-text">
-          <strong>#{r.channelName} · {r.userName || r.user}{r.held ? <em>not delivered</em> : null}</strong>
-          <span className="hs-board-text">{r.text}</span>
-          <small>{formatAge(r.at)}{r.caughtUp ? ' · read back after a gap' : ''}{r.cut ? ' · a long text, cut here' : ''} · {r.held ?? `delivered to ${sessionName(r.session)}`}</small>
-        </span>
-      </div></li>)}</ul>
-    </section>
-
-    <section aria-label="Slack connection and channels">
-      <header className="hs-board-head"><h2>Connection</h2><small>{c ? `${c.team} · bot ${c.botName}` : 'Not connected'}</small></header>
-      {!c ? <form className="hs-slack-connect" aria-label="Connect Slack" onSubmit={e => { e.preventDefault(); run(async () => { const s = await slackApi.connect(bot.trim(), appToken.trim(), operator.trim()); if (s) { setBot(''); setAppToken(''); } return s; }); }}>
+  const c = status?.connection;
+  return <SlackPane label="Connection" title="Connection" about={c ? `${c.team} · bot ${c.botName}` : 'Not connected'}>
+    {status => {
+      const counts = status.counts;
+      const alarm = counts.sentWithoutApproval + counts.refusedApprovals + counts.deliveredFromStrangers;
+      return !c ? <form className="hs-slack-connect" aria-label="Connect Slack" onSubmit={e => { e.preventDefault(); run(async () => { const s = await slackApi.connect(bot.trim(), appToken.trim(), operator.trim()); if (s) { setBot(''); setAppToken(''); } return s; }); }}>
         <p className="hs-board-help">Create a Slack app in your workspace from the manifest <b>docs/slack-app-manifest.yaml</b>, install it, and paste its two tokens. They are kept in the macOS Keychain on this Mac and shown to no agent.</p>
         <label>Bot token<input type="password" autoComplete="off" spellCheck={false} placeholder="xoxb-…" value={bot} onChange={e => setBot(e.target.value)}/></label>
         <label>App-level token<input type="password" autoComplete="off" spellCheck={false} placeholder="xapp-… (scope connections:write)" value={appToken} onChange={e => setAppToken(e.target.value)}/></label>
@@ -224,7 +279,15 @@ export default function SlackView({ active, onOpen, onWaiting }: { active: boole
         <details className="hs-slack-audit"><summary>Audit ({status.audit.length})</summary>
           <ul>{status.audit.map((a, i) => <li key={`${a.at}-${i}`}><small>{new Date(a.at).toLocaleTimeString()} · {a.kind}</small> {a.text}</li>)}</ul>
         </details>
-      </>}
-    </section>
-  </div>;
+      </>;
+    }}
+  </SlackPane>;
 }
+
+/** Slack's panes: in every layout of Sessions, offered in the type menus and the empty pane. */
+export const slackPanes: PaneType[] = [
+  { type: 'slack-waiting', label: 'Slack posts waiting for you', title: 'Waiting for you', icon: <MessageSquareShare size={14}/>, switchable: true, singleton: true, min: PANEL_MIN, render: () => <SlackWaitingPanel/> },
+  { type: 'slack-posts', label: 'Slack posts', title: 'Posts', icon: <Send size={14}/>, switchable: true, singleton: true, min: PANEL_MIN, render: () => <SlackPostsPanel/> },
+  { type: 'slack-received', label: 'received Slack messages', title: 'Received', icon: <Inbox size={14}/>, switchable: true, singleton: true, min: PANEL_MIN, render: () => <SlackReceivedPanel/> },
+  { type: 'slack-connection', label: 'Slack connection', title: 'Connection', icon: <PlugZap size={14}/>, switchable: true, singleton: true, min: PANEL_MIN, render: () => <SlackConnectionPanel/> },
+];

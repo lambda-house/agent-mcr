@@ -1,16 +1,63 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowRight, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ArrowRight, ClipboardList, StickyNote, X } from 'lucide-react';
+import { create } from 'zustand';
+import { Pane, usePane, useSurfaceShown, type PaneType } from '@lambda-house/workbench';
+import { Button, Segmented, keepSame } from '@lambda-house/ui';
 import { formatUntil, harnessApi, openReports, reportGroups, shortPath, tildePath, type Board, type ExecutorLine, type Hosted, type Report } from '../utils/harness';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
+import { sharedPoll } from '../utils/sharedPoll';
+import { useSessionsView } from '../sessionsView';
 import '../styles/harness.css';
-import { Button, Segmented, keepSame } from '@lambda-house/ui';
+
+// Board: what sessions reported to the person (their `report` tool), and the
+// notes they left for each other on the bulletin board, as two panes of
+// Sessions' layouts (Reports, Bulletin board). Text here is written by
+// agents: it is shown, never acted on. Both panes show one board, read every
+// few seconds while one of them is on screen.
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const KIND = { needs_human: 'Needs you', done: 'Done', status: 'Status' } as const;
 type Filter = 'all' | keyof typeof KIND;
 /** How long a note of the person can stay: label and hours */
 const LASTS: [string, number][] = [['1 hour', 1], ['8 hours', 8], ['1 day', 24], ['3 days', 72], ['1 week', 168], ['2 weeks', 336]];
+/** The smallest Board or Slack pane, px. */
+export const PANEL_MIN = { w: 260, h: 120 };
+
+interface BoardFeed {
+  board: Board | null;
+  hosted: Hosted[];
+  home: string;
+  error: string;
+}
+
+/** The board, the hosted sessions (which reports can open one) and the home folder (folder names). */
+export const useBoard = create<BoardFeed>(() => ({ board: null, hosted: [], home: '', error: '' }));
+let homeAsked = false;
+
+export async function refreshBoard(): Promise<void> {
+  if (!homeAsked) {
+    homeAsked = true;
+    harnessApi.status().then(s => useBoard.setState({ home: s.home ?? '' })).catch(() => { homeAsked = false; });
+  }
+  try {
+    const [b, list] = await Promise.all([harnessApi.board(), harnessApi.list()]);
+    useBoard.setState(held => ({ board: keepSame(held.board, b), hosted: keepSame(held.hosted, list), error: '' }));
+  } catch (e) { useBoard.setState({ error: err(e) }); }
+}
+
+const useBoardPoll = sharedPoll(refreshBoard, 3000);
+
+/** The board while this pane is on screen. */
+function useBoardFeed(): BoardFeed {
+  const pane = usePane();
+  const shown = useSurfaceShown() && (pane?.visible ?? true);
+  useEffect(() => { if (!isTauri()) useBoard.setState({ error: 'Open the desktop app to see the board.' }); }, []);
+  useBoardPoll(shown && isTauri());
+  return useBoard();
+}
+
+const folderName = (home: string) => (path: string) => shortPath(tildePath(path, home));
 
 /**
  * The executors of a supervising session, as the harness recorded them when
@@ -25,66 +72,15 @@ function ExecutorLines({ lines }: { lines: ExecutorLine[] }) {
   </span>;
 }
 
-/**
- * What sessions reported to the person (their `report` tool), and the notes
- * they left for each other on the bulletin board. Text here is written by
- * agents: it is shown, never acted on. Reports are grouped by supervisor,
- * with its executors' reports under its own.
- */
-export default function BoardView({ active, onOpen }: { active: boolean; /** Show a running session in Live */ onOpen: (id: string) => void }) {
-  const [board, setBoard] = useState<Board | null>(null);
-  const [hosted, setHosted] = useState<Hosted[]>([]);
-  const [home, setHome] = useState('');
-  const [error, setError] = useState('');
+/** Reports, grouped by supervisor, with its executors' reports under its own. A click shows the session in Live. */
+export function ReportsPanel() {
+  const { board, hosted, home, error } = useBoardFeed();
   const [filter, setFilter] = useState<Filter>('all');
-  // A note is removed on the second click
-  const [removing, setRemoving] = useState('');
-  const [draft, setDraft] = useState('');
-  const [scope, setScope] = useState('');
-  const [hours, setHours] = useState(24);
-  const [posting, setPosting] = useState(false);
-  const mounted = useRef(true);
-
-  const refresh = useCallback(async () => {
-    try {
-      const [b, list] = await Promise.all([harnessApi.board(), harnessApi.list()]);
-      if (mounted.current) { setBoard(held => keepSame(held, b)); setHosted(held => keepSame(held, list)); setError(''); }
-    } catch (e) { if (mounted.current) setError(err(e)); }
-  }, []);
-
-  useEffect(() => {
-    mounted.current = true;
-    if (!isTauri()) { setError('Open the desktop app to see the board.'); return; }
-    harnessApi.status().then(s => { if (mounted.current) setHome(s.home ?? ''); }).catch(() => {});
-    return () => { mounted.current = false; };
-  }, []);
-  useEffect(() => {
-    if (!active || !isTauri()) return;
-    void refresh();
-    const timer = setInterval(() => { if (!document.hidden) void refresh(); }, 3000);
-    return () => clearInterval(timer);
-  }, [active, refresh]);
-
+  const onOpen = useSessionsView.getState().openLive;
   const running = useMemo(() => new Set(hosted.filter(h => !h.exit).map(h => h.id)), [hosted]);
   const open = useMemo(() => openReports(board?.reports ?? [], hosted), [board, hosted]);
   const groups = useMemo(() => reportGroups((board?.reports ?? []).filter(r => filter === 'all' || r.kind === filter), hosted), [board, filter, hosted]);
-  const notes = useMemo(() => [...board?.notes ?? []].reverse(), [board]);
-  const folder = (path: string) => shortPath(tildePath(path, home));
-  // A note can be for one of the folders sessions run in, or for all
-  const folders = useMemo(() => [...new Set(hosted.filter(h => !h.exit && h.cwd).map(h => h.cwd))].sort(), [hosted]);
-  const post = () => {
-    if (!draft.trim() || posting) return;
-    setPosting(true);
-    harnessApi.postNote(draft, hours, folders.includes(scope) ? scope : undefined)
-      .then(() => { if (mounted.current) setDraft(''); return refresh(); })
-      .catch(e => { if (mounted.current) setError(err(e)); })
-      .finally(() => { if (mounted.current) setPosting(false); });
-  };
-  const remove = (id: string) => {
-    if (removing !== id) { setRemoving(id); setTimeout(() => setRemoving(r => r === id ? '' : r), 3000); return; }
-    setRemoving('');
-    harnessApi.removeNote(id).then(refresh).catch(e => setError(err(e)));
-  };
+  const folder = folderName(home);
 
   const row = (r: Report) => {
     const live = running.has(r.session);
@@ -101,15 +97,14 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
     return live ? <button type="button" className="hs-board-row" title="Show this session in Live" onClick={() => onOpen(r.session)}>{body}</button> : <div className="hs-board-row">{body}</div>;
   };
 
-  return <div className="hs-board">
-    {error && <div className="hs-error" role="alert">{error}</div>}
-    <section aria-label="Reports">
+  return <Pane as="section" className="hs-board" aria-label="Reports" title="Reports">
+    <div className="hs-panel-body">
       <header className="hs-board-head">
-        <h2>Reports</h2>
         <small>What sessions told you. Click one to open its session</small>
         <Segmented kind="choice" className="hs-board-filter" label="Kind of report" value={filter} onChange={setFilter}
           options={(['all', 'needs_human', 'done', 'status'] as Filter[]).map(f => ({ value: f, label: f === 'all' ? 'All' : KIND[f] }))}/>
       </header>
+      {error && <div className="hs-error" role="alert">{error}</div>}
       <p className="hs-board-help">A <b>Needs you</b> report waits until you type into its session; a <b>Done</b> one until you open the session. A <b>Status</b> report notifies nobody: it says where a session and its executors stood, and the session's next one replaces it.</p>
       {board && !groups.length && <p className="hs-empty">{board.reports.length ? 'No reports of this kind.' : 'No reports yet. A session reports when it cannot go on without you, when a piece of work is complete, or to say where it stands.'}</p>}
       {groups.map(g => <div key={g.session || 'alone'} className="hs-board-group" role="group" aria-label={g.session ? `Reports of ${g.name} and its executors` : 'Reports of sessions without a supervisor'}>
@@ -123,12 +118,42 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
           </li>)}
         </ul>
       </div>)}
-    </section>
-    <section aria-label="Bulletin board">
+    </div>
+  </Pane>;
+}
+
+/** The bulletin board: notes sessions read when they start, and the person's own; a note is removed on the second click. */
+export function NotesPanel() {
+  const { board, hosted, home, error } = useBoardFeed();
+  const [removing, setRemoving] = useState('');
+  const [draft, setDraft] = useState('');
+  const [scope, setScope] = useState('');
+  const [hours, setHours] = useState(24);
+  const [posting, setPosting] = useState(false);
+  const notes = useMemo(() => [...board?.notes ?? []].reverse(), [board]);
+  const folder = folderName(home);
+  // A note can be for one of the folders sessions run in, or for all
+  const folders = useMemo(() => [...new Set(hosted.filter(h => !h.exit && h.cwd).map(h => h.cwd))].sort(), [hosted]);
+  const post = () => {
+    if (!draft.trim() || posting) return;
+    setPosting(true);
+    harnessApi.postNote(draft, hours, folders.includes(scope) ? scope : undefined)
+      .then(() => { setDraft(''); return refreshBoard(); })
+      .catch(e => useBoard.setState({ error: err(e) }))
+      .finally(() => setPosting(false));
+  };
+  const remove = (id: string) => {
+    if (removing !== id) { setRemoving(id); setTimeout(() => setRemoving(r => r === id ? '' : r), 3000); return; }
+    setRemoving('');
+    harnessApi.removeNote(id).then(refreshBoard).catch(e => useBoard.setState({ error: err(e) }));
+  };
+
+  return <Pane as="section" className="hs-board" aria-label="Bulletin board" title="Bulletin board">
+    <div className="hs-panel-body">
       <header className="hs-board-head">
-        <h2>Bulletin board</h2>
         <small>Notes sessions read when they start, until the notes expire</small>
       </header>
+      {error && <div className="hs-error" role="alert">{error}</div>}
       <form className="hs-board-post" aria-label="Leave a note" onSubmit={e => { e.preventDefault(); post(); }}>
         <textarea value={draft} rows={2} maxLength={2000} aria-label="Note" placeholder="Leave a note for the sessions: a rule, a file not to touch, a step nobody should run"
           onChange={e => setDraft(e.target.value)}
@@ -162,6 +187,12 @@ export default function BoardView({ active, onOpen }: { active: boolean; /** Sho
           </div>
         </li>)}
       </ul>
-    </section>
-  </div>;
+    </div>
+  </Pane>;
 }
+
+/** Board's panes: in every layout of Sessions, offered in the type menus and the empty pane. */
+export const boardPanes: PaneType[] = [
+  { type: 'board-reports', label: 'reports', title: 'Reports', icon: <ClipboardList size={14}/>, switchable: true, singleton: true, min: PANEL_MIN, render: () => <ReportsPanel/> },
+  { type: 'board-notes', label: 'bulletin board', title: 'Bulletin board', icon: <StickyNote size={14}/>, switchable: true, singleton: true, min: PANEL_MIN, render: () => <NotesPanel/> },
+];

@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import SlackView from './SlackView';
+import { SlackConnectionPanel, SlackPostsPanel, SlackReceivedPanel, SlackWaitingPanel, useSlack } from './SlackView';
 import { harnessApi, slackApi, type Hosted, type SlackStatus } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({
@@ -37,6 +37,9 @@ const type = async (el: HTMLTextAreaElement | HTMLInputElement, value: string) =
   await act(async () => { Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(el, value); el.dispatchEvent(new Event('input', { bubbles: true })); });
 };
 const button = (label: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.trim() === label)!;
+/** Slack as it first is: its four panes. */
+const renderSlack = () => root.render(<><SlackWaitingPanel/><SlackPostsPanel/><SlackReceivedPanel/><SlackConnectionPanel/></>);
+const waiting = () => useSlack.getState().waiting;
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -46,14 +49,14 @@ beforeEach(() => {
   vi.mocked(slackApi.status).mockResolvedValue(status);
   vi.mocked(slackApi.decide).mockResolvedValue(status);
   vi.mocked(slackApi.policy).mockResolvedValue(status);
+  useSlack.setState({ status: null, hosted: [], error: '', busy: false, waiting: 0 });
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 
 describe('Slack view', () => {
   it('shows the post that waits with its exact text and approves it unchanged', async () => {
-    const onWaiting = vi.fn();
-    await act(async () => root.render(<SlackView active onOpen={vi.fn()} onWaiting={onWaiting}/>)); await flush();
-    expect(onWaiting).toHaveBeenCalledWith(1);
+    await act(async () => renderSlack()); await flush();
+    expect(waiting()).toBe(1);
     const text = host.querySelector<HTMLTextAreaElement>('.hs-slack-waiting textarea')!;
     expect(text.value).toBe('Deployed 1.2');
     await act(async () => button('Approve').click()); await flush();
@@ -63,23 +66,22 @@ describe('Slack view', () => {
   it('updates the badge on approval and ignores a late status from before the approval', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {
-      const onWaiting = vi.fn();
       vi.mocked(harnessApi.list).mockRejectedValue(new Error('Runner unavailable'));
       let finishStatus!: (reply: SlackStatus) => void;
       vi.mocked(slackApi.status).mockResolvedValueOnce(status).mockReturnValueOnce(new Promise(resolve => { finishStatus = resolve; }));
       vi.mocked(slackApi.decide).mockResolvedValue({ ...status, posts: status.posts.slice(1), counts: { ...status.counts, waiting: 0 } });
-      await act(async () => root.render(<SlackView active onOpen={vi.fn()} onWaiting={onWaiting}/>)); await flush();
-      expect(onWaiting).toHaveBeenLastCalledWith(1);
+      await act(async () => renderSlack()); await flush();
+      expect(waiting()).toBe(1);
       await act(async () => { vi.advanceTimersByTime(3000); });
       await act(async () => button('Approve').click()); await flush();
-      expect(onWaiting).toHaveBeenLastCalledWith(0);
+      expect(waiting()).toBe(0);
       await act(async () => finishStatus(status));
-      expect(onWaiting).toHaveBeenLastCalledWith(0);
+      expect(waiting()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
 
   it('sends the changed text when the person edits before approving, and a reason when denying', async () => {
-    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    await act(async () => renderSlack()); await flush();
     await type(host.querySelector<HTMLTextAreaElement>('.hs-slack-waiting textarea')!, 'Deployed 1.2.1');
     await act(async () => button('Approve as changed').click()); await flush();
     expect(slackApi.decide).toHaveBeenLastCalledWith('p2', true, 'Deployed 1.2.1', undefined);
@@ -90,8 +92,8 @@ describe('Slack view', () => {
   });
 
   it('says where each received message went, and changes a channel policy through the backend', async () => {
-    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
-    const received = host.querySelector('section[aria-label="Slack posts and messages"]')!.textContent!;
+    await act(async () => renderSlack()); await flush();
+    const received = host.querySelector('section[aria-label="Received"]')!.textContent!;
     expect(received).toContain("The sender is not on the channel's list");
     expect(received).toContain('delivered to Release notes');
     const posting = [...host.querySelectorAll<HTMLSelectElement>('.hs-slack-channel select')].find(s => s.value === 'approve')!;
@@ -103,14 +105,14 @@ describe('Slack view', () => {
   });
 
   it('says on the channel that its route reaches nobody, and that Slack asked to wait with the history', async () => {
-    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    await act(async () => renderSlack()); await flush();
     expect(host.querySelector('.hs-slack-channel .hs-slack-warning')).toBeNull();
     expect(host.textContent).not.toContain('Slack asked to wait');
     await act(async () => root.unmount()); root = createRoot(host);
     vi.mocked(slackApi.status).mockResolvedValue({ ...status, channels: [{ ...status.channels[0], routeProblem: 'The routed session is not running' }], catchUpWait: { until: Date.now() + 60_000, channels: ['ops'] }, storeError: 'No space left on device (os error 28)' });
-    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    await act(async () => renderSlack()); await flush();
     expect(host.querySelector('.hs-slack-channel .hs-slack-warning')!.textContent).toContain('The routed session is not running. A message that arrives now is kept under Received and delivered to nobody');
-    const connection = host.querySelector('section[aria-label="Slack connection and channels"]')!.textContent!;
+    const connection = host.querySelector('section[aria-label="Connection"]')!.textContent!;
     expect(connection).toContain('Slack asked to wait before it gives the history of #ops');
     expect(connection).toContain('is read back at ');
     expect(connection).toContain('could not be saved on this Mac (No space left on device (os error 28)). Nothing is sent or delivered');
@@ -118,7 +120,7 @@ describe('Slack view', () => {
 
   it('says that approval in Slack is off unless the person switches it on', async () => {
     vi.mocked(slackApi.status).mockResolvedValue({ ...status, connection: { ...status.connection!, approveInSlack: false } });
-    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    await act(async () => renderSlack()); await flush();
     const toggle = [...host.querySelectorAll<HTMLLabelElement>('.hs-slack-toggle')].find(l => l.textContent!.includes('Approve in Slack too'))!;
     expect(toggle.textContent).toContain('Off unless you switch it on: posts are approved here. When on, the bot sends Tim a direct message');
     expect(toggle.querySelector<HTMLInputElement>('input')!.checked).toBe(false);
@@ -128,7 +130,7 @@ describe('Slack view', () => {
 
   it('offers only the connect form while nothing is connected', async () => {
     vi.mocked(slackApi.status).mockResolvedValue({ ...status, connection: null, enabled: false, link: 'off', channels: [], posts: [], received: [], counts: { ...status.counts, waiting: 0, held: 0 } });
-    await act(async () => root.render(<SlackView active onOpen={vi.fn()}/>)); await flush();
+    await act(async () => renderSlack()); await flush();
     expect(host.querySelector('form[aria-label="Connect Slack"]')).not.toBeNull();
     expect(host.querySelectorAll('.hs-slack-channel').length).toBe(0);
     expect(host.querySelectorAll('input[type="password"]').length).toBe(2);
