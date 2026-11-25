@@ -1135,10 +1135,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                     <p className="hs-empty-none">No running sessions yet. Click New agent to start one.</p>
                   )}
 
-                  <div className="hs-empty-panels">
-                    <h4>Or show a panel here</h4>
-                    <PanelChoices/>
-                  </div>
+                  <PanelChoices heading="Or show a panel here"/>
                 </div>
               </div>}
             </>

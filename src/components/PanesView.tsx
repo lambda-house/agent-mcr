@@ -22,17 +22,18 @@ export const PANEL_ABOUT: Record<string, string> = {
   'slack-connection': 'Slack’s connection and its channels',
 };
 
-/** The panels this pane can turn into, one button each (the type menu's items). */
-export function PanelChoices() {
+/** The panels this pane can turn into, one button each (the type menu's items), under `heading` if given; nothing when every panel is shown. */
+export function PanelChoices({ heading }: { heading?: string }) {
   const pane = usePane();
   const types = pane?.actions.types ?? [];
   if (!pane || !types.length) return null;
-  return <div className="hs-empty-actions" role="group" aria-label="Show a panel here">
+  const choices = <div className="hs-empty-actions" role="group" aria-label="Show a panel here">
     {types.map(t => <button key={t.type} type="button" className="hs-empty-action" onClick={() => pane.actions.setType(t.type)}>
       {t.icon}
       <span><strong>{t.title}</strong>{PANEL_ABOUT[t.type] && <small>{PANEL_ABOUT[t.type]}</small>}</span>
     </button>)}
   </div>;
+  return heading ? <div className="hs-empty-panels"><h4>{heading}</h4>{choices}</div> : choices;
 }
 
 /** An empty pane of Board or Slack: which panel to show here. */

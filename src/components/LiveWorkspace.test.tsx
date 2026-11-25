@@ -1010,6 +1010,8 @@ describe('panes on the workbench layout', () => {
     // Two panes can take a session now: the empty one picks among those no pane shows
     const picks = [...host.querySelectorAll<HTMLButtonElement>('.hs-pane-pick')];
     expect(picks.map(b => b.querySelector('strong')?.textContent)).toEqual(['Second shell']);
+    // No panel to offer here (none is registered): no heading for them either
+    expect(host.querySelector('.hs-empty-panels')).toBeNull();
     await act(async () => picks[0].click()); await flush();
     expect(types()).toEqual(['live-sessions', 'session', 'session']);
     expect(shown()).toEqual(['s1', 'r1']);
