@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeLiveList } from '../store';
-import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report, directorySections, pathBelow, subfolderTag, type Resumable, unframe } from './harness';
+import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, showHostedRow, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report, directorySections, pathBelow, subfolderTag, type Resumable, unframe } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
+
+it('shows running rows and applies the ended-row grace from the exit time', () => {
+  const ended = hosted({ exit: { code: 1, signal: null, at: 1000 } });
+  expect(showHostedRow(hosted(), 1000)).toBe(true);
+  expect(showHostedRow(ended, 1000)).toBe(false);
+  expect(showHostedRow(ended, 30_999, 30_000)).toBe(true);
+  expect(showHostedRow(ended, 31_000, 30_000)).toBe(false);
+});
 
 function transfer(items: { kind: string; type: string }[]): DataTransfer {
   const file = new File([new Uint8Array([1])], 'x.png', { type: 'image/png' });

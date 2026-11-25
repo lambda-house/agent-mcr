@@ -57,6 +57,19 @@ describe('kept terminals (MCR-139)', () => {
     expect(keep.take('a')?.term).toBe('A2');
   });
 
+  it('does not spend a slot on a closed terminal when its pane detaches', () => {
+    const dropped: string[] = [];
+    const keep = new TerminalKeep<string>(1, t => dropped.push(t));
+    keep.retain(new Set(['running', 'closed']));
+    keep.protect(new Set(['closed']));
+    keep.put('running', { term: 'live output', offset: 1 });
+    keep.forget('closed');
+    keep.protect(new Set());
+    keep.put('closed', { term: 'closed output', offset: 1 });
+    expect(dropped).toEqual(['closed output']);
+    expect(keep.ids).toEqual(['running']);
+  });
+
   it('never takes back a session that left the list, also when its terminal is put after that (review 17088)', () => {
     const dropped: string[] = [];
     const keep = new TerminalKeep<string>(4, t => dropped.push(t));

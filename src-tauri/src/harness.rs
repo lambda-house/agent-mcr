@@ -22,6 +22,7 @@ use crate::runner::{self, lock, now_ms, Client, Unit};
 use crate::session_mcp::{read_frame, Protocol, Server};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -787,8 +788,8 @@ pub struct Subagent {
 /// assistant message, or the acknowledgement of its report to the caller (the
 /// wording depends on the Claude Code version; when it isn't recognised the
 /// subagent shows as quiet, not finished). Only the last record is looked at.
-fn subagent_finished(path: &Path) -> bool {
-    let Some(last) = last_record(path) else { return false };
+fn subagent_finished(file: &mut std::fs::File) -> bool {
+    let Some(last) = last_record(file) else { return false };
     match serde_json::from_str::<Value>(&last) {
         Ok(v) if v["type"] == "assistant" => v["message"]["stop_reason"] == "end_turn",
         Ok(v) if v["type"] == "user" => last.contains("Report delivered to your caller"),
@@ -796,42 +797,75 @@ fn subagent_finished(path: &Path) -> bool {
     }
 }
 
-/// The last complete record of a transcript, read from its tail only.
-fn last_record(path: &Path) -> Option<String> {
+/// The last complete record of an opened transcript, read from its tail only.
+fn last_record(file: &mut std::fs::File) -> Option<String> {
     use std::io::{Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let _ = file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)));
+    file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024))).ok()?;
     let mut tail = Vec::new();
     let _ = file.take(256 * 1024).read_to_end(&mut tail);
     String::from_utf8_lossy(&tail).lines().rev().find(|l| !l.trim().is_empty()).map(str::to_owned)
 }
 
+/// A time of an opened file in milliseconds; 0 when it is not known.
+fn file_ms(time: std::io::Result<std::time::SystemTime>) -> u64 {
+    time.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Tests: a lookup of subagents under this home folder waits here, inside
+/// the I/O functions themselves, until the sender is used or dropped
+#[cfg(test)]
+static SUBAGENT_STALL: Mutex<Option<(PathBuf, std::sync::mpsc::Receiver<()>)>> = Mutex::new(None);
+
+#[cfg(test)]
+fn subagent_stall(home: &Path) {
+    let stall = lock(&SUBAGENT_STALL).take_if(|(at, _)| at == home);
+    if let Some((_, rx)) = stall {
+        let _ = rx.recv();
+    }
+}
+
 /// Subagents a Codex conversation started that wrote something since `since`,
 /// newest first: the transcripts whose head names it as their parent thread.
 /// Only the head (who started it, its name) and the type of the last record
-/// are read, never what it said.
+/// are read, never what it said. Each file is opened once, confined to the
+/// real transcript folder (`open_confined`), and its times come from the handle.
 pub fn codex_subagents(home: &Path, thread: &str, since: u64) -> Vec<Subagent> {
+    #[cfg(test)]
+    subagent_stall(home);
     if !is_uuid(thread) {
         return Vec::new();
     }
+    let Some(root) = real_root(home, ".codex/sessions") else { return Vec::new() };
     let mut files = Vec::new();
-    jsonl_files(&home.join(".codex/sessions"), 3, &mut files);
+    jsonl_files(&root, 3, &mut files);
     let clean = |text: String| text.chars().filter(|c| !c.is_control()).take(120).collect::<String>();
     let mut out: Vec<Subagent> = files
         .iter()
         .filter_map(|path| {
-            let last_activity = modified_ms(path);
-            if last_activity < since || crate::agents::head_value(path, "parent_thread_id", 8192).as_deref() != Some(thread) {
+            // Old rollouts are passed over by the listing's own look, without opening them
+            if file_ms(std::fs::symlink_metadata(path).and_then(|m| m.modified())) < since {
+                return None;
+            }
+            let mut file = crate::transcript_stats::open_confined(&root, path.strip_prefix(&root).ok()?).ok()?;
+            let meta = file.metadata().ok()?;
+            let last_activity = file_ms(meta.modified());
+            if last_activity < since {
+                return None;
+            }
+            let mut head = Vec::new();
+            (&mut file).take(8192).read_to_end(&mut head).ok()?;
+            let value = |key: &str| crate::agents::value_in(&head, key);
+            if value("parent_thread_id").as_deref() != Some(thread) {
                 return None;
             }
             let stem = path.file_stem()?.to_str()?;
             let id = stem.get(stem.len().checked_sub(36)?..)?.to_string();
             // What it is for is the last part of its path (/root/belief_details); its nickname is how Codex shows it
-            let task = crate::agents::head_value(path, "agent_path", 8192).unwrap_or_default();
-            let nickname = crate::agents::head_value(path, "agent_nickname", 8192).unwrap_or_default();
-            let created = std::fs::metadata(path).and_then(|m| m.created()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
-            let finished = last_record(path)
+            let task = value("agent_path").unwrap_or_default();
+            let nickname = value("agent_nickname").unwrap_or_default();
+            let created = Some(file_ms(meta.created())).filter(|&ms| ms > 0);
+            let finished = last_record(&mut file)
                 .and_then(|l| serde_json::from_str::<Value>(&l).ok())
                 .is_some_and(|v| ["task_complete", "task_completed", "turn_aborted"].contains(&v["payload"]["type"].as_str().unwrap_or("")));
             Some(Subagent {
@@ -852,38 +886,156 @@ pub fn codex_subagents(home: &Path, thread: &str, since: u64) -> Vec<Subagent> {
 
 const MAX_SUBAGENTS: usize = 20;
 
+/// Where a session's subagents are looked up.
+#[derive(Clone, Debug, PartialEq)]
+struct SubagentWant {
+    home: PathBuf,
+    profile: String,
+    transcript: Option<String>,
+    conversation: Option<String>,
+}
+
+struct SubagentEntry {
+    want: SubagentWant,
+    found: Vec<Subagent>,
+    /// When the last lookup ended
+    looked: Option<Instant>,
+    /// A request found it due: the worker looks it up
+    asked: bool,
+    busy: bool,
+}
+
+/// How long a session's subagent list is used before it is looked up again.
+const SUBAGENTS_FRESH: Duration = Duration::from_secs(5);
+
+/// The subagents of the running sessions (MCR-149 round 4). The session list
+/// and every tool built on it (`whoami`, `overview`, `session_status`) serve
+/// the last list found and never wait for a lookup: the agents' files are
+/// read by one worker thread, started at the first request and ended once
+/// the harness is gone, and the map's lock is never held across file I/O.
+struct Subagents {
+    map: Mutex<BTreeMap<String, SubagentEntry>>,
+    wake: Condvar,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl Subagents {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { map: Mutex::new(BTreeMap::new()), wake: Condvar::new(), started: std::sync::atomic::AtomicBool::new(false) })
+    }
+
+    /// The subagents last found for these sessions, at once. A list older
+    /// than `SUBAGENTS_FRESH` is looked up again in the background; sessions
+    /// not named here are forgotten.
+    fn get(self: &Arc<Self>, wants: Vec<(String, SubagentWant)>) -> BTreeMap<String, Vec<Subagent>> {
+        let mut map = lock(&self.map);
+        map.retain(|id, _| wants.iter().any(|(w, _)| w == id));
+        let mut due = false;
+        let out = wants
+            .into_iter()
+            .map(|(id, want)| {
+                let e = map.entry(id.clone()).or_insert_with(|| SubagentEntry { want: want.clone(), found: Vec::new(), looked: None, asked: false, busy: false });
+                if e.want != want {
+                    *e = SubagentEntry { want, found: Vec::new(), looked: None, asked: false, busy: false };
+                }
+                if !e.busy && e.looked.is_none_or(|at| at.elapsed() > SUBAGENTS_FRESH) {
+                    e.asked = true;
+                    due = true;
+                }
+                (id, e.found.clone())
+            })
+            .collect();
+        drop(map);
+        if due {
+            self.start();
+            self.wake.notify_all();
+        }
+        out
+    }
+
+    fn start(self: &Arc<Self>) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        if let Err(e) = std::thread::Builder::new().name("subagents".into()).spawn(move || Self::work(me)) {
+            eprintln!("harness: the subagents' worker did not start: {e}");
+            self.started.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn work(me: std::sync::Weak<Self>) {
+        loop {
+            let Some(this) = me.upgrade() else { return };
+            let job = {
+                let mut map = lock(&this.map);
+                match map.iter_mut().filter(|(_, e)| e.asked && !e.busy).min_by_key(|(_, e)| e.looked) {
+                    Some((id, e)) => {
+                        e.asked = false;
+                        e.busy = true;
+                        Some((id.clone(), e.want.clone()))
+                    }
+                    None => {
+                        let _ = this.wake.wait_timeout(map, Duration::from_secs(1));
+                        None
+                    }
+                }
+            };
+            let Some((id, want)) = job else { continue };
+            let recent = now_ms().saturating_sub(3_600_000);
+            let found = adapter(&want.profile).subagents(&want.home, want.transcript.as_deref(), want.conversation.as_deref(), recent);
+            let mut map = lock(&this.map);
+            if let Some(e) = map.get_mut(&id).filter(|e| e.busy && e.want == want) {
+                e.found = found;
+                e.looked = Some(Instant::now());
+                e.busy = false;
+            }
+        }
+    }
+}
+
 /// Subagents of the Claude session with this transcript that wrote something
 /// since `since`, newest first. Claude Code keeps them next to the transcript,
 /// in `<session id>/subagents/agent-<id>.jsonl` with a `.meta.json`. Only the
-/// meta file is read (what it is for, its kind and model), never what it said.
+/// meta file is read (what it is for, its kind and model) and the last record
+/// of the transcript, never what it said. Every file is opened confined to the
+/// real location of Claude's transcript folder (`open_confined`), so a folder
+/// swapped for a link after the listing leads nowhere.
 pub fn subagents(home: &Path, transcript: &str, since: u64) -> Vec<Subagent> {
+    #[cfg(test)]
+    subagent_stall(home);
     let transcript = Path::new(transcript);
-    if !transcript.starts_with(home.join(".claude/projects")) || transcript.extension().is_none_or(|e| e != "jsonl") {
+    if transcript.extension().is_none_or(|e| e != "jsonl") || transcript.components().any(|c| c == std::path::Component::ParentDir) {
         return Vec::new();
     }
-    let dir = transcript.with_extension("").join("subagents");
+    // Only inside the real location of Claude's transcript folder, however the
+    // reported path or a folder in it is linked (MCR-149 review)
+    let (Some(root), Ok(dir)) = (real_root(home, ".claude/projects"), dunce::canonicalize(transcript.with_extension("").join("subagents"))) else { return Vec::new() };
+    let Ok(rel) = dir.strip_prefix(&root).map(Path::to_path_buf) else { return Vec::new() };
+    let open = |name: &str| crate::transcript_stats::open_confined(&root, &rel.join(name)).ok();
     let mut out: Vec<Subagent> = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|entry| {
-            let path = entry.path();
-            let id = path.file_name()?.to_str()?.strip_prefix("agent-")?.strip_suffix(".jsonl")?.to_string();
-            let last_activity = modified_ms(&path);
+            let name = entry.file_name().to_str()?.to_string();
+            let id = name.strip_prefix("agent-")?.strip_suffix(".jsonl")?.to_string();
+            let mut file = open(&name)?;
+            let last_activity = file_ms(file.metadata().and_then(|m| m.modified()));
             if last_activity < since {
                 return None;
             }
-            let meta_path = dir.join(format!("agent-{id}.meta.json"));
-            let meta: Value = std::fs::File::open(&meta_path)
-                .ok()
-                .and_then(|f| serde_json::from_reader(f.take(64 * 1024)).ok())
-                .unwrap_or(Value::Null);
+            // A regular file, opened without waiting: a pipe here would hold every session list
+            let meta_file = open(&format!("agent-{id}.meta.json"));
+            let meta_ms = meta_file.as_ref().map_or(0, |f| file_ms(f.metadata().and_then(|m| m.modified())));
+            let meta: Value = meta_file.and_then(|f| serde_json::from_reader(f.take(64 * 1024)).ok()).unwrap_or(Value::Null);
             let field = |key: &str| meta[key].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(120).collect::<String>();
-            let started = match modified_ms(&meta_path) {
+            let started = match meta_ms {
                 0 => last_activity,
                 at => at.min(last_activity),
             };
-            let finished = subagent_finished(&path);
+            let finished = subagent_finished(&mut file);
             Some(Subagent { id, description: field("description"), agent_type: field("agentType"), model: field("model"), started, last_activity, finished })
         })
         .collect();
@@ -964,6 +1116,15 @@ pub struct Tracked {
     draft_generation: Option<u64>,
     /// When the app last said that `draft` changed
     pub typed: u64,
+    /// That a cockpit click placed the unsent line `draft` counts (MCR-154),
+    /// so a refused click can name it: what kind of line and when, both the
+    /// service's own (`Placed`). Never the line or the entry's id: an agent
+    /// wrote those, and a credential the detector does not know could be in
+    /// them. Forgotten at the operator's Enter, when the hold ends or when
+    /// they begin a line of their own. In memory only: not in the store or a
+    /// session list; after a service restart a refusal says "an unsent line"
+    #[serde(skip)]
+    placed: Option<Placed>,
     /// The operator was told that something waits for this draft (once per draft)
     pub held_told: bool,
     /// When the operator last pressed Enter in its terminal, by the app's
@@ -1348,22 +1509,21 @@ impl Store {
     }
 
     /// The session's process ended (the runner said so, or its list shows it):
-    /// the store knows it from here on. Nothing waits on an ended session:
-    /// its mark goes, and its open waits are closed. Returns true when this
-    /// changed anything.
+    /// the store knows it from here on. Prompts and waits end with the process,
+    /// but the operator can still have a report to read.
     fn end(&mut self, id: &str) -> bool {
         let Some(t) = self.sessions.get_mut(id) else { return false };
-        if t.state == ENDED && t.attention.is_none() {
+        if t.state == ENDED {
             return false;
         }
-        t.attention = None;
+        let pending = t.pending_report.take().and_then(|id| self.reports.iter().find(|r| r.id == id));
+        t.attention = t.attention.take().filter(|a| a.report.is_some()).or_else(|| pending.map(|r| report_mark(&r.kind, &r.text, r.created)));
         t.draft = false;
         t.draft_generation = None;
+        t.placed = None;
         t.held_told = false;
-        if t.state != ENDED {
-            t.state = ENDED.into();
-            t.since = now_ms();
-        }
+        t.state = ENDED.into();
+        t.since = now_ms();
         // A restart ends the process and carries the waits to the new one
         if !self.restarting.contains(id) {
             let now = now_ms();
@@ -1458,7 +1618,8 @@ impl Store {
 
     /// A report made at a prompt gets its mark once the prompt is gone (MCR-124,
     /// M7). Run at every write of the store, so no place that takes a prompt
-    /// mark away can forget it. A later report, or the session's end, ends it.
+    /// mark away can forget it. A later report replaces it. An exit raises it
+    /// in `end`, when the prompt itself can no longer be answered.
     fn raise_pending(&mut self, now: u64) {
         let pending: Vec<(String, String)> = self.sessions.iter().filter_map(|(id, t)| t.pending_report.clone().map(|r| (id.clone(), r))).collect();
         for (id, report) in pending {
@@ -1884,10 +2045,137 @@ fn short_text(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
+/// What the context figures of a session say they are (MCR-149).
+const CONTEXT_NOTE: &str = "context: from the agent's transcript, its own usage records, deduplicated; times are what the files say, not a live process. cacheLikelyWarm is an estimate from the recorded cache lifetime (Codex records none: one hour is assumed); tokensEstimated means the size was estimated from a compaction summary. unattributedTurns are responses the harness cannot put in a round it knows (before a restart, or before the first task): the round figures and reasons leave them out. complete false: the transcript was not read to its end within this request: the figures are those of its last full read, readAgeSeconds ago, and freshRecommended is null; before any full read only rounds is given. freshRecommended applies comms contract rules 11 and 13 to executors (not leads) with fixed limits.";
+
+/// The limits of comms contract rules 11 and 13 that `freshRecommended`
+/// applies: reuse an executor only within 45 minutes of its last turn, for at
+/// most 3 rounds, while no round ran over 60 turns or 2 hours, and never after
+/// a compaction. Fixed until the profiles carry them (MCR-150).
+const REUSE_IDLE_MS: u64 = 45 * 60 * 1000;
+const REUSE_ROUNDS: usize = 3;
+const ROUND_TURNS: usize = 60;
+const ROUND_MS: u64 = 2 * 60 * 60 * 1000;
+
+/// Codex records no cache lifetime; its cache misses after about an hour.
+const CODEX_CACHE_MS: u64 = 60 * 60 * 1000;
+
+/// A response recorded this long before its task's start still counts for
+/// that round: the task's start and the transcript's clock can differ a little.
+const ROUND_LEAD_MS: u64 = 5_000;
+
+/// How long a request waits for the worker that reads transcripts
+/// (`transcript_stats::Contexts`); what it has not read to the end by then is
+/// shown from its last full read, with `complete: false`.
+const CONTEXT_BUDGET: Duration = Duration::from_millis(1500);
+
+/// What the context figures need of a session from the store.
+struct Seat {
+    profile: String,
+    transcript: Option<String>,
+    conversation: Option<String>,
+    /// It works for another session and leads none: rules 11 and 13 are
+    /// about executors (a lead works for the root Supervisor too)
+    executor: bool,
+    /// Its tasks that were started: when, and when they ended (0: still open)
+    rounds: Vec<(u64, u64)>,
+}
+
+/// The real location of an agent's transcript folder (see `transcript_stats::real_root`).
+use crate::transcript_stats::real_root;
+
+/// Where a session stands for a lead's choice between reusing it and
+/// starting a fresh one (MCR-149): the context it re-reads at every turn,
+/// how long ago its last model response was recorded (the prompt cache lives
+/// that long past it), its rounds (tasks it was given) and its token use so
+/// far in input-token equivalents. `rounds` are its started tasks, in order.
+/// `current`: read to the end after the request asked; otherwise these are
+/// the figures of the last read that was, `read_at` (ms), and say
+/// `complete: false` with no recommendation either way.
+fn context_figures(c: &crate::transcript_stats::Figures, rounds: &[(u64, u64)], executor: bool, now: u64, current: bool, read_at: u64) -> Value {
+    let claude = c.claude;
+    // Responses go to the round whose task had started when they were recorded.
+    // Earlier ones (before a restart, or typed by the operator before any task)
+    // cannot be put in a round the harness knows: they are counted as such, never merged into the first
+    let mut per_round = vec![0usize; rounds.len()];
+    // Responses whose time was dropped to bound what is kept are in no round either
+    let mut before = c.turns_dropped as usize;
+    for &at in &c.turns {
+        match rounds.iter().rposition(|&(start, _)| at > 0 && at + ROUND_LEAD_MS >= start) {
+            Some(round) => per_round[round] += 1,
+            None => before += 1,
+        }
+    }
+    let durations: Vec<u64> = rounds.iter().map(|&(start, end)| if end > 0 { end } else { now }.saturating_sub(start)).collect();
+    let idle = (c.last_turn_at > 0).then(|| now.saturating_sub(c.last_turn_at));
+    let (ttl, ttl_from) = match (c.cache_ttl, claude) {
+        (0, true) => (None, Value::Null),
+        (0, false) => (Some(CODEX_CACHE_MS), json!("assumed")),
+        (s, _) => (Some(s * 1000), json!("transcript")),
+    };
+    let most_turns = per_round.iter().copied().max().unwrap_or(0);
+    let longest = durations.iter().copied().max().unwrap_or(0);
+    let fresh: Value = if executor && current {
+        let mut why = Vec::new();
+        if rounds.len() >= REUSE_ROUNDS {
+            why.push(format!("it has run {} rounds; another would be over {REUSE_ROUNDS} (rule 11)", rounds.len()));
+        }
+        if let Some(ms) = idle.filter(|&ms| ms >= REUSE_IDLE_MS) {
+            why.push(format!("its last turn was {} minutes ago, at least {} (rule 11)", ms / 60_000, REUSE_IDLE_MS / 60_000));
+        }
+        if most_turns > ROUND_TURNS {
+            why.push(format!("a round ran {most_turns} turns, over {ROUND_TURNS} (rule 11)"));
+        }
+        if longest > ROUND_MS {
+            why.push(format!("a round ran {} minutes, over {} (rule 11)", longest / 60_000, ROUND_MS / 60_000));
+        }
+        if c.compactions > 0 {
+            why.push(format!("its context was compacted {} times (rule 13)", c.compactions));
+        }
+        json!(why)
+    } else {
+        Value::Null
+    };
+    json!({
+        "tokens": c.now,
+        "tokensEstimated": c.now_estimated,
+        "window": (c.window > 0).then_some(c.window),
+        "peakTokens": c.peak,
+        "compactions": c.compactions,
+        "lastTurnAgeSeconds": idle.map(|ms| ms / 1000),
+        "cacheTtlSeconds": ttl.map(|ms| ms / 1000),
+        "cacheTtlFrom": ttl_from,
+        "cacheLikelyWarm": idle.zip(ttl).map(|(idle, ttl)| idle < ttl),
+        "rounds": rounds.len(),
+        "roundTurns": per_round.last(),
+        "roundAgeSeconds": durations.last().map(|ms| ms / 1000),
+        "maxRoundTurns": most_turns,
+        "maxRoundSeconds": longest / 1000,
+        "turns": c.turns.len() as u64 + c.turns_dropped,
+        "unattributedTurns": before,
+        "inputEquivalent": c.input_equivalent,
+        "freshRecommended": fresh,
+        "complete": current,
+        "readAgeSeconds": now.saturating_sub(read_at) / 1000,
+    })
+}
+
+/// The context figures of a session whose transcript was never read to its
+/// end: only the rounds, which come from the store. Partial figures, and an
+/// empty `freshRecommended`, would read as final.
+fn unread_figures(rounds: &[(u64, u64)]) -> Value {
+    json!({
+        "tokens": null, "tokensEstimated": null, "window": null, "peakTokens": null, "compactions": null, "lastTurnAgeSeconds": null,
+        "cacheTtlSeconds": null, "cacheTtlFrom": null, "cacheLikelyWarm": null, "rounds": rounds.len(),
+        "roundTurns": null, "roundAgeSeconds": null, "maxRoundTurns": null, "maxRoundSeconds": null, "turns": null,
+        "unattributedTurns": null, "inputEquivalent": null, "freshRecommended": null, "complete": false, "readAgeSeconds": null,
+    })
+}
+
 impl Store {
     // Matches the Board's openReports rule: one active mark, latest matching report.
     fn open_report(&self, session: &str) -> Option<&Report> {
-        let tracked = self.sessions.get(session).filter(|t| t.state != ENDED)?;
+        let tracked = self.sessions.get(session)?;
         // A report made at a prompt is open while the prompt stands (MCR-124, M7)
         if let Some(pending) = tracked.pending_report.as_deref().filter(|_| tracked.attention.as_ref().is_some_and(|a| a.kind == "permission")) {
             return self.reports.iter().find(|r| r.id == pending);
@@ -2319,12 +2607,64 @@ fn answered(tracked: &mut Tracked, now: u64) {
     }
 }
 
+/// The line a cockpit click placed, as a refusal names it (MCR-154): only
+/// what the service knows of its own, the kind of click and when. No text
+/// and no id an agent wrote.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placed {
+    /// "the decision line", "the Ask more line" or "the line"
+    what: &'static str,
+    at: u64,
+}
+
+impl Placed {
+    /// For a click that resolved to a line to type (`Deed::Type`)
+    fn of(act: cockpit::Act, at: u64) -> Placed {
+        let what = match act {
+            cockpit::Act::Choose(_) => "the decision line",
+            cockpit::Act::Ask => "the Ask more line",
+            _ => "the line",
+        };
+        Placed { what, at }
+    }
+
+    /// "the decision line an earlier click placed there 3 minutes ago"
+    fn told(&self, now: u64) -> String {
+        let minutes = now.saturating_sub(self.at) / 60_000;
+        let ago = match minutes {
+            0 => "a moment ago".to_string(),
+            1 => "a minute ago".to_string(),
+            2..=119 => format!("{minutes} minutes ago"),
+            _ => format!("{} hours ago", minutes / 60),
+        };
+        format!("{} an earlier click placed there {ago}", self.what)
+    }
+}
+
+/// What a look at a session's screen found of its input box, for a click (MCR-97, MCR-154).
+enum BoxSeen {
+    /// Proved there, and empty where the adapter can tell (`Adapter::input_box`)
+    Ready,
+    /// There, with text in it that the harness did not see typed (`Adapter::input_box_with_text`)
+    WithText,
+    /// Not found: a menu, a screen this build does not know, or no screen
+    NotFound,
+}
+
+/// Why a click placed nothing, and what the operator can do (MCR-154): the
+/// operator read the bare "not found" as "clicks don't work". No wording here
+/// says Ctrl+C: in a working agent it stops the turn (MCR-122).
+const UNSENT: &str = "an unsent line is in its input box. Press Enter in that session to send it, or delete it there, then click again (with an empty box, an Enter there ends the hold)";
+const BOX_WITH_TEXT: &str = "its input box shows text, likely a line nobody sent yet (or a suggestion the agent drew there). Press Enter in that session to send it, or delete it there, then click again";
+const BOX_NOT_FOUND: &str = "the input box of that session was not found on its screen: it may be at a menu or a question, or show something this build does not know. Look at its terminal, answer or close what is there, then click again";
+
 /// The harness no longer counts an unsent line in this session. `typed` is
 /// set to now, so `held` keeps out of the box for `DRAFT_QUIET_MS` more: a key
 /// the app is telling just now lands before anything is typed there.
 fn clear_draft(tracked: &mut Tracked, now: u64) {
     tracked.draft = false;
     tracked.draft_generation = None;
+    tracked.placed = None;
     tracked.typed = now;
     tracked.held_told = false;
     if tracked.attention.as_ref().is_some_and(|a| a.text == HELD_MARK) {
@@ -2588,8 +2928,9 @@ pub struct Harness {
     processes: Mutex<(Option<Instant>, Arc<Vec<Process>>)>,
     /// Per running shell: its processor time and when that last moved
     activity: Mutex<BTreeMap<i32, (f64, u64)>>,
-    /// Subagents per session, looked up in the agents' files at most every five seconds
-    subagents: Mutex<BTreeMap<String, (Instant, Vec<Subagent>)>>,
+    /// Subagents per session, looked up in the agents' files at most every
+    /// five seconds by their own worker thread, never on a request's thread
+    subagents: Arc<Subagents>,
     /// The Slack connector (D14)
     slack: Arc<Slack>,
     /// The memory server (D16): the sign-in and the router of the `mcr-memory` MCP server
@@ -2611,6 +2952,9 @@ pub struct Harness {
     /// (`operator_draft` says so again while the person types): kept here,
     /// not in the store, which is written only when the draft changes
     draft_words: Mutex<BTreeMap<String, u64>>,
+    /// The transcripts followed for the context figures (MCR-149), numbers
+    /// only and in memory only, read by their own worker thread
+    contexts: Arc<crate::transcript_stats::Contexts>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -2761,7 +3105,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -2834,6 +3178,30 @@ impl Harness {
         Client::connect(&socket)?.call(req)
     }
 
+    /// Forget an ended session at the operator's request, after any open report is seen.
+    fn forget_ended(&self, id: &str) -> Result<Value, String> {
+        // Task-result notices still have the executor relation when they are posted.
+        self.tell_assigners();
+        let socket = runner_socket(&self.dir);
+        runner::ensure(&socket)?;
+        self.update(|s| {
+            if s.restarting.contains(id) {
+                return Err("The session is restarting".into());
+            }
+            if s.sessions.get(id).is_some_and(|t| t.pending_report.is_some() || t.attention.as_ref().is_some_and(|a| a.report.is_some())) {
+                return Err("Mark the session's report as seen before forgetting it".into());
+            }
+            // Keep the report check and removal together. The runner checks for exit.
+            match Client::connect(&socket)?.call(json!({"op": "forget", "id": id})) {
+                Err(e) if e != format!("No session {id}") => return Err(e),
+                _ => {}
+            }
+            s.sessions.remove(id);
+            s.cockpit.keep(|tracked| tracked != id);
+            Ok(json!({}))
+        })
+    }
+
     /// The runner's terminals with what this service knows about each.
     fn processes(&self) -> Arc<Vec<Process>> {
         let mut cached = lock(&self.processes);
@@ -2875,7 +3243,7 @@ impl Harness {
         // An exit the service did not hear of (it was down, or restarting): the list says so
         let ended: Vec<&str> = {
             let store = lock(&self.store);
-            infos.iter().filter(|i| !i["exit"].is_null()).filter_map(|i| i["id"].as_str()).filter(|id| store.sessions.get(*id).is_some_and(|t| t.state != ENDED || t.attention.is_some())).collect()
+            infos.iter().filter(|i| !i["exit"].is_null()).filter_map(|i| i["id"].as_str()).filter(|id| store.sessions.get(*id).is_some_and(|t| t.state != ENDED)).collect()
         };
         if !ended.is_empty() {
             self.update(|s| ended.iter().for_each(|id| { s.end(id); }));
@@ -2914,7 +3282,6 @@ impl Harness {
         let ids: BTreeSet<&str> = infos.iter().filter_map(|i| i["id"].as_str()).collect();
         let processes = self.processes();
         lock(&self.activity).retain(|pid, _| processes.iter().any(|p| p.pid == *pid));
-        lock(&self.subagents).retain(|id, _| ids.contains(id.as_str()));
         // Whether the folders of ended sessions are still there (MCR-107), asked
         // before the store is locked: a folder on a share that went away can
         // make the question hang, and nothing else may wait for it
@@ -2925,9 +3292,25 @@ impl Harness {
             .filter(|cwd| !self.folder_there(cwd))
             .map(str::to_owned)
             .collect();
+        // Subagents as last looked up; the lookup itself, in the agents'
+        // files, is the worker's (MCR-149 round 4): no file is read here
+        let home = self.launch_home().ok();
+        let subagents: BTreeMap<String, Vec<Subagent>> = match &home {
+            Some(home) => {
+                let wants: Vec<(String, SubagentWant)> = {
+                    let store = lock(&self.store);
+                    infos
+                        .iter()
+                        .filter(|i| i["exit"].is_null())
+                        .filter_map(|i| i["id"].as_str())
+                        .filter_map(|id| store.sessions.get(id).map(|t| (id.to_string(), SubagentWant { home: home.clone(), profile: t.profile.clone(), transcript: t.transcript.clone(), conversation: t.agent_session.clone() })))
+                        .collect()
+                };
+                self.subagents.get(wants)
+            }
+            None => BTreeMap::new(),
+        };
         let store = lock(&self.store);
-        let home = dirs::home_dir();
-        let recent = now_ms().saturating_sub(3_600_000);
         Ok(infos
             .iter()
             .map(|info| {
@@ -2940,7 +3323,7 @@ impl Harness {
                 });
                 if !info["exit"].is_null() {
                     tracked.state = "exited".into();
-                    tracked.attention = None;
+                    tracked.attention = tracked.attention.filter(|a| a.report.is_some());
                 }
                 // An unnamed session goes by the title its agent gave it
                 tracked.named = !tracked.name.is_empty();
@@ -2961,13 +3344,8 @@ impl Harness {
                 if let (true, true, Some(pid)) = (info["exit"].is_null(), adapter(&tracked.profile).is_agent(), info["pid"].as_i64()) {
                     out["shells"] = json!(self.with_activity(shells(&processes, pid as i32, now_ms()), now_ms()));
                 }
-                if let (true, Some(home)) = (info["exit"].is_null(), &home) {
-                    let mut cached = lock(&self.subagents);
-                    let entry = cached.entry(id.to_string()).or_insert_with(|| (Instant::now() - Duration::from_secs(60), Vec::new()));
-                    if entry.0.elapsed() > Duration::from_secs(5) {
-                        *entry = (Instant::now(), adapter(&tracked.profile).subagents(home, tracked.transcript.as_deref(), tracked.agent_session.as_deref(), recent));
-                    }
-                    out["subagents"] = json!(entry.1);
+                if info["exit"].is_null() && home.is_some() {
+                    out["subagents"] = json!(subagents.get(id).cloned().unwrap_or_default());
                 }
                 out
             })
@@ -3572,10 +3950,19 @@ impl Harness {
         self.runner(json!({"op": "write", "id": session, "data": data})).map(|_| ())
     }
 
-    /// Positive proof that a session's input box is on screen (`Adapter::input_box`).
-    fn input_box(&self, session: &str) -> bool {
+    /// Positive proof that a session's input box is on screen (`Adapter::input_box`),
+    /// else whether it is there with text in it, from one read of the screen.
+    fn input_box(&self, session: &str) -> BoxSeen {
         let profile = lock(&self.store).sessions.get(session).map(|t| t.profile.clone()).unwrap_or_default();
-        self.screen(session).is_some_and(|text| adapter(&profile).input_box(&text))
+        let Some(text) = self.screen(session) else { return BoxSeen::NotFound };
+        let agent = adapter(&profile);
+        if agent.input_box(&text) {
+            BoxSeen::Ready
+        } else if agent.input_box_with_text(&text) {
+            BoxSeen::WithText
+        } else {
+            BoxSeen::NotFound
+        }
     }
 
     /// A click in the cockpit (MCR-97): `by`, `id` and `updated` name the
@@ -3593,7 +3980,8 @@ impl Harness {
             cockpit::Deed::Link(link) => Ok(json!({ "link": link })),
             cockpit::Deed::Copy(text) => Ok(json!({ "copy": text })),
             cockpit::Deed::Type { session, text } => {
-                self.place(&session, &text)?;
+                // Named after the action resolved: nothing of the request is taken before (review 17271)
+                self.place(&session, &text, Placed::of(act, now_ms()))?;
                 Ok(json!({ "placed": session }))
             }
         }
@@ -3602,7 +3990,15 @@ impl Harness {
     /// Why a line cannot be placed in a session's input box now, by what the
     /// store knows: it must be an agent that is idle by its own word, asks
     /// nothing, has no line of the operator's, and has nothing on its way.
-    fn place_refusal(store: &Store, session: &str, now: u64) -> Option<&'static str> {
+    fn place_refusal(store: &Store, session: &str, now: u64) -> Option<Cow<'static, str>> {
+        Self::place_obstacle(store, session, now).map(|why| match store.sessions.get(session).filter(|_| why == UNSENT) {
+            // What the operator can do about it, and that the cockpit placed the line (MCR-154)
+            Some(Tracked { placed: Some(placed), .. }) => Cow::Owned(format!("an unsent line is in its input box: {}. Press Enter in that session to send it, or delete it there (with an empty box, an Enter there ends the hold), then click again", placed.told(now))),
+            _ => Cow::Borrowed(why),
+        })
+    }
+
+    fn place_obstacle(store: &Store, session: &str, now: u64) -> Option<&'static str> {
         let Some(t) = store.sessions.get(session).filter(|t| t.state != ENDED) else { return Some("that session has ended or is gone") };
         if !adapter(&t.profile).is_agent() {
             return Some("that session is not an agent with an input box");
@@ -3614,7 +4010,7 @@ impl Harness {
             return Some("that session is not idle by its own word: it works, or has not reported yet");
         }
         if t.draft {
-            return Some("that session already has an unsent line in its input box. Send it or delete it there first (with an empty box, an Enter there ends the hold)");
+            return Some(UNSENT);
         }
         if held(t, now) {
             return Some("a line was just cleared in that session; try again in a few seconds");
@@ -3636,7 +4032,7 @@ impl Harness {
     /// added: the operator presses it. The line counts as their unsent line
     /// from before it is written (`Tracked.draft`, MCR-85), so no notice and
     /// no task is typed into it.
-    fn place(&self, session: &str, text: &str) -> Result<(), String> {
+    fn place(&self, session: &str, text: &str, placed: Placed) -> Result<(), String> {
         let refuse = |why: &str| Err(format!("Refused: {why}."));
         cockpit::placeable(text).or_else(|why| refuse(&format!("the line {why}")))?;
         // Not while the harness types there itself: its Enter would send this line too
@@ -3644,33 +4040,37 @@ impl Harness {
         let Ok(_typing) = writer.try_lock() else { return refuse("the harness is typing into that session right now; try again in a few seconds") };
         let now = now_ms();
         if let Some(why) = Self::place_refusal(&lock(&self.store), session, now) {
-            return refuse(why);
+            return refuse(&why);
         }
         if lock(&self.wrote).get(session).is_some_and(|at| now.saturating_sub(*at) < PLACE_QUIET_MS) {
             return refuse("the harness typed into that session a moment ago; try again in a few seconds");
         }
         // What the store cannot know: that the box is there. A menu takes letters and digits as keys
-        if !self.input_box(session) {
-            return refuse("the input box of that session was not found on its screen: it may be at a menu, or have text in the box");
+        match self.input_box(session) {
+            BoxSeen::Ready => {}
+            BoxSeen::WithText => return refuse(BOX_WITH_TEXT),
+            BoxSeen::NotFound => return refuse(BOX_NOT_FOUND),
         }
         // The line is the operator's from here; checked once more under the lock that sets it
         let held = self.update(|s| match Self::place_refusal(s, session, now_ms()) {
             Some(why) => Err(why),
             None => {
-                let t = s.sessions.get_mut(session).ok_or("that session has ended or is gone")?;
+                let t = s.sessions.get_mut(session).ok_or(Cow::Borrowed("that session has ended or is gone"))?;
                 (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
                 t.draft_generation = None;
+                t.placed = Some(placed);
                 Ok(())
             }
         });
         if let Err(why) = held {
-            return refuse(why);
+            return refuse(&why);
         }
         if let Err(e) = self.type_into(session, &format!("\x1b[200~{text}\x1b[201~")) {
             self.update(|s| {
                 if let Some(t) = s.sessions.get_mut(session) {
                     (t.draft, t.typed) = (false, now_ms());
                     t.draft_generation = None;
+                    t.placed = None;
                 }
             });
             return Err(e);
@@ -4235,10 +4635,11 @@ impl Harness {
             "cockpit_publish" | "cockpit_patch" | "cockpit_read" => self.cockpit_tool(Some(me), name, args)?,
             "overview" => {
                 let sessions = self.sessions()?;
-                lock(&self.store).overview(&sessions, Some(me), now_ms())
+                let tree = lock(&self.store).overview(&sessions, Some(me), now_ms());
+                self.with_contexts(tree)
             }
             "whoami" => {
-                let mut out = Self::brief(&self.session(me)?);
+                let mut out = self.with_context(Self::brief(&self.session(me)?), me);
                 let store = lock(&self.store);
                 out["supervisor"] = json!(store.sessions.get(me).and_then(|t| t.supervisor.clone()));
                 out["executors"] = json!(store.executors(me));
@@ -5130,6 +5531,7 @@ impl Harness {
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
             "supervisor" => self.supervisor(req),
             "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true, req["refreshProfile"] == true),
+            "forget_ended" => self.forget_ended(id()?),
             "settings" => {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
@@ -5211,6 +5613,12 @@ impl Harness {
                         if let Some(t) = s.sessions.get_mut(id) {
                             if t.draft != draft || (enter && draft) {
                                 if draft {
+                                    // A line the operator began, not one the cockpit placed. An
+                                    // Enter told with a new line (the app reads the draft when its
+                                    // worker calls) sent the placed one: that line is gone too
+                                    if !t.draft || enter {
+                                        t.placed = None;
+                                    }
                                     (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
                                     t.draft_generation = owner;
                                 } else if may_clear(t) {
@@ -5276,8 +5684,12 @@ impl Harness {
             // The human looked at this version of the notice; a newer one must survive.
             "ack" => {
                 let id = id()?;
+                let since = req["since"].as_u64();
                 self.update(|s| {
-                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| a.kind == "notification" && req["since"].as_u64().is_none_or(|since| since == a.since))) {
+                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| {
+                        let can_ack = a.kind == "notification" || (t.state == ENDED && a.report.is_some() && since.is_some());
+                        can_ack && since.is_none_or(|since| since == a.since)
+                    })) {
                         t.attention = None;
                     }
                 });
@@ -5369,6 +5781,75 @@ impl Harness {
         })
     }
 
+    /// The context figures of these sessions (MCR-149), null for a session
+    /// whose agent keeps no transcript the harness can read or whose
+    /// transcript was not found. No file is read here: the worker of
+    /// `self.contexts` reads them, and this waits for it at most `CONTEXT_BUDGET`.
+    fn contexts(&self, ids: &[&str]) -> BTreeMap<String, Value> {
+        let (seats, known): (BTreeMap<String, Seat>, BTreeSet<String>) = {
+            let store = lock(&self.store);
+            let seats = ids.iter().filter_map(|id| {
+                let t = store.sessions.get(*id).filter(|t| t.state != ENDED)?;
+                let mut rounds: Vec<(u64, u64)> = store.tasks.values().filter(|k| k.session == *id && k.started > 0).map(|k| (k.started, k.finished)).collect();
+                rounds.sort_unstable();
+                let leads = t.agent_profile.as_ref().is_some_and(|p| p.role == "lead" || p.role == "supervisor") || !store.executors(id).is_empty();
+                Some((id.to_string(), Seat { profile: t.profile.clone(), transcript: t.transcript.clone(), conversation: t.agent_session.clone(), executor: t.supervisor.is_some() && !leads, rounds }))
+            }).collect();
+            // Ended and forgotten sessions are not followed
+            (seats, store.sessions.iter().filter(|(_, t)| t.state != ENDED).map(|(id, _)| id.clone()).collect())
+        };
+        let Ok(home) = self.launch_home() else { return BTreeMap::new() };
+        // A session is followed only with a conversation id and an agent that keeps transcripts
+        let wants: Vec<(String, crate::transcript_stats::Want)> = seats.iter().filter_map(|(id, seat)| {
+            let (folder, depth) = adapter(&seat.profile).transcripts()?;
+            let conversation = seat.conversation.clone().filter(|c| is_uuid(c))?;
+            let claude = adapter(&seat.profile).id() != "codex";
+            Some((id.clone(), crate::transcript_stats::Want { home: home.clone(), folder, depth, conversation, reported: seat.transcript.clone(), claude }))
+        }).collect();
+        let mut answers = self.contexts.ask(wants, |id| known.contains(id), CONTEXT_BUDGET);
+        let now = now_ms();
+        ids.iter().map(|id| {
+            use crate::transcript_stats::Answer;
+            let figures = match (seats.get(*id), answers.remove(*id)) {
+                (Some(seat), Some(Answer::Current(Some(f)))) => context_figures(&f, &seat.rounds, seat.executor, now, true, now),
+                (Some(seat), Some(Answer::Behind(Some((f, at))))) => context_figures(&f, &seat.rounds, seat.executor, now, false, at),
+                (Some(seat), Some(Answer::Behind(None))) => unread_figures(&seat.rounds),
+                _ => Value::Null,
+            };
+            (id.to_string(), figures)
+        }).collect()
+    }
+
+    /// Adds `context` to every session of an `overview` tree.
+    fn with_contexts(&self, mut tree: Value) -> Value {
+        fn ids<'a>(nodes: &'a Value, out: &mut Vec<&'a str>) {
+            for n in nodes.as_array().into_iter().flatten() {
+                out.extend(n["id"].as_str());
+                ids(&n["executors"], out);
+            }
+        }
+        fn put(nodes: &mut Value, figures: &mut BTreeMap<String, Value>) {
+            for n in nodes.as_array_mut().into_iter().flatten() {
+                let id = n["id"].as_str().unwrap_or("").to_string();
+                n["context"] = figures.remove(&id).unwrap_or(Value::Null);
+                put(&mut n["executors"], figures);
+            }
+        }
+        let mut list = Vec::new();
+        ids(&tree["sessions"], &mut list);
+        let mut figures = self.contexts(&list);
+        put(&mut tree["sessions"], &mut figures);
+        tree["contextNote"] = json!(CONTEXT_NOTE);
+        tree
+    }
+
+    /// `out` with the context figures of the session `id`.
+    fn with_context(&self, mut out: Value, id: &str) -> Value {
+        out["context"] = self.contexts(&[id]).remove(id).unwrap_or(Value::Null);
+        out["contextNote"] = json!(CONTEXT_NOTE);
+        out
+    }
+
     fn brief(session: &Value) -> Value {
         let h = &session["harness"];
         let out = json!({
@@ -5408,13 +5889,14 @@ impl Harness {
             "profiles_list" => crate::profiles::list_tool(&self.dir, args),
             "overview" => {
                 let sessions = self.sessions()?;
-                Ok(lock(&self.store).overview(&sessions, None, now_ms()))
+                let tree = lock(&self.store).overview(&sessions, None, now_ms());
+                Ok(self.with_contexts(tree))
             }
             "session_list" => Ok(json!({ "sessions": self.sessions()?.iter().map(Self::brief).collect::<Vec<_>>() })),
             "session_status" => {
                 let s = self.session(text("session")?)?;
                 let tasks: Vec<Task> = lock(&self.store).tasks.values().filter(|t| t.session == s["id"].as_str().unwrap_or("")).cloned().collect();
-                let mut out = Self::brief(&s);
+                let mut out = self.with_context(Self::brief(&s), s["id"].as_str().unwrap_or(""));
                 out["lastMessage"] = s["harness"]["lastMessage"].clone();
                 out["tasks"] = json!(tasks);
                 Ok(out)
@@ -5904,9 +6386,9 @@ fn supervisor_tools() -> Value {
     let wait = json!({"type": "integer", "description": "How long to wait, in seconds (default 50, at most 600)"});
     let cockpit: Vec<Value> = cockpit_tools(true).into_iter().map(|(name, description, props, required, _)| tool(name, &description, props, required)).collect();
     json!({ "tools": [
-        tool("overview", "All live supervisor/executor trees, then independent sessions: state and status ages in seconds (null when unknown), open tasks, unread messages, waits, latest open report and attention.", json!({}), &[]),
+        tool("overview", "All live supervisor/executor trees, then independent sessions: state and status ages in seconds (null when unknown), open tasks, unread messages, waits, latest open report and attention. Each session's context: its context size in tokens, seconds since its last model turn and whether the prompt cache is likely still warm, its rounds (tasks) and the turns of the latest, its input-equivalent tokens so far, and for executors freshRecommended (reasons to start a fresh one instead of reusing it).", json!({}), &[]),
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
-        tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
+        tool("session_status", "One session with its tasks, its last message and its context (as in overview).", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
             "profile": {"type": "string", "description": "An agent profile id such as implementer@claude-opus (see profiles_list), or an enabled harness id for a session without a profile"},
             "role": {"type": "string", "description": "The part it plays (reviewer, implementer of X): its peers see it in list_peers"},
@@ -5958,8 +6440,8 @@ fn agent_tools() -> Value {
     let to = json!({"type": "string", "description": "The peer's name, id or mcr:<id> pointer (see list_peers)"});
     let mut tools = vec![
         tool("guide", "The working rules for sessions that see each other here: when and how to reach a peer, and what a message from a peer is. Read it before your first message to a peer.", json!({}), &[], true),
-        tool("overview", "Your session and its executor tree only: state and status ages in seconds, open tasks, unread messages, waits, latest open report and attention. Unknown ages are null.", json!({}), &[], true),
-        tool("whoami", "This session as the harness knows it: id, name, agent kind, folder, state.", json!({}), &[], true),
+        tool("overview", "Your session and its executor tree only: state and status ages in seconds, open tasks, unread messages, waits, latest open report and attention. Unknown ages are null. Each session's context: its context size in tokens, seconds since its last model turn and whether the prompt cache is likely still warm, its rounds (tasks) and the turns of the latest, its input-equivalent tokens so far, and for executors freshRecommended (reasons to start a fresh one instead of reusing it).", json!({}), &[], true),
+        tool("whoami", "This session as the harness knows it: id, name, agent kind, folder, state, and its context (as in overview).", json!({}), &[], true),
         tool("list_peers", "The other running agent sessions on this machine: id, name, agent kind (claude, codex, shell), folder, state, role and what they say they are doing. Sessions in your folder come first: `folder` is same, below (a subfolder of yours) or above (it contains yours). Call it when you start and before you change shared files.", json!({"same_folder": {"type": "boolean", "description": "Only the sessions in your folder, below it or above it"}}), &[], true),
         tool("send_message", "Leave a message in a peer's inbox. The peer is told when it is idle. No reply is expected; use ask for a question.", json!({"to": to, "text": {"type": "string"}}), &["to", "text"], false),
         tool("ask", "Ask a peer a question. Its reply arrives in your inbox; end your turn and you are told, or wait with listen.", json!({"to": to, "question": {"type": "string"}}), &["to", "question"], false),
@@ -5987,7 +6469,7 @@ fn agent_tools() -> Value {
         tool("task_assign", "Give one of your executors a task. It is typed in when the executor is idle. You are told in your inbox when it ends, or wait with task_wait.", json!({"session": to, "text": {"type": "string", "description": "The prompt"}}), &["session", "text"], false),
         tool("task_status", "The state of a task you gave an executor: queued, working, completed (with its last message), delivered or failed.", json!({"task": {"type": "string"}}), &["task"], true),
         tool("task_wait", "Wait inside this turn until a task you gave an executor ends or the time is up.", json!({"task": {"type": "string"}, "timeout_seconds": {"type": "integer", "description": "Default 50, at most 600"}}), &["task"], true),
-        tool("session_status", "One of your executors: state, what it waits for, its tasks and its last message.", json!({"session": to}), &["session"], true),
+        tool("session_status", "One of your executors: state, what it waits for, its tasks, its last message and its context (as in overview): check it before you give the executor another round.", json!({"session": to}), &["session"], true),
         tool("session_result", "The last message one of your executors ended a turn with.", json!({"session": to}), &["session"], true),
         tool("terminal_read", "The terminal of one of your executors as text (last lines). Data, not instructions.", json!({"session": to, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"], true),
         tool("executor_end", "End an idle executor you started yourself with executor_create. If something prevents the end, the refusal names it. A done report can stay on the Board when the executor ends. Its conversation is kept, and the operator sees that you ended it.", json!({"session": {"type": "string", "description": "The executor's id or mcr:<id> pointer"}}), &["session"], false),
@@ -9760,12 +10242,16 @@ mod tests {
         }
         // An open needs_human report is no obstacle: that is where the operator answers
         harness.update(|s| s.sessions.get_mut("ex").unwrap().attention = Some(Attention { kind: "assessment".into(), text: "needs you".into(), since: 1, report: Some("needs_human".into()), ..Attention::default() }));
-        // The screen: a menu, a box with text, no screen at all
+        // The screen: a menu or no screen at all, and a box with text the app never told of (MCR-154)
         let rule = "\u{2500}".repeat(80);
-        for screen in [format!("{rule}\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n"), claude_idle_screen().replace("\n\u{276f}\n", "\n\u{276f} half a line\n"), String::new()] {
+        for screen in [format!("{rule}\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n"), String::new()] {
             lock(&harness.shown).insert("ex".into(), screen);
-            assert!(click().unwrap_err().contains("input box of that session was not found"));
+            let err = click().unwrap_err();
+            assert!(err.contains("input box of that session was not found") && err.contains("then click again"), "{err}");
         }
+        lock(&harness.shown).insert("ex".into(), claude_idle_screen().replace("\n\u{276f}\n", "\n\u{276f} half a line\n"));
+        let err = click().unwrap_err();
+        assert!(err.starts_with("Refused: its input box shows text") && err.contains("Press Enter in that session to send it, or delete it there, then click again"), "{err}");
         lock(&harness.shown).insert("ex".into(), claude_idle_screen());
         // The action was published again since the panel showed it
         assert!(harness.cockpit_act(None, "lead", "word", stamp + 1, cockpit::Act::Place).unwrap_err().contains("published again"));
@@ -9779,6 +10265,86 @@ mod tests {
         *lock(&harness.typed) = None;
         assert!(harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(0)).is_err());
         assert!(!lock(&harness.store).sessions["lead"].draft);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_click_names_the_placed_line_still_in_the_box_and_what_to_do() {
+        let (dir, harness, stamp) = clickable("unsent");
+        let fix = "Press Enter in that session to send it, or delete it there (with an empty box, an Enter there ends the hold), then click again";
+        let refusal = |choice: usize| {
+            lock(&harness.wrote).clear();
+            harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(choice)).unwrap_err()
+        };
+        let place = |choice: usize| {
+            harness.update(|s| s.sessions.get_mut("lead").unwrap().typed = 0);
+            lock(&harness.wrote).clear();
+            harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(choice)).unwrap()
+        };
+        // The owner's case of MCR-154: a decision placed in the lead's box and not sent, then another click for that box
+        assert_eq!(place(1), json!({"placed": "lead"}));
+        // What is kept of it is the service's own and stays out of the store and the session lists
+        assert!(lock(&harness.store).sessions["lead"].placed.is_some());
+        let saved = serde_json::to_value(&lock(&harness.store).sessions["lead"]).unwrap();
+        assert!(saved.get("placed").is_none() && !saved.to_string().contains("decision line"), "{saved}");
+        let err = refusal(0);
+        assert_eq!(err, format!("Refused: an unsent line is in its input box: the decision line an earlier click placed there a moment ago. {fix}."));
+        // Nothing an agent wrote is repeated: not the line, not the entry's id
+        assert!(!err.contains("Drop it") && !err.contains("pick") && !err.contains("Ctrl"), "{err}");
+        // Nothing went into the box that holds the line
+        assert_eq!(typed_so_far(&harness).len(), 1);
+        // The operator's Enter sends it and the line is forgotten; a line they begin themselves is never named
+        harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        assert!(lock(&harness.store).sessions["lead"].placed.is_none());
+        harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": true})).unwrap();
+        let err = refusal(0);
+        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("earlier click") && err.contains("an Enter there ends the hold"), "{err}");
+        // A placed line the operator types on is still named: the app's key says nothing about it
+        harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        place(0);
+        harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": true})).unwrap();
+        assert!(refusal(1).contains("the decision line an earlier click placed there"));
+        // An Enter told together with a new line (the app's worker reads the draft when it calls):
+        // the placed line was sent, the new one is held and is not named as the placed one
+        harness.control(&json!({"op": "operator_input", "id": "lead", "draft": true})).unwrap();
+        let t = lock(&harness.store).sessions["lead"].clone();
+        assert!(t.draft && t.placed.is_none());
+        let err = refusal(1);
+        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("earlier click"), "{err}");
+        assert_eq!(typed_so_far(&harness).len(), 2);
+        // A choice the action does not have is refused as such, whatever its number, before anything is named
+        harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        harness.update(|s| s.sessions.get_mut("lead").unwrap().typed = 0);
+        for n in [2, usize::MAX] {
+            assert!(refusal(n).contains("no such option"));
+        }
+        // How long ago, in the service's words
+        assert_eq!(Placed::of(cockpit::Act::Ask, 0).told(3 * 60_000 + 5), "the Ask more line an earlier click placed there 3 minutes ago");
+        assert_eq!(Placed::of(cockpit::Act::Place, 0).told(60_000), "the line an earlier click placed there a minute ago");
+        assert_eq!(Placed::of(cockpit::Act::Place, 0).told(3 * 3_600_000), "the line an earlier click placed there 3 hours ago");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refusal_never_repeats_an_entry_id_that_looks_like_a_credential() {
+        let (dir, harness, stamp) = clickable("secret-id");
+        // A fake token, put together at run time: it passes `ident` and the detector knows its shape
+        let id = ["gh", "p_", "abcdefghij0123456789abcdef"].concat();
+        assert!(cockpit::looks_secret(&id) && id.len() <= 40 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+        harness.update(|s| {
+            let facts = s.cockpit_facts(stamp);
+            s.cockpit.publish(&cockpit::Who { id: "ex", root: false }, &facts, &json!({
+                "tracks": [{"id": "own", "title": "Own", "lead": "ex", "state": "waiting_human"}],
+                "actions": [{"id": id, "track": "own", "title": "Say it", "kind": "typed_word", "where": {"session": "ex"}, "say": "looks fine", "risk": "reversible"}],
+            }), stamp).unwrap();
+        });
+        // A typed word places its `say` alone, which passed the detector: the id is in no line
+        assert_eq!(harness.cockpit_act(None, "ex", &id, stamp, cockpit::Act::Place).unwrap(), json!({"placed": "ex"}));
+        assert_eq!(typed_so_far(&harness), [("ex".to_string(), "\x1b[200~looks fine\x1b[201~".to_string())]);
+        lock(&harness.wrote).clear();
+        let err = harness.cockpit_act(None, "ex", &id, stamp, cockpit::Act::Place).unwrap_err();
+        assert!(err.contains("the line an earlier click placed there"), "{err}");
+        assert!(!err.contains(&id) && !cockpit::looks_secret(&err), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10922,6 +11488,8 @@ mod tests {
             s.sessions.insert("gone".into(), Tracked { name: "Trust check Codex".into(), profile: "codex".into(), state: "waiting".into(), supervisor: Some("up".into()), ..Tracked::default() });
             s.sessions.get_mut("gone").unwrap().attention = Some(Attention { kind: "permission".into(), text: "Trust this folder?".into(), since: 1, ..Attention::default() });
             s.waits.insert("w".into(), Wait { id: "w".into(), session: "gone".into(), created: 1, expect_by: now_ms() + 3_600_000, on: "CI".into(), ..Wait::default() });
+            s.sessions.insert("worktree".into(), Tracked { name: "Worktree executor".into(), profile: "claude".into(), state: "idle".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            s.report("worktree", "done", "Ready to read").unwrap();
         });
         // The status report asks the list first: only the running executor is in it
         let report = h.agent_tool("up", "report", &json!({"kind": "status", "text": "where things stand"})).unwrap();
@@ -10937,13 +11505,20 @@ mod tests {
         assert!(lock(&h.store).waits["w"].cleared > 0);
         let on_disk: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
         assert_eq!((on_disk.sessions["gone"].state.as_str(), on_disk.sessions["gone"].attention.is_none()), (ENDED, true));
-        // And nothing in the attention list
-        assert!(h.attention().unwrap().is_empty());
+        // The dead prompt is gone. The report survives reconciliation and later polls.
+        let attention = h.attention().unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0]["session"], "worktree");
+        assert_eq!(attention[0]["attention"]["report"], "done");
         // An ended session whose folder is no longer on disk says so in the list (MCR-107);
         // one whose folder is there, and a running one, do not
         let listed = h.sessions().unwrap();
+        let ended_report = listed.iter().find(|s| s["id"] == "worktree").unwrap();
+        assert_eq!(ended_report["harness"]["attention"]["report"], "done");
         let gone_folder = |id: &str| listed.iter().find(|s| s["id"] == id).unwrap()["cwdGone"].clone();
         assert_eq!((gone_folder("worktree"), gone_folder("gone"), gone_folder("running-in-gone"), gone_folder("up")), (json!(true), Value::Null, Value::Null, Value::Null));
+        h.control(&json!({"op": "ack", "id": "worktree", "since": ended_report["harness"]["attention"]["since"]})).unwrap();
+        assert!(h.attention().unwrap().is_empty());
         // The Slack connector is told only of running sessions, so a channel routed to the
         // ended one is held as "The routed session is not running", and its inbox takes nothing
         use crate::slack::Host;
@@ -11009,9 +11584,539 @@ mod tests {
     }
 
     #[test]
+    fn an_ended_executor_keeps_its_open_report_and_the_assigner_can_read_its_result() {
+        let dir = socket_test_dir("mcr-ended-report-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = Harness::open(&dir);
+        let report = h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { name: "Lead".into(), state: "working".into(), ..Tracked::default() });
+            s.sessions.insert("worker".into(), Tracked { name: "Worker".into(), state: "waiting".into(), supervisor: Some("lead".into()),
+                attention: Some(Attention { kind: "permission".into(), since: 1, ..Attention::default() }), ..Tracked::default() });
+            s.sessions.insert("done".into(), Tracked { state: "idle".into(), ..Tracked::default() });
+            s.report("done", "done", "Finished").unwrap();
+            s.tasks.insert("task".into(), Task { id: "task".into(), session: "worker".into(), text: "Run the checks".into(), state: "completed".into(),
+                created: 1, started: 2, finished: 3, result: Some("All checks passed".into()), by: "lead".into(), told: false });
+            s.post(Message { from: "worker".into(), to: "lead".into(), text: "A final message".into(), ..Message::default() });
+            s.report("worker", "needs_human", "Check the result").unwrap()
+        });
+        h.runner_event(&json!({"event": "exited", "id": "worker"}));
+        h.runner_event(&json!({"event": "exited", "id": "worker"}));
+        h.runner_event(&json!({"event": "exited", "id": "done"}));
+        h.tell_assigners();
+        let state = Harness::open(&dir);
+        {
+            let s = lock(&state.store);
+            assert!(s.executors("lead").is_empty());
+            assert!(s.under("lead", "worker"));
+            assert!(s.sessions["worker"].pending_report.is_none());
+            let mark = s.sessions["worker"].attention.as_ref().unwrap();
+            assert_eq!((mark.kind.as_str(), mark.since), ("assessment", report.created));
+            assert_eq!(s.open_report("worker").unwrap().id, report.id);
+            assert_eq!(s.open_report("done").unwrap().kind, "done");
+        }
+        let task = state.agent_tool("lead", "task_status", &json!({"task": "task"})).unwrap();
+        assert_eq!(task["result"], "All checks passed");
+        let inbox = state.agent_tool("lead", "read_inbox", &json!({})).unwrap();
+        let messages = inbox["messages"].as_array().unwrap();
+        for text in ["A final message", "All checks passed"] {
+            assert!(messages.iter().any(|m| m["from"]["id"] == "worker" && m["text"].as_str().is_some_and(|s| s.contains(text))), "{inbox}");
+        }
+        state.control(&json!({"op": "ack", "id": "worker", "since": report.created - 1})).unwrap();
+        assert!(lock(&state.store).open_report("worker").is_some());
+        state.control(&json!({"op": "ack", "id": "worker", "since": report.created})).unwrap();
+        let s = lock(&state.store);
+        assert!(s.open_report("worker").is_none());
+        assert!(s.board_reports().iter().any(|r| r.id == report.id));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_app_forgets_only_ended_sessions_without_open_reports() {
+        let dir = socket_test_dir("mcr-forget-ended-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut ended = BTreeSet::from(["done", "needs-human", "hidden"]);
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "forget" => {
+                        let id = req["id"].as_str().unwrap();
+                        if id == "live" { json!({"error": "The session is still running"}) }
+                        else if ended.remove(id) { json!({}) }
+                        else { json!({"error": format!("No session {id}")}) }
+                    }
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+            assert!(ended.is_empty());
+        });
+        let h = Harness::open(&dir);
+        let reports = h.update(|s| {
+            for id in ["done", "needs-human", "hidden", "live"] {
+                s.sessions.insert(id.into(), Tracked { state: "idle".into(), ..Tracked::default() });
+            }
+            s.sessions.get_mut("hidden").unwrap().supervisor = Some("live".into());
+            s.tasks.insert("task".into(), Task { id: "task".into(), session: "hidden".into(), by: "live".into(),
+                text: "Run the checks".into(), state: "completed".into(), created: 1, started: 2, finished: 3,
+                result: Some("All checks passed".into()), told: false });
+            let reports = [("done", "done"), ("needs-human", "needs_human")]
+                .map(|(id, kind)| (id, s.report(id, kind, "Open report").unwrap()));
+            for id in ["done", "needs-human", "hidden"] { s.end(id); }
+            reports
+        });
+        let forget = |id: &str| h.control(&json!({"op": "forget_ended", "id": id}));
+        assert!(forget("hidden").is_ok());
+        assert!(forget("hidden").is_ok(), "retry after an already successful forget");
+        let inbox = h.agent_tool("live", "read_inbox", &json!({})).unwrap();
+        assert!(inbox["messages"][0]["text"].as_str().unwrap().contains("All checks passed"));
+        assert!(forget("live").unwrap_err().contains("still running"));
+        for (id, report) in reports {
+            let ack = |since| h.control(&json!({"op": "ack", "id": id, "since": since})).unwrap();
+            assert!(forget(id).unwrap_err().contains("report as seen"));
+            ack(report.created - 1);
+            assert!(forget(id).unwrap_err().contains("report as seen"));
+            ack(report.created);
+            forget(id).unwrap();
+            assert!(!lock(&h.store).sessions.contains_key(id));
+            assert!(lock(&h.store).board_reports().iter().any(|r| r.id == report.id));
+        }
+        assert_eq!(lock(&h.store).sessions.keys().map(String::as_str).collect::<Vec<_>>(), ["live"]);
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_title_that_only_asks_is_not_a_name() {
         assert_eq!(title_name("[ ! ] Action Required | teob-ai", "/work/teob-ai"), "");
         assert_eq!(title_name("[ . ] Action Required", "/work/teob-ai"), "");
         assert_eq!(title_name("Action Required review | teob-ai", "/work/teob-ai"), "Action Required review");
+    }
+
+    fn rfc3339(ms: u64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms as i64).unwrap().to_rfc3339()
+    }
+
+    fn append_rows(path: &Path, rows: &[Value]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        for r in rows {
+            writeln!(f, "{r}").unwrap();
+        }
+    }
+
+    fn claude_response(id: &str, at: u64, input: u64, read: u64, written_1h: u64, output: u64) -> Value {
+        json!({"type": "assistant", "timestamp": rfc3339(at), "sessionId": "s", "message": {"id": id, "model": "claude-opus-5-5", "stop_reason": "end_turn",
+            "usage": {"input_tokens": input, "cache_read_input_tokens": read, "cache_creation_input_tokens": written_1h, "cache_creation": {"ephemeral_1h_input_tokens": written_1h}, "output_tokens": output}}})
+    }
+
+    /// MCR-149: the context figures of a hosted Claude executor come from its
+    /// transcript (responses deduplicated, read on from where the last read
+    /// stopped) and its rounds from the tasks it was given.
+    #[test]
+    fn context_figures_come_from_the_transcript_and_the_tasks() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let conversation = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{conversation}.jsonl"));
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let base = now_ms() - 3 * 3600 * 1000;
+        append_rows(&transcript, &[
+            json!({"type": "user", "timestamp": rfc3339(base), "message": {"role": "user", "content": "first task"}}),
+            claude_response("m1", base + 1_000, 10, 0, 1_000, 50),
+            // A second content block of the same response repeats its usage
+            claude_response("m1", base + 1_100, 10, 0, 1_000, 50),
+            claude_response("m2", base + 2_000_000, 5, 1_000, 200, 20),
+        ]);
+        let task = |id: &str, started: u64, finished: u64| Task { id: id.into(), session: "ex".into(), text: String::new(), state: "completed".into(), created: started, started, finished, result: None, by: String::new(), told: false };
+        h.update(|s| {
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), agent_session: Some(conversation.into()), ..Tracked::default() });
+            s.tasks.insert("t1".into(), task("t1", base - 100, base + 1_500));
+            s.tasks.insert("t2".into(), task("t2", base + 1_999_000, base + 2_100_000));
+            s.tasks.insert("t3".into(), Task { state: "queued".into(), started: 0, ..task("t3", 0, 0) });
+        });
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        assert_eq!((c["tokens"].as_u64(), c["turns"].as_u64(), c["rounds"].as_u64(), c["roundTurns"].as_u64(), c["maxRoundTurns"].as_u64()), (Some(1_205), Some(2), Some(2), Some(1), Some(1)));
+        // 10 + 2×1000 + 5×50, then 5 + 2×200 + 0.1×1000 + 5×20
+        assert_eq!(c["inputEquivalent"], 2_865);
+        assert_eq!((c["cacheTtlSeconds"].as_u64(), c["cacheTtlFrom"].as_str(), c["cacheLikelyWarm"].as_bool(), c["complete"].as_bool()), (Some(3600), Some("transcript"), Some(false), Some(true)));
+        assert!(c["lastTurnAgeSeconds"].as_u64().unwrap() > 45 * 60);
+        let why = c["freshRecommended"].as_array().unwrap();
+        assert!(why.len() == 1 && why[0].as_str().unwrap().contains("minutes ago"), "{why:?}");
+
+        // What was appended is read on, and a warm cache recommends nothing
+        append_rows(&transcript, &[claude_response("m3", now_ms() - 60_000, 5, 1_200, 0, 10)]);
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        assert_eq!((c["tokens"].as_u64(), c["turns"].as_u64(), c["roundTurns"].as_u64(), c["cacheLikelyWarm"].as_bool()), (Some(1_205), Some(3), Some(2), Some(true)));
+        assert_eq!(c["freshRecommended"], json!([]));
+
+        // A third round, a long round and a compaction each recommend a fresh one
+        h.update(|s| {
+            s.tasks.insert("t4".into(), task("t4", now_ms() - 3 * 3600 * 1000 + 3_000_000, now_ms() - 30_000));
+        });
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        let why: Vec<&str> = c["freshRecommended"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(why.iter().any(|w| w.contains("3 rounds")) && why.iter().any(|w| w.contains("minutes, over 120")), "{why:?}");
+        append_rows(&transcript, &[json!({"type": "user", "timestamp": rfc3339(now_ms()), "isCompactSummary": true, "message": {"role": "user", "content": "summary"}})]);
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        assert!(c["freshRecommended"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("compacted 1 times")));
+
+        // Not an executor: the figures without a recommendation, in an overview tree too
+        let tree = h.with_contexts(json!({"sessions": [{"id": "lead", "executors": [{"id": "ex", "executors": []}]}]}));
+        assert_eq!(tree["sessions"][0]["context"]["freshRecommended"], Value::Null);
+        assert_eq!((tree["sessions"][0]["context"]["turns"].as_u64(), tree["sessions"][0]["context"]["unattributedTurns"].as_u64()), (Some(3), Some(3)));
+        assert!(tree["sessions"][0]["executors"][0]["context"]["freshRecommended"].is_array());
+        assert!(tree["contextNote"].as_str().unwrap().contains("not a live process"));
+        // Forgotten sessions are no longer followed
+        h.update(|s| {
+            s.sessions.remove("lead");
+        });
+        h.contexts(&[]);
+        assert!(!h.contexts.follows("lead") && h.contexts.follows("ex"));
+    }
+
+    /// MCR-149: a Codex transcript is found by its thread id, a repeated
+    /// `token_count` is one response, and its cache lifetime is assumed.
+    #[test]
+    fn codex_context_figures_find_the_rollout_and_count_responses_once() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let thread = "01a209e6-e17b-7aa3-9814-00c34a8d6a48";
+        let rollout = home.join(format!(".codex/sessions/2026/11/25/rollout-2026-11-25T10-00-00-{thread}.jsonl"));
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let at = now_ms() - 10 * 60 * 1000;
+        let count = |ms: u64, last: [u64; 3], total: [u64; 3]| json!({"timestamp": rfc3339(ms), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": last[0], "cached_input_tokens": last[1], "output_tokens": last[2]},
+            "total_token_usage": {"input_tokens": total[0], "cached_input_tokens": total[1], "output_tokens": total[2]}, "model_context_window": 258_400}}});
+        append_rows(&rollout, &[
+            json!({"timestamp": rfc3339(at), "type": "session_meta", "payload": {"id": thread, "cwd": "/w", "thread_source": "user"}}),
+            count(at + 1_000, [100, 80, 10], [100, 80, 10]),
+            count(at + 1_200, [100, 80, 10], [100, 80, 10]),
+            count(at + 60_000, [200, 150, 20], [300, 230, 30]),
+        ]);
+        h.update(|s| {
+            s.sessions.insert("cx".into(), Tracked { profile: "codex".into(), state: "idle".into(), supervisor: Some("lead".into()), agent_session: Some(thread.into()), ..Tracked::default() });
+        });
+        let c = h.contexts(&["cx"]).remove("cx").unwrap();
+        assert_eq!((c["tokens"].as_u64(), c["window"].as_u64(), c["turns"].as_u64(), c["rounds"].as_u64(), c["roundTurns"].as_u64(), c["unattributedTurns"].as_u64()), (Some(200), Some(258_400), Some(2), Some(0), None, Some(2)));
+        // (300 − 230) + 0.1×230 + 8×30
+        assert_eq!(c["inputEquivalent"], 333);
+        assert_eq!((c["cacheTtlFrom"].as_str(), c["cacheLikelyWarm"].as_bool()), (Some("assumed"), Some(true)));
+    }
+
+    /// MCR-149 round 2: a lead is no executor for rules 11 and 13, by its
+    /// profile or because it leads sessions itself; turns from before its
+    /// first round (a restart, the operator typing) are in no round.
+    #[test]
+    fn leads_get_no_recommendation_and_earlier_turns_are_in_no_round() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let base = now_ms() - 3 * 3600 * 1000;
+        let ids = ["0b8c9630-d8ae-4b6f-a765-44266a0929e0", "1b8c9630-d8ae-4b6f-a765-44266a0929e0", "2b8c9630-d8ae-4b6f-a765-44266a0929e0"];
+        let path = |i: usize| home.join(format!(".claude/projects/-w/{}.jsonl", ids[i]));
+        for i in 0..3 {
+            // 70 responses before the round, one in it
+            let mut rows: Vec<Value> = (0..70).map(|n| claude_response(&format!("old{n}"), base + n * 1000, 1, 0, 0, 1)).collect();
+            rows.push(claude_response("new", base + 3_600_000, 1, 0, 0, 1));
+            append_rows(&path(i), &rows);
+        }
+        let lead_ref = crate::profiles::ProfileRef { id: "lead@claude-opus".into(), role: "lead".into(), ..Default::default() };
+        h.update(|s| {
+            let tracked = |i: usize, supervisor: &str| Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some(supervisor.into()), transcript: Some(path(i).display().to_string()), agent_session: Some(ids[i].into()), ..Tracked::default() };
+            s.sessions.insert("lead".into(), Tracked { agent_profile: Some(lead_ref.clone()), ..tracked(0, "root") });
+            s.sessions.insert("bare-lead".into(), tracked(1, "root"));
+            s.sessions.insert("ex".into(), tracked(2, "bare-lead"));
+            for (n, id) in ["lead", "bare-lead", "ex"].iter().enumerate() {
+                let task = format!("t{n}");
+                s.tasks.insert(task.clone(), Task { id: task, session: (*id).into(), text: String::new(), state: "completed".into(), created: base + 3_500_000, started: base + 3_500_000, finished: base + 3_700_000, result: None, by: String::new(), told: false });
+            }
+        });
+        let all = h.contexts(&["lead", "bare-lead", "ex"]);
+        assert_eq!(all["lead"]["freshRecommended"], Value::Null);
+        assert_eq!(all["bare-lead"]["freshRecommended"], Value::Null);
+        let ex = &all["ex"];
+        assert_eq!((ex["turns"].as_u64(), ex["unattributedTurns"].as_u64(), ex["roundTurns"].as_u64(), ex["maxRoundTurns"].as_u64()), (Some(71), Some(70), Some(1), Some(1)));
+        // Idle for long, but no round over 60 turns
+        let why: Vec<&str> = ex["freshRecommended"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(why.len() == 1 && why[0].contains("minutes ago"), "{why:?}");
+    }
+
+    /// MCR-149 review: the idle reason holds from 45 minutes on, and an
+    /// ended session is neither shown nor followed.
+    #[test]
+    fn the_idle_reason_starts_at_45_minutes_and_ended_sessions_are_not_followed() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let conversation = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{conversation}.jsonl"));
+        let at = 1_800_000_000_000;
+        append_rows(&transcript, &[claude_response("m1", at, 10, 0, 0, 1)]);
+        let root = real_root(&home, ".claude/projects").unwrap();
+        let mut f = crate::transcript_stats::Follow::new(&root, Path::new(&format!("-w/{conversation}.jsonl")), true);
+        assert!(f.read(Duration::from_secs(5)).unwrap());
+        let figures = f.stats.figures();
+        let idle = |ms: u64| context_figures(&figures, &[], true, at + ms, true, at + ms)["freshRecommended"].as_array().unwrap().len();
+        assert_eq!((idle(REUSE_IDLE_MS - 1), idle(REUSE_IDLE_MS)), (0, 1));
+
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home);
+        h.update(|s| {
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
+        });
+        assert!(h.contexts(&["ex"])["ex"]["complete"].as_bool().unwrap());
+        assert!(h.contexts.follows("ex"));
+        h.update(|s| s.sessions.get_mut("ex").unwrap().state = ENDED.into());
+        assert_eq!(h.contexts(&["ex"])["ex"], Value::Null);
+        assert!(!h.contexts.follows("ex"));
+    }
+
+    /// MCR-149 round 3: transcripts are read by the worker, never on the
+    /// request's thread, so a read that stalls cannot hold the answer past
+    /// `CONTEXT_BUDGET`. Before any read to the end there are only the rounds;
+    /// after one, its figures with `complete: false`, their age and no
+    /// recommendation either way, never figures of a part of the file.
+    #[test]
+    fn a_stalled_transcript_read_does_not_delay_the_figures() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let conversation = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{conversation}.jsonl"));
+        let base = now_ms() - 3 * 3600 * 1000;
+        append_rows(&transcript, &[claude_response("m1", base, 10, 0, 0, 1)]);
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home);
+        h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), ..Tracked::default() });
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
+        });
+        let timed = |h: &Harness| {
+            let began = Instant::now();
+            let c = h.contexts(&["ex"]).remove("ex").unwrap();
+            (c, began.elapsed())
+        };
+        let limit = CONTEXT_BUDGET + Duration::from_millis(1_000);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *h.contexts.stall.lock().unwrap() = Some(("ex".into(), rx));
+        let (c, took) = timed(&h);
+        assert!(took < limit, "the request waited {took:?} on a stalled read");
+        assert_eq!((c["complete"].as_bool(), c["rounds"].as_u64(), c["tokens"].is_null(), c["freshRecommended"].is_null()), (Some(false), Some(0), true, true));
+        drop(tx);
+
+        let (c, _) = timed(&h);
+        assert_eq!((c["complete"].as_bool(), c["tokens"].as_u64(), c["readAgeSeconds"].as_u64()), (Some(true), Some(10), Some(0)));
+        assert_eq!(c["freshRecommended"].as_array().map(Vec::len), Some(1));
+
+        append_rows(&transcript, &[claude_response("m2", now_ms(), 20, 0, 0, 1)]);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *h.contexts.stall.lock().unwrap() = Some(("ex".into(), rx));
+        let (c, took) = timed(&h);
+        assert!(took < limit, "the request waited {took:?} on a stalled read");
+        assert_eq!((c["complete"].as_bool(), c["tokens"].as_u64(), c["turns"].as_u64(), c["freshRecommended"].is_null()), (Some(false), Some(10), Some(1), true));
+        assert!(c["readAgeSeconds"].is_u64());
+        drop(tx);
+        let (c, _) = timed(&h);
+        assert_eq!((c["complete"].as_bool(), c["tokens"].as_u64(), c["turns"].as_u64()), (Some(true), Some(20), Some(2)));
+    }
+
+    /// MCR-149 round 2: a named pipe at the reported transcript path is not
+    /// opened, so no context read waits on it (it would wait for a writer).
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_reported_as_the_transcript_does_not_hang_the_figures() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let id = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let pipe = home.join(format!(".claude/projects/-w/{id}.jsonl"));
+        std::fs::create_dir_all(pipe.parent().unwrap()).unwrap();
+        let c_path = std::ffi::CString::new(pipe.display().to_string()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home);
+        h.update(|s| {
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), transcript: Some(pipe.display().to_string()), agent_session: Some(id.into()), ..Tracked::default() });
+        });
+        let h = Arc::new(h);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = h.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reader.contexts(&["ex"]).remove("ex"));
+        });
+        let c = rx.recv_timeout(Duration::from_secs(5)).expect("the figures waited on the pipe");
+        assert_eq!(c, Some(Value::Null));
+        // And the next request is not held up either
+        assert_eq!(h.contexts(&["ex"]).remove("ex"), Some(Value::Null));
+    }
+
+    /// MCR-149: a transcript is read only when it names the session's
+    /// conversation and lies inside the real location of its agent's folder:
+    /// no `..`, no symlinked folder below it, no symlinked folder for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_transcript_outside_the_agents_folder_or_of_another_conversation_is_not_read() {
+        use crate::transcript_stats::{locate, open_confined, Found, Want};
+        let home = dunce::canonicalize(state_dir(None)).unwrap();
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let id = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let other = "1b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let root = home.join(".claude/projects");
+        let inside = root.join(format!("-w/{id}.jsonl"));
+        append_rows(&inside, &[]);
+        let at = Found::At(root.clone(), PathBuf::from(format!("-w/{id}.jsonl")));
+        let want = |home: &Path, reported: Option<&str>, conversation: &str| Want { home: home.to_path_buf(), folder: ".claude/projects", depth: 1, conversation: conversation.into(), reported: reported.map(str::to_owned), claude: true };
+        let found = |reported: Option<&str>, conversation: &str| locate(&want(&home, reported, conversation), soon());
+        assert_eq!(found(Some(&inside.display().to_string()), id), at);
+        // A reported path that does not name the conversation is not taken; the conversation's own file is
+        let another = root.join(format!("-w/{other}.jsonl"));
+        append_rows(&another, &[]);
+        assert_eq!(found(Some(&another.display().to_string()), id), at);
+        assert_eq!(found(Some(&home.join(format!(".claude/projects/../../etc/{id}.jsonl")).display().to_string()), id), at);
+        assert_eq!(found(Some(&format!("/etc/{id}.jsonl")), id), at);
+        // Without a conversation nothing is read, not even a path inside
+        assert_eq!(found(Some(&inside.display().to_string()), ""), Found::Nothing);
+        assert_eq!(found(None, "../x"), Found::Nothing);
+        // A symlinked folder below the root that leads out: neither the reported path nor the walk follows it
+        let third = "2b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let elsewhere = home.join("elsewhere");
+        append_rows(&elsewhere.join(format!("{third}.jsonl")), &[]);
+        std::os::unix::fs::symlink(&elsewhere, root.join("-link")).unwrap();
+        assert_eq!(found(Some(&root.join(format!("-link/{third}.jsonl")).display().to_string()), third), Found::Nothing);
+        assert!(open_confined(&root, Path::new(&format!("-link/{third}.jsonl"))).is_err());
+        // A symlinked transcript folder is not the agent's folder
+        let codex_home = dunce::canonicalize(state_dir(None)).unwrap();
+        let real_sessions = codex_home.join("real-sessions/2026/11/25");
+        append_rows(&real_sessions.join(format!("rollout-2026-11-25T10-00-00-{id}.jsonl")), &[]);
+        std::fs::create_dir_all(codex_home.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(codex_home.join("real-sessions"), codex_home.join(".codex/sessions")).unwrap();
+        let codex = Want { folder: ".codex/sessions", depth: 3, claude: false, ..want(&codex_home, None, id) };
+        assert_eq!(locate(&codex, soon()), Found::Nothing);
+        // A walk past its deadline says so
+        assert_eq!(locate(&want(&home, None, third), Instant::now()), Found::Unfinished);
+        // A shell keeps no transcript: no figures, nothing followed
+        let dir = state_dir(None);
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        h.update(|s| {
+            s.sessions.insert("sh".into(), Tracked { profile: "shell".into(), state: "idle".into(), agent_session: Some(id.into()), ..Tracked::default() });
+        });
+        assert_eq!(h.contexts(&["sh"])["sh"], Value::Null);
+        assert!(!h.contexts.follows("sh"));
+    }
+
+    /// MCR-149 round 4: the public tools serve the subagents last found and
+    /// never wait for a lookup in the agents' files. With the subagents'
+    /// worker held inside a lookup, `whoami` and `overview` answer within the
+    /// context budget; once it goes on, the list it found is served.
+    #[test]
+    #[cfg(unix)]
+    fn a_stalled_subagent_lookup_does_not_hold_the_public_tools() {
+        let dir = socket_test_dir("mcr-sub-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dunce::canonicalize(state_dir(None)).unwrap();
+        let conversation = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{conversation}.jsonl"));
+        append_rows(&transcript, &[claude_response("m1", now_ms() - 60_000, 10, 0, 0, 1)]);
+        let agents = home.join(format!(".claude/projects/-w/{conversation}/subagents"));
+        append_rows(&agents.join("agent-a1.jsonl"), &[json!({"type": "assistant", "message": {"stop_reason": "end_turn"}})]);
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut line = String::new();
+                if BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                let answer = match req["op"].as_str() {
+                    Some("hello") => json!({"protocol": runner::PROTOCOL}),
+                    Some("list") => json!({"sessions": [{"id": "lead", "cwd": "/w", "meta": {"profile": "claude"}}]}),
+                    _ => json!({}),
+                };
+                let _ = writeln!(stream, "{answer}");
+            }
+        });
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
+        });
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *lock(&SUBAGENT_STALL) = Some((home.clone(), rx));
+        let limit = CONTEXT_BUDGET + Duration::from_millis(1_000);
+        for tool in ["whoami", "overview", "whoami"] {
+            let began = Instant::now();
+            let out = h.agent_tool("lead", tool, &json!({})).unwrap();
+            let took = began.elapsed();
+            assert!(took < limit, "{tool} waited {took:?} on a stalled subagent lookup");
+            let me = if tool == "overview" { &out["sessions"][0] } else { &out };
+            assert_eq!(me["context"]["tokens"].as_u64(), Some(10), "{tool}: {me}");
+            if tool == "whoami" {
+                assert_eq!(me["subagents"], json!([]));
+            }
+        }
+        drop(tx);
+        // The worker goes on; the list it found is what the next answers serve
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let me = h.agent_tool("lead", "whoami", &json!({})).unwrap();
+            if me["subagents"].as_array().is_some_and(|a| a.len() == 1) {
+                assert_eq!(me["subagents"][0]["id"], "a1");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the subagents were never served: {}", me["subagents"]);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MCR-149 review: a named pipe among a Claude session's subagent files
+    /// is not opened, and the session list does not wait on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_among_subagent_files_does_not_hang_the_list() {
+        let home = dunce::canonicalize(state_dir(None)).unwrap();
+        let id = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{id}.jsonl"));
+        append_rows(&transcript, &[]);
+        let dir = home.join(format!(".claude/projects/-w/{id}/subagents"));
+        append_rows(&dir.join("agent-a1.jsonl"), &[json!({"type": "assistant", "message": {"stop_reason": "end_turn"}})]);
+        for name in ["agent-a1.meta.json", "agent-p1.jsonl"] {
+            let c_path = std::ffi::CString::new(dir.join(name).display().to_string()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        }
+        // A meta file that links out of Claude's folder is not read through the confined open
+        let outside = home.join("outside.json");
+        std::fs::write(&outside, r#"{"description":"read through a link"}"#).unwrap();
+        append_rows(&dir.join("agent-a2.jsonl"), &[json!({"type": "assistant", "message": {"stop_reason": "end_turn"}})]);
+        std::os::unix::fs::symlink(&outside, dir.join("agent-a2.meta.json")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = transcript.display().to_string();
+        let h2 = home.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(subagents(&h2, &t, 0));
+        });
+        let found = rx.recv_timeout(Duration::from_secs(5)).expect("the subagents waited on a pipe");
+        let mut seen: Vec<_> = found.iter().map(|a| (a.id.as_str(), a.finished, a.description.as_str())).collect();
+        seen.sort();
+        assert_eq!(seen, [("a1", true, ""), ("a2", true, "")]);
+        // The subagents folder replaced by a link out of Claude's folder: nothing is listed or opened
+        let elsewhere = home.join("elsewhere/subagents");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        append_rows(&elsewhere.join("agent-x1.jsonl"), &[]);
+        std::fs::rename(&dir, home.join("old-subagents")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert!(subagents(&home, &transcript.display().to_string(), 0).is_empty());
     }
 }

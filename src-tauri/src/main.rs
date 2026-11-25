@@ -43,6 +43,7 @@ mod session_commands;
 mod session_db;
 mod session_memory;
 mod sessions;
+mod transcript_stats;
 
 // ============================================================
 // Types
