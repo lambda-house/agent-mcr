@@ -1870,6 +1870,131 @@ fn short_text(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
+/// What the context figures of a session say they are (MCR-149).
+const CONTEXT_NOTE: &str = "context: from the agent's transcript, its own usage records, deduplicated; times are what the files say, not a live process. cacheLikelyWarm is an estimate from the recorded cache lifetime (Codex records none: one hour is assumed). freshRecommended applies comms contract rules 11 and 13 to executors with fixed limits.";
+
+/// The limits of comms contract rules 11 and 13 that `freshRecommended`
+/// applies: reuse an executor only within 45 minutes of its last turn, for at
+/// most 3 rounds, while no round ran over 60 turns or 2 hours, and never after
+/// a compaction. Fixed until the profiles carry them (MCR-150).
+const REUSE_IDLE_MS: u64 = 45 * 60 * 1000;
+const REUSE_ROUNDS: usize = 3;
+const ROUND_TURNS: usize = 60;
+const ROUND_MS: u64 = 2 * 60 * 60 * 1000;
+
+/// Codex records no cache lifetime; its cache misses after about an hour.
+const CODEX_CACHE_MS: u64 = 60 * 60 * 1000;
+
+/// A response recorded this long before its task's start still counts for
+/// that round: the task's start and the transcript's clock can differ a little.
+const ROUND_LEAD_MS: u64 = 5_000;
+
+/// How long all transcript reading for one request may take; what is not
+/// read by then is read at the next request, and the figures say `complete: false`.
+const CONTEXT_BUDGET: Duration = Duration::from_millis(1500);
+
+/// How long a session whose transcript was not found is not looked for again.
+const TRANSCRIPT_LOOK_AGAIN: Duration = Duration::from_secs(30);
+
+/// A session's transcript as the context figures follow it: found for the
+/// conversation and reported path it was looked up with.
+struct Followed {
+    key: (Option<String>, Option<String>),
+    looked: Instant,
+    follow: Option<crate::sessions::Follow>,
+}
+
+/// What the context figures need of a session from the store.
+struct Seat {
+    profile: String,
+    transcript: Option<String>,
+    conversation: Option<String>,
+    executor: bool,
+    /// Its tasks that were started: when, and when they ended (0: still open)
+    rounds: Vec<(u64, u64)>,
+}
+
+/// The transcript of a hosted session: the path its hooks reported when it
+/// lies under its agent's transcript folder, else the file named by its
+/// conversation id. Never a path outside that folder.
+fn transcript_for(home: &Path, profile: &str, reported: Option<&str>, conversation: Option<&str>) -> Option<PathBuf> {
+    let (folder, depth) = adapter(profile).transcripts()?;
+    let root = home.join(folder);
+    let inside = |p: &Path| p.starts_with(&root) && p.extension().is_some_and(|e| e == "jsonl") && !p.components().any(|c| c == std::path::Component::ParentDir);
+    if let Some(path) = reported.map(Path::new).filter(|p| inside(p)) {
+        return Some(path.to_path_buf());
+    }
+    let suffix = format!("{}.jsonl", conversation.filter(|c| is_uuid(c))?);
+    let mut files = Vec::new();
+    jsonl_files(&root, depth, &mut files);
+    files.into_iter().find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix)))
+}
+
+/// Where a session stands for a lead's choice between reusing it and
+/// starting a fresh one (MCR-149): the context it re-reads at every turn,
+/// how long ago its last model response was recorded (the prompt cache lives
+/// that long past it), its rounds (tasks it was given) and its token use so
+/// far in input-token equivalents. `rounds` are its started tasks, in order.
+fn context_figures(f: &crate::sessions::Follow, rounds: &[(u64, u64)], executor: bool, complete: bool, now: u64) -> Value {
+    let c = f.context();
+    let claude = f.claude();
+    // Responses go to the round whose task had started when they were recorded; earlier ones to the first
+    let mut per_round = vec![0usize; rounds.len().max(1)];
+    for &at in f.turns() {
+        let round = rounds.iter().rposition(|&(start, _)| at > 0 && at + ROUND_LEAD_MS >= start).unwrap_or(0);
+        per_round[round] += 1;
+    }
+    let durations: Vec<u64> = rounds.iter().map(|&(start, end)| if end > 0 { end } else { now }.saturating_sub(start)).collect();
+    let idle = (c.cache_at > 0).then(|| now.saturating_sub(c.cache_at));
+    let (ttl, ttl_from) = match (c.cache_ttl, claude) {
+        (0, true) => (None, Value::Null),
+        (0, false) => (Some(CODEX_CACHE_MS), json!("assumed")),
+        (s, _) => (Some(s * 1000), json!("transcript")),
+    };
+    let most_turns = per_round.iter().copied().max().unwrap_or(0);
+    let longest = durations.iter().copied().max().unwrap_or(0);
+    let fresh: Value = if executor {
+        let mut why = Vec::new();
+        if rounds.len() >= REUSE_ROUNDS {
+            why.push(format!("it has run {} rounds; another would be over {REUSE_ROUNDS} (rule 11)", rounds.len()));
+        }
+        if let Some(ms) = idle.filter(|&ms| ms > REUSE_IDLE_MS) {
+            why.push(format!("its last turn was {} minutes ago, over {} (rule 11)", ms / 60_000, REUSE_IDLE_MS / 60_000));
+        }
+        if most_turns > ROUND_TURNS {
+            why.push(format!("a round ran {most_turns} turns, over {ROUND_TURNS} (rule 11)"));
+        }
+        if longest > ROUND_MS {
+            why.push(format!("a round ran {} minutes, over {} (rule 11)", longest / 60_000, ROUND_MS / 60_000));
+        }
+        if c.compactions > 0 {
+            why.push(format!("its context was compacted {} times (rule 13)", c.compactions));
+        }
+        json!(why)
+    } else {
+        Value::Null
+    };
+    json!({
+        "tokens": c.now,
+        "window": (c.window > 0).then_some(c.window),
+        "peakTokens": c.peak,
+        "compactions": c.compactions,
+        "lastTurnAgeSeconds": idle.map(|ms| ms / 1000),
+        "cacheTtlSeconds": ttl.map(|ms| ms / 1000),
+        "cacheTtlFrom": ttl_from,
+        "cacheLikelyWarm": idle.zip(ttl).map(|(idle, ttl)| idle < ttl),
+        "rounds": rounds.len(),
+        "roundTurns": per_round.last().copied().unwrap_or(0),
+        "roundAgeSeconds": durations.last().map(|ms| ms / 1000),
+        "maxRoundTurns": most_turns,
+        "maxRoundSeconds": longest / 1000,
+        "turns": f.turns().len(),
+        "inputEquivalent": f.usage().input_equivalent(claude),
+        "freshRecommended": fresh,
+        "complete": complete,
+    })
+}
+
 impl Store {
     // Matches the Board's openReports rule: one active mark, latest matching report.
     fn open_report(&self, session: &str) -> Option<&Report> {
@@ -2588,6 +2713,9 @@ pub struct Harness {
     /// (`operator_draft` says so again while the person types): kept here,
     /// not in the store, which is written only when the draft changes
     draft_words: Mutex<BTreeMap<String, u64>>,
+    /// Per session, its transcript as read so far for the context figures
+    /// (MCR-149), in memory only
+    contexts: Mutex<BTreeMap<String, Followed>>,
 }
 
 fn runner_socket(dir: &Path) -> PathBuf {
@@ -2738,7 +2866,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: Mutex::new(BTreeMap::new()) };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -4162,10 +4290,11 @@ impl Harness {
             "cockpit_publish" | "cockpit_patch" | "cockpit_read" => self.cockpit_tool(Some(me), name, args)?,
             "overview" => {
                 let sessions = self.sessions()?;
-                lock(&self.store).overview(&sessions, Some(me), now_ms())
+                let tree = lock(&self.store).overview(&sessions, Some(me), now_ms());
+                self.with_contexts(tree)
             }
             "whoami" => {
-                let mut out = Self::brief(&self.session(me)?);
+                let mut out = self.with_context(Self::brief(&self.session(me)?), me);
                 let store = lock(&self.store);
                 out["supervisor"] = json!(store.sessions.get(me).and_then(|t| t.supervisor.clone()));
                 out["executors"] = json!(store.executors(me));
@@ -5301,6 +5430,78 @@ impl Harness {
         })
     }
 
+    /// The context figures of these sessions (MCR-149), null for a session
+    /// whose agent keeps no transcript the harness can read or whose
+    /// transcript was not found. The store is not locked while files are read.
+    fn contexts(&self, ids: &[&str]) -> BTreeMap<String, Value> {
+        let (seats, known): (BTreeMap<String, Seat>, BTreeSet<String>) = {
+            let store = lock(&self.store);
+            let seats = ids.iter().filter_map(|id| {
+                let t = store.sessions.get(*id)?;
+                let mut rounds: Vec<(u64, u64)> = store.tasks.values().filter(|k| k.session == *id && k.started > 0).map(|k| (k.started, k.finished)).collect();
+                rounds.sort_unstable();
+                Some((id.to_string(), Seat { profile: t.profile.clone(), transcript: t.transcript.clone(), conversation: t.agent_session.clone(), executor: t.supervisor.is_some(), rounds }))
+            }).collect();
+            (seats, store.sessions.keys().cloned().collect())
+        };
+        let Ok(home) = self.launch_home() else { return BTreeMap::new() };
+        let began = Instant::now();
+        let now = now_ms();
+        let mut followed = lock(&self.contexts);
+        followed.retain(|id, _| known.contains(id));
+        seats.into_iter().map(|(id, seat)| {
+            let key = (seat.conversation.clone(), seat.transcript.clone());
+            let stale = followed.get(&id).is_none_or(|f| f.key != key || (f.follow.is_none() && f.looked.elapsed() >= TRANSCRIPT_LOOK_AGAIN));
+            if stale {
+                let path = transcript_for(&home, &seat.profile, seat.transcript.as_deref(), seat.conversation.as_deref());
+                let kind = if adapter(&seat.profile).id() == "codex" { "codex" } else { "claude" };
+                followed.insert(id.clone(), Followed { key, looked: Instant::now(), follow: path.map(|p| crate::sessions::Follow::new(&p, kind)) });
+            }
+            let Some(follow) = followed.get_mut(&id).and_then(|f| f.follow.as_mut()) else { return (id, Value::Null) };
+            // Once the request's time is spent, the rest show what was read before
+            let left = CONTEXT_BUDGET.saturating_sub(began.elapsed());
+            let read = if left.is_zero() { Ok(follow.caught_up()) } else { follow.read(left) };
+            let figures = match read {
+                Ok(complete) => context_figures(follow, &seat.rounds, seat.executor, complete, now),
+                Err(e) => {
+                    eprintln!("harness: context of {id}: {e}");
+                    Value::Null
+                }
+            };
+            (id, figures)
+        }).collect()
+    }
+
+    /// Adds `context` to every session of an `overview` tree.
+    fn with_contexts(&self, mut tree: Value) -> Value {
+        fn ids<'a>(nodes: &'a Value, out: &mut Vec<&'a str>) {
+            for n in nodes.as_array().into_iter().flatten() {
+                out.extend(n["id"].as_str());
+                ids(&n["executors"], out);
+            }
+        }
+        fn put(nodes: &mut Value, figures: &mut BTreeMap<String, Value>) {
+            for n in nodes.as_array_mut().into_iter().flatten() {
+                let id = n["id"].as_str().unwrap_or("").to_string();
+                n["context"] = figures.remove(&id).unwrap_or(Value::Null);
+                put(&mut n["executors"], figures);
+            }
+        }
+        let mut list = Vec::new();
+        ids(&tree["sessions"], &mut list);
+        let mut figures = self.contexts(&list);
+        put(&mut tree["sessions"], &mut figures);
+        tree["contextNote"] = json!(CONTEXT_NOTE);
+        tree
+    }
+
+    /// `out` with the context figures of the session `id`.
+    fn with_context(&self, mut out: Value, id: &str) -> Value {
+        out["context"] = self.contexts(&[id]).remove(id).unwrap_or(Value::Null);
+        out["contextNote"] = json!(CONTEXT_NOTE);
+        out
+    }
+
     fn brief(session: &Value) -> Value {
         let h = &session["harness"];
         let out = json!({
@@ -5340,13 +5541,14 @@ impl Harness {
             "profiles_list" => crate::profiles::list_tool(&self.dir, args),
             "overview" => {
                 let sessions = self.sessions()?;
-                Ok(lock(&self.store).overview(&sessions, None, now_ms()))
+                let tree = lock(&self.store).overview(&sessions, None, now_ms());
+                Ok(self.with_contexts(tree))
             }
             "session_list" => Ok(json!({ "sessions": self.sessions()?.iter().map(Self::brief).collect::<Vec<_>>() })),
             "session_status" => {
                 let s = self.session(text("session")?)?;
                 let tasks: Vec<Task> = lock(&self.store).tasks.values().filter(|t| t.session == s["id"].as_str().unwrap_or("")).cloned().collect();
-                let mut out = Self::brief(&s);
+                let mut out = self.with_context(Self::brief(&s), s["id"].as_str().unwrap_or(""));
                 out["lastMessage"] = s["harness"]["lastMessage"].clone();
                 out["tasks"] = json!(tasks);
                 Ok(out)
@@ -5836,9 +6038,9 @@ fn supervisor_tools() -> Value {
     let wait = json!({"type": "integer", "description": "How long to wait, in seconds (default 50, at most 600)"});
     let cockpit: Vec<Value> = cockpit_tools(true).into_iter().map(|(name, description, props, required, _)| tool(name, &description, props, required)).collect();
     json!({ "tools": [
-        tool("overview", "All live supervisor/executor trees, then independent sessions: state and status ages in seconds (null when unknown), open tasks, unread messages, waits, latest open report and attention.", json!({}), &[]),
+        tool("overview", "All live supervisor/executor trees, then independent sessions: state and status ages in seconds (null when unknown), open tasks, unread messages, waits, latest open report and attention. Each session's context: its context size in tokens, seconds since its last model turn and whether the prompt cache is likely still warm, its rounds (tasks) and the turns of the latest, its input-equivalent tokens so far, and for executors freshRecommended (reasons to start a fresh one instead of reusing it).", json!({}), &[]),
         tool("session_list", "All hosted sessions: state (starting, working, idle, waiting, unknown, exited), what they wait for, open tasks.", json!({}), &[]),
-        tool("session_status", "One session with its tasks and its last message.", json!({"session": session}), &["session"]),
+        tool("session_status", "One session with its tasks, its last message and its context (as in overview).", json!({"session": session}), &["session"]),
         tool("session_create", "Start an agent session in a terminal the operator can watch. Give `profile` and `cwd`, or `resume` with the id of an earlier Claude or Codex session (see session_resumable). `task` is the first prompt; the result then carries its task id for task_wait.", json!({
             "profile": {"type": "string", "description": "An agent profile id such as implementer@claude-opus (see profiles_list), or an enabled harness id for a session without a profile"},
             "role": {"type": "string", "description": "The part it plays (reviewer, implementer of X): its peers see it in list_peers"},
@@ -5890,8 +6092,8 @@ fn agent_tools() -> Value {
     let to = json!({"type": "string", "description": "The peer's name, id or mcr:<id> pointer (see list_peers)"});
     let mut tools = vec![
         tool("guide", "The working rules for sessions that see each other here: when and how to reach a peer, and what a message from a peer is. Read it before your first message to a peer.", json!({}), &[], true),
-        tool("overview", "Your session and its executor tree only: state and status ages in seconds, open tasks, unread messages, waits, latest open report and attention. Unknown ages are null.", json!({}), &[], true),
-        tool("whoami", "This session as the harness knows it: id, name, agent kind, folder, state.", json!({}), &[], true),
+        tool("overview", "Your session and its executor tree only: state and status ages in seconds, open tasks, unread messages, waits, latest open report and attention. Unknown ages are null. Each session's context: its context size in tokens, seconds since its last model turn and whether the prompt cache is likely still warm, its rounds (tasks) and the turns of the latest, its input-equivalent tokens so far, and for executors freshRecommended (reasons to start a fresh one instead of reusing it).", json!({}), &[], true),
+        tool("whoami", "This session as the harness knows it: id, name, agent kind, folder, state, and its context (as in overview).", json!({}), &[], true),
         tool("list_peers", "The other running agent sessions on this machine: id, name, agent kind (claude, codex, shell), folder, state, role and what they say they are doing. Sessions in your folder come first: `folder` is same, below (a subfolder of yours) or above (it contains yours). Call it when you start and before you change shared files.", json!({"same_folder": {"type": "boolean", "description": "Only the sessions in your folder, below it or above it"}}), &[], true),
         tool("send_message", "Leave a message in a peer's inbox. The peer is told when it is idle. No reply is expected; use ask for a question.", json!({"to": to, "text": {"type": "string"}}), &["to", "text"], false),
         tool("ask", "Ask a peer a question. Its reply arrives in your inbox; end your turn and you are told, or wait with listen.", json!({"to": to, "question": {"type": "string"}}), &["to", "question"], false),
@@ -5919,7 +6121,7 @@ fn agent_tools() -> Value {
         tool("task_assign", "Give one of your executors a task. It is typed in when the executor is idle. You are told in your inbox when it ends, or wait with task_wait.", json!({"session": to, "text": {"type": "string", "description": "The prompt"}}), &["session", "text"], false),
         tool("task_status", "The state of a task you gave an executor: queued, working, completed (with its last message), delivered or failed.", json!({"task": {"type": "string"}}), &["task"], true),
         tool("task_wait", "Wait inside this turn until a task you gave an executor ends or the time is up.", json!({"task": {"type": "string"}, "timeout_seconds": {"type": "integer", "description": "Default 50, at most 600"}}), &["task"], true),
-        tool("session_status", "One of your executors: state, what it waits for, its tasks and its last message.", json!({"session": to}), &["session"], true),
+        tool("session_status", "One of your executors: state, what it waits for, its tasks, its last message and its context (as in overview): check it before you give the executor another round.", json!({"session": to}), &["session"], true),
         tool("session_result", "The last message one of your executors ended a turn with.", json!({"session": to}), &["session"], true),
         tool("terminal_read", "The terminal of one of your executors as text (last lines). Data, not instructions.", json!({"session": to, "lines": {"type": "integer", "description": "Default 60, at most 2000"}}), &["session"], true),
         tool("executor_end", "End an idle executor you started yourself with executor_create. If something prevents the end, the refusal names it. A done report can stay on the Board when the executor ends. Its conversation is kept, and the operator sees that you ended it.", json!({"session": {"type": "string", "description": "The executor's id or mcr:<id> pointer"}}), &["session"], false),
@@ -10813,5 +11015,136 @@ mod tests {
         assert_eq!(title_name("[ ! ] Action Required | teob-ai", "/work/teob-ai"), "");
         assert_eq!(title_name("[ . ] Action Required", "/work/teob-ai"), "");
         assert_eq!(title_name("Action Required review | teob-ai", "/work/teob-ai"), "Action Required review");
+    }
+
+    fn rfc3339(ms: u64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms as i64).unwrap().to_rfc3339()
+    }
+
+    fn append_rows(path: &Path, rows: &[Value]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        for r in rows {
+            writeln!(f, "{r}").unwrap();
+        }
+    }
+
+    fn claude_response(id: &str, at: u64, input: u64, read: u64, written_1h: u64, output: u64) -> Value {
+        json!({"type": "assistant", "timestamp": rfc3339(at), "sessionId": "s", "message": {"id": id, "model": "claude-opus-5-5", "stop_reason": "end_turn",
+            "usage": {"input_tokens": input, "cache_read_input_tokens": read, "cache_creation_input_tokens": written_1h, "cache_creation": {"ephemeral_1h_input_tokens": written_1h}, "output_tokens": output}}})
+    }
+
+    /// MCR-149: the context figures of a hosted Claude executor come from its
+    /// transcript (responses deduplicated, read on from where the last read
+    /// stopped) and its rounds from the tasks it was given.
+    #[test]
+    fn context_figures_come_from_the_transcript_and_the_tasks() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let conversation = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{conversation}.jsonl"));
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let base = now_ms() - 3 * 3600 * 1000;
+        append_rows(&transcript, &[
+            json!({"type": "user", "timestamp": rfc3339(base), "message": {"role": "user", "content": "first task"}}),
+            claude_response("m1", base + 1_000, 10, 0, 1_000, 50),
+            // A second content block of the same response repeats its usage
+            claude_response("m1", base + 1_100, 10, 0, 1_000, 50),
+            claude_response("m2", base + 2_000_000, 5, 1_000, 200, 20),
+        ]);
+        let task = |id: &str, started: u64, finished: u64| Task { id: id.into(), session: "ex".into(), text: String::new(), state: "completed".into(), created: started, started, finished, result: None, by: String::new(), told: false };
+        h.update(|s| {
+            s.sessions.insert("ex".into(), Tracked { profile: "claude".into(), state: "idle".into(), supervisor: Some("lead".into()), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), agent_session: Some(conversation.into()), ..Tracked::default() });
+            s.tasks.insert("t1".into(), task("t1", base - 100, base + 1_500));
+            s.tasks.insert("t2".into(), task("t2", base + 1_999_000, base + 2_100_000));
+            s.tasks.insert("t3".into(), Task { state: "queued".into(), started: 0, ..task("t3", 0, 0) });
+        });
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        assert_eq!((c["tokens"].as_u64(), c["turns"].as_u64(), c["rounds"].as_u64(), c["roundTurns"].as_u64(), c["maxRoundTurns"].as_u64()), (Some(1_205), Some(2), Some(2), Some(1), Some(1)));
+        // 10 + 2×1000 + 5×50, then 5 + 2×200 + 0.1×1000 + 5×20
+        assert_eq!(c["inputEquivalent"], 2_865);
+        assert_eq!((c["cacheTtlSeconds"].as_u64(), c["cacheTtlFrom"].as_str(), c["cacheLikelyWarm"].as_bool(), c["complete"].as_bool()), (Some(3600), Some("transcript"), Some(false), Some(true)));
+        assert!(c["lastTurnAgeSeconds"].as_u64().unwrap() > 45 * 60);
+        let why = c["freshRecommended"].as_array().unwrap();
+        assert!(why.len() == 1 && why[0].as_str().unwrap().contains("minutes ago"), "{why:?}");
+
+        // What was appended is read on, and a warm cache recommends nothing
+        append_rows(&transcript, &[claude_response("m3", now_ms() - 60_000, 5, 1_200, 0, 10)]);
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        assert_eq!((c["tokens"].as_u64(), c["turns"].as_u64(), c["roundTurns"].as_u64(), c["cacheLikelyWarm"].as_bool()), (Some(1_205), Some(3), Some(2), Some(true)));
+        assert_eq!(c["freshRecommended"], json!([]));
+
+        // A third round, a long round and a compaction each recommend a fresh one
+        h.update(|s| {
+            s.tasks.insert("t4".into(), task("t4", now_ms() - 3 * 3600 * 1000 + 3_000_000, now_ms() - 30_000));
+        });
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        let why: Vec<&str> = c["freshRecommended"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(why.iter().any(|w| w.contains("3 rounds")) && why.iter().any(|w| w.contains("minutes, over 120")), "{why:?}");
+        append_rows(&transcript, &[json!({"type": "user", "timestamp": rfc3339(now_ms()), "isCompactSummary": true, "message": {"role": "user", "content": "summary"}})]);
+        let c = h.contexts(&["ex"]).remove("ex").unwrap();
+        assert!(c["freshRecommended"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("compacted 1 times")));
+
+        // Not an executor: the figures without a recommendation, in an overview tree too
+        let tree = h.with_contexts(json!({"sessions": [{"id": "lead", "executors": [{"id": "ex", "executors": []}]}]}));
+        assert_eq!(tree["sessions"][0]["context"]["freshRecommended"], Value::Null);
+        assert_eq!(tree["sessions"][0]["context"]["turns"], 3);
+        assert!(tree["sessions"][0]["executors"][0]["context"]["freshRecommended"].is_array());
+        assert!(tree["contextNote"].as_str().unwrap().contains("not a live process"));
+        // Forgotten sessions are no longer followed
+        h.update(|s| {
+            s.sessions.remove("lead");
+        });
+        h.contexts(&[]);
+        assert!(!lock(&h.contexts).contains_key("lead"));
+    }
+
+    /// MCR-149: a Codex transcript is found by its thread id, a repeated
+    /// `token_count` is one response, and its cache lifetime is assumed.
+    #[test]
+    fn codex_context_figures_find_the_rollout_and_count_responses_once() {
+        let dir = state_dir(None);
+        let home = dir.join("home");
+        let thread = "01a209e6-e17b-7aa3-9814-00c34a8d6a48";
+        let rollout = home.join(format!(".codex/sessions/2026/11/25/rollout-2026-11-25T10-00-00-{thread}.jsonl"));
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        let at = now_ms() - 10 * 60 * 1000;
+        let count = |ms: u64, last: [u64; 3], total: [u64; 3]| json!({"timestamp": rfc3339(ms), "type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": last[0], "cached_input_tokens": last[1], "output_tokens": last[2]},
+            "total_token_usage": {"input_tokens": total[0], "cached_input_tokens": total[1], "output_tokens": total[2]}, "model_context_window": 258_400}}});
+        append_rows(&rollout, &[
+            json!({"timestamp": rfc3339(at), "type": "session_meta", "payload": {"id": thread, "cwd": "/w", "thread_source": "user"}}),
+            count(at + 1_000, [100, 80, 10], [100, 80, 10]),
+            count(at + 1_200, [100, 80, 10], [100, 80, 10]),
+            count(at + 60_000, [200, 150, 20], [300, 230, 30]),
+        ]);
+        h.update(|s| {
+            s.sessions.insert("cx".into(), Tracked { profile: "codex".into(), state: "idle".into(), supervisor: Some("lead".into()), agent_session: Some(thread.into()), ..Tracked::default() });
+        });
+        let c = h.contexts(&["cx"]).remove("cx").unwrap();
+        assert_eq!((c["tokens"].as_u64(), c["window"].as_u64(), c["turns"].as_u64(), c["rounds"].as_u64(), c["roundTurns"].as_u64()), (Some(200), Some(258_400), Some(2), Some(0), Some(2)));
+        // (300 − 230) + 0.1×230 + 8×30
+        assert_eq!(c["inputEquivalent"], 333);
+        assert_eq!((c["cacheTtlFrom"].as_str(), c["cacheLikelyWarm"].as_bool()), (Some("assumed"), Some(true)));
+    }
+
+    /// MCR-149: only a file under the agent's own transcript folder is read.
+    #[test]
+    fn a_reported_transcript_outside_the_agents_folder_is_not_read() {
+        let home = state_dir(None);
+        let id = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let inside = home.join(format!(".claude/projects/-w/{id}.jsonl"));
+        append_rows(&inside, &[]);
+        assert_eq!(transcript_for(&home, "claude", Some(&inside.display().to_string()), None), Some(inside.clone()));
+        let escape = home.join(".claude/projects/../../etc/x.jsonl").display().to_string();
+        assert_eq!(transcript_for(&home, "claude", Some(&escape), None), None);
+        assert_eq!(transcript_for(&home, "claude", Some("/etc/passwd"), None), None);
+        // Not trusted, the reported path gives way to the conversation's own file
+        assert_eq!(transcript_for(&home, "claude", Some("/etc/x.jsonl"), Some(id)), Some(inside));
+        assert_eq!(transcript_for(&home, "claude", None, Some("../x")), None);
+        assert_eq!(transcript_for(&home, "shell", None, Some(id)), None);
     }
 }

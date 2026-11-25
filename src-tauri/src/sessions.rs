@@ -23,8 +23,35 @@ pub struct Usage {
     pub cache_write: u64,
     pub output: u64,
     pub reasoning: u64,
+    /// The part of `cache_write` written for one hour (Claude records 5
+    /// minutes or 1 hour per request; Codex records no writes). Read by the
+    /// harness's own transcript reading (`Follow`); checkpoints the app stored
+    /// before it existed carry 0
+    #[serde(default)]
+    pub cache_write_1h: u64,
 }
+/// List-price ratios of what a token costs against an uncached input token,
+/// as the token study of MCR-149 counted them (input-token equivalents)
+const CLAUDE_EQ: (f64, f64, f64, f64) = (1.25, 2.0, 0.1, 5.0);
+const CODEX_EQ: (f64, f64) = (0.1, 8.0);
 impl Usage {
+    /// Input-token equivalents: Claude uncached input 1, cache write 1.25
+    /// (5 minutes) or 2 (1 hour), cache read 0.1, output 5; Codex uncached
+    /// input 1, cached input 0.1, output 8. Cache reads and writes are parts
+    /// of `input`, and reasoning is part of `output`: neither is added again
+    pub fn input_equivalent(&self, claude: bool) -> u64 {
+        let f = |n: u64| n as f64;
+        let eq = if claude {
+            let (w5m, w1h, read, out) = CLAUDE_EQ;
+            let hour = self.cache_write_1h.min(self.cache_write);
+            let uncached = self.input.saturating_sub(self.cached).saturating_sub(self.cache_write);
+            f(uncached) + w5m * f(self.cache_write - hour) + w1h * f(hour) + read * f(self.cached) + out * f(self.output)
+        } else {
+            let (read, out) = CODEX_EQ;
+            f(self.input.saturating_sub(self.cached)) + read * f(self.cached) + out * f(self.output)
+        };
+        eq.round() as u64
+    }
     fn from(v: &Value, claude: bool) -> Self {
         let n = |k: &str| v[k].as_u64().unwrap_or(0);
         let cached = n(if claude {
@@ -49,6 +76,7 @@ impl Usage {
             } else {
                 n("reasoning_output_tokens")
             },
+            cache_write_1h: if claude { v["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0) } else { 0 },
         }
     }
     fn add(&mut self, v: &Self) {
@@ -57,6 +85,7 @@ impl Usage {
         self.cache_write += v.cache_write;
         self.output += v.output;
         self.reasoning += v.reasoning;
+        self.cache_write_1h += v.cache_write_1h;
     }
     fn delta(&self, old: &Self) -> Self {
         Self {
@@ -65,6 +94,7 @@ impl Usage {
             cache_write: self.cache_write.saturating_sub(old.cache_write),
             output: self.output.saturating_sub(old.output),
             reasoning: self.reasoning.saturating_sub(old.reasoning),
+            cache_write_1h: self.cache_write_1h.saturating_sub(old.cache_write_1h),
         }
     }
 }
@@ -389,6 +419,14 @@ struct Indexed {
     /// The event tail and parser maps are in the persisted checkpoint.
     #[serde(skip)]
     parked: bool,
+    /// When each model response was recorded (ms), for the harness's own
+    /// reading only (`Follow`); `None` in the index, which keeps no such list
+    #[serde(skip)]
+    turns: Option<Vec<u64>>,
+    /// The last Codex `last_token_usage` counted as a response: Codex can
+    /// repeat it in the next `token_count`
+    #[serde(skip)]
+    last_turn: (u64, u64, u64),
 }
 impl Indexed {
     fn new(path: &Path, provider: &str) -> Self {
@@ -442,6 +480,23 @@ impl Indexed {
             reset: false,
             dirty: false,
             parked: false,
+            turns: None,
+            last_turn: (0, 0, 0),
+        }
+    }
+    /// Starts the transcript over (it was replaced, cut or parsed by another
+    /// version), still listing response times when it did
+    fn restart(&mut self, path: &Path) {
+        let follow = self.turns.is_some();
+        *self = Self::new(path, &self.session.provider);
+        if follow {
+            self.turns = Some(Vec::new());
+        }
+        self.reset = true;
+    }
+    fn turn(&mut self, at: u64) {
+        if let Some(turns) = &mut self.turns {
+            turns.push(at);
         }
     }
     fn usage(&mut self, key: String, usage: Usage, model: String) {
@@ -483,6 +538,13 @@ impl Indexed {
                 }
                 let last = &info["last_token_usage"];
                 let input = last["input_tokens"].as_u64().unwrap_or(0);
+                if last.is_object() {
+                    let seen = (input, last["cached_input_tokens"].as_u64().unwrap_or(0), last["output_tokens"].as_u64().unwrap_or(0));
+                    if seen != self.last_turn {
+                        self.last_turn = seen;
+                        self.turn(millis(at));
+                    }
+                }
                 self.session.context.response(input);
                 if input > 0 {
                     let cached = last["cached_input_tokens"].as_u64().unwrap_or(0);
@@ -672,7 +734,12 @@ impl Indexed {
                             };
                             self.session.context.cache_response(millis(at), ttl, usage.cached, usage.input.saturating_sub(usage.cached));
                         }
-                        self.usage(strv(m, "id"), usage, model);
+                        let key = strv(m, "id");
+                        // Claude Code writes a row per content block of a response, with its usage
+                        if !self.records.contains_key(&key) {
+                            self.turn(millis(at));
+                        }
+                        self.usage(key, usage, model);
                     }
                 }
                 self.session.status = if m["stop_reason"].as_str() == Some("end_turn") {
@@ -753,8 +820,7 @@ impl Indexed {
 
     fn read(&mut self, path: &Path, db: Option<&mut Database>) -> Result<u64, String> {
         if self.parser_version != PARSER_VERSION {
-            *self = Self::new(path, &self.session.provider);
-            self.reset = true;
+            self.restart(path);
         }
         if fs::symlink_metadata(path)
             .map_err(|e| e.to_string())?
@@ -798,8 +864,7 @@ impl Indexed {
             || anchors_changed
             || (meta.len() == self.offset && self.modified != modified)
         {
-            *self = Self::new(path, &self.session.provider);
-            self.reset = true;
+            self.restart(path);
         } else if self.parked {
             // An unchanged transcript returned above. An append needs its exact
             // deduplication state and event tail, so reload just this checkpoint.
@@ -866,6 +931,54 @@ impl Indexed {
         self.prefix_hash = prefix;
         self.tail_hash = tail;
         Ok(self.offset - initial_offset)
+    }
+}
+/// One hosted session's transcript, read by the harness service (MCR-149)
+/// with the index's own parser and usage deduplication, in memory only and
+/// without the database. No text is kept: the events go after every read.
+/// What it tells is what the files say, not a live process.
+pub struct Follow {
+    indexed: Indexed,
+    path: PathBuf,
+}
+impl Follow {
+    /// `provider` is `claude` or `codex`
+    pub fn new(path: &Path, provider: &str) -> Self {
+        let mut indexed = Indexed::new(path, provider);
+        indexed.turns = Some(Vec::new());
+        Self { indexed, path: path.to_path_buf() }
+    }
+    pub fn claude(&self) -> bool {
+        self.indexed.session.provider != "codex"
+    }
+    /// Reads what was appended since the last read, for about `budget` at
+    /// most; true once it has read up to the last whole record
+    pub fn read(&mut self, budget: std::time::Duration) -> Result<bool, String> {
+        let began = std::time::Instant::now();
+        loop {
+            let read = self.indexed.read(&self.path, None);
+            self.indexed.session.events.clear();
+            self.indexed.session.pending_events.clear();
+            read?;
+            if self.indexed.caught_up || began.elapsed() >= budget {
+                return Ok(self.indexed.caught_up);
+            }
+        }
+    }
+    /// It was read up to the last whole record the last time
+    pub fn caught_up(&self) -> bool {
+        self.indexed.caught_up
+    }
+    pub fn context(&self) -> &Context {
+        &self.indexed.session.context
+    }
+    /// All model responses, subagents in the same transcript included, deduplicated
+    pub fn usage(&self) -> &Usage {
+        &self.indexed.session.usage
+    }
+    /// When each model response was recorded (ms), in transcript order
+    pub fn turns(&self) -> &[u64] {
+        self.indexed.turns.as_deref().unwrap_or(&[])
     }
 }
 fn recorded_exit(text: &str) -> Option<i64> {
