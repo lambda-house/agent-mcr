@@ -271,15 +271,28 @@ fn launch_for(l: &Launch) -> Result<(Vec<String>, BTreeMap<String, String>), Str
 /// version managers the user has in Terminal.
 #[cfg(unix)]
 pub fn argv_for(l: &Launch) -> Result<Vec<String>, String> {
-    let cmd = command_line(l)?;
+    Ok(login_argv(command_line(l)?))
+}
+
+/// A command line run as a session's is: in the login shell, `-l -i -c`
+#[cfg(unix)]
+fn login_argv(cmd: String) -> Vec<String> {
     let mut shell = login_shell();
     // The command line is quoted for a POSIX shell; fish and others read quotes differently
     let posix = ["sh", "bash", "zsh", "dash", "ksh"].contains(&Path::new(&shell).file_name().and_then(|n| n.to_str()).unwrap_or(""));
     if !cmd.is_empty() && !posix {
         shell = if Path::new("/bin/zsh").is_file() { "/bin/zsh" } else { "/bin/sh" }.into();
     }
-    Ok(if cmd.is_empty() { vec![shell, "-l".into()] } else { vec![shell, "-l".into(), "-i".into(), "-c".into(), cmd] })
+    if cmd.is_empty() { vec![shell, "-l".into()] } else { vec![shell, "-l".into(), "-i".into(), "-c".into(), cmd] }
 }
+
+/// What the Codex socket check gives a launch (MCR-162): ports or not, with
+/// the fixed reason for none; or the fixed reason for refusing the profile,
+/// with whether the plain line was then shown to have no network
+type SocketsVerdict = Result<(bool, Option<&'static str>), (&'static str, bool)>;
+
+#[cfg(test)]
+type SocketsCheck = Box<dyn Fn() -> SocketsVerdict + Send>;
 
 /// Claude hook command string for the current platform.
 pub fn claude_hook_command(exe: &str, event: &str, windows: bool) -> String {
@@ -2893,6 +2906,15 @@ pub struct Harness {
     typed: Mutex<Option<Vec<(String, String)>>>,
     #[cfg(test)]
     launch_home: Option<PathBuf>,
+    /// The Codex socket check for tests, in place of running Codex: None
+    /// refuses, as no test may run the real one
+    #[cfg(test)]
+    sockets_check: Mutex<Option<SocketsCheck>>,
+    /// The system a launch decides the Codex socket profile for, in place of
+    /// this one's (`launch_os`), so the tests of another system's line run
+    /// here too
+    #[cfg(test)]
+    launch_os: Option<&'static str>,
     /// Cockpit entries whose publisher was told that they are behind (`tell_outdated`)
     outdated_told: Mutex<BTreeSet<ToldOutdated>>,
     dir: PathBuf,
@@ -3083,7 +3105,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -3502,6 +3524,40 @@ impl Harness {
         Ok(())
     }
 
+    /// Runs `codex_sockets::check` for a Codex launch in `dir`, with the
+    /// variables its terminal will have (MCR-162)
+    fn codex_sockets_check(&self, exe: &str, dir: &Path, env: &[(String, String)]) -> SocketsVerdict {
+        #[cfg(test)]
+        {
+            let _ = (exe, dir, env);
+            match &*lock(&self.sockets_check) {
+                Some(check) => check(),
+                None => Err(("not checked in tests", false)),
+            }
+        }
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            let nonce = runner::random_id()[..16].to_string();
+            let mut all: Vec<(String, String)> = runner::pty_env().into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+            all.extend(env.iter().cloned());
+            crate::codex_sockets::check(login_argv, exe, dir, &all, &nonce).map(|grant| (grant.ports, grant.no_ports)).map_err(|r| (r.why, r.off_checked))
+        }
+        #[cfg(all(not(target_os = "macos"), not(test)))]
+        {
+            let _ = (exe, dir, env);
+            Err(("not on this system", false))
+        }
+    }
+
+    /// The system whose Codex line a launch decides (MCR-162)
+    fn launch_os(&self) -> &'static str {
+        #[cfg(test)]
+        if let Some(os) = self.launch_os {
+            return os;
+        }
+        std::env::consts::OS
+    }
+
     fn launch_home(&self) -> Result<PathBuf, String> {
         #[cfg(test)]
         if let Some(home) = &self.launch_home {
@@ -3622,7 +3678,46 @@ impl Harness {
                 }
             }
         }
-        let auto_mode::RootMatch { root, mut rejected } = auto_mode::matching_root(&self.dir, &home, &dir, &profile, supervisor)?;
+        // Codex reads the roots only where a root could change its line
+        // (MCR-162 review 17269 P3): an unreadable auto-mode.json never stops
+        // a Codex launch, it only keeps the plain line, and says so
+        let codex_could = Launch { profile: &profile, supervisor, agent: chosen.as_ref().map(|c| &c.profile), ..Default::default() }.codex_could_take_sockets(self.launch_os());
+        let (root, mut rejected) = match profile.as_str() {
+            "codex" if !codex_could => (None, Vec::new()),
+            "codex" => match auto_mode::matching_root(&self.dir, &home, &dir, &profile, supervisor) {
+                Ok(m) => (m.root, m.rejected),
+                Err(e) => {
+                    let note = format!("auto-mode roots not used: {e}");
+                    eprintln!("harness: {note}");
+                    (None, vec![note])
+                }
+            },
+            _ => {
+                let m = auto_mode::matching_root(&self.dir, &home, &dir, &profile, supervisor)?;
+                (m.root, m.rejected)
+            }
+        };
+        // The socket profile only after Codex itself showed its policy for
+        // this folder (review 17269 P1); decided here, before a restart hangs
+        // up the session it replaces
+        // The session's id and its own variables are chosen first, so the
+        // check runs with what the session's terminal will have
+        let id = runner::random_id()[..12].to_string();
+        let own_env = [
+            ("AGENT_MCR_PROFILE".to_string(), profile.clone()),
+            ("AGENT_MCR_SESSION".to_string(), id.clone()),
+            ("AGENT_MCR_HARNESS".to_string(), socket(&self.dir).display().to_string()),
+        ];
+        let (sockets_refused, codex_ports, ports_refused, network_off_checked) = match &root {
+            Some(_) if codex_could => match self.codex_sockets_check(&exe, &dir, &own_env) {
+                Ok((ports, why)) => (None, ports, why, false),
+                Err((why, off)) => (Some(why), false, None, off),
+            },
+            _ => (None, false, None, false),
+        };
+        if let Some(reason) = sockets_refused {
+            eprintln!("harness: Codex unix sockets refused in {}: {reason}", dir.display());
+        }
         let launch = Launch {
             supervisor,
             plugin: &plugin.display().to_string(),
@@ -3637,7 +3732,11 @@ impl Harness {
             task: if cfg!(windows) { None } else { task },
             own_hooks: lock(&self.store).codex_hooks,
             agent: chosen.as_ref().map(|c| &c.profile),
-            claude_auto_root: root.as_deref(),
+            auto_root: root.as_deref(),
+            sockets_refused,
+            codex_ports,
+            ports_refused,
+            network_off_checked,
         };
         let (argv, mut spawn_env) = launch_for(&launch)?;
         // The text launched is kept, so a restart starts the same version (L5)
@@ -3660,10 +3759,7 @@ impl Harness {
             // separate turn before the supervisor has assigned its next task.
             spawn_env.insert("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(), "false".into());
         }
-        spawn_env.insert("AGENT_MCR_PROFILE".into(), profile.clone());
-        let id = runner::random_id()[..12].to_string();
-        spawn_env.insert("AGENT_MCR_SESSION".into(), id.clone());
-        spawn_env.insert("AGENT_MCR_HARNESS".into(), socket(&self.dir).display().to_string());
+        spawn_env.extend(own_env);
         let name: String = req["name"].as_str().unwrap_or("").trim().chars().filter(|c| !c.is_control()).take(80).collect();
         let mut meta = json!({ "profile": profile, "label": label });
         if !name.is_empty() {
@@ -6744,8 +6840,7 @@ mod tests {
     /// A folder for a test that listens on a socket in it: `/tmp` on Unix, where
     /// the macOS temp folder would make the path too long for `sun_path`.
     fn socket_test_dir(prefix: &str) -> PathBuf {
-        let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
-        base.join(format!("{prefix}{}", runner::random_id()))
+        crate::ipc::test_socket_dir(&format!("{prefix}{}", runner::random_id()))
     }
 
     /// MCR-129: a bridge that connected while the service could not tell who
@@ -7815,7 +7910,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn auto_mode_trusts_promoted_claude_sessions_before_spawn() {
-        let fixture = tempfile::Builder::new().prefix("mcr152-").tempdir_in("/tmp").unwrap();
+        let fixture = tempfile::Builder::new().prefix("mcr152-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let dir = dunce::canonicalize(fixture.path()).unwrap();
         let home = dir.join("home");
         let work = home.join("work");
@@ -7926,7 +8021,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn auto_mode_prepares_trust_before_hangup_and_fresh_create_can_fall_back() {
-        let fixture = tempfile::Builder::new().prefix("mcr152-r-").tempdir_in("/tmp").unwrap();
+        let fixture = tempfile::Builder::new().prefix("mcr152-r-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let dir = dunce::canonicalize(fixture.path()).unwrap();
         let home = dir.join("home");
         let cwd = home.join("work");
@@ -7999,6 +8094,259 @@ mod tests {
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
         server.join().unwrap();
+    }
+
+    /// A fake runner for the MCR-162 tests: records spawns, and the order of
+    /// spawns and hangups in `events`, which the socket check writes to too.
+    /// Unix only, as the two tests that use it (they run on Linux too)
+    #[cfg(unix)]
+    fn codex_root_runner(dir: &Path, events: Arc<Mutex<Vec<String>>>) -> (Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<()>) {
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let spawned = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen = spawned.clone();
+        let server = std::thread::spawn(move || {
+            let mut sessions = BTreeMap::<String, Value>::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "list" => json!({"sessions": sessions.values().collect::<Vec<_>>()}),
+                    "spawn" => {
+                        lock(&events).push(format!("spawn {}", req["id"].as_str().unwrap()));
+                        lock(&seen).push(req.clone());
+                        sessions.insert(req["id"].as_str().unwrap().into(), req);
+                        json!({})
+                    }
+                    "signal" => {
+                        lock(&events).push(format!("signal {}", req["id"].as_str().unwrap()));
+                        sessions.get_mut(req["id"].as_str().unwrap()).unwrap()["exit"] = json!(0);
+                        json!({})
+                    }
+                    "forget" => {
+                        sessions.remove(req["id"].as_str().unwrap());
+                        json!({})
+                    }
+                    "write" => json!({}),
+                    "snapshot" => json!({"data": ""}),
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+        });
+        (spawned, server)
+    }
+
+    #[cfg(unix)]
+    fn stop_test_runner(dir: &Path, server: std::thread::JoinHandle<()>) {
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+    }
+
+    /// MCR-162: a Codex session under an auto-mode root gets Unix sockets in
+    /// place of plain workspace-write, as a profile launch, a bare launch, an
+    /// executor and after a restart, once the launch check passed; whoami,
+    /// executor_create and overview say so. Outside the root, and on a system
+    /// other than macOS, the line is today's and nothing is checked. When the
+    /// check refuses (review 17269 P1), the session starts with plain
+    /// workspace-write and effectiveMode gives the reason; a restart decides
+    /// that before it hangs up the session it replaces.
+    #[test]
+    #[cfg(unix)]
+    fn codex_under_a_root_gets_unix_sockets_only_after_the_check() {
+        // Linux on every host (review 17295 P2: its line was checked on Linux
+        // alone), then this host's own system
+        codex_under_a_root_on(Some("linux"));
+        codex_under_a_root_on(None);
+    }
+
+    #[cfg(unix)]
+    fn codex_under_a_root_on(os: Option<&'static str>) {
+        let fixture = tempfile::Builder::new().prefix("mcr162-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
+        let dir = dunce::canonicalize(fixture.path()).unwrap();
+        let home = dir.join("home");
+        let work = home.join("work");
+        let worktree = work.join("wt/new");
+        let elsewhere = home.join("elsewhere");
+        for cwd in [&worktree, &elsewhere, &work.join("repo")] {
+            std::fs::create_dir_all(cwd).unwrap();
+        }
+        std::fs::write(dir.join("auto-mode.json"), br#"{"roots":["~/work"]}"#).unwrap();
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (spawned, server) = codex_root_runner(&dir, events.clone());
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        h.launch_os = os;
+        let verdict: Arc<Mutex<SocketsVerdict>> = Arc::new(Mutex::new(Ok((true, None))));
+        let (told, answer) = (events.clone(), verdict.clone());
+        *lock(&h.sockets_check) = Some(Box::new(move || {
+            lock(&told).push("check".into());
+            *lock(&answer)
+        }));
+        let checks = || lock(&events).iter().filter(|e| *e == "check").count();
+        let macos = h.launch_os() == crate::agents::CODEX_SOCKETS_OS;
+        // Elsewhere the roots are not read for Codex, so no root is named
+        let under = if macos { "workspace-write + unix sockets + ports (root ~/work, macOS firewall on at launch)" } else { "workspace-write (profile)" };
+        let under_bare = if macos { under } else { "workspace-write (adapter default)" };
+
+        let lead = h.tool("session_create", &json!({"profile": "lead@codex", "cwd": "~/work"})).unwrap();
+        let lead_id = lead["id"].as_str().unwrap().to_string();
+        assert_eq!(lead["effectiveMode"], under);
+        let executor = h.agent_tool(&lead_id, "executor_create", &json!({"profile": "implementer@codex", "cwd": worktree})).unwrap();
+        assert_eq!(executor["effectiveMode"], under);
+        let executor_id = executor["id"].as_str().unwrap().to_string();
+        let me = h.agent_tool(&executor_id, "whoami", &json!({})).unwrap();
+        assert_eq!(me["effectiveMode"], under);
+        let overview = h.agent_tool(&lead_id, "overview", &json!({})).unwrap();
+        assert_eq!(overview["sessions"][0]["executors"][0]["effectiveMode"], under);
+        let bare = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
+        assert_eq!(bare["effectiveMode"], under_bare);
+        assert_eq!(checks(), if macos { 3 } else { 0 });
+        let outside = h.tool("session_create", &json!({"profile": "codex", "cwd": elsewhere})).unwrap();
+        assert_eq!(outside["effectiveMode"], "workspace-write (adapter default)");
+        let outside_profile = h.tool("session_create", &json!({"profile": "implementer@codex", "cwd": elsewhere})).unwrap();
+        assert_eq!(outside_profile["effectiveMode"], "workspace-write (profile)");
+        let claude = h.tool("session_create", &json!({"profile": "implementer@claude-opus", "cwd": worktree})).unwrap();
+        assert!(claude["effectiveMode"].as_str().unwrap().starts_with("auto (root ~/work"), "{claude}");
+        assert_eq!(checks(), if macos { 3 } else { 0 }, "outside a root and for Claude nothing is checked");
+        let replacement = h.tool("session_restart", &json!({"session": executor_id, "force": true})).unwrap();
+        assert_eq!(replacement["replaced"], executor_id.as_str());
+        assert_eq!(replacement["effectiveMode"], under);
+        let replacement_id = replacement["id"].as_str().unwrap().to_string();
+
+        // The firewall is off: Unix sockets without ports, said with the reason
+        *lock(&verdict) = Ok((false, Some("the macOS firewall is off")));
+        let no_ports = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
+        let sockets_only = if macos { "workspace-write + unix sockets (root ~/work, no ports: the macOS firewall is off)" } else { under_bare };
+        assert_eq!(no_ports["effectiveMode"], sockets_only);
+
+        // The check refuses and then shows the plain line has no network
+        let reason = "Codex's managed network proxy is not running";
+        *lock(&verdict) = Err((reason, true));
+        let refused = if macos { format!("workspace-write (root ~/work, network off (checked), unix sockets refused: {reason})") } else { under_bare.to_string() };
+        let fallback = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
+        assert_eq!(fallback["effectiveMode"], refused.as_str());
+        // A restart decides before it hangs up, and still restarts
+        let before = lock(&events).len();
+        // The plain line could not be shown to be off: said so, and the line
+        // keeps its explicit network_access=false; a restart decides that too
+        // before it hangs up
+        *lock(&verdict) = Err((reason, false));
+        let unchecked = if macos { format!("workspace-write (root ~/work, network not checked: Codex's managed policy applies, unix sockets refused: {reason})") } else { under.to_string() };
+        let restarted = h.tool("session_restart", &json!({"session": replacement_id, "force": true})).unwrap();
+        assert_eq!(restarted["effectiveMode"], unchecked.as_str());
+        let order: Vec<String> = lock(&events)[before..].to_vec();
+        let at = |prefix: &str| order.iter().position(|e| e.starts_with(prefix));
+        assert!(at(&format!("signal {replacement_id}")).is_some(), "{order:?}");
+        if macos {
+            assert!(at("check") < at(&format!("signal {replacement_id}")), "{order:?}");
+        } else {
+            assert_eq!(at("check"), None);
+        }
+
+        let spawned = lock(&spawned);
+        let line = |i: usize| spawned[i]["argv"].as_array().unwrap().last().unwrap().as_str().unwrap().to_string();
+        let profile = format!("'default_permissions=\"{}\"'", crate::agents::CODEX_SOCKET_PROFILE);
+        // 0 lead, 1 executor, 2 bare, 3 and 4 outside, 5 Claude, 6 restart,
+        // 7 no ports, 8 refused, 9 refused restart
+        for (i, widened, ports) in [(0, macos, true), (1, macos, true), (2, macos, true), (3, false, false), (4, false, false), (6, macos, true), (7, macos, false), (8, false, false), (9, false, false)] {
+            let line = line(i);
+            assert_eq!(line.contains(&profile), widened, "{line}");
+            assert_eq!(line.contains("'--enable' 'network_proxy'"), widened, "{line}");
+            assert_eq!(line.contains("allow_local_binding=true"), widened && ports, "{line}");
+            assert_eq!(line.contains("allow_local_binding=false"), widened && !ports, "{line}");
+            assert_eq!(line.contains("workspace-write"), !widened, "{line}");
+            assert_eq!(line.contains("network_access=false"), macos && i >= 8, "{line}");
+            assert_eq!(line.matches("on-request").count(), 1, "{line}");
+        }
+        assert!(line(2).starts_with("exec codex '--enable' 'network_proxy'") == macos, "{}", line(2));
+        assert!(line(3).starts_with("exec codex --sandbox workspace-write --ask-for-approval on-request "), "{}", line(3));
+        if macos {
+            assert!(line(8).starts_with("exec codex '--sandbox' 'workspace-write' '-c' 'sandbox_workspace_write.network_access=false' '--ask-for-approval' 'on-request' "), "{}", line(8));
+        }
+        assert!(!line(5).contains("network_proxy") && !line(5).contains("default_permissions"), "{}", line(5));
+        drop(spawned);
+        stop_test_runner(&dir, server);
+    }
+
+    /// MCR-162 review 17269 P3: an auto-mode.json that cannot be read or
+    /// parsed never stops a Codex launch and never changes its line: not
+    /// where no socket profile applies (read-only, outside a root, and
+    /// Windows and Linux, where the file is not read for Codex at all,
+    /// `codex_could_take_sockets`), and not in workspace-write on macOS,
+    /// where the roots are unknown and the line stays plain with a note.
+    /// Claude keeps refusing to launch on such a file (MCR-152).
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_auto_mode_config_leaves_codex_launches_plain() {
+        an_unreadable_auto_mode_config_on(Some("linux"));
+        an_unreadable_auto_mode_config_on(None);
+    }
+
+    #[cfg(unix)]
+    fn an_unreadable_auto_mode_config_on(os: Option<&'static str>) {
+        let fixture = tempfile::Builder::new().prefix("mcr162-p3-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
+        let dir = dunce::canonicalize(fixture.path()).unwrap();
+        let home = dir.join("home");
+        let work = home.join("work");
+        let elsewhere = home.join("elsewhere");
+        for cwd in [&work.join("validate"), &elsewhere] {
+            std::fs::create_dir_all(cwd).unwrap();
+        }
+        let config = dir.join("auto-mode.json");
+        std::fs::write(&config, br#"{"roots":["~/work"]}"#).unwrap();
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (spawned, server) = codex_root_runner(&dir, events.clone());
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        h.launch_os = os;
+        *lock(&h.sockets_check) = Some(Box::new(|| panic!("no root is known, so nothing may be checked")));
+        // A read-only Codex profile of the operator's, approved
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("profiles/ro.toml"), "id = \"custom@codex-ro\"\nversion = 1\nrole = \"custom\"\nadapter = \"codex\"\n\n[permissions]\nmode = \"read-only\"\npush = \"none\"\n").unwrap();
+        crate::profiles::approve(&dir, "ro.toml", 1).unwrap();
+        let macos = h.launch_os() == crate::agents::CODEX_SOCKETS_OS;
+        let plain = "exec codex --sandbox workspace-write --ask-for-approval on-request ";
+        for (broken, kind) in [(&b"{\"roots\":"[..], auto_mode::INVALID), (&b"{\"roots\":[\"~/work\"],\"more\":1}"[..], auto_mode::INVALID), (&b"{\"roots\":[\"work\"]}"[..], auto_mode::RELATIVE_ROOT), (&b""[..], auto_mode::CANNOT_READ)] {
+            if kind == auto_mode::CANNOT_READ {
+                std::fs::remove_file(&config).unwrap();
+                std::fs::create_dir(&config).unwrap();
+            } else {
+                std::fs::write(&config, broken).unwrap();
+            }
+            let first = lock(&spawned).len();
+            for cwd in [work.clone(), elsewhere.clone()] {
+                let bare = h.tool("session_create", &json!({"profile": "codex", "cwd": cwd})).unwrap();
+                let mode = bare["effectiveMode"].as_str().unwrap();
+                if macos {
+                    // Fixed words: nothing of the file, its path or the parser's diagnosis
+                    assert_eq!(mode, format!("workspace-write (adapter default, auto-mode roots not used: {kind})"));
+                } else {
+                    assert_eq!(mode, "workspace-write (adapter default)");
+                }
+                let profiled = h.tool("session_create", &json!({"profile": "implementer@codex", "cwd": cwd})).unwrap();
+                assert!(profiled["effectiveMode"].as_str().unwrap().starts_with("workspace-write (profile"), "{profiled}");
+            }
+            let read_only = h.tool("session_create", &json!({"profile": "custom@codex-ro", "cwd": work.join("validate")})).unwrap();
+            assert_eq!(read_only["effectiveMode"], "read-only (profile)");
+            let claude = h.tool("session_create", &json!({"profile": "claude", "cwd": work.clone()}));
+            assert_eq!(claude.unwrap_err(), kind);
+            let spawned = lock(&spawned);
+            let lines: Vec<String> = spawned[first..].iter().map(|s| s["argv"].as_array().unwrap().last().unwrap().as_str().unwrap().to_string()).collect();
+            assert_eq!(lines.len(), 5);
+            for line in &lines[..4] {
+                assert!(line.contains("workspace-write") && line.matches("on-request").count() == 1 && !line.contains("network_proxy") && !line.contains("default_permissions"), "{line}");
+            }
+            assert!(lines[0].starts_with(plain) && lines[2].starts_with(plain), "{lines:?}");
+            assert!(lines[4].contains("'--sandbox' 'read-only'") && !lines[4].contains("network_proxy"), "{}", lines[4]);
+            drop(spawned);
+        }
+        assert!(!lock(&events).iter().any(|e| e == "check"));
+        stop_test_runner(&dir, server);
     }
 
     /// MCR-136 review 17005 P1: an executor never delivers, whoever starts it.
@@ -8770,7 +9118,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn executor_end_accepts_a_completed_task_with_an_open_done_mark() {
-        let dir = tempfile::Builder::new().prefix("mcr158-").tempdir_in("/tmp").unwrap();
+        let dir = tempfile::Builder::new().prefix("mcr158-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let harness = Harness::open(dir.path());
         let report = harness.update(|s| {
             s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "working".into(), ..Tracked::default() });
@@ -9350,7 +9698,7 @@ mod tests {
 
     #[test]
     fn memory_bridge_replays_the_handshake_to_a_restarted_service() {
-        let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
+        let dir = crate::ipc::test_socket_dir(&format!("mcr-b-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
         let listener = Listener::bind(&path).unwrap();
@@ -9378,7 +9726,7 @@ mod tests {
 
     #[test]
     fn bridge_survives_a_service_restart() {
-        let dir = Path::new("/tmp").join(format!("mcr-b-{}", runner::random_id()));
+        let dir = crate::ipc::test_socket_dir(&format!("mcr-b-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
         let listener = Listener::bind(&path).unwrap();

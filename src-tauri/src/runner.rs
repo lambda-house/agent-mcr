@@ -486,6 +486,18 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// What a session's terminal adds to the runner's own environment, before
+/// the launch's variables. The harness's Codex socket check runs with the
+/// same (MCR-162), so its shell starts as the session's does.
+pub fn pty_env() -> Vec<(&'static str, &'static str)> {
+    let mut env = vec![("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "AgentMCR")];
+    if std::env::var_os("LANG").is_none() {
+        // launchd starts the runner without a locale; agents print UTF-8
+        env.push(("LANG", "en_US.UTF-8"));
+    }
+    env
+}
+
 pub fn random_id() -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let mut bytes = [0u8; 16];
@@ -625,12 +637,8 @@ impl Runner {
         let mut cmd = CommandBuilder::new(&req.argv[0]);
         cmd.args(&req.argv[1..]);
         cmd.cwd(&req.cwd);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "AgentMCR");
-        if std::env::var_os("LANG").is_none() {
-            // launchd starts the runner without a locale; agents print UTF-8
-            cmd.env("LANG", "en_US.UTF-8");
+        for (k, v) in pty_env() {
+            cmd.env(k, v);
         }
         for (k, v) in &req.env {
             cmd.env(k, v);
@@ -1604,12 +1612,7 @@ mod tests {
 
     fn temp_socket(name: &str) -> std::path::PathBuf {
         // Socket paths are limited to ~100 bytes; keep them short
-        let root = if cfg!(unix) {
-            std::path::PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        let dir = root.join(format!("amcr-{}-{name}", std::process::id()));
+        let dir = crate::ipc::test_socket_dir(&format!("amcr-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("r.sock")
     }
