@@ -2570,6 +2570,11 @@ pub struct Harness {
     /// refuses, as no test may run the real one
     #[cfg(test)]
     sockets_check: Mutex<Option<SocketsCheck>>,
+    /// The system a launch decides the Codex socket profile for, in place of
+    /// this one's (`launch_os`), so the tests of another system's line run
+    /// here too
+    #[cfg(test)]
+    launch_os: Option<&'static str>,
     /// Cockpit entries whose publisher was told that they are behind (`tell_outdated`)
     outdated_told: Mutex<BTreeSet<ToldOutdated>>,
     dir: PathBuf,
@@ -2756,7 +2761,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()) };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()) };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -3166,6 +3171,15 @@ impl Harness {
         }
     }
 
+    /// The system whose Codex line a launch decides (MCR-162)
+    fn launch_os(&self) -> &'static str {
+        #[cfg(test)]
+        if let Some(os) = self.launch_os {
+            return os;
+        }
+        std::env::consts::OS
+    }
+
     fn launch_home(&self) -> Result<PathBuf, String> {
         #[cfg(test)]
         if let Some(home) = &self.launch_home {
@@ -3289,7 +3303,7 @@ impl Harness {
         // Codex reads the roots only where a root could change its line
         // (MCR-162 review 17269 P3): an unreadable auto-mode.json never stops
         // a Codex launch, it only keeps the plain line, and says so
-        let codex_could = Launch { profile: &profile, supervisor, agent: chosen.as_ref().map(|c| &c.profile), ..Default::default() }.codex_could_take_sockets(std::env::consts::OS);
+        let codex_could = Launch { profile: &profile, supervisor, agent: chosen.as_ref().map(|c| &c.profile), ..Default::default() }.codex_could_take_sockets(self.launch_os());
         let (root, mut rejected) = match profile.as_str() {
             "codex" if !codex_could => (None, Vec::new()),
             "codex" => match auto_mode::matching_root(&self.dir, &home, &dir, &profile, supervisor) {
@@ -7659,6 +7673,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn codex_under_a_root_gets_unix_sockets_only_after_the_check() {
+        // Linux on every host (review 17295 P2: its line was checked on Linux
+        // alone), then this host's own system
+        codex_under_a_root_on(Some("linux"));
+        codex_under_a_root_on(None);
+    }
+
+    #[cfg(unix)]
+    fn codex_under_a_root_on(os: Option<&'static str>) {
         let fixture = tempfile::Builder::new().prefix("mcr162-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let dir = dunce::canonicalize(fixture.path()).unwrap();
         let home = dir.join("home");
@@ -7673,6 +7695,7 @@ mod tests {
         let (spawned, server) = codex_root_runner(&dir, events.clone());
         let mut h = Harness::open(&dir);
         h.launch_home = Some(home.clone());
+        h.launch_os = os;
         let verdict: Arc<Mutex<SocketsVerdict>> = Arc::new(Mutex::new(Ok((true, None))));
         let (told, answer) = (events.clone(), verdict.clone());
         *lock(&h.sockets_check) = Some(Box::new(move || {
@@ -7680,8 +7703,10 @@ mod tests {
             *lock(&answer)
         }));
         let checks = || lock(&events).iter().filter(|e| *e == "check").count();
-        let macos = std::env::consts::OS == crate::agents::CODEX_SOCKETS_OS;
-        let under = if macos { "workspace-write + unix sockets + ports (root ~/work, macOS firewall on at launch)" } else { "workspace-write (root ~/work, unix sockets are passed on macos only)" };
+        let macos = h.launch_os() == crate::agents::CODEX_SOCKETS_OS;
+        // Elsewhere the roots are not read for Codex, so no root is named
+        let under = if macos { "workspace-write + unix sockets + ports (root ~/work, macOS firewall on at launch)" } else { "workspace-write (profile)" };
+        let under_bare = if macos { under } else { "workspace-write (adapter default)" };
 
         let lead = h.tool("session_create", &json!({"profile": "lead@codex", "cwd": "~/work"})).unwrap();
         let lead_id = lead["id"].as_str().unwrap().to_string();
@@ -7694,7 +7719,7 @@ mod tests {
         let overview = h.agent_tool(&lead_id, "overview", &json!({})).unwrap();
         assert_eq!(overview["sessions"][0]["executors"][0]["effectiveMode"], under);
         let bare = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
-        assert_eq!(bare["effectiveMode"], under);
+        assert_eq!(bare["effectiveMode"], under_bare);
         assert_eq!(checks(), if macos { 3 } else { 0 });
         let outside = h.tool("session_create", &json!({"profile": "codex", "cwd": elsewhere})).unwrap();
         assert_eq!(outside["effectiveMode"], "workspace-write (adapter default)");
@@ -7711,13 +7736,13 @@ mod tests {
         // The firewall is off: Unix sockets without ports, said with the reason
         *lock(&verdict) = Ok((false, Some("the macOS firewall is off")));
         let no_ports = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
-        let sockets_only = if macos { "workspace-write + unix sockets (root ~/work, no ports: the macOS firewall is off)" } else { under };
+        let sockets_only = if macos { "workspace-write + unix sockets (root ~/work, no ports: the macOS firewall is off)" } else { under_bare };
         assert_eq!(no_ports["effectiveMode"], sockets_only);
 
         // The check refuses and then shows the plain line has no network
         let reason = "Codex's managed network proxy is not running";
         *lock(&verdict) = Err((reason, true));
-        let refused = if macos { format!("workspace-write (root ~/work, network off (checked), unix sockets refused: {reason})") } else { under.to_string() };
+        let refused = if macos { format!("workspace-write (root ~/work, network off (checked), unix sockets refused: {reason})") } else { under_bare.to_string() };
         let fallback = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
         assert_eq!(fallback["effectiveMode"], refused.as_str());
         // A restart decides before it hangs up, and still restarts
@@ -7773,6 +7798,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_unreadable_auto_mode_config_leaves_codex_launches_plain() {
+        an_unreadable_auto_mode_config_on(Some("linux"));
+        an_unreadable_auto_mode_config_on(None);
+    }
+
+    #[cfg(unix)]
+    fn an_unreadable_auto_mode_config_on(os: Option<&'static str>) {
         let fixture = tempfile::Builder::new().prefix("mcr162-p3-").tempdir_in(crate::ipc::test_socket_base()).unwrap();
         let dir = dunce::canonicalize(fixture.path()).unwrap();
         let home = dir.join("home");
@@ -7787,12 +7818,13 @@ mod tests {
         let (spawned, server) = codex_root_runner(&dir, events.clone());
         let mut h = Harness::open(&dir);
         h.launch_home = Some(home.clone());
+        h.launch_os = os;
         *lock(&h.sockets_check) = Some(Box::new(|| panic!("no root is known, so nothing may be checked")));
         // A read-only Codex profile of the operator's, approved
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
         std::fs::write(dir.join("profiles/ro.toml"), "id = \"custom@codex-ro\"\nversion = 1\nrole = \"custom\"\nadapter = \"codex\"\n\n[permissions]\nmode = \"read-only\"\npush = \"none\"\n").unwrap();
         crate::profiles::approve(&dir, "ro.toml", 1).unwrap();
-        let macos = std::env::consts::OS == crate::agents::CODEX_SOCKETS_OS;
+        let macos = h.launch_os() == crate::agents::CODEX_SOCKETS_OS;
         let plain = "exec codex --sandbox workspace-write --ask-for-approval on-request ";
         for (broken, kind) in [(&b"{\"roots\":"[..], auto_mode::INVALID), (&b"{\"roots\":[\"~/work\"],\"more\":1}"[..], auto_mode::INVALID), (&b"{\"roots\":[\"work\"]}"[..], auto_mode::RELATIVE_ROOT), (&b""[..], auto_mode::CANNOT_READ)] {
             if kind == auto_mode::CANNOT_READ {
