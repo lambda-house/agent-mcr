@@ -233,6 +233,9 @@ pub struct Follow {
     /// and at the same or a greater length, is read again from its start
     modified: Option<SystemTime>,
     anchors: (u64, u64),
+    /// The file's length when the last read ended: past `offset` when it
+    /// ends in bytes without a newline (a record its writer has not finished)
+    observed: u64,
     /// How often it started over at the beginning of a rewritten file
     restarts: u64,
     pub stats: Stats,
@@ -240,11 +243,12 @@ pub struct Follow {
 
 impl Follow {
     pub fn new(root: &Path, rel: &Path, claude: bool) -> Self {
-        Self { root: root.to_path_buf(), rel: rel.to_path_buf(), offset: 0, identity: None, modified: None, anchors: (0, 0), restarts: 0, stats: Stats::new(claude) }
+        Self { root: root.to_path_buf(), rel: rel.to_path_buf(), offset: 0, identity: None, modified: None, anchors: (0, 0), observed: 0, restarts: 0, stats: Stats::new(claude) }
     }
     /// Whether what was read is no longer what the file holds: another file
     /// (inode), a shorter one, or one changed since the last read without
-    /// growing (agents only append) or with other bytes at its anchors.
+    /// growing past the length it had then (agents only append; bytes after
+    /// the last newline count) or with other bytes at its anchors.
     /// Everything is looked at through the opened handle.
     fn rewritten(&self, file: &mut File, meta: &std::fs::Metadata) -> Result<bool, String> {
         if self.offset == 0 {
@@ -256,7 +260,7 @@ impl Follow {
         if meta.modified().ok() == self.modified {
             return Ok(false);
         }
-        Ok(meta.len() == self.offset || anchors(file, self.offset)? != self.anchors)
+        Ok(meta.len() <= self.observed || anchors(file, self.offset)? != self.anchors)
     }
     /// Reads what was appended for about `slice`; true once it has read up
     /// to the last whole record
@@ -304,7 +308,9 @@ impl Follow {
     }
     /// Remembers the file as this read leaves it: its time and anchors
     fn mark(&mut self, file: &mut File) -> Result<(), String> {
-        self.modified = file.metadata().map_err(|e| e.to_string())?.modified().ok();
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        self.modified = meta.modified().ok();
+        self.observed = meta.len();
         self.anchors = anchors(file, self.offset)?;
         Ok(())
     }
@@ -1070,5 +1076,57 @@ mod tests {
         assert_eq!((s.turn_count(), s.input_equivalent(), s.keys.len(), s.order.len()), (2, 15, 2, 2));
         assert!(format!("{s:?}").len() < 4096, "the id's text is kept");
         assert_eq!(std::mem::size_of::<Key>(), 16);
+    }
+    fn filler(n: usize) -> Vec<Value> {
+        (0..n).map(|k| json!({"type":"user","timestamp":"2026-01-01T09:00:00Z","message":{"content":"x".repeat(100 + k)}})).collect()
+    }
+
+    /// MCR-149 round 5: the check for a same-length rewrite uses the length
+    /// the file had, not the offset parsed to. With bytes after the last
+    /// newline (an unfinished record, or a last record without a newline) a
+    /// rewrite is still read again; finishing the record is read on.
+    #[test]
+    fn a_rewrite_with_bytes_after_the_last_newline_is_read_again() {
+        for (name, tail) in [("pending", "{\"type\":\"user\",\"message\":{\"content\":\"unfin".to_string()), ("unterminated", reply("m9", "2026-01-01T10:09:00Z", 7, 0, 0, 1).to_string())] {
+            let (root, rel) = fixture(name);
+            let path = root.join(&rel);
+            // The rewritten record lies outside both anchors (past the first
+            // 4 KiB, before the last 256 bytes): only the length can tell
+            append(&path, &filler(40));
+            append(&path, &[reply("m1", "2026-01-01T10:00:00Z", 100, 0, 0, 1)]);
+            append(&path, &filler(2));
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(tail.as_bytes()).unwrap();
+            let mut f = Follow::new(&root, &rel, true);
+            read_all(&mut f);
+            assert!(f.observed > f.offset, "{name}: bytes after the last newline");
+            assert_eq!((f.stats.now, f.restarts), (100, 0), "{name}");
+            rewrite_in_place(&path, "\"input_tokens\":100", "\"input_tokens\":900");
+            read_all(&mut f);
+            assert_eq!((f.stats.now, f.stats.turn_count(), f.restarts), (900, 1, 1), "{name}: a rewrite with bytes after the last newline was not seen");
+        }
+        // The writer finishes its record: an append, read on
+        let (root, rel) = fixture("finished");
+        let path = root.join(&rel);
+        append(&path, &[reply("m1", "2026-01-01T10:00:00Z", 100, 0, 0, 1)]);
+        let row = reply("m2", "2026-01-01T10:01:00Z", 300, 0, 0, 1).to_string();
+        let (head, rest) = row.split_at(row.len() / 2);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(head.as_bytes()).unwrap();
+        let mut f = Follow::new(&root, &rel, true);
+        read_all(&mut f);
+        assert_eq!(f.stats.turn_count(), 1);
+        std::thread::sleep(Duration::from_millis(20));
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{rest}").unwrap();
+        read_all(&mut f);
+        assert_eq!((f.stats.now, f.stats.turn_count(), f.restarts), (300, 2, 0));
+
+        // Through the worker: the request after such a rewrite is current with the new figures
+        let (want, path) = want_in("unterminated");
+        append(&path, &[reply("m1", "2026-01-01T10:00:00Z", 100, 0, 0, 1)]);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"type\":\"user\"").unwrap();
+        let contexts = Contexts::new();
+        let ask = || contexts.ask(vec![("ex".into(), want.clone())], |_| true, Duration::from_secs(10)).remove("ex").unwrap();
+        assert!(matches!(ask(), Answer::Current(Some(f)) if f.now == 100));
+        rewrite_in_place(&path, "\"input_tokens\":100", "\"input_tokens\":900");
+        assert!(matches!(ask(), Answer::Current(Some(f)) if f.now == 900));
     }
 }
