@@ -7615,7 +7615,9 @@ mod tests {
     }
 
     /// A fake runner for the MCR-162 tests: records spawns, and the order of
-    /// spawns and hangups in `events`, which the socket check writes to too
+    /// spawns and hangups in `events`, which the socket check writes to too.
+    /// Unix only, as the two tests that use it (they run on Linux too)
+    #[cfg(unix)]
     fn codex_root_runner(dir: &Path, events: Arc<Mutex<Vec<String>>>) -> (Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<()>) {
         let listener = Listener::bind(dir.join("runner.sock")).unwrap();
         let spawned = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -7656,6 +7658,7 @@ mod tests {
         (spawned, server)
     }
 
+    #[cfg(unix)]
     fn stop_test_runner(dir: &Path, server: std::thread::JoinHandle<()>) {
         let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
         writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
