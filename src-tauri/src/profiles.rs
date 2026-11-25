@@ -1161,7 +1161,7 @@ The operator started you from an agent profile. `whoami` shows it: its id and ve
 - Deny rules in your profile are best-effort: a command that slips past one is still not allowed. The real boundaries are branch protection, read-only credentials and the operator's prompts; never look for a way around a rule.
 - The skills and MCP servers your profile names (`skills`, `mcpExpected`) are the ones your work expects. If one is missing, say so in your first status instead of working around it.
 - Never put a secret into a report, a note, a message, the cockpit, Jira or a commit.
-- On Codex under an auto-mode root on macOS, `effectiveMode` says `workspace-write + loopback`. Commands can then bind and reach loopback ports, and Unix sockets below `/tmp/agent-mcr-sockets`, without a prompt. Every other network request, and every write outside your folder, `/tmp` and `$TMPDIR`, still goes to the operator. Never route around that through a local service.
+- On Codex under an auto-mode root on macOS, `effectiveMode` says `workspace-write + unix sockets` when the harness's launch check passed. Commands can then bind and reach Unix sockets below `/tmp/agent-mcr-sockets` without a prompt. TCP listening, loopback included, every other network request, and every write outside your folder, `/tmp` and `$TMPDIR`, still go to the operator. `unix sockets refused: <reason>` means the check failed and you have plain workspace-write. Never route around that through a local service.
 "#;
 
 /// The part of the role guide for one role.

@@ -1,5 +1,5 @@
 //! Operator-owned roots and the Claude Code workspace trust record (MCR-152).
-//! A root also gives Codex sessions loopback sockets (MCR-162).
+//! A root also gives Codex sessions Unix sockets in one folder (MCR-162).
 
 use serde::Deserialize;
 use serde_json::value::{to_raw_value, RawValue};
