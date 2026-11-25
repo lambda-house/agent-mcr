@@ -286,8 +286,9 @@ fn login_argv(cmd: String) -> Vec<String> {
 }
 
 /// What the Codex socket check gives a launch (MCR-162): ports or not, with
-/// the fixed reason for none, or the fixed reason for refusing the profile
-type SocketsVerdict = Result<(bool, Option<&'static str>), &'static str>;
+/// the fixed reason for none; or the fixed reason for refusing the profile,
+/// with whether the plain line was then shown to have no network
+type SocketsVerdict = Result<(bool, Option<&'static str>), (&'static str, bool)>;
 
 #[cfg(test)]
 type SocketsCheck = Box<dyn Fn() -> SocketsVerdict + Send>;
@@ -3148,7 +3149,7 @@ impl Harness {
             let _ = (exe, dir, env);
             match &*lock(&self.sockets_check) {
                 Some(check) => check(),
-                None => Err("not checked in tests"),
+                None => Err(("not checked in tests", false)),
             }
         }
         #[cfg(all(target_os = "macos", not(test)))]
@@ -3156,12 +3157,12 @@ impl Harness {
             let nonce = runner::random_id()[..16].to_string();
             let mut all: Vec<(String, String)> = runner::pty_env().into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
             all.extend(env.iter().cloned());
-            crate::codex_sockets::check(login_argv, exe, dir, &all, &nonce).map(|grant| (grant.ports, grant.no_ports))
+            crate::codex_sockets::check(login_argv, exe, dir, &all, &nonce).map(|grant| (grant.ports, grant.no_ports)).map_err(|r| (r.why, r.off_checked))
         }
         #[cfg(all(not(target_os = "macos"), not(test)))]
         {
             let _ = (exe, dir, env);
-            Err("not on this system")
+            Err(("not on this system", false))
         }
     }
 
@@ -3315,12 +3316,12 @@ impl Harness {
             ("AGENT_MCR_SESSION".to_string(), id.clone()),
             ("AGENT_MCR_HARNESS".to_string(), socket(&self.dir).display().to_string()),
         ];
-        let (sockets_refused, codex_ports, ports_refused) = match &root {
+        let (sockets_refused, codex_ports, ports_refused, network_off_checked) = match &root {
             Some(_) if codex_could => match self.codex_sockets_check(&exe, &dir, &own_env) {
-                Ok((ports, why)) => (None, ports, why),
-                Err(why) => (Some(why), false, None),
+                Ok((ports, why)) => (None, ports, why, false),
+                Err((why, off)) => (Some(why), false, None, off),
             },
-            _ => (None, false, None),
+            _ => (None, false, None, false),
         };
         if let Some(reason) = sockets_refused {
             eprintln!("harness: Codex unix sockets refused in {}: {reason}", dir.display());
@@ -3343,6 +3344,7 @@ impl Harness {
             sockets_refused,
             codex_ports,
             ports_refused,
+            network_off_checked,
         };
         let (argv, mut spawn_env) = launch_for(&launch)?;
         // The text launched is kept, so a restart starts the same version (L5)
@@ -7679,7 +7681,7 @@ mod tests {
         }));
         let checks = || lock(&events).iter().filter(|e| *e == "check").count();
         let macos = std::env::consts::OS == crate::agents::CODEX_SOCKETS_OS;
-        let under = if macos { "workspace-write + unix sockets + ports (root ~/work, macOS firewall on)" } else { "workspace-write (root ~/work, unix sockets are passed on macos only)" };
+        let under = if macos { "workspace-write + unix sockets + ports (root ~/work, macOS firewall on at launch)" } else { "workspace-write (root ~/work, unix sockets are passed on macos only)" };
 
         let lead = h.tool("session_create", &json!({"profile": "lead@codex", "cwd": "~/work"})).unwrap();
         let lead_id = lead["id"].as_str().unwrap().to_string();
@@ -7712,16 +7714,21 @@ mod tests {
         let sockets_only = if macos { "workspace-write + unix sockets (root ~/work, no ports: the macOS firewall is off)" } else { under };
         assert_eq!(no_ports["effectiveMode"], sockets_only);
 
-        // The check refuses: workspace-write with the network off, said with the reason
+        // The check refuses and then shows the plain line has no network
         let reason = "Codex's managed network proxy is not running";
-        *lock(&verdict) = Err(reason);
-        let refused = if macos { format!("workspace-write (root ~/work, network off, unix sockets refused: {reason})") } else { under.to_string() };
+        *lock(&verdict) = Err((reason, true));
+        let refused = if macos { format!("workspace-write (root ~/work, network off (checked), unix sockets refused: {reason})") } else { under.to_string() };
         let fallback = h.tool("session_create", &json!({"profile": "codex", "cwd": work.join("repo")})).unwrap();
         assert_eq!(fallback["effectiveMode"], refused.as_str());
         // A restart decides before it hangs up, and still restarts
         let before = lock(&events).len();
+        // The plain line could not be shown to be off: said so, and the line
+        // keeps its explicit network_access=false; a restart decides that too
+        // before it hangs up
+        *lock(&verdict) = Err((reason, false));
+        let unchecked = if macos { format!("workspace-write (root ~/work, network not checked: Codex's managed policy applies, unix sockets refused: {reason})") } else { under.to_string() };
         let restarted = h.tool("session_restart", &json!({"session": replacement_id, "force": true})).unwrap();
-        assert_eq!(restarted["effectiveMode"], refused.as_str());
+        assert_eq!(restarted["effectiveMode"], unchecked.as_str());
         let order: Vec<String> = lock(&events)[before..].to_vec();
         let at = |prefix: &str| order.iter().position(|e| e.starts_with(prefix));
         assert!(at(&format!("signal {replacement_id}")).is_some(), "{order:?}");

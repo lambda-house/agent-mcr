@@ -71,6 +71,10 @@ const MESSAGES: &[(&str, &str)] = &[
     ("unreadable", "a Codex config or rules file cannot be read"),
     ("invalid", "a Codex config file is not valid TOML"),
     ("nonce", "the probe was given no nonce"),
+    ("home-unlisted", "the Codex home folder cannot be listed"),
+    ("off-proxy", "a network proxy runs in the plain sandbox"),
+    ("off-connect", "the plain sandbox let a connection through"),
+    ("off-bind", "the plain sandbox let a command listen on TCP"),
 ];
 pub const TIMEOUT: &str = "the check did not finish within 2 s";
 pub const NOT_STARTED: &str = "the check could not start";
@@ -88,6 +92,14 @@ pub struct Grant {
     pub no_ports: Option<&'static str>,
 }
 
+/// Why the profile was refused, and whether the plain line it falls back
+/// to was then shown to have no network (review 17287 P1)
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub why: &'static str,
+    pub off_checked: bool,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Firewall {
     On,
@@ -96,12 +108,23 @@ pub enum Firewall {
 }
 
 /// The firewall's global state from `socketfilterfw --getglobalstate`:
-/// state 1 (on) and 2 (essential services only) are on
+/// state 1 (on) and 2 (essential services only) are on. Only one complete
+/// answer counts (review 17287 P2): a single line `Firewall is … (State = N)`
+/// with one state, ended by its `)`, whose words agree with it ("disabled"
+/// for 0 alone). A truncated, repeated or contradictory answer is unknown,
+/// which gives the sockets-only words
 pub fn firewall_from(success: bool, out: &str) -> Firewall {
-    let state = out.split_once("(State = ").and_then(|(_, rest)| rest.split(')').next()).map(str::trim);
-    match (success, state) {
-        (true, Some("1" | "2")) => Firewall::On,
-        (true, Some("0")) => Firewall::Off,
+    let line = out.strip_suffix('\n').unwrap_or(out);
+    if !success || line.contains(['\n', '\r']) || !line.starts_with("Firewall is ") || line.matches("State").count() != 1 {
+        return Firewall::Unknown;
+    }
+    let Some(state) = line.strip_suffix(')').and_then(|l| l.rsplit_once(". (State = ")).map(|(_, n)| n) else {
+        return Firewall::Unknown;
+    };
+    let disabled = line.contains("disabled");
+    match state {
+        "1" | "2" if !disabled => Firewall::On,
+        "0" if disabled && !line.contains("enabled") => Firewall::Off,
         _ => Firewall::Unknown,
     }
 }
@@ -122,12 +145,37 @@ pub fn command(exe: &str, cwd: &Path, nonce: &str, ports: bool) -> String {
     )
 }
 
+/// The command line that runs the probe in the plain line's sandbox, the
+/// fallback: workspace-write with `network_access=false`, as a session gets
+/// it (`agents::CODEX_NETWORK_OFF`). `codex sandbox` takes a legacy
+/// `sandbox_mode` only without `-P` and `--cd`, so the folder is the shell's
+/// own (`cd`), and managed requirements are then included by default
+pub fn off_command(exe: &str, cwd: &Path, nonce: &str) -> String {
+    use crate::agents::sh;
+    format!(
+        "cd {} && exec codex sandbox -c {} -c {} -- {} {PROBE_FLAG} {nonce} off \"${{CODEX_HOME:-$HOME/.codex}}\"",
+        sh(&cwd.display().to_string()),
+        sh("sandbox_mode=\"workspace-write\""),
+        sh(crate::agents::CODEX_NETWORK_OFF[1]),
+        sh(exe),
+    )
+}
+
 /// The whole check for a launch in `cwd`: `login` wraps a command line as
 /// the session's login shell runs it, `env` is what the session's terminal
-/// adds to this process's environment
+/// adds to this process's environment. A refusal then checks, in what is
+/// left of the same deadline, that the plain line has no network
 #[cfg_attr(test, allow(dead_code))]
-pub fn check(login: impl Fn(String) -> Vec<String>, exe: &str, cwd: &Path, env: &[(String, String)], nonce: &str) -> Result<Grant, &'static str> {
+pub fn check(login: impl Fn(String) -> Vec<String>, exe: &str, cwd: &Path, env: &[(String, String)], nonce: &str) -> Result<Grant, Refused> {
     let until = Instant::now() + DEADLINE;
+    let granted = sockets(&login, exe, cwd, env, nonce, until);
+    granted.map_err(|why| Refused {
+        why,
+        off_checked: why != TIMEOUT && run_bounded(&login(off_command(exe, cwd, nonce)), Some(cwd), env, until).is_ok_and(|ran| verdict(ran.success, &ran.out, nonce).is_ok()),
+    })
+}
+
+fn sockets(login: &impl Fn(String) -> Vec<String>, exe: &str, cwd: &Path, env: &[(String, String)], nonce: &str, until: Instant) -> Result<Grant, &'static str> {
     prepare_socket_dir()?;
     let firewall = match run_bounded(&[FIREWALL.into(), "--getglobalstate".into()], None, &[], until) {
         Ok(ran) => firewall_from(ran.success, &ran.out),
@@ -277,12 +325,16 @@ fn prepare_socket_dir() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The probe's entry (`agent-mcr --codex-sockets-probe <nonce> <ports|sockets>
-/// <codex home>`), run inside the sandbox; prints one line, returns the exit code
+/// The probe's entry (`agent-mcr --codex-sockets-probe <nonce>
+/// <ports|sockets|off> <codex home>`), run inside the sandbox; prints one
+/// line, returns the exit code
 pub fn probe_main(nonce: &str, mode: &str, codex_home: &str) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let ports = mode == "ports";
-    match probe(nonce, ports, Path::new(codex_home), &cwd) {
+    let result = match mode {
+        "off" => probe_off(nonce),
+        _ => probe(nonce, mode == "ports", Path::new(codex_home), &cwd),
+    };
+    match result {
         Ok(()) => {
             println!("{PROBE_OK} {nonce}");
             0
@@ -307,6 +359,42 @@ fn probe(nonce: &str, ports: bool, codex_home: &Path, cwd: &Path) -> Result<(), 
         Some(code) => Err(code),
         None => Ok(()),
     }
+}
+
+/// The plain line's sandbox has no network: no proxy of Codex's, and
+/// Seatbelt refuses a connection out, one to loopback and TCP listening
+fn probe_off(nonce: &str) -> Result<(), &'static str> {
+    if nonce.is_empty() || !nonce.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("nonce");
+    }
+    no_proxy_env(|k| std::env::var(k).ok())?;
+    for to in [OUTSIDE, "127.0.0.1:9"] {
+        let to: std::net::SocketAddr = to.parse().map_err(|_| "off-connect")?;
+        match std::net::TcpStream::connect_timeout(&to, Duration::from_millis(500)) {
+            Err(e) if refused_by_sandbox(&e) => {}
+            _ => return Err("off-connect"),
+        }
+    }
+    for at in ["127.0.0.1:0", "0.0.0.0:0"] {
+        match std::net::TcpListener::bind(at) {
+            Err(e) if refused_by_sandbox(&e) => {}
+            _ => return Err("off-bind"),
+        }
+    }
+    Ok(())
+}
+
+/// No sign of Codex's proxy: its marker, or a proxy address on loopback
+pub fn no_proxy_env(var: impl Fn(&str) -> Option<String>) -> Result<(), &'static str> {
+    if var("CODEX_NETWORK_PROXY_ACTIVE").is_some_and(|v| !v.trim().is_empty()) {
+        return Err("off-proxy");
+    }
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        if var(key).is_some_and(|v| loopback_url(&v).is_some()) {
+            return Err("off-proxy");
+        }
+    }
+    Ok(())
 }
 
 /// The managed proxy's HTTPS address from the environment Codex gave the
@@ -411,8 +499,13 @@ fn proxy_refuses(proxy: std::net::SocketAddr, nonce: &str, ports: bool) -> Resul
 /// managed files
 pub struct Sources {
     pub config_dirs: Vec<PathBuf>,
-    pub layers: Vec<PathBuf>,
+    /// The `<name>.config.toml` layers, or None when `CODEX_HOME` could not
+    /// be listed: then which layers exist is unknown and the profile is
+    /// refused (review 17287 P3)
+    pub layers: Option<Vec<PathBuf>>,
     pub managed: Vec<PathBuf>,
+    /// A folder of managed files that could not be listed
+    pub unlisted: bool,
 }
 
 impl Sources {
@@ -421,10 +514,7 @@ impl Sources {
         config_dirs.extend(cwd.ancestors().map(|dir| dir.join(".codex")));
         let mut seen = std::collections::BTreeSet::new();
         config_dirs.retain(|d| seen.insert(d.clone()));
-        let layers = match std::fs::read_dir(codex_home) {
-            Ok(entries) => entries.flatten().map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".config.toml"))).collect(),
-            Err(_) => Vec::new(),
-        };
+        let layers = listed(codex_home).map(|paths| paths.into_iter().filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".config.toml"))).collect());
         let mut managed = vec![
             PathBuf::from("/etc/codex/requirements.toml"),
             PathBuf::from("/etc/codex/managed_config.toml"),
@@ -432,10 +522,20 @@ impl Sources {
         ];
         let prefs = Path::new("/Library/Managed Preferences");
         managed.push(prefs.join("com.openai.codex.plist"));
-        if let Ok(users) = std::fs::read_dir(prefs) {
-            managed.extend(users.flatten().map(|u| u.path().join("com.openai.codex.plist")));
-        }
-        Self { config_dirs, layers, managed }
+        let users = listed(prefs);
+        let unlisted = users.is_none();
+        managed.extend(users.unwrap_or_default().into_iter().map(|u| u.join("com.openai.codex.plist")));
+        Self { config_dirs, layers, managed, unlisted }
+    }
+}
+
+/// The entries of `dir`: empty when it does not exist, None when it or any
+/// entry cannot be read
+fn listed(dir: &Path) -> Option<Vec<PathBuf>> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>().ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
     }
 }
 
@@ -444,6 +544,12 @@ impl Sources {
 /// structured `network_proxy` feature table refuses whatever it holds, and
 /// any `network_rule` in a rules file refuses whether it allows or denies
 pub fn refusal(sources: &Sources) -> Option<&'static str> {
+    if sources.unlisted {
+        return Some("unreadable");
+    }
+    let Some(layers) = &sources.layers else {
+        return Some("home-unlisted");
+    };
     for file in &sources.managed {
         match std::fs::symlink_metadata(file) {
             Ok(_) => return Some("managed"),
@@ -451,7 +557,7 @@ pub fn refusal(sources: &Sources) -> Option<&'static str> {
             Err(_) => return Some("unreadable"),
         }
     }
-    for layer in &sources.layers {
+    for layer in layers {
         if let Some(code) = config_refusal(layer) {
             return Some(code);
         }
@@ -509,8 +615,11 @@ fn rules_refusal(dir: &Path) -> Option<&'static str> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::NotADirectory => return None,
         Err(_) => return Some("unreadable"),
     };
-    for entry in entries.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "rules")) {
-        match read_small(&entry.path()) {
+    let Ok(paths) = entries.map(|e| e.map(|e| e.path())).collect::<Result<Vec<_>, _>>() else {
+        return Some("unreadable");
+    };
+    for path in paths.into_iter().filter(|p| p.extension().is_some_and(|x| x == "rules")) {
+        match read_small(&path) {
             Ok(Some(text)) if text.contains("network_rule") => return Some("rule"),
             Ok(_) => {}
             Err(code) => return Some(code),
@@ -549,13 +658,39 @@ mod tests {
     }
 
     #[test]
-    fn the_firewall_is_on_only_when_it_says_so() {
+    fn the_firewall_is_on_only_when_one_complete_answer_says_so() {
         assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)\n"), Firewall::On);
-        assert_eq!(firewall_from(true, "Firewall is set to block all non-essential incoming connections. (State = 2)\n"), Firewall::On);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)"), Firewall::On);
+        assert_eq!(firewall_from(true, "Firewall is blocking all non-essential incoming connections. (State = 2)\n"), Firewall::On);
         assert_eq!(firewall_from(true, "Firewall is disabled. (State = 0)\n"), Firewall::Off);
+        // A failed run, another answer, a state out of range
         assert_eq!(firewall_from(false, "Firewall is enabled. (State = 1)\n"), Firewall::Unknown);
         assert_eq!(firewall_from(true, "something else\n"), Firewall::Unknown);
-        assert_eq!(firewall_from(true, "(State = 7)"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 7)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, ""), Firewall::Unknown);
+        // Truncated (review 17287 P2)
+        for cut in ["Firewall is enabled. (State = 1", "Firewall is enabled. (State = ", "Firewall is enabled. (State", "Firewall is enabled."] {
+            assert_eq!(firewall_from(true, cut), Firewall::Unknown, "{cut}");
+        }
+        // Two answers, or words and state that disagree
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)\nFirewall is disabled. (State = 0)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1) (State = 0)"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is disabled. (State = 1)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 0)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)\r\n"), Firewall::Unknown);
+    }
+
+    #[test]
+    fn the_plain_sandbox_counts_as_off_only_without_a_proxy() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string());
+        assert_eq!(no_proxy_env(env(&[])), Ok(()));
+        // A proxy outside this Mac set by the owner is not Codex's
+        assert_eq!(no_proxy_env(env(&[("HTTPS_PROXY", "http://proxy.example:3128")])), Ok(()));
+        assert_eq!(no_proxy_env(env(&[("CODEX_NETWORK_PROXY_ACTIVE", "1")])), Err("off-proxy"));
+        assert_eq!(no_proxy_env(env(&[("ALL_PROXY", "socks5h://127.0.0.1:62790")])), Err("off-proxy"));
+        let line = off_command("/Apps/agent mcr", Path::new("/Users/me/work/repo"), "n0nce");
+        assert_eq!(line, "cd '/Users/me/work/repo' && exec codex sandbox -c 'sandbox_mode=\"workspace-write\"' -c 'sandbox_workspace_write.network_access=false' -- '/Apps/agent mcr' --codex-sockets-probe n0nce off \"${CODEX_HOME:-$HOME/.codex}\"");
+        assert!(!line.contains("-P ") && !line.contains("--cd") && !line.contains("network_proxy"), "{line}");
     }
 
     /// Absent, removed or ineffective proxy support all reach the probe as
@@ -583,7 +718,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".codex")).unwrap();
         let sources = || {
             let all = Sources::for_launch(&home, &cwd);
-            Sources { config_dirs: all.config_dirs.into_iter().filter(|d| d.starts_with(dir.path())).collect(), layers: all.layers, managed: vec![dir.path().join("etc/requirements.toml")] }
+            Sources { config_dirs: all.config_dirs.into_iter().filter(|d| d.starts_with(dir.path())).collect(), layers: all.layers, managed: vec![dir.path().join("etc/requirements.toml")], unlisted: false }
         };
         let dirs = sources().config_dirs;
         assert!(dirs.contains(&home) && dirs.contains(&cwd.join(".codex")) && dirs.contains(&dir.path().join("work/.codex")));
@@ -601,7 +736,7 @@ mod tests {
         std::fs::write(home.join("config.toml"), "").unwrap();
         // A separate `<name>.config.toml` layer, as `-p <name>` or a wrapper selects
         std::fs::write(home.join("fast.config.toml"), "[permissions.agent-mcr-sockets.network]\nenabled = true\n").unwrap();
-        assert_eq!(sources().layers, vec![home.join("fast.config.toml")]);
+        assert_eq!(sources().layers, Some(vec![home.join("fast.config.toml")]));
         assert_eq!(refusal(&sources()), Some("profile"));
         std::fs::write(home.join("fast.config.toml"), "[features.network_proxy]\ndomains = {}\n").unwrap();
         assert_eq!(refusal(&sources()), Some("proxy-table"));
@@ -633,9 +768,46 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Root reads anything; the refusal is for everyone else
         if std::fs::read(&file).is_err() {
-            assert_eq!(refusal(&Sources { config_dirs: vec![dir.path().into()], layers: vec![], managed: vec![] }), Some("unreadable"));
+            assert_eq!(refusal(&Sources { config_dirs: vec![dir.path().into()], layers: Some(vec![]), managed: vec![], unlisted: false }), Some("unreadable"));
         }
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A named layer that cannot be read
+        if std::fs::read(&file).is_ok() {
+            let layer = dir.path().join("fast.config.toml");
+            std::fs::write(&layer, "").unwrap();
+            std::fs::set_permissions(&layer, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&layer).is_err() {
+                assert_eq!(refusal(&Sources::for_launch(dir.path(), Path::new("/nonexistent-folder"))), Some("unreadable"));
+            }
+            std::fs::set_permissions(&layer, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    /// A `CODEX_HOME` that can be searched but not listed: a named profile
+    /// layer in it could still be loaded by path, so which layers exist is
+    /// unknown and the widened profile is refused (review 17287 P3)
+    #[test]
+    fn a_codex_home_that_cannot_be_listed_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("codex-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("hidden.config.toml"), "[features.network_proxy]\nenabled = true\n").unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let blind = std::fs::read_dir(&home).is_err();
+        let sources = Sources::for_launch(&home, Path::new("/nonexistent-folder"));
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Root lists anything; the refusal is for everyone else
+        if blind {
+            assert_eq!(sources.layers, None);
+            assert_eq!(refusal(&sources), Some("home-unlisted"));
+            assert_eq!(message("home-unlisted"), "the Codex home folder cannot be listed");
+        }
+        // A home that does not exist has no layers, which is no refusal
+        let missing = Sources::for_launch(&dir.path().join("none"), Path::new("/nonexistent-folder"));
+        assert_eq!(missing.layers, Some(vec![]));
+        // A managed-preferences folder that cannot be listed
+        assert_eq!(refusal(&Sources { config_dirs: vec![], layers: Some(vec![]), managed: vec![], unlisted: true }), Some("unreadable"));
     }
 
     /// The deadline holds for the output too: a descendant that keeps the
@@ -677,17 +849,24 @@ mod tests {
         let firewall = run_bounded(&[FIREWALL.into(), "--getglobalstate".into()], None, &[], Instant::now() + DEADLINE).map(|r| firewall_from(r.success, &r.out)).unwrap();
         let grant = run("").unwrap();
         assert_eq!(grant.ports, firewall == Firewall::On);
+        // A refusal checks the plain line, which on this Mac has no network
+        let refused = |r: Result<Grant, Refused>| r.unwrap_err();
         let home = tempfile::tempdir().unwrap();
         let in_home = format!("export CODEX_HOME={}; ", crate::agents::sh(&home.path().display().to_string()));
         std::fs::write(home.path().join("config.toml"), "[features.network_proxy]\nenabled = true\n").unwrap();
-        assert_eq!(run(&in_home), Err(message("proxy-table")));
+        assert_eq!(refused(run(&in_home)), Refused { why: message("proxy-table"), off_checked: true });
         std::fs::write(home.path().join("config.toml"), "").unwrap();
         std::fs::write(home.path().join("work.config.toml"), "[permissions.agent-mcr-sockets.network]\nenabled = true\n").unwrap();
-        assert_eq!(run(&in_home), Err(message("profile")));
+        assert_eq!(refused(run(&in_home)), Refused { why: message("profile"), off_checked: true });
         std::fs::remove_file(home.path().join("work.config.toml")).unwrap();
         std::fs::create_dir_all(home.path().join("rules")).unwrap();
         std::fs::write(home.path().join("rules/default.rules"), "network_rule(host=\"github.com\", protocol=\"https\", decision=\"allow\")\n").unwrap();
-        assert_eq!(run(&in_home), Err(message("rule")));
+        assert_eq!(refused(run(&in_home)), Refused { why: message("rule"), off_checked: true });
+        // An ordinary config that opens workspace-write's network does not
+        // open the plain line: the command-line override wins
+        std::fs::remove_file(home.path().join("rules/default.rules")).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[features.network_proxy]\nenabled = true\n[sandbox_workspace_write]\nnetwork_access = true\n").unwrap();
+        assert_eq!(refused(run(&in_home)), Refused { why: message("proxy-table"), off_checked: true });
     }
 
     /// The probe runs the launch's words, never a `--sandbox` beside them

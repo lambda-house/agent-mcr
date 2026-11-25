@@ -282,6 +282,10 @@ pub struct Launch<'a> {
     pub codex_ports: bool,
     /// With the socket profile and no ports: the fixed reason why not
     pub ports_refused: Option<&'a str>,
+    /// With a refusal: the plain line it falls back to was run under Codex
+    /// and showed no network (review 17287 P1). Otherwise Codex's managed
+    /// policy decides, as for any plain line, and `effectiveMode` says so
+    pub network_off_checked: bool,
 }
 
 // The root override promotes acceptEdits and manual. Plan keeps its mode (MCR-160).
@@ -357,12 +361,13 @@ impl Launch<'_> {
             _ => return None,
         };
         let mut reason = match self.auto_root {
-            Some(root) if self.codex_sockets_on(os) && self.codex_ports => format!("root {root}, macOS firewall on"),
+            Some(root) if self.codex_sockets_on(os) && self.codex_ports => format!("root {root}, macOS firewall on at launch"),
             Some(root) if self.codex_sockets_on(os) => format!("root {root}, no ports: {}", self.ports_refused.unwrap_or("not checked")),
             Some(root) if self.claude_uses_auto() => format!("root {root}"),
             Some(root) if self.codex_sockets() => format!("root {root}, unix sockets are passed on {CODEX_SOCKETS_OS} only"),
             Some(root) if self.profile == "codex" && self.codex_mode() == "workspace-write" && self.sockets_refused.is_some() => {
-                format!("root {root}, network off, unix sockets refused: {}", self.sockets_refused.unwrap_or(""))
+                let network = if self.network_off_checked { CODEX_OFF_CHECKED } else { CODEX_OFF_UNCHECKED };
+                format!("root {root}, {network}, unix sockets refused: {}", self.sockets_refused.unwrap_or(""))
             }
             Some(root) => format!("profile mode kept under root {root}"),
             None if self.profile_mode().is_some() => "profile".into(),
@@ -935,6 +940,12 @@ impl Adapter for Codex {
         true
     }
 }
+
+/// What `effectiveMode` says of the fallback's network: checked under Codex
+/// in the same deadline, or left to Codex's managed policy, as for any
+/// plain line (review 17287 P1)
+pub const CODEX_OFF_CHECKED: &str = "network off (checked)";
+pub const CODEX_OFF_UNCHECKED: &str = "network not checked: Codex's managed policy applies";
 
 /// What a refused check adds after `--sandbox workspace-write` (MCR-162)
 pub const CODEX_NETWORK_OFF: [&str; 2] = ["-c", "sandbox_workspace_write.network_access=false"];
@@ -1716,10 +1727,10 @@ mod tests {
         for agent in [None, Some(&implementer), Some(&lead), Some(&validator), Some(&read_only)] {
             let mode = agent.and_then(|p| p.permissions.mode.as_deref()).unwrap_or("workspace-write");
             for root in [None, Some("~/work")] {
-                for (refused, ports) in [(None, false), (None, true), (Some(refusal), false)] {
+                for (refused, ports, checked) in [(None, false, false), (None, true, false), (Some(refusal), false, true), (Some(refusal), false, false)] {
                     for resumed in [None, Some(resume)] {
                         let ports_refused = (refused.is_none() && !ports).then_some(firewall_off);
-                        let l = Launch { profile: "codex", exe: "/x", agent, auto_root: root, sockets_refused: refused, codex_ports: ports, ports_refused, resume: resumed, ..Default::default() };
+                        let l = Launch { profile: "codex", exe: "/x", agent, auto_root: root, sockets_refused: refused, codex_ports: ports, ports_refused, network_off_checked: checked, resume: resumed, ..Default::default() };
                         let eligible = root.is_some() && mode == "workspace-write";
                         let widened = eligible && refused.is_none();
                         let fallback = eligible && refused.is_some();
@@ -1755,9 +1766,10 @@ mod tests {
                         assert_eq!(mac.windows(2).filter(|w| w[0] == "--ask-for-approval" && w[1] == "on-request").count(), 1);
                         // What each says of itself
                         let reason = match (root, agent) {
-                            (Some(_), _) if widened && ports => "root ~/work, macOS firewall on".to_owned(),
+                            (Some(_), _) if widened && ports => "root ~/work, macOS firewall on at launch".to_owned(),
                             (Some(_), _) if widened => format!("root ~/work, no ports: {firewall_off}"),
-                            (Some(_), _) if eligible => format!("root ~/work, network off, unix sockets refused: {refusal}"),
+                            (Some(_), _) if eligible && checked => format!("root ~/work, network off (checked), unix sockets refused: {refusal}"),
+                            (Some(_), _) if eligible => format!("root ~/work, network not checked: Codex's managed policy applies, unix sockets refused: {refusal}"),
                             (Some(_), _) => "profile mode kept under root ~/work".to_owned(),
                             (None, Some(_)) => "profile".to_owned(),
                             (None, None) => "adapter default".to_owned(),
