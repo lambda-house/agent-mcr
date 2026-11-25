@@ -103,11 +103,11 @@ export default function SessionWorkspace({ active = true }: { active?: boolean }
   const sessions = useZustand(store, s => s.snapshot.sessions);
   const directory = useZustand(store, s => s.lists[s.lastList]?.directory ?? '');
   const setDirectory = (path: string) => store.getState().setFilters(store.getState().lastList, { directory: path });
-  /** Continue an earlier session in a hosted terminal, in its own folder. */
+  /** Continue an earlier session in a hosted terminal, in its own folder, and show that one in Live. */
   const withResume = useMemo<Journal>(() => ({
     store,
-    host: { ...journal.host, resume: async (s) => { await harnessApi.spawn('', '', 120, 32, s.id); show('live'); } },
-  }), [store, show]);
+    host: { ...journal.host, resume: async (s) => { const resumed = await harnessApi.spawn('', '', 120, 32, s.id); openLive(resumed.id); } },
+  }), [store, openLive]);
 
   // The same cleaned names in Live and the palette, joined by conversation id
   const titles = useMemo(() => Object.fromEntries(sessions.filter(s => !s.parentId).map(s => [s.id, formatSessionTitle(s)])), [sessions]);

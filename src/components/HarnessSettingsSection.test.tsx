@@ -3,11 +3,11 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import HarnessSettingsSection from './HarnessSettingsSection';
-import { harnessApi, type HarnessPreferences } from '../utils/harness';
+import { harnessApi, type HarnessPreferences, type Hosted } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({
   ...await importOriginal<object>(),
-  harnessApi: { status: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn(), codexHooks: vi.fn(), programQuery: vi.fn(), background: vi.fn(), stopBackground: vi.fn() },
+  harnessApi: { status: vi.fn(), list: vi.fn(), forget: vi.fn(), preferences: vi.fn(), savePreferences: vi.fn(), outsideSupervisors: vi.fn(), codexHooks: vi.fn(), programQuery: vi.fn(), background: vi.fn(), stopBackground: vi.fn() },
 }));
 const prefs: HarnessPreferences = {
   profiles: ['claude', 'codex', 'antigravity', 'pi', 'opencode', 'shell'].map(id => ({ id, label: id === 'shell' ? 'Terminal' : id, command: id === 'shell' ? '' : id, optional: ['antigravity', 'pi', 'opencode'].includes(id), canSupervise: id !== 'shell', taskTracking: ['claude', 'codex'].includes(id) })),
@@ -21,6 +21,7 @@ beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   host = document.createElement('div'); document.body.append(host); root = createRoot(host);
   vi.mocked(harnessApi.status).mockResolvedValue({ runner: { protocol: 1, pid: 7, version: '0.1.0', exe: '/x' }, profiles: prefs.profiles, home: '/Users/me' });
+  vi.mocked(harnessApi.list).mockResolvedValue([]);
   vi.mocked(harnessApi.preferences).mockResolvedValue(prefs);
   vi.mocked(harnessApi.savePreferences).mockImplementation(async next => ({ ...prefs, ...next }));
 });
@@ -117,6 +118,37 @@ it('uses adapter capabilities for supervisor choices and labels optional plugins
   expect(host.textContent).toContain('Optional plugin · pi');
   expect(host.textContent).toContain('Built in · claude');
   expect([...(host.querySelector('select') as HTMLSelectElement).options].map(o => o.value)).toEqual(['', 'claude']);
+});
+
+it('forgets already-ended sessions without open reports and leaves failures available to retry', async () => {
+  const hidden: Hosted = { id: 'hidden', pid: 10, argv: [], cwd: '/work/old', started: 1, cols: 80, rows: 24,
+    title: '', lastOutput: 2, exit: { code: 0, signal: null, at: 3 }, meta: {} };
+  const retry = { ...hidden, id: 'retry' };
+  const running = { ...hidden, id: 'running', exit: null };
+  const reported = (report: 'done' | 'needs_human'): Hosted => ({ ...hidden, id: report, harness: {
+    name: report, profile: 'claude', state: 'exited', since: 3, precise: true, agentSession: null, lastMessage: null,
+    attention: { report, kind: report === 'done' ? 'notification' : 'assessment', text: 'Open report', since: 2 },
+  } });
+  const retained = [running, reported('done'), reported('needs_human')];
+  vi.mocked(harnessApi.list).mockResolvedValue([hidden, retry, ...retained]);
+  vi.mocked(harnessApi.forget).mockImplementation(async id => {
+    if (id === 'retry') throw new Error('Runner busy');
+    vi.mocked(harnessApi.list).mockResolvedValue([retry, ...retained]);
+  });
+  await act(async () => root.render(<HarnessSettingsSection/>)); await flush();
+  const cleanup = () => [...host.querySelectorAll('button')].find(b => b.textContent?.startsWith('Forget ended sessions'));
+  expect(cleanup()?.textContent).toBe('Forget ended sessions · 2');
+  await act(async () => cleanup()!.click()); await flush();
+  expect(vi.mocked(harnessApi.forget).mock.calls).toEqual([['hidden'], ['retry']]);
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain('Runner busy');
+  expect(cleanup()?.textContent).toBe('Forget ended sessions · 1');
+
+  vi.mocked(harnessApi.forget).mockImplementation(async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue(retained);
+  });
+  await act(async () => cleanup()!.click()); await flush();
+  expect(harnessApi.forget).toHaveBeenLastCalledWith('retry');
+  expect(cleanup()).toBeUndefined();
 });
 
 it('shows background processes and stops all of them from Settings', async () => {

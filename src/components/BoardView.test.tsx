@@ -127,9 +127,10 @@ describe('Board view', () => {
 
 describe('board helpers', () => {
   it('counts a report as open only while its session still carries it', () => {
+    const ended = { ...session, exit: { code: 0, signal: null, at: 9 } };
     expect([...openReports(board.reports, [session])]).toEqual(['r3']);
-    expect(openReports(board.reports, [{ ...session, harness: { ...session.harness!, attention: null } }]).size).toBe(0);
-    expect(openReports(board.reports, [{ ...session, exit: { code: 0, signal: null, at: 9 } }]).size).toBe(0);
+    expect([...openReports(board.reports, [ended])]).toEqual(['r3']);
+    expect(openReports(board.reports, [{ ...ended, harness: { ...ended.harness!, attention: null } }]).size).toBe(0);
   });
   it('says how long until a moment', () => {
     expect([30_000, 20 * 60_000, 5 * 3_600_000, 72 * 3_600_000].map(ms => formatUntil(ms, 0))).toEqual(['in 1 min', 'in 20 min', 'in 5 h', 'in 3 days']);

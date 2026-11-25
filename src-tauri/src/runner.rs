@@ -1223,8 +1223,8 @@ pub const RUNNER: Unit = Unit { label: LAUNCH_LABEL, flag: "--runner", name: "ru
 /// units, or has stopped them. The app shows its question on this text.
 pub const NOT_ALLOWED: &str = "Background processes are not allowed";
 
-/// Whether this process may install, start, replace or remove the background
-/// units for the folder a socket lives in. Only the app's own config folder
+/// Whether this process may query launchd or install, start, replace or remove
+/// background units for the socket's folder. Only the app's own config folder
 /// qualifies, and never a test: a harness opened in a temporary folder once
 /// replaced the person's running runner with a test binary, which ended every
 /// hosted session.
@@ -1372,7 +1372,7 @@ pub fn unit_status(socket: &Path, unit: &Unit) -> Value {
 pub fn stop_unit(socket: &Path, unit: &Unit, remove: bool) -> Result<(), String> {
     let pid = Client::connect(socket).and_then(|mut c| c.call(json!({"op": "hello"}))).ok().and_then(|h| h["pid"].as_i64()).map(|p| p as i32);
     #[cfg(target_os = "macos")]
-    {
+    if may_manage(socket) {
         // SAFETY: getuid has no preconditions
         let service = format!("gui/{}/{}", unsafe { libc::getuid() }, unit.label);
         // The label may be held by another copy of the app with its own
@@ -1382,8 +1382,8 @@ pub fn stop_unit(socket: &Path, unit: &Unit, remove: bool) -> Result<(), String>
             None => false,
             Some(running) => running.is_none() || running == pid,
         };
-        if ours && may_manage(socket) {
-            let _ = std::process::Command::new("launchctl").args(["bootout", &service]).output();
+        if ours {
+            let _ = launchctl().args(["bootout", &service]).output();
         }
     }
     if let Some(pid) = pid {
@@ -1415,11 +1415,20 @@ pub fn stop_unit(socket: &Path, unit: &Unit, remove: bool) -> Result<(), String>
     Ok(())
 }
 
+/// A test must fail before it can execute any launchctl command.
+#[cfg(target_os = "macos")]
+fn launchctl() -> std::process::Command {
+    #[cfg(test)]
+    panic!("a test attempted to run launchctl");
+    #[cfg(not(test))]
+    std::process::Command::new("launchctl")
+}
+
 /// The process launchd runs for a service: `None` when the service is not
 /// registered, `Some(None)` when it is registered and not running.
 #[cfg(target_os = "macos")]
 fn launchd_pid(service: &str) -> Option<Option<i32>> {
-    let out = std::process::Command::new("launchctl").args(["print", service]).output().ok()?;
+    let out = launchctl().args(["print", service]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1500,7 +1509,6 @@ pub fn launch_agent_plist(unit: &Unit, exe: &Path, log: &Path) -> String {
 
 #[cfg(target_os = "macos")]
 fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
-    use std::process::Command;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = socket.with_extension("log");
     let home = dirs::home_dir().ok_or("Home directory unavailable")?;
@@ -1519,12 +1527,12 @@ fn start(socket: &Path, unit: &Unit) -> Result<(), String> {
             return Err(format!("The {} is already run by another copy of Agent MCR (pid {pid}). Quit that copy and stop its background processes first.", unit.name));
         }
         // Registered and not running: re-register this executable.
-        let _ = Command::new("launchctl").args(["bootout", &service]).output();
+        let _ = launchctl().args(["bootout", &service]).output();
         std::fs::write(&plist, &content).map_err(|e| e.to_string())?;
     }
     // Fails harmlessly when already loaded
-    let _ = Command::new("launchctl").arg("bootstrap").arg(&domain).arg(&plist).output();
-    let out = Command::new("launchctl").args(["kickstart", &service]).output().map_err(|e| e.to_string())?;
+    let _ = launchctl().arg("bootstrap").arg(&domain).arg(&plist).output();
+    let out = launchctl().args(["kickstart", &service]).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!("launchctl kickstart failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -1908,6 +1916,7 @@ mod tests {
         assert_eq!(list["sessions"][0]["exit"]["code"], 3);
         control.call(json!({"op": "forget", "id": "t1"})).unwrap();
         assert_eq!(control.call(json!({"op": "list"})).unwrap()["sessions"].as_array().unwrap().len(), 0);
+        assert!(snapshot(&socket, "t1").is_err(), "forget removes the scrollback along with the ended session");
     }
 
     #[cfg(unix)]
@@ -2478,6 +2487,14 @@ mod tests {
         sink.0.lock().unwrap().clear();
         handle_dsr(&mut dsr, b"\x1b[6n", true, &writer);
         assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stopping_a_unit_in_a_test_does_not_run_launchctl() {
+        let socket = temp_socket("stop-unit");
+        // Even a read-only query would panic at the launchctl command boundary.
+        stop_unit(&socket, &RUNNER, false).unwrap();
     }
 
     /// A unit is installed, started, replaced or removed only for the app's

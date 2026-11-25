@@ -393,6 +393,13 @@ pub trait Adapter: Sync {
     fn empty_input_box(&self, _screen: &str) -> bool {
         false
     }
+    /// The agent's input box is on screen with text in it (MCR-154): an
+    /// unsent line, or a suggestion the agent draws there. Only for saying
+    /// why a click placed nothing; it never lets anything be typed. False
+    /// when unsure
+    fn input_box_with_text(&self, _screen: &str) -> bool {
+        false
+    }
     /// Whether `empty_input_box` can ever be true; where not, no screen is read for it
     fn shows_empty_input_box(&self) -> bool {
         false
@@ -511,6 +518,26 @@ fn claude_input_box(screen: &str) -> bool {
     lines[at] == "\u{276f}" && at >= 1 && named_rule(lines[at - 1]) && lines.get(at + 1).is_some_and(|l| rule(l)) && lines.len() - (at + 2) <= 2
 }
 
+/// Claude Code's input box with text in it (MCR-154): the frame of
+/// `claude_input_box`, but the prompt line has text after the mark, which may
+/// wrap onto a few more lines before the lower rule. A menu's choice ("❯ 1.
+/// Yes") is not taken for text. Used for the wording of a refusal only.
+fn claude_input_box_with_text(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let Some(last) = lines.iter().rposition(|l| !l.is_empty()) else { return false };
+    let lines = &lines[..=last];
+    let rule = |l: &str| l.chars().count() >= 20 && l.chars().all(|c| c == '\u{2500}');
+    let named_rule = |l: &str| l.starts_with("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}") && l.ends_with('\u{2500}') && l.chars().count() >= 20;
+    let Some(low) = lines.iter().rposition(|l| rule(l)) else { return false };
+    if lines.len() - (low + 1) > 2 {
+        return false;
+    }
+    let Some(at) = lines[..low].iter().rposition(|l| l.starts_with('\u{276f}')) else { return false };
+    let text = lines[at]['\u{276f}'.len_utf8()..].trim();
+    let menu = text.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    !text.is_empty() && !menu && at >= 1 && named_rule(lines[at - 1]) && low - at <= 8 && !lines[at + 1..low].iter().any(|l| named_rule(l))
+}
+
 impl Adapter for Claude {
     fn profile(&self) -> Profile {
         Profile { id: "claude", label: "Claude Code", command: "claude --permission-mode acceptEdits", optional: false, can_supervise: true, task_tracking: true }
@@ -524,6 +551,9 @@ impl Adapter for Claude {
     }
     fn shows_empty_input_box(&self) -> bool {
         true
+    }
+    fn input_box_with_text(&self, screen: &str) -> bool {
+        claude_input_box_with_text(screen)
     }
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
@@ -1111,6 +1141,33 @@ mod tests {
         // Other programs: Codex by its own marks, a shell never
         assert!(Codex.input_box("\u{203a} Ask Codex to do anything\n\n  ? for shortcuts\n") && !Codex.input_box(&idle(&rule)));
         assert!(!Shell.input_box(&idle(&rule)) && !adapter("agy").input_box(&idle(&rule)));
+    }
+
+    #[test]
+    fn claudes_input_box_with_text_is_told_apart_from_an_empty_box_and_a_menu() {
+        let rule = "\u{2500}".repeat(80);
+        let named = format!("{} Lead \u{2500}", "\u{2500}".repeat(72));
+        let mode = "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)";
+        let boxed = |upper: &str, inside: &str| format!("(text)\n\u{273b} Worked for 29s\n{upper}\n{inside}\n{rule}\n{mode}\n");
+        // A placed line, one that wrapped, under a named rule
+        for (upper, inside) in [
+            (rule.as_str(), "\u{276f} Decision mcr148-relaunch: Holds survive a relaunch"),
+            (rule.as_str(), "\u{276f} a long line that the terminal\n  wrapped onto a second one"),
+            (named.as_str(), "\u{276f}\u{a0}half a line"),
+        ] {
+            let screen = boxed(upper, inside);
+            assert!(Claude.input_box_with_text(&screen), "{screen}");
+            assert!(!Claude.input_box(&screen) && !Claude.empty_input_box(&screen));
+        }
+        // The empty box is not a box with text, and neither is a menu or no box at all
+        assert!(!Claude.input_box_with_text(&boxed(&rule, "\u{276f}")));
+        let menu = format!("(text)\n{rule}\n Bash command\n   cargo test\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n\n Esc to cancel\n");
+        assert!(!Claude.input_box_with_text(&menu));
+        assert!(!Claude.input_box_with_text(&boxed(&rule, "\u{276f} 1. Yes\n  2. No")));
+        assert!(!Claude.input_box_with_text(&format!("{rule}\n\u{276f} text\n{rule}\n one\n two\n three\n")));
+        assert!(!Claude.input_box_with_text("\u{276f} text\n") && !Claude.input_box_with_text(""));
+        // Other programs cannot say
+        assert!(!Codex.input_box_with_text("\u{203a} some text\n\n  ? for shortcuts\n") && !Shell.input_box_with_text(&boxed(&rule, "\u{276f} x")));
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::runner::{self, lock, now_ms, Client, Unit};
 use crate::session_mcp::{read_frame, Protocol, Server};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -951,6 +952,15 @@ pub struct Tracked {
     draft_generation: Option<u64>,
     /// When the app last said that `draft` changed
     pub typed: u64,
+    /// That a cockpit click placed the unsent line `draft` counts (MCR-154),
+    /// so a refused click can name it: what kind of line and when, both the
+    /// service's own (`Placed`). Never the line or the entry's id: an agent
+    /// wrote those, and a credential the detector does not know could be in
+    /// them. Forgotten at the operator's Enter, when the hold ends or when
+    /// they begin a line of their own. In memory only: not in the store or a
+    /// session list; after a service restart a refusal says "an unsent line"
+    #[serde(skip)]
+    placed: Option<Placed>,
     /// The operator was told that something waits for this draft (once per draft)
     pub held_told: bool,
     /// When the operator last pressed Enter in its terminal, by the app's
@@ -1335,22 +1345,21 @@ impl Store {
     }
 
     /// The session's process ended (the runner said so, or its list shows it):
-    /// the store knows it from here on. Nothing waits on an ended session:
-    /// its mark goes, and its open waits are closed. Returns true when this
-    /// changed anything.
+    /// the store knows it from here on. Prompts and waits end with the process,
+    /// but the operator can still have a report to read.
     fn end(&mut self, id: &str) -> bool {
         let Some(t) = self.sessions.get_mut(id) else { return false };
-        if t.state == ENDED && t.attention.is_none() {
+        if t.state == ENDED {
             return false;
         }
-        t.attention = None;
+        let pending = t.pending_report.take().and_then(|id| self.reports.iter().find(|r| r.id == id));
+        t.attention = t.attention.take().filter(|a| a.report.is_some()).or_else(|| pending.map(|r| report_mark(&r.kind, &r.text, r.created)));
         t.draft = false;
         t.draft_generation = None;
+        t.placed = None;
         t.held_told = false;
-        if t.state != ENDED {
-            t.state = ENDED.into();
-            t.since = now_ms();
-        }
+        t.state = ENDED.into();
+        t.since = now_ms();
         // A restart ends the process and carries the waits to the new one
         if !self.restarting.contains(id) {
             let now = now_ms();
@@ -1445,7 +1454,8 @@ impl Store {
 
     /// A report made at a prompt gets its mark once the prompt is gone (MCR-124,
     /// M7). Run at every write of the store, so no place that takes a prompt
-    /// mark away can forget it. A later report, or the session's end, ends it.
+    /// mark away can forget it. A later report replaces it. An exit raises it
+    /// in `end`, when the prompt itself can no longer be answered.
     fn raise_pending(&mut self, now: u64) {
         let pending: Vec<(String, String)> = self.sessions.iter().filter_map(|(id, t)| t.pending_report.clone().map(|r| (id.clone(), r))).collect();
         for (id, report) in pending {
@@ -1874,7 +1884,7 @@ fn short_text(text: &str, chars: usize) -> String {
 impl Store {
     // Matches the Board's openReports rule: one active mark, latest matching report.
     fn open_report(&self, session: &str) -> Option<&Report> {
-        let tracked = self.sessions.get(session).filter(|t| t.state != ENDED)?;
+        let tracked = self.sessions.get(session)?;
         // A report made at a prompt is open while the prompt stands (MCR-124, M7)
         if let Some(pending) = tracked.pending_report.as_deref().filter(|_| tracked.attention.as_ref().is_some_and(|a| a.kind == "permission")) {
             return self.reports.iter().find(|r| r.id == pending);
@@ -2306,12 +2316,64 @@ fn answered(tracked: &mut Tracked, now: u64) {
     }
 }
 
+/// The line a cockpit click placed, as a refusal names it (MCR-154): only
+/// what the service knows of its own, the kind of click and when. No text
+/// and no id an agent wrote.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placed {
+    /// "the decision line", "the Ask more line" or "the line"
+    what: &'static str,
+    at: u64,
+}
+
+impl Placed {
+    /// For a click that resolved to a line to type (`Deed::Type`)
+    fn of(act: cockpit::Act, at: u64) -> Placed {
+        let what = match act {
+            cockpit::Act::Choose(_) => "the decision line",
+            cockpit::Act::Ask => "the Ask more line",
+            _ => "the line",
+        };
+        Placed { what, at }
+    }
+
+    /// "the decision line an earlier click placed there 3 minutes ago"
+    fn told(&self, now: u64) -> String {
+        let minutes = now.saturating_sub(self.at) / 60_000;
+        let ago = match minutes {
+            0 => "a moment ago".to_string(),
+            1 => "a minute ago".to_string(),
+            2..=119 => format!("{minutes} minutes ago"),
+            _ => format!("{} hours ago", minutes / 60),
+        };
+        format!("{} an earlier click placed there {ago}", self.what)
+    }
+}
+
+/// What a look at a session's screen found of its input box, for a click (MCR-97, MCR-154).
+enum BoxSeen {
+    /// Proved there, and empty where the adapter can tell (`Adapter::input_box`)
+    Ready,
+    /// There, with text in it that the harness did not see typed (`Adapter::input_box_with_text`)
+    WithText,
+    /// Not found: a menu, a screen this build does not know, or no screen
+    NotFound,
+}
+
+/// Why a click placed nothing, and what the operator can do (MCR-154): the
+/// operator read the bare "not found" as "clicks don't work". No wording here
+/// says Ctrl+C: in a working agent it stops the turn (MCR-122).
+const UNSENT: &str = "an unsent line is in its input box. Press Enter in that session to send it, or delete it there, then click again (with an empty box, an Enter there ends the hold)";
+const BOX_WITH_TEXT: &str = "its input box shows text, likely a line nobody sent yet (or a suggestion the agent drew there). Press Enter in that session to send it, or delete it there, then click again";
+const BOX_NOT_FOUND: &str = "the input box of that session was not found on its screen: it may be at a menu or a question, or show something this build does not know. Look at its terminal, answer or close what is there, then click again";
+
 /// The harness no longer counts an unsent line in this session. `typed` is
 /// set to now, so `held` keeps out of the box for `DRAFT_QUIET_MS` more: a key
 /// the app is telling just now lands before anything is typed there.
 fn clear_draft(tracked: &mut Tracked, now: u64) {
     tracked.draft = false;
     tracked.draft_generation = None;
+    tracked.placed = None;
     tracked.typed = now;
     tracked.held_told = false;
     if tracked.attention.as_ref().is_some_and(|a| a.text == HELD_MARK) {
@@ -2812,6 +2874,30 @@ impl Harness {
         Client::connect(&socket)?.call(req)
     }
 
+    /// Forget an ended session at the operator's request, after any open report is seen.
+    fn forget_ended(&self, id: &str) -> Result<Value, String> {
+        // Task-result notices still have the executor relation when they are posted.
+        self.tell_assigners();
+        let socket = runner_socket(&self.dir);
+        runner::ensure(&socket)?;
+        self.update(|s| {
+            if s.restarting.contains(id) {
+                return Err("The session is restarting".into());
+            }
+            if s.sessions.get(id).is_some_and(|t| t.pending_report.is_some() || t.attention.as_ref().is_some_and(|a| a.report.is_some())) {
+                return Err("Mark the session's report as seen before forgetting it".into());
+            }
+            // Keep the report check and removal together. The runner checks for exit.
+            match Client::connect(&socket)?.call(json!({"op": "forget", "id": id})) {
+                Err(e) if e != format!("No session {id}") => return Err(e),
+                _ => {}
+            }
+            s.sessions.remove(id);
+            s.cockpit.keep(|tracked| tracked != id);
+            Ok(json!({}))
+        })
+    }
+
     /// The runner's terminals with what this service knows about each.
     fn processes(&self) -> Arc<Vec<Process>> {
         let mut cached = lock(&self.processes);
@@ -2853,7 +2939,7 @@ impl Harness {
         // An exit the service did not hear of (it was down, or restarting): the list says so
         let ended: Vec<&str> = {
             let store = lock(&self.store);
-            infos.iter().filter(|i| !i["exit"].is_null()).filter_map(|i| i["id"].as_str()).filter(|id| store.sessions.get(*id).is_some_and(|t| t.state != ENDED || t.attention.is_some())).collect()
+            infos.iter().filter(|i| !i["exit"].is_null()).filter_map(|i| i["id"].as_str()).filter(|id| store.sessions.get(*id).is_some_and(|t| t.state != ENDED)).collect()
         };
         if !ended.is_empty() {
             self.update(|s| ended.iter().for_each(|id| { s.end(id); }));
@@ -2918,7 +3004,7 @@ impl Harness {
                 });
                 if !info["exit"].is_null() {
                     tracked.state = "exited".into();
-                    tracked.attention = None;
+                    tracked.attention = tracked.attention.filter(|a| a.report.is_some());
                 }
                 // An unnamed session goes by the title its agent gave it
                 tracked.named = !tracked.name.is_empty();
@@ -3476,10 +3562,19 @@ impl Harness {
         self.runner(json!({"op": "write", "id": session, "data": data})).map(|_| ())
     }
 
-    /// Positive proof that a session's input box is on screen (`Adapter::input_box`).
-    fn input_box(&self, session: &str) -> bool {
+    /// Positive proof that a session's input box is on screen (`Adapter::input_box`),
+    /// else whether it is there with text in it, from one read of the screen.
+    fn input_box(&self, session: &str) -> BoxSeen {
         let profile = lock(&self.store).sessions.get(session).map(|t| t.profile.clone()).unwrap_or_default();
-        self.screen(session).is_some_and(|text| adapter(&profile).input_box(&text))
+        let Some(text) = self.screen(session) else { return BoxSeen::NotFound };
+        let agent = adapter(&profile);
+        if agent.input_box(&text) {
+            BoxSeen::Ready
+        } else if agent.input_box_with_text(&text) {
+            BoxSeen::WithText
+        } else {
+            BoxSeen::NotFound
+        }
     }
 
     /// A click in the cockpit (MCR-97): `by`, `id` and `updated` name the
@@ -3497,7 +3592,8 @@ impl Harness {
             cockpit::Deed::Link(link) => Ok(json!({ "link": link })),
             cockpit::Deed::Copy(text) => Ok(json!({ "copy": text })),
             cockpit::Deed::Type { session, text } => {
-                self.place(&session, &text)?;
+                // Named after the action resolved: nothing of the request is taken before (review 17271)
+                self.place(&session, &text, Placed::of(act, now_ms()))?;
                 Ok(json!({ "placed": session }))
             }
         }
@@ -3506,7 +3602,15 @@ impl Harness {
     /// Why a line cannot be placed in a session's input box now, by what the
     /// store knows: it must be an agent that is idle by its own word, asks
     /// nothing, has no line of the operator's, and has nothing on its way.
-    fn place_refusal(store: &Store, session: &str, now: u64) -> Option<&'static str> {
+    fn place_refusal(store: &Store, session: &str, now: u64) -> Option<Cow<'static, str>> {
+        Self::place_obstacle(store, session, now).map(|why| match store.sessions.get(session).filter(|_| why == UNSENT) {
+            // What the operator can do about it, and that the cockpit placed the line (MCR-154)
+            Some(Tracked { placed: Some(placed), .. }) => Cow::Owned(format!("an unsent line is in its input box: {}. Press Enter in that session to send it, or delete it there (with an empty box, an Enter there ends the hold), then click again", placed.told(now))),
+            _ => Cow::Borrowed(why),
+        })
+    }
+
+    fn place_obstacle(store: &Store, session: &str, now: u64) -> Option<&'static str> {
         let Some(t) = store.sessions.get(session).filter(|t| t.state != ENDED) else { return Some("that session has ended or is gone") };
         if !adapter(&t.profile).is_agent() {
             return Some("that session is not an agent with an input box");
@@ -3518,7 +3622,7 @@ impl Harness {
             return Some("that session is not idle by its own word: it works, or has not reported yet");
         }
         if t.draft {
-            return Some("that session already has an unsent line in its input box. Send it or delete it there first (with an empty box, an Enter there ends the hold)");
+            return Some(UNSENT);
         }
         if held(t, now) {
             return Some("a line was just cleared in that session; try again in a few seconds");
@@ -3540,7 +3644,7 @@ impl Harness {
     /// added: the operator presses it. The line counts as their unsent line
     /// from before it is written (`Tracked.draft`, MCR-85), so no notice and
     /// no task is typed into it.
-    fn place(&self, session: &str, text: &str) -> Result<(), String> {
+    fn place(&self, session: &str, text: &str, placed: Placed) -> Result<(), String> {
         let refuse = |why: &str| Err(format!("Refused: {why}."));
         cockpit::placeable(text).or_else(|why| refuse(&format!("the line {why}")))?;
         // Not while the harness types there itself: its Enter would send this line too
@@ -3548,33 +3652,37 @@ impl Harness {
         let Ok(_typing) = writer.try_lock() else { return refuse("the harness is typing into that session right now; try again in a few seconds") };
         let now = now_ms();
         if let Some(why) = Self::place_refusal(&lock(&self.store), session, now) {
-            return refuse(why);
+            return refuse(&why);
         }
         if lock(&self.wrote).get(session).is_some_and(|at| now.saturating_sub(*at) < PLACE_QUIET_MS) {
             return refuse("the harness typed into that session a moment ago; try again in a few seconds");
         }
         // What the store cannot know: that the box is there. A menu takes letters and digits as keys
-        if !self.input_box(session) {
-            return refuse("the input box of that session was not found on its screen: it may be at a menu, or have text in the box");
+        match self.input_box(session) {
+            BoxSeen::Ready => {}
+            BoxSeen::WithText => return refuse(BOX_WITH_TEXT),
+            BoxSeen::NotFound => return refuse(BOX_NOT_FOUND),
         }
         // The line is the operator's from here; checked once more under the lock that sets it
         let held = self.update(|s| match Self::place_refusal(s, session, now_ms()) {
             Some(why) => Err(why),
             None => {
-                let t = s.sessions.get_mut(session).ok_or("that session has ended or is gone")?;
+                let t = s.sessions.get_mut(session).ok_or(Cow::Borrowed("that session has ended or is gone"))?;
                 (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
                 t.draft_generation = None;
+                t.placed = Some(placed);
                 Ok(())
             }
         });
         if let Err(why) = held {
-            return refuse(why);
+            return refuse(&why);
         }
         if let Err(e) = self.type_into(session, &format!("\x1b[200~{text}\x1b[201~")) {
             self.update(|s| {
                 if let Some(t) = s.sessions.get_mut(session) {
                     (t.draft, t.typed) = (false, now_ms());
                     t.draft_generation = None;
+                    t.placed = None;
                 }
             });
             return Err(e);
@@ -5034,6 +5142,7 @@ impl Harness {
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
             "supervisor" => self.supervisor(req),
             "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true, req["refreshProfile"] == true),
+            "forget_ended" => self.forget_ended(id()?),
             "settings" => {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
@@ -5115,6 +5224,12 @@ impl Harness {
                         if let Some(t) = s.sessions.get_mut(id) {
                             if t.draft != draft || (enter && draft) {
                                 if draft {
+                                    // A line the operator began, not one the cockpit placed. An
+                                    // Enter told with a new line (the app reads the draft when its
+                                    // worker calls) sent the placed one: that line is gone too
+                                    if !t.draft || enter {
+                                        t.placed = None;
+                                    }
                                     (t.draft, t.typed, t.held_told) = (true, now_ms(), false);
                                     t.draft_generation = owner;
                                 } else if may_clear(t) {
@@ -5180,8 +5295,12 @@ impl Harness {
             // The human looked at this version of the notice; a newer one must survive.
             "ack" => {
                 let id = id()?;
+                let since = req["since"].as_u64();
                 self.update(|s| {
-                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| a.kind == "notification" && req["since"].as_u64().is_none_or(|since| since == a.since))) {
+                    if let Some(t) = s.sessions.get_mut(id).filter(|t| t.attention.as_ref().is_some_and(|a| {
+                        let can_ack = a.kind == "notification" || (t.state == ENDED && a.report.is_some() && since.is_some());
+                        can_ack && since.is_none_or(|since| since == a.since)
+                    })) {
                         t.attention = None;
                     }
                 });
@@ -9412,12 +9531,16 @@ mod tests {
         }
         // An open needs_human report is no obstacle: that is where the operator answers
         harness.update(|s| s.sessions.get_mut("ex").unwrap().attention = Some(Attention { kind: "assessment".into(), text: "needs you".into(), since: 1, report: Some("needs_human".into()), ..Attention::default() }));
-        // The screen: a menu, a box with text, no screen at all
+        // The screen: a menu or no screen at all, and a box with text the app never told of (MCR-154)
         let rule = "\u{2500}".repeat(80);
-        for screen in [format!("{rule}\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n"), claude_idle_screen().replace("\n\u{276f}\n", "\n\u{276f} half a line\n"), String::new()] {
+        for screen in [format!("{rule}\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n"), String::new()] {
             lock(&harness.shown).insert("ex".into(), screen);
-            assert!(click().unwrap_err().contains("input box of that session was not found"));
+            let err = click().unwrap_err();
+            assert!(err.contains("input box of that session was not found") && err.contains("then click again"), "{err}");
         }
+        lock(&harness.shown).insert("ex".into(), claude_idle_screen().replace("\n\u{276f}\n", "\n\u{276f} half a line\n"));
+        let err = click().unwrap_err();
+        assert!(err.starts_with("Refused: its input box shows text") && err.contains("Press Enter in that session to send it, or delete it there, then click again"), "{err}");
         lock(&harness.shown).insert("ex".into(), claude_idle_screen());
         // The action was published again since the panel showed it
         assert!(harness.cockpit_act(None, "lead", "word", stamp + 1, cockpit::Act::Place).unwrap_err().contains("published again"));
@@ -9431,6 +9554,86 @@ mod tests {
         *lock(&harness.typed) = None;
         assert!(harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(0)).is_err());
         assert!(!lock(&harness.store).sessions["lead"].draft);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_click_names_the_placed_line_still_in_the_box_and_what_to_do() {
+        let (dir, harness, stamp) = clickable("unsent");
+        let fix = "Press Enter in that session to send it, or delete it there (with an empty box, an Enter there ends the hold), then click again";
+        let refusal = |choice: usize| {
+            lock(&harness.wrote).clear();
+            harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(choice)).unwrap_err()
+        };
+        let place = |choice: usize| {
+            harness.update(|s| s.sessions.get_mut("lead").unwrap().typed = 0);
+            lock(&harness.wrote).clear();
+            harness.cockpit_act(None, "lead", "pick", stamp, cockpit::Act::Choose(choice)).unwrap()
+        };
+        // The owner's case of MCR-154: a decision placed in the lead's box and not sent, then another click for that box
+        assert_eq!(place(1), json!({"placed": "lead"}));
+        // What is kept of it is the service's own and stays out of the store and the session lists
+        assert!(lock(&harness.store).sessions["lead"].placed.is_some());
+        let saved = serde_json::to_value(&lock(&harness.store).sessions["lead"]).unwrap();
+        assert!(saved.get("placed").is_none() && !saved.to_string().contains("decision line"), "{saved}");
+        let err = refusal(0);
+        assert_eq!(err, format!("Refused: an unsent line is in its input box: the decision line an earlier click placed there a moment ago. {fix}."));
+        // Nothing an agent wrote is repeated: not the line, not the entry's id
+        assert!(!err.contains("Drop it") && !err.contains("pick") && !err.contains("Ctrl"), "{err}");
+        // Nothing went into the box that holds the line
+        assert_eq!(typed_so_far(&harness).len(), 1);
+        // The operator's Enter sends it and the line is forgotten; a line they begin themselves is never named
+        harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        assert!(lock(&harness.store).sessions["lead"].placed.is_none());
+        harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": true})).unwrap();
+        let err = refusal(0);
+        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("earlier click") && err.contains("an Enter there ends the hold"), "{err}");
+        // A placed line the operator types on is still named: the app's key says nothing about it
+        harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        place(0);
+        harness.control(&json!({"op": "operator_draft", "id": "lead", "draft": true})).unwrap();
+        assert!(refusal(1).contains("the decision line an earlier click placed there"));
+        // An Enter told together with a new line (the app's worker reads the draft when it calls):
+        // the placed line was sent, the new one is held and is not named as the placed one
+        harness.control(&json!({"op": "operator_input", "id": "lead", "draft": true})).unwrap();
+        let t = lock(&harness.store).sessions["lead"].clone();
+        assert!(t.draft && t.placed.is_none());
+        let err = refusal(1);
+        assert!(err.starts_with("Refused: an unsent line is in its input box. ") && !err.contains("earlier click"), "{err}");
+        assert_eq!(typed_so_far(&harness).len(), 2);
+        // A choice the action does not have is refused as such, whatever its number, before anything is named
+        harness.control(&json!({"op": "operator_input", "id": "lead"})).unwrap();
+        harness.update(|s| s.sessions.get_mut("lead").unwrap().typed = 0);
+        for n in [2, usize::MAX] {
+            assert!(refusal(n).contains("no such option"));
+        }
+        // How long ago, in the service's words
+        assert_eq!(Placed::of(cockpit::Act::Ask, 0).told(3 * 60_000 + 5), "the Ask more line an earlier click placed there 3 minutes ago");
+        assert_eq!(Placed::of(cockpit::Act::Place, 0).told(60_000), "the line an earlier click placed there a minute ago");
+        assert_eq!(Placed::of(cockpit::Act::Place, 0).told(3 * 3_600_000), "the line an earlier click placed there 3 hours ago");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refusal_never_repeats_an_entry_id_that_looks_like_a_credential() {
+        let (dir, harness, stamp) = clickable("secret-id");
+        // A fake token, put together at run time: it passes `ident` and the detector knows its shape
+        let id = ["gh", "p_", "abcdefghij0123456789abcdef"].concat();
+        assert!(cockpit::looks_secret(&id) && id.len() <= 40 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+        harness.update(|s| {
+            let facts = s.cockpit_facts(stamp);
+            s.cockpit.publish(&cockpit::Who { id: "ex", root: false }, &facts, &json!({
+                "tracks": [{"id": "own", "title": "Own", "lead": "ex", "state": "waiting_human"}],
+                "actions": [{"id": id, "track": "own", "title": "Say it", "kind": "typed_word", "where": {"session": "ex"}, "say": "looks fine", "risk": "reversible"}],
+            }), stamp).unwrap();
+        });
+        // A typed word places its `say` alone, which passed the detector: the id is in no line
+        assert_eq!(harness.cockpit_act(None, "ex", &id, stamp, cockpit::Act::Place).unwrap(), json!({"placed": "ex"}));
+        assert_eq!(typed_so_far(&harness), [("ex".to_string(), "\x1b[200~looks fine\x1b[201~".to_string())]);
+        lock(&harness.wrote).clear();
+        let err = harness.cockpit_act(None, "ex", &id, stamp, cockpit::Act::Place).unwrap_err();
+        assert!(err.contains("the line an earlier click placed there"), "{err}");
+        assert!(!err.contains(&id) && !cockpit::looks_secret(&err), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10574,6 +10777,8 @@ mod tests {
             s.sessions.insert("gone".into(), Tracked { name: "Trust check Codex".into(), profile: "codex".into(), state: "waiting".into(), supervisor: Some("up".into()), ..Tracked::default() });
             s.sessions.get_mut("gone").unwrap().attention = Some(Attention { kind: "permission".into(), text: "Trust this folder?".into(), since: 1, ..Attention::default() });
             s.waits.insert("w".into(), Wait { id: "w".into(), session: "gone".into(), created: 1, expect_by: now_ms() + 3_600_000, on: "CI".into(), ..Wait::default() });
+            s.sessions.insert("worktree".into(), Tracked { name: "Worktree executor".into(), profile: "claude".into(), state: "idle".into(), supervisor: Some("up".into()), ..Tracked::default() });
+            s.report("worktree", "done", "Ready to read").unwrap();
         });
         // The status report asks the list first: only the running executor is in it
         let report = h.agent_tool("up", "report", &json!({"kind": "status", "text": "where things stand"})).unwrap();
@@ -10589,13 +10794,20 @@ mod tests {
         assert!(lock(&h.store).waits["w"].cleared > 0);
         let on_disk: Store = serde_json::from_slice(&std::fs::read(dir.join("harness-state.json")).unwrap()).unwrap();
         assert_eq!((on_disk.sessions["gone"].state.as_str(), on_disk.sessions["gone"].attention.is_none()), (ENDED, true));
-        // And nothing in the attention list
-        assert!(h.attention().unwrap().is_empty());
+        // The dead prompt is gone. The report survives reconciliation and later polls.
+        let attention = h.attention().unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0]["session"], "worktree");
+        assert_eq!(attention[0]["attention"]["report"], "done");
         // An ended session whose folder is no longer on disk says so in the list (MCR-107);
         // one whose folder is there, and a running one, do not
         let listed = h.sessions().unwrap();
+        let ended_report = listed.iter().find(|s| s["id"] == "worktree").unwrap();
+        assert_eq!(ended_report["harness"]["attention"]["report"], "done");
         let gone_folder = |id: &str| listed.iter().find(|s| s["id"] == id).unwrap()["cwdGone"].clone();
         assert_eq!((gone_folder("worktree"), gone_folder("gone"), gone_folder("running-in-gone"), gone_folder("up")), (json!(true), Value::Null, Value::Null, Value::Null));
+        h.control(&json!({"op": "ack", "id": "worktree", "since": ended_report["harness"]["attention"]["since"]})).unwrap();
+        assert!(h.attention().unwrap().is_empty());
         // The Slack connector is told only of running sessions, so a channel routed to the
         // ended one is held as "The routed session is not running", and its inbox takes nothing
         use crate::slack::Host;
@@ -10658,6 +10870,117 @@ mod tests {
         let ex = lock(&harness.store).sessions["ex"].clone();
         assert_eq!((ex.state.as_str(), ex.attention.is_none()), (ENDED, true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ended_executor_keeps_its_open_report_and_the_assigner_can_read_its_result() {
+        let dir = socket_test_dir("mcr-ended-report-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = Harness::open(&dir);
+        let report = h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { name: "Lead".into(), state: "working".into(), ..Tracked::default() });
+            s.sessions.insert("worker".into(), Tracked { name: "Worker".into(), state: "waiting".into(), supervisor: Some("lead".into()),
+                attention: Some(Attention { kind: "permission".into(), since: 1, ..Attention::default() }), ..Tracked::default() });
+            s.sessions.insert("done".into(), Tracked { state: "idle".into(), ..Tracked::default() });
+            s.report("done", "done", "Finished").unwrap();
+            s.tasks.insert("task".into(), Task { id: "task".into(), session: "worker".into(), text: "Run the checks".into(), state: "completed".into(),
+                created: 1, started: 2, finished: 3, result: Some("All checks passed".into()), by: "lead".into(), told: false });
+            s.post(Message { from: "worker".into(), to: "lead".into(), text: "A final message".into(), ..Message::default() });
+            s.report("worker", "needs_human", "Check the result").unwrap()
+        });
+        h.runner_event(&json!({"event": "exited", "id": "worker"}));
+        h.runner_event(&json!({"event": "exited", "id": "worker"}));
+        h.runner_event(&json!({"event": "exited", "id": "done"}));
+        h.tell_assigners();
+        let state = Harness::open(&dir);
+        {
+            let s = lock(&state.store);
+            assert!(s.executors("lead").is_empty());
+            assert!(s.under("lead", "worker"));
+            assert!(s.sessions["worker"].pending_report.is_none());
+            let mark = s.sessions["worker"].attention.as_ref().unwrap();
+            assert_eq!((mark.kind.as_str(), mark.since), ("assessment", report.created));
+            assert_eq!(s.open_report("worker").unwrap().id, report.id);
+            assert_eq!(s.open_report("done").unwrap().kind, "done");
+        }
+        let task = state.agent_tool("lead", "task_status", &json!({"task": "task"})).unwrap();
+        assert_eq!(task["result"], "All checks passed");
+        let inbox = state.agent_tool("lead", "read_inbox", &json!({})).unwrap();
+        let messages = inbox["messages"].as_array().unwrap();
+        for text in ["A final message", "All checks passed"] {
+            assert!(messages.iter().any(|m| m["from"]["id"] == "worker" && m["text"].as_str().is_some_and(|s| s.contains(text))), "{inbox}");
+        }
+        state.control(&json!({"op": "ack", "id": "worker", "since": report.created - 1})).unwrap();
+        assert!(lock(&state.store).open_report("worker").is_some());
+        state.control(&json!({"op": "ack", "id": "worker", "since": report.created})).unwrap();
+        let s = lock(&state.store);
+        assert!(s.open_report("worker").is_none());
+        assert!(s.board_reports().iter().any(|r| r.id == report.id));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_app_forgets_only_ended_sessions_without_open_reports() {
+        let dir = socket_test_dir("mcr-forget-ended-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut ended = BTreeSet::from(["done", "needs-human", "hidden"]);
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "forget" => {
+                        let id = req["id"].as_str().unwrap();
+                        if id == "live" { json!({"error": "The session is still running"}) }
+                        else if ended.remove(id) { json!({}) }
+                        else { json!({"error": format!("No session {id}")}) }
+                    }
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+            assert!(ended.is_empty());
+        });
+        let h = Harness::open(&dir);
+        let reports = h.update(|s| {
+            for id in ["done", "needs-human", "hidden", "live"] {
+                s.sessions.insert(id.into(), Tracked { state: "idle".into(), ..Tracked::default() });
+            }
+            s.sessions.get_mut("hidden").unwrap().supervisor = Some("live".into());
+            s.tasks.insert("task".into(), Task { id: "task".into(), session: "hidden".into(), by: "live".into(),
+                text: "Run the checks".into(), state: "completed".into(), created: 1, started: 2, finished: 3,
+                result: Some("All checks passed".into()), told: false });
+            let reports = [("done", "done"), ("needs-human", "needs_human")]
+                .map(|(id, kind)| (id, s.report(id, kind, "Open report").unwrap()));
+            for id in ["done", "needs-human", "hidden"] { s.end(id); }
+            reports
+        });
+        let forget = |id: &str| h.control(&json!({"op": "forget_ended", "id": id}));
+        assert!(forget("hidden").is_ok());
+        assert!(forget("hidden").is_ok(), "retry after an already successful forget");
+        let inbox = h.agent_tool("live", "read_inbox", &json!({})).unwrap();
+        assert!(inbox["messages"][0]["text"].as_str().unwrap().contains("All checks passed"));
+        assert!(forget("live").unwrap_err().contains("still running"));
+        for (id, report) in reports {
+            let ack = |since| h.control(&json!({"op": "ack", "id": id, "since": since})).unwrap();
+            assert!(forget(id).unwrap_err().contains("report as seen"));
+            ack(report.created - 1);
+            assert!(forget(id).unwrap_err().contains("report as seen"));
+            ack(report.created);
+            forget(id).unwrap();
+            assert!(!lock(&h.store).sessions.contains_key(id));
+            assert!(lock(&h.store).board_reports().iter().any(|r| r.id == report.id));
+        }
+        assert_eq!(lock(&h.store).sessions.keys().map(String::as_str).collect::<Vec<_>>(), ["live"]);
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -6,8 +6,9 @@
  *
  * Terminals still assigned to a pane are protected even when the pane is
  * clipped or zero-sized (MCR-140). Of the others, at most `max` are kept,
- * the least recently detached going first. Sessions that leave the list go
- * at once. A dropped terminal starts over with the runner's replay. Saving
+ * the least recently detached going first. Closing a session or removing it
+ * from the list drops its terminal at once. Other evicted terminals start
+ * over with the runner's replay. Saving
  * serialized text lost parser state for unfinished escape sequences (review
  * 17086), so the keep holds the xterm itself.
  */
@@ -23,7 +24,7 @@ export const MAX_KEPT = 4;
 export class TerminalKeep<T> {
   private kept = new Map<string, Kept<T>>();
   private assigned: ReadonlySet<string> = new Set();
-  /** The sessions of the last list, and those that were in a list and left it: never kept again */
+  /** The last list, and sessions that closed or left the list: never kept again */
   private listed = new Set<string>();
   private gone = new Set<string>();
 
@@ -57,20 +58,26 @@ export class TerminalKeep<T> {
 
   private trim() {
     const unassigned = [...this.kept.keys()].filter(id => !this.assigned.has(id));
-    for (const id of unassigned.slice(0, Math.max(0, unassigned.length - this.max))) this.forget(id);
+    for (const id of unassigned.slice(0, Math.max(0, unassigned.length - this.max))) this.evict(id);
   }
 
   /** Drop the kept terminals of sessions that are not in `ids`, the list now */
   retain(ids: Set<string>) {
-    for (const id of this.listed) if (!ids.has(id)) this.gone.add(id);
+    for (const id of this.listed) if (!ids.has(id)) this.forget(id);
     this.listed = new Set(ids);
-    for (const [id, k] of [...this.kept]) if (!ids.has(id)) { this.kept.delete(id); this.drop(k.term); }
+    for (const id of this.kept.keys()) if (!ids.has(id)) this.evict(id);
   }
 
-  /** Drop the kept terminal of one session */
+  /** Release the terminal even if its pane has yet to detach and put it back. */
   forget(id: string) {
+    this.gone.add(id);
+    this.evict(id);
+  }
+
+  private evict(id: string) {
     const k = this.kept.get(id);
-    if (k) { this.kept.delete(id); this.drop(k.term); }
+    this.kept.delete(id);
+    if (k) this.drop(k.term);
   }
 
   get ids(): string[] { return [...this.kept.keys()]; }

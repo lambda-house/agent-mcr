@@ -561,7 +561,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
 
   return <div className="hs-terminal-wrap">
     <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
-    {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended. Its output is kept until you forget it.'}</div>}
+    {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended.'}</div>}
     {menu && <Menu label="Selection" at={{ top: menu.y, left: menu.x }} focusIndex={1} onClose={() => setMenu(null)} items={[
       { label: 'Copy', onSelect: () => copyText(menu.text) },
       { label: 'Copy as task…', onSelect: () => openTask(menu.text) },

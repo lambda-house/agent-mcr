@@ -14,8 +14,8 @@ import { keepSame } from '@lambda-house/ui';
  * it does in the list: a search is the list filtered, not a second layout.
  */
 
-/** A running session that waits for the person. */
-export const needsYou = (h: Hosted) => !h.exit && !!h.harness?.attention;
+/** Attention on a running session, or an unread report left by an ended one. */
+export const needsYou = (h: Hosted) => !!h.harness?.attention && (!h.exit || !!h.harness.attention.report);
 
 /** Rows that are dimmed: idle or ended, unless something asks for the person. */
 export const rowIdle = (h: Hosted) => !needsYou(h) && (hostedState(h) === 'idle' || !!h.exit) && !(!h.exit && h.shells?.length);

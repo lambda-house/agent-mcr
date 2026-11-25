@@ -30,7 +30,7 @@ const unmounts: string[] = [];
 // Every render of a terminal stand-in: a list poll that changed nothing renders none (MCR-139)
 const renders: string[] = [];
 // The keep of hidden terminals (MCR-139): what the view tells it to retain
-const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); }, protect: vi.fn() }));
+const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); }, protect: vi.fn(), forget: vi.fn() }));
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
   return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
@@ -44,6 +44,10 @@ vi.mock('./TerminalPane', async () => {
 
 const running: Hosted = { id: 'r1', pid: 42, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec claude'], cwd: '/work/repo', started: 2, cols: 120, rows: 32, title: 'Fixing tests', lastOutput: 1, exit: null, meta: { label: 'Claude Code', profile: 'claude' } };
 const ended: Hosted = { ...running, id: 'e1', started: 1, title: '', exit: { code: 0, signal: null, at: 3 }, meta: { label: 'Shell', profile: 'shell' } };
+const withReport = (h: Hosted, report: 'done' | 'needs_human', text: string, since = 5): Hosted => ({
+  ...h, harness: { name: '', profile: 'claude', state: h.exit ? 'exited' : 'idle', since: 1, precise: true, agentSession: null, lastMessage: null,
+    attention: { report, kind: report === 'done' ? 'notification' : 'assessment', text, since } },
+});
 
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
@@ -120,7 +124,7 @@ it('advances hosted row and Supervisor ages while the list stamp stays the same'
     } };
     const supervisor: Hosted = { ...working, id: 'supervisor', meta: { ...working.meta, role: 'supervisor' } };
     const done: Hosted = { ...working, id: 'done', harness: { ...working.harness!, state: 'idle', lastMessage: 'Fixed', lastMessageAt: now - 270_000 } };
-    const justEnded: Hosted = { ...ended, exit: { ...ended.exit!, at: now - 1000 } };
+    const justEnded = withReport({ ...ended, exit: { ...ended.exit!, at: now - 1000 } }, 'done', 'Run finished');
     vi.mocked(harnessApi.list).mockResolvedValue([working, supervisor, done, justEnded]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
     const rowLabels = () => rows().map(row => row.textContent).join('\n');
@@ -218,12 +222,13 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
   });
 
   it('leaves out folders that are gone and agents\' temporary folders, says why, and the switch turns it off', async () => {
-    vi.mocked(harnessApi.list).mockResolvedValue([running, { ...ended, cwd: '/Users/me/work/agent-mcr/.claude/worktrees/mcr-49-memory', cwdGone: true }]);
+    vi.mocked(harnessApi.list).mockResolvedValue([running]);
     vi.mocked(harnessApi.resumable).mockResolvedValue([
       { agent: 'claude', id: 'p1', cwd: '/private/tmp/claude-501/x/scratchpad', modified: 9 },
       { agent: 'claude', id: 'p2', cwd: '/Users/me/work/agent-mcr/.claude/live-check/hooks', modified: 8 },
       { agent: 'codex', id: 'p3', cwd: '/Users/me/api', modified: 7 },
       { agent: 'claude', id: 'p4', cwd: '/Users/me/old', modified: 6, gone: true },
+      { agent: 'claude', id: 'p5', cwd: '/Users/me/work/agent-mcr/.claude/worktrees/mcr-49-memory', modified: 5, gone: true },
     ]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(folders().map(f => f.getAttribute('aria-label'))).toEqual(['Folder /work/repo', 'Folder /Users/me/api']);
@@ -296,38 +301,27 @@ describe('hiding folders and cleaning up (MCR-107)', () => {
     expect(useStore.getState().liveList).toEqual(kept);
   });
 
-  it('removes the ended sessions it could, and says which part failed', async () => {
-    const ended2: Hosted = { ...ended, id: 'e2', cwd: '/Users/me/api' };
-    vi.mocked(harnessApi.list).mockResolvedValue([ended, ended2, running]);
-    vi.mocked(harnessApi.forget).mockImplementation(async id => { if (id === 'e2') throw new Error('runner unreachable'); });
+  it.each(['done', 'needs_human'] as const)('keeps an ended row with an open %s report until it is marked as seen', async report => {
+    const dir = '/tmp/reports';
+    const reported = withReport({ ...ended, cwd: dir, title: 'Reporter', cwdGone: true }, report, 'Read this report');
+    useStore.setState({ liveList: { ...DEFAULT_LIVE_LIST, hiddenFolders: [dir] } });
+    vi.mocked(harnessApi.list).mockResolvedValue([running, reported]);
+    vi.mocked(harnessApi.ack).mockImplementation(async () => {
+      vi.mocked(harnessApi.list).mockResolvedValue([running, { ...reported, harness: { ...reported.harness!, attention: null } }]);
+    });
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    // e1 is open in a pane: it must leave it, although e2 failed
-    await act(async () => ([...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes('Shell')) as HTMLButtonElement).click()); await flush();
+    const row = host.querySelector<HTMLButtonElement>('.hs-dir .needs-you .hs-item')!;
+    expect(row.textContent).toContain('Read this report');
+    expect(host.querySelector('.hs-cleanup')).toBeNull();
+    await act(async () => row.click()); await flush();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
     expect(host.querySelector('[data-terminal="e1"]')).not.toBeNull();
-    await act(async () => (host.querySelector('.hs-cleanup') as HTMLButtonElement).click());
-    await act(async () => ([...document.querySelectorAll('[role="alertdialog"] button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
-    expect(host.querySelector('[data-terminal="e1"]')).toBeNull();
-    expect(host.querySelector('[role="alert"]')!.textContent).toContain('1 of 2 ended sessions could not be removed: runner unreachable');
-  });
-
-  it('removes all ended sessions after saying how many, and only those', async () => {
-    const ended2: Hosted = { ...ended, id: 'e2', cwd: '/Users/me/api' };
-    vi.mocked(harnessApi.list).mockResolvedValue([ended, ended2, running]);
-    vi.mocked(harnessApi.forget).mockResolvedValue();
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    const cleanup = host.querySelector('.hs-cleanup') as HTMLButtonElement;
-    expect(cleanup.textContent).toContain('Remove ended sessions · 2');
-    await act(async () => cleanup.click());
-    const dialog = document.querySelector('[role="alertdialog"]')!;
-    expect(dialog.textContent).toContain('Remove 2 ended sessions from the list?');
-    expect(dialog.textContent).toContain('conversations stay on disk');
+    await act(async () => button('Actions for Reporter').click());
+    const seen = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(b => b.textContent?.includes('Mark report as seen'))!;
+    await act(async () => seen.click()); await flush();
+    expect(harnessApi.ack).toHaveBeenCalledWith('e1', 5);
+    expect(rows().map(r => r.textContent).join(' ')).not.toContain('Reporter');
     expect(harnessApi.forget).not.toHaveBeenCalled();
-    // Cancel: nothing goes
-    await act(async () => ([...dialog.querySelectorAll('button')].find(b => b.textContent === 'Cancel') as HTMLButtonElement).click());
-    expect(harnessApi.forget).not.toHaveBeenCalled();
-    await act(async () => cleanup.click());
-    await act(async () => ([...document.querySelectorAll('[role="alertdialog"] button')].find(b => b.textContent === 'Remove 2') as HTMLButtonElement).click()); await flush();
-    expect(vi.mocked(harnessApi.forget).mock.calls.map(c => c[0]).sort()).toEqual(['e1', 'e2']);
     expect(harnessApi.signal).not.toHaveBeenCalled();
   });
 });
@@ -350,6 +344,20 @@ describe('executors in a worktree below their lead (MCR-133)', () => {
     expect(earlier.getAttribute('title')).toContain('in /work/teob-ai/.claude/worktrees/agent-mcr-120');
     // A session is still started in the section's own folder
     expect(button('Start a session in /work/teob-ai')).not.toBeNull();
+  });
+
+  it('keeps a running executor in the same section and order when its lead exits', async () => {
+    const peer = { ...running, id: 'peer', cwd: lead.cwd, started: 1.5, title: 'Other session' };
+    vi.mocked(harnessApi.list).mockResolvedValue([peer, worker, lead]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    const names = () => rows().map(r => r.querySelector('.hs-actions button')?.getAttribute('aria-label'));
+    expect(names()).toEqual(['Actions for Lead', 'Actions for Worker', 'Actions for Other session']);
+    vi.mocked(harnessApi.list).mockResolvedValue([peer, worker, { ...lead, exit: ended.exit }]);
+    await act(async () => window.dispatchEvent(new Event('focus'))); await flush();
+    expect(folders().map(f => f.getAttribute('aria-label'))).toEqual(['Folder /work/teob-ai']);
+    expect(names()).toEqual(['Actions for Worker', 'Actions for Other session']);
+    expect(rows()[0].querySelector('.hs-rel.subdir')?.textContent).toBe('agent-mcr-129');
+    expect(rows()[0].textContent).not.toContain('under Lead');
   });
 });
 
@@ -436,29 +444,37 @@ describe('Live workspace', () => {
     expect(folders()[0].className).toContain('live');
     const items = [...host.querySelectorAll('.hs-item strong')].map(e => e.textContent?.trim());
     // An unnamed session goes by the title its agent gave it; the agent kind is a mark; the folder is the section
-    expect(items).toEqual(['Fixing tests', 'Shell']);
-    expect([...host.querySelectorAll('.hs-item .hs-mark')].map(e => e.getAttribute('aria-label'))).toEqual(['Claude Code', 'Shell']);
+    expect(items).toEqual(['Fixing tests']);
+    expect([...host.querySelectorAll('.hs-item .hs-mark')].map(e => e.getAttribute('aria-label'))).toEqual(['Claude Code']);
     // The dot carries the state; pid and output age are not in the row
     expect(rows().map(li => li.textContent).join(' ')).not.toMatch(/pid|output|running/);
     expect(host.querySelector('.hs-dot.running')?.getAttribute('aria-label')).toBe('running');
-    expect(host.querySelector('.hs-dot.exited')?.getAttribute('aria-label')).toBe('exited');
+    expect(host.querySelector('.hs-dot.exited')).toBeNull();
     expect(host.textContent).not.toContain('Runner pid');
   });
 
-  it('keeps ended sessions in the list in exited state, allows viewing output and removing them', async () => {
-    vi.mocked(harnessApi.forget).mockResolvedValue();
-    vi.mocked(harnessApi.list).mockResolvedValue([running, { ...ended, cwd: '/work/finished' }]);
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    expect(folders().map(f => f.querySelector('.hs-dir-path')?.getAttribute('title'))).toEqual(['/work/repo', '/work/finished']);
-    expect(host.querySelector('.hs-dot.exited')?.getAttribute('aria-label')).toBe('exited');
-    const endedButton = [...host.querySelectorAll('.hs-dir .hs-item')].find(b => b.textContent?.includes('Shell')) as HTMLButtonElement;
-    await act(async () => endedButton.click()); await flush();
-    expect(host.querySelector('.hs-pane:not([hidden]) [data-terminal="e1"]')).not.toBeNull();
-    await act(async () => button('Actions for Shell').click());
-    const remove = [...host.querySelectorAll('[role="menuitem"]')].find(b => b.textContent?.includes('Remove from the list')) as HTMLButtonElement;
-    expect(remove).toBeTruthy();
-    await act(async () => remove.click()); await flush();
-    expect(harnessApi.forget).toHaveBeenCalledWith('e1');
+  it('drops a naturally ended row on the next poll and resumes its earlier conversation in one click', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+      await act(async () => rows()[0].querySelector('button')!.click()); await flush();
+      vi.mocked(harnessApi.list).mockResolvedValue([{ ...running, exit: { code: 0, signal: null, at: Date.now() } }]);
+      vi.mocked(harnessApi.resumable).mockResolvedValue([{ id: 'conversation', agent: 'claude', cwd: running.cwd, title: running.title, modified: 5 }]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); }); await flush();
+      expect(rows()).toHaveLength(0);
+      expect(host.querySelector('[data-terminal="r1"]')).not.toBeNull();
+      expect(harnessApi.forget).not.toHaveBeenCalled();
+      const fresh: Hosted = { ...running, id: 'r2' };
+      vi.mocked(harnessApi.spawn).mockImplementation(async () => {
+        vi.mocked(harnessApi.list).mockResolvedValue([fresh]);
+        vi.mocked(harnessApi.resumable).mockResolvedValue([]);
+        return fresh;
+      });
+      await act(async () => host.querySelector<HTMLButtonElement>('.hs-earlier-toggle')!.click());
+      await act(async () => host.querySelector<HTMLButtonElement>('.hs-earlier .hs-resume')!.click()); await flush();
+      expect(harnessApi.spawn).toHaveBeenCalledWith('', '', 120, 32, 'conversation');
+      expect(host.querySelector('[data-terminal="r2"]')).not.toBeNull();
+    } finally { vi.useRealTimers(); }
   });
 
   it('has one action menu per row: copy a reference, restart, or close the session for good', async () => {
@@ -502,11 +518,65 @@ describe('Live workspace', () => {
     await act(async () => button('Actions for Shell').click());
     // Close ends the session; once it has ended it is dropped without a second step
     await act(async () => button('Actions for Fixing tests').click());
-    vi.mocked(harnessApi.list).mockResolvedValue([shell, { ...fresh, exit: { code: 0, signal: 'HUP', at: 4 } }]);
     await act(async () => item('Close session').click()); await flush();
     expect(harnessApi.signal).toHaveBeenCalledWith('r2', 'HUP');
-    expect(harnessApi.forget).toHaveBeenCalledWith('r2');
-    expect(harnessApi.forget).not.toHaveBeenCalledWith('e1');
+    expect(harnessApi.forget).not.toHaveBeenCalled();
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, { ...fresh, exit: { code: 0, signal: 'HUP', at: 4 } }]);
+    await act(async () => window.dispatchEvent(new Event('focus'))); await flush();
+    expect(harnessApi.forget).toHaveBeenCalledExactlyOnceWith('r2');
+    expect(host.querySelector('[data-terminal="r2"]')).toBeNull();
+    expect(rows().map(r => r.querySelector('strong')?.textContent?.trim())).toEqual(['Shell']);
+  });
+
+  it.each(['done', 'needs_human'] as const)('forgets a closed session only after its current %s report is marked as seen', async report => {
+    vi.mocked(harnessApi.signal).mockResolvedValue();
+    vi.mocked(harnessApi.forget).mockResolvedValue();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => rows()[0].querySelector('button')!.click());
+    const action = async (text: string) => {
+      await act(async () => button('Actions for Fixing tests').click());
+      const item = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(b => b.textContent?.includes(text))!;
+      await act(async () => item.click()); await flush();
+    };
+    const exited = withReport({ ...running, exit: ended.exit }, report, 'Read the first report');
+    vi.mocked(harnessApi.list).mockResolvedValue([exited]);
+    await action('Close session');
+    expect(harnessApi.forget).not.toHaveBeenCalled();
+    expect(kept.forget).toHaveBeenCalledWith('r1');
+    expect(host.querySelector('[data-terminal="r1"]')).toBeNull();
+    expect(rows()[0].textContent).toContain('Read the first report');
+
+    const updated = withReport(exited, report, 'Read the newer report', 6);
+    vi.mocked(harnessApi.ack).mockImplementationOnce(async () => {
+      vi.mocked(harnessApi.list).mockResolvedValue([updated]);
+    });
+    await action('Mark report as seen');
+    expect(harnessApi.ack).toHaveBeenLastCalledWith('r1', 5);
+    expect(harnessApi.forget).not.toHaveBeenCalled();
+    expect(rows()[0].textContent).toContain('Read the newer report');
+
+    await act(async () => rows()[0].querySelector('button')!.click());
+    vi.mocked(harnessApi.ack).mockImplementationOnce(async () => {
+      vi.mocked(harnessApi.list).mockResolvedValue([{ ...updated, harness: { ...updated.harness!, attention: null } }]);
+    });
+    await action('Mark report as seen');
+    expect(harnessApi.ack).toHaveBeenLastCalledWith('r1', 6);
+    expect(harnessApi.forget).toHaveBeenCalledExactlyOnceWith('r1');
+    expect(host.querySelector('[data-terminal="r1"]')).toBeNull();
+    expect(rows()).toHaveLength(0);
+  });
+
+  it('finishes Close when the process exits before HUP reaches it', async () => {
+    vi.mocked(harnessApi.signal).mockRejectedValue('The session has ended');
+    vi.mocked(harnessApi.forget).mockResolvedValue();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => button('Actions for Fixing tests').click());
+    const close = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(b => b.textContent?.includes('Close session'))!;
+    await act(async () => close.click()); await flush();
+    expect(harnessApi.forget).not.toHaveBeenCalled();
+    vi.mocked(harnessApi.list).mockResolvedValue([{ ...running, exit: ended.exit }]);
+    await act(async () => window.dispatchEvent(new Event('focus'))); await flush();
+    expect(harnessApi.forget).toHaveBeenCalledExactlyOnceWith('r1');
   });
 
   it('gives a session restarted in a pane that is not the selected one its terminal', async () => {
@@ -561,8 +631,9 @@ describe('Live workspace', () => {
     expect(shown()).toEqual(['t1']);
     expect(forward().disabled).toBe(true);
     // An ended session is passed over: r1 ends, Back goes past it to nothing left
-    vi.mocked(harnessApi.list).mockResolvedValue([ended, shell, { ...running, exit: { code: 0, signal: null, at: 9 } }, third]);
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, shell, withReport({ ...running, exit: { code: 0, signal: null, at: 9 } }, 'done', 'Result to read'), third]);
     await act(async () => { await new Promise(r => setTimeout(r, 2100)); }); await flush();
+    expect(rows().map(r => r.textContent).join(' ')).toContain('Result to read');
     expect(back().disabled).toBe(true);
     // Nothing was ever written to a terminal
     expect(harnessApi.signal).not.toHaveBeenCalled();
@@ -739,8 +810,9 @@ describe('Live workspace', () => {
     vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...running, exit: { code: 0, signal: null, at: 4 } }]);
     await act(async () => button('quit r1').click()); await flush();
     expect(harnessApi.signal).not.toHaveBeenCalled();
-    expect(harnessApi.forget).toHaveBeenCalledWith('r1');
-    expect(harnessApi.forget).not.toHaveBeenCalledWith('e1');
+    expect(harnessApi.forget).toHaveBeenCalledExactlyOnceWith('r1');
+    expect(kept.forget).toHaveBeenCalledWith('r1');
+    expect(rows()).toHaveLength(0);
     expect(host.querySelector('[data-terminal="r1"]')).toBeNull();
     expect(host.textContent).toContain('Select a session, or start one.');
   });
@@ -897,7 +969,7 @@ describe('Live workspace', () => {
     // Its own tile above the list, not a row in it
     expect(host.querySelector('.hs-supervisor')?.className).toContain('running selected');
     expect(host.querySelector('.hs-supervisor strong')?.textContent).toBe('Supervisor');
-    expect(rows()).toHaveLength(2);
+    expect(rows()).toHaveLength(1);
     expect(folders()).toHaveLength(1);
     expect(button('Actions for the supervisor')).not.toBeNull();
     // A second click selects the running one instead of starting another
