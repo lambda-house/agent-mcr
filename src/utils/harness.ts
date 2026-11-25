@@ -840,7 +840,7 @@ export function sectionFolders(sessions: Hosted[]): Map<string, string> {
  * such section: a worktree gets a section only for a session that is not such
  * an executor (MCR-133).
  */
-export function directorySections(sessions: Hosted[], resumable: Resumable[], pinned: string[]): DirSection[] {
+export function directorySections(sessions: Hosted[], resumable: Resumable[], pinned: string[], folders = sectionFolders(sessions)): DirSection[] {
   const by = new Map<string, DirSection>();
   const at = (path: string) => {
     let section = by.get(path);
@@ -848,7 +848,6 @@ export function directorySections(sessions: Hosted[], resumable: Resumable[], pi
     return section;
   };
   pinned.forEach(at);
-  const folders = sectionFolders(sessions);
   for (const h of sessions) { const d = at(folders.get(h.id) ?? h.cwd); d.sessions.push(h); d.latest = Math.max(d.latest, h.started); }
   // Only a section that something else lists takes in the history of the folders below it, the nearest first:
   // a folder with nothing but history never gathers another's

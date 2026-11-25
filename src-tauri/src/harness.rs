@@ -2785,6 +2785,30 @@ impl Harness {
         Client::connect(&socket)?.call(req)
     }
 
+    /// Forget an ended session at the operator's request, after any open report is seen.
+    fn forget_ended(&self, id: &str) -> Result<Value, String> {
+        // Task-result notices still have the executor relation when they are posted.
+        self.tell_assigners();
+        let socket = runner_socket(&self.dir);
+        runner::ensure(&socket)?;
+        self.update(|s| {
+            if s.restarting.contains(id) {
+                return Err("The session is restarting".into());
+            }
+            if s.sessions.get(id).is_some_and(|t| t.pending_report.is_some() || t.attention.as_ref().is_some_and(|a| a.report.is_some())) {
+                return Err("Mark the session's report as seen before forgetting it".into());
+            }
+            // Keep the report check and removal together. The runner checks for exit.
+            match Client::connect(&socket)?.call(json!({"op": "forget", "id": id})) {
+                Err(e) if e != format!("No session {id}") => return Err(e),
+                _ => {}
+            }
+            s.sessions.remove(id);
+            s.cockpit.keep(|tracked| tracked != id);
+            Ok(json!({}))
+        })
+    }
+
     /// The runner's terminals with what this service knows about each.
     fn processes(&self) -> Arc<Vec<Process>> {
         let mut cached = lock(&self.processes);
@@ -4986,6 +5010,7 @@ impl Harness {
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
             "supervisor" => self.supervisor(req),
             "restart" => self.restart(req["id"].as_str().unwrap_or(""), req["force"] == true, req["refreshProfile"] == true),
+            "forget_ended" => self.forget_ended(id()?),
             "settings" => {
                 if let Some(on) = req["outsideSupervisors"].as_bool() {
                     self.update(|s| s.outside_supervisors = on);
@@ -10554,6 +10579,70 @@ mod tests {
         let s = lock(&state.store);
         assert!(s.open_report("worker").is_none());
         assert!(s.board_reports().iter().any(|r| r.id == report.id));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_app_forgets_only_ended_sessions_without_open_reports() {
+        let dir = socket_test_dir("mcr-forget-ended-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut ended = BTreeSet::from(["done", "needs-human", "hidden"]);
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let out = match req["op"].as_str().unwrap() {
+                    "stop-test" => break,
+                    "hello" => json!({"protocol": runner::PROTOCOL}),
+                    "forget" => {
+                        let id = req["id"].as_str().unwrap();
+                        if id == "live" { json!({"error": "The session is still running"}) }
+                        else if ended.remove(id) { json!({}) }
+                        else { json!({"error": format!("No session {id}")}) }
+                    }
+                    other => panic!("unexpected runner call {other}"),
+                };
+                writeln!(stream, "{out}").unwrap();
+            }
+            assert!(ended.is_empty());
+        });
+        let h = Harness::open(&dir);
+        let reports = h.update(|s| {
+            for id in ["done", "needs-human", "hidden", "live"] {
+                s.sessions.insert(id.into(), Tracked { state: "idle".into(), ..Tracked::default() });
+            }
+            s.sessions.get_mut("hidden").unwrap().supervisor = Some("live".into());
+            s.tasks.insert("task".into(), Task { id: "task".into(), session: "hidden".into(), by: "live".into(),
+                text: "Run the checks".into(), state: "completed".into(), created: 1, started: 2, finished: 3,
+                result: Some("All checks passed".into()), told: false });
+            let reports = [("done", "done"), ("needs-human", "needs_human")]
+                .map(|(id, kind)| (id, s.report(id, kind, "Open report").unwrap()));
+            for id in ["done", "needs-human", "hidden"] { s.end(id); }
+            reports
+        });
+        let forget = |id: &str| h.control(&json!({"op": "forget_ended", "id": id}));
+        assert!(forget("hidden").is_ok());
+        assert!(forget("hidden").is_ok(), "retry after an already successful forget");
+        let inbox = h.agent_tool("live", "read_inbox", &json!({})).unwrap();
+        assert!(inbox["messages"][0]["text"].as_str().unwrap().contains("All checks passed"));
+        assert!(forget("live").unwrap_err().contains("still running"));
+        for (id, report) in reports {
+            let ack = |since| h.control(&json!({"op": "ack", "id": id, "since": since})).unwrap();
+            assert!(forget(id).unwrap_err().contains("report as seen"));
+            ack(report.created - 1);
+            assert!(forget(id).unwrap_err().contains("report as seen"));
+            ack(report.created);
+            forget(id).unwrap();
+            assert!(!lock(&h.store).sessions.contains_key(id));
+            assert!(lock(&h.store).board_reports().iter().any(|r| r.id == report.id));
+        }
+        assert_eq!(lock(&h.store).sessions.keys().map(String::as_str).collect::<Vec<_>>(), ["live"]);
+        let mut stream = Stream::connect(dir.join("runner.sock")).unwrap();
+        writeln!(stream, "{}", json!({"op": "stop-test"})).unwrap();
+        server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

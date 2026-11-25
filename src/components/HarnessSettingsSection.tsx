@@ -20,18 +20,28 @@ export function programQueryDescription(on: boolean): string {
     : `${what} Off: nothing is answered; reports are shown all the same.`;
 }
 
+const endedWithoutReports = async () => (await harnessApi.list())
+  .filter(h => h.exit && !h.harness?.attention?.report).map(h => h.id);
+
 export default function HarnessSettingsSection() {
   const [prefs, setPrefs] = useState<HarnessPreferences | null>(null);
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [copied, setCopied] = useState(false);
   const [backgroundOpen, setBackgroundOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [ended, setEnded] = useState<string[]>([]);
+  const [forgetting, setForgetting] = useState(false);
   const [error, setError] = useState('');
   const hideNoise = useStore(s => s.liveList.hideNoise);
   const setLiveList = useStore(s => s.setLiveList);
   useEffect(() => {
     let active = true;
-    harnessApi.status().then(s => { if (active) setStatus(s); }).catch(e => { if (active) setError(String(e)); });
+    harnessApi.status().then(async s => {
+      if (!active) return;
+      setStatus(s);
+      const ids = await endedWithoutReports();
+      if (active) setEnded(ids);
+    }).catch(e => { if (active) setError(String(e)); });
     harnessApi.preferences().then(p => { if (active) setPrefs(p); }).catch(e => { if (active) setError(String(e)); });
     return () => { active = false; };
   }, []);
@@ -41,6 +51,17 @@ export default function HarnessSettingsSection() {
     try { setPrefs(await harnessApi.savePreferences({ enabledProfiles, supervisorProfile })); }
     catch (e) { setError(String(e)); }
     finally { setSaving(false); }
+  };
+  const forgetEnded = async () => {
+    setForgetting(true); setError('');
+    try {
+      for (const id of ended) {
+        try { await harnessApi.forget(id); setEnded(ids => ids.filter(x => x !== id)); }
+        catch (e) { setError(String(e)); }
+      }
+      setEnded(await endedWithoutReports());
+    } catch (e) { setError(String(e)); }
+    finally { setForgetting(false); }
   };
 
   return <div className="settings-section">
@@ -87,6 +108,9 @@ export default function HarnessSettingsSection() {
           <span className="settings-toggle-slider"/>
         </label>
       }/>
+      {status && ended.length > 0 && <SettingRow label="Ended sessions" description="Release terminal output from ended sessions. Saved conversations stay in Earlier and Journal. Mark open reports as seen before forgetting their sessions." control={
+        <button type="button" disabled={forgetting} onClick={() => void forgetEnded()}>Forget ended sessions · {ended.length}</button>
+      }/>}
       <SettingRow label="Background processes" description="Runner and harness service keep sessions alive when the app closes." control={
         <button type="button" aria-expanded={backgroundOpen} onClick={() => setBackgroundOpen(open => !open)}>{backgroundOpen ? 'Hide' : 'Manage…'}</button>
       }/>

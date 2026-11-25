@@ -1020,7 +1020,7 @@ pub async fn harness_signal(id: String, signal: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn harness_forget(id: String) -> Result<(), String> {
     valid_id(&id)?;
-    blocking(move || call(json!({"op": "forget", "id": id})).map(drop)).await
+    blocking(move || service(json!({"op": "forget_ended", "id": id})).map(drop)).await
 }
 
 #[tauri::command]
