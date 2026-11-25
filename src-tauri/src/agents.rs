@@ -45,7 +45,8 @@ pub fn modified_ms(path: &Path) -> u64 {
 /// can be megabytes long, so this never parses whole lines.
 pub fn head_value(path: &Path, key: &str, limit: u64) -> Option<String> {
     let mut head = Vec::new();
-    std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
+    // A regular file only: a named pipe in an agent's folder would wait for good
+    crate::sessions::open_regular(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
     let needle = format!("\"{key}\":\"");
     let at = head.windows(needle.len()).position(|w| w == needle.as_bytes())? + needle.len() - 1;
     serde_json::Deserializer::from_slice(&head[at..]).into_iter::<String>().next()?.ok()
@@ -103,7 +104,7 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
         }
     }
 
-    let Ok(file) = std::fs::File::open(path) else { return TranscriptSummary::default() };
+    let Ok(file) = crate::sessions::open_regular(path) else { return TranscriptSummary::default() };
     let mut reader = std::io::BufReader::new(file.take(192 * 1024));
     let mut line = String::new();
     let mut custom = None;

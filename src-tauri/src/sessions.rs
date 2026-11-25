@@ -3,7 +3,7 @@ use crate::session_db::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-pub const PARSER_VERSION: u32 = 8;
+pub const PARSER_VERSION: u32 = 9;
 pub fn digest(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -158,6 +158,9 @@ pub struct Context {
     /// A compaction came after the latest response: the next request has a
     /// new prompt, so the cache not serving it says nothing about a pause
     pub after_compaction: bool,
+    /// `now` is estimated from a compaction summary's length (4 characters a
+    /// token), not a size the agent recorded
+    pub now_estimated: bool,
 }
 /// Codex records no cache lifetime: a response this long after the one before
 /// that the cache did not serve is taken for a cold wakeup. Shorter gaps are
@@ -210,6 +213,7 @@ impl Context {
             return;
         }
         self.now = input;
+        self.now_estimated = false;
         self.peak = self.peak.max(input);
         if self.first == 0 {
             self.first = input;
@@ -252,6 +256,10 @@ pub struct Session {
     pub malformed_lines: u64,
     pub source: String,
     pub turn_id: String,
+    /// Keeps numbers only (`Follow`): no title, events, ticket keys, tool,
+    /// skill or memory names, agent name
+    #[serde(skip)]
+    stats_only: bool,
 }
 impl Session {
     fn summary(&self) -> Self {
@@ -285,10 +293,14 @@ impl Session {
             malformed_lines: self.malformed_lines,
             source: self.source.clone(),
             turn_id: self.turn_id.clone(),
+            stats_only: false,
         }
     }
 
     fn title_from(&mut self, text: &str) {
+        if self.stats_only {
+            return;
+        }
         let text = text.trim();
         if self.title.is_empty()
             && text.len() >= 12
@@ -303,7 +315,7 @@ impl Session {
         }
     }
     fn event(&mut self, at: &str, kind: &str, text: String, tool: Option<String>) {
-        if text.is_empty()
+        if self.stats_only || text.is_empty()
             || self
                 .events
                 .back()
@@ -359,6 +371,9 @@ impl Session {
         tool: Option<String>,
         mut fact: ToolFact,
     ) {
+        if self.stats_only {
+            return;
+        }
         if let (Some(skill), Some(observation)) = (&fact.skill, &fact.skill_observation) {
             self.skill_observations
                 .entry(skill.clone())
@@ -425,9 +440,24 @@ struct Indexed {
     turns: Option<Vec<u64>>,
     /// The last Codex `last_token_usage` counted as a response: Codex can
     /// repeat it in the next `token_count`
-    #[serde(skip)]
+    #[serde(default)]
     last_turn: (u64, u64, u64),
+    /// Responses whose turn time was dropped to keep `turns` bounded
+    #[serde(skip)]
+    turns_dropped: u64,
+    /// A Claude compaction boundary came and its summary has not: the summary
+    /// is the same compaction
+    #[serde(default)]
+    boundary_open: bool,
+    /// The order `records` were added in, to drop the oldest (`Follow` only)
+    #[serde(skip)]
+    record_order: VecDeque<String>,
 }
+/// Response times and deduplication keys `Follow` keeps per session; a key
+/// repeats within a few rows (a response's content blocks), so dropping old
+/// ones loses no deduplication in practice
+const FOLLOW_TURNS: usize = 10_000;
+const FOLLOW_RECORDS: usize = 1_024;
 impl Indexed {
     fn new(path: &Path, provider: &str) -> Self {
         let stem = path
@@ -482,6 +512,9 @@ impl Indexed {
             parked: false,
             turns: None,
             last_turn: (0, 0, 0),
+            turns_dropped: 0,
+            boundary_open: false,
+            record_order: VecDeque::new(),
         }
     }
     /// Starts the transcript over (it was replaced, cut or parsed by another
@@ -490,16 +523,33 @@ impl Indexed {
         let follow = self.turns.is_some();
         *self = Self::new(path, &self.session.provider);
         if follow {
-            self.turns = Some(Vec::new());
+            self.follow();
         }
         self.reset = true;
     }
+    /// Numbers only, response times listed, everything bounded (`Follow`)
+    fn follow(&mut self) {
+        self.turns = Some(Vec::new());
+        self.session.stats_only = true;
+    }
     fn turn(&mut self, at: u64) {
         if let Some(turns) = &mut self.turns {
+            if turns.len() == FOLLOW_TURNS {
+                turns.remove(0);
+                self.turns_dropped += 1;
+            }
             turns.push(at);
         }
     }
     fn usage(&mut self, key: String, usage: Usage, model: String) {
+        if self.session.stats_only && !self.records.contains_key(&key) {
+            self.record_order.push_back(key.clone());
+            if self.record_order.len() > FOLLOW_RECORDS {
+                if let Some(old) = self.record_order.pop_front() {
+                    self.records.remove(&old);
+                }
+            }
+        }
         let previous = self.records.entry(key).or_default();
         let delta = usage.delta(previous);
         previous.add(&delta);
@@ -508,6 +558,9 @@ impl Indexed {
         self.session.usage_known = true;
     }
     fn called(&mut self, call: &str, name: &str, fact: &ToolFact) {
+        if self.session.stats_only {
+            return;
+        }
         if !call.is_empty() && self.calls.len() < 4096 {
             self.calls.insert(call.into(), name.into());
         }
@@ -516,6 +569,9 @@ impl Indexed {
         }
     }
     fn returned(&mut self, call: &str, bytes: usize) {
+        if self.session.stats_only {
+            return;
+        }
         if let Some(name) = self.calls.remove(call) {
             *self.session.context.tool_bytes.entry(name).or_default() += bytes as u64;
         }
@@ -538,17 +594,17 @@ impl Indexed {
                 }
                 let last = &info["last_token_usage"];
                 let input = last["input_tokens"].as_u64().unwrap_or(0);
-                if last.is_object() {
-                    let seen = (input, last["cached_input_tokens"].as_u64().unwrap_or(0), last["output_tokens"].as_u64().unwrap_or(0));
-                    if seen != self.last_turn {
-                        self.last_turn = seen;
-                        self.turn(millis(at));
+                // Codex can repeat the last response's usage in a later
+                // `token_count`: it is one response, and its time stays the first's
+                let cached = last["cached_input_tokens"].as_u64().unwrap_or(0);
+                let seen = (input, cached, last["output_tokens"].as_u64().unwrap_or(0));
+                if last.is_object() && seen != self.last_turn {
+                    self.last_turn = seen;
+                    self.turn(millis(at));
+                    self.session.context.response(input);
+                    if input > 0 {
+                        self.session.context.paused_response(millis(at), cached, input.saturating_sub(cached));
                     }
-                }
-                self.session.context.response(input);
-                if input > 0 {
-                    let cached = last["cached_input_tokens"].as_u64().unwrap_or(0);
-                    self.session.context.paused_response(millis(at), cached, input.saturating_sub(cached));
                 }
             }
             match kind {
@@ -557,7 +613,9 @@ impl Indexed {
                     if self.session.cwd.is_empty() {
                         self.session.id = strv(p, "id");
                         self.session.cwd = strv(p, "cwd");
-                        self.session.name = strv(p, "agent_path");
+                        if !self.session.stats_only {
+                            self.session.name = strv(p, "agent_path");
+                        }
                         self.session.parent_id = p["parent_thread_id"]
                             .as_str()
                             .or(p["source"]["subagent"]["thread_spawn"]["parent_thread_id"]
@@ -670,7 +728,9 @@ impl Indexed {
                     }
                     "function_call" | "custom_tool_call" => {
                         let name = strv(p, "name");
-                        *self.session.tools.entry(name.clone()).or_default() += 1;
+                        if !self.session.stats_only {
+                            *self.session.tools.entry(name.clone()).or_default() += 1;
+                        }
                         let args = p["arguments"]
                             .as_str()
                             .or(p["input"].as_str())
@@ -706,7 +766,7 @@ impl Indexed {
                     self.session.id = id.into();
                 }
             }
-            if let Some(name) = r["agentId"].as_str() {
+            if let Some(name) = r["agentId"].as_str().filter(|_| !self.session.stats_only) {
                 self.session.name = name.into();
             }
             if kind == "summary" {
@@ -722,7 +782,14 @@ impl Indexed {
                     self.session.model = model.clone();
                     if m["usage"].is_object() {
                         let usage = Usage::from(&m["usage"], true);
-                        if r["isSidechain"] != true {
+                        let key = strv(m, "id");
+                        // Claude Code writes a row per content block of a
+                        // response, with its usage: one response, at the first row's time
+                        let new = !self.records.contains_key(&key);
+                        if new {
+                            self.turn(millis(at));
+                        }
+                        if new && r["isSidechain"] != true {
                             self.session.context.response(usage.input);
                             let written = &m["usage"]["cache_creation"];
                             let ttl = if written["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0) > 0 {
@@ -733,11 +800,6 @@ impl Indexed {
                                 0
                             };
                             self.session.context.cache_response(millis(at), ttl, usage.cached, usage.input.saturating_sub(usage.cached));
-                        }
-                        let key = strv(m, "id");
-                        // Claude Code writes a row per content block of a response, with its usage
-                        if !self.records.contains_key(&key) {
-                            self.turn(millis(at));
                         }
                         self.usage(key, usage, model);
                     }
@@ -752,13 +814,22 @@ impl Indexed {
             // No response follows a compaction until the next prompt, so the
             // context it left is taken from the boundary: the recorded size,
             // else an estimate from the summary's length (4 characters a token).
+            // A compaction is its boundary (a system row); its summary follows
+            // and counts only when no boundary announced it (older versions)
             if r["subtype"] == "compact_boundary" && r["isSidechain"] != true {
+                self.session.context.compactions += 1;
+                self.boundary_open = true;
                 self.session.context.now = r["compactMetadata"]["postTokens"].as_u64().unwrap_or(0);
+                self.session.context.now_estimated = false;
             }
             if r["isCompactSummary"] == true {
-                self.session.context.compactions += 1;
+                if !self.boundary_open {
+                    self.session.context.compactions += 1;
+                }
+                self.boundary_open = false;
                 if self.session.context.now == 0 {
                     self.session.context.now = value_text(&m["content"]).len() as u64 / 4;
+                    self.session.context.now_estimated = true;
                 }
             }
             if kind == "user" || kind == "assistant" {
@@ -789,7 +860,9 @@ impl Indexed {
                             }
                             "tool_use" => {
                                 let name = strv(part, "name");
-                                *self.session.tools.entry(name.clone()).or_default() += 1;
+                                if !self.session.stats_only {
+                                    *self.session.tools.entry(name.clone()).or_default() += 1;
+                                }
                                 let text = part["input"].to_string();
                                 let mut fact = tool_fact(part, &text, &name, self.offset);
                                 self.called(part["id"].as_str().unwrap_or(""), &name, &fact);
@@ -819,10 +892,15 @@ impl Indexed {
     }
 
     fn read(&mut self, path: &Path, db: Option<&mut Database>) -> Result<u64, String> {
+        let file = open_regular(path)?;
+        self.read_open(path, file, db, std::time::Duration::from_millis(100))
+    }
+
+    /// Reads on from the last offset in `file`, opened from `path`, for about `slice`.
+    fn read_open(&mut self, path: &Path, mut file: File, db: Option<&mut Database>, slice: std::time::Duration) -> Result<u64, String> {
         if self.parser_version != PARSER_VERSION {
             self.restart(path);
         }
-        let mut file = open_regular(path)?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         let modified = meta
             .modified()
@@ -905,7 +983,7 @@ impl Indexed {
             }
             let relevant = if self.session.provider == "claude" {
                 serde_json::from_slice::<RecordType>(&line)
-                    .map(|r| r.kind == "assistant" || r.kind == "user" || r.kind == "summary")
+                    .map(|r| r.kind == "assistant" || r.kind == "user" || r.kind == "summary" || r.kind == "system")
                     .unwrap_or(true)
             } else {
                 true
@@ -916,7 +994,7 @@ impl Indexed {
                     Err(_) => self.session.malformed_lines += 1,
                 }
             }
-            if began.elapsed() > std::time::Duration::from_millis(100) {
+            if began.elapsed() > slice {
                 break;
             }
         }
@@ -928,35 +1006,41 @@ impl Indexed {
 }
 /// One hosted session's transcript, read by the harness service (MCR-149)
 /// with the index's own parser and usage deduplication, in memory only and
-/// without the database. The events go after every read; the parser's short
-/// summary fields (the title, ticket keys, tool names, folder, model) stay in
-/// memory while it follows and are never returned. What it tells is what the
-/// files say, not a live process.
+/// without the database. It parses for numbers only: no title, events, ticket
+/// keys, tool, skill or memory names and no agent name are kept. What it keeps
+/// is the conversation id, folder, model and effort, the usage and context
+/// counters, at most `FOLLOW_TURNS` response times and `FOLLOW_RECORDS`
+/// response ids for deduplication. What it tells is what the files say, not a
+/// live process.
 pub struct Follow {
     indexed: Indexed,
+    root: PathBuf,
     path: PathBuf,
 }
 impl Follow {
+    /// `path` is read only where it lies inside `root` (`open_inside`);
     /// `provider` is `claude` or `codex`
-    pub fn new(path: &Path, provider: &str) -> Self {
+    pub fn new(root: &Path, path: &Path, provider: &str) -> Self {
         let mut indexed = Indexed::new(path, provider);
-        indexed.turns = Some(Vec::new());
-        Self { indexed, path: path.to_path_buf() }
+        indexed.follow();
+        Self { indexed, root: root.to_path_buf(), path: path.to_path_buf() }
     }
     pub fn claude(&self) -> bool {
         self.indexed.session.provider != "codex"
     }
-    /// Reads what was appended since the last read, for about `budget` at
-    /// most; true once it has read up to the last whole record
-    pub fn read(&mut self, budget: std::time::Duration) -> Result<bool, String> {
-        let began = std::time::Instant::now();
+    /// Reads what was appended since the last read until `deadline`; true
+    /// once it has read up to the last whole record. Nothing is opened or
+    /// read once the deadline has passed
+    pub fn read(&mut self, deadline: std::time::Instant) -> Result<bool, String> {
         loop {
-            let read = self.indexed.read(&self.path, None);
-            self.indexed.session.events.clear();
-            self.indexed.session.pending_events.clear();
-            read?;
-            if self.indexed.caught_up || began.elapsed() >= budget {
-                return Ok(self.indexed.caught_up);
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            let file = open_inside(&self.root, &self.path)?;
+            self.indexed.read_open(&self.path, file, None, left.min(std::time::Duration::from_millis(100)))?;
+            if self.indexed.caught_up {
+                return Ok(true);
             }
         }
     }
@@ -967,9 +1051,76 @@ impl Follow {
     pub fn usage(&self) -> &Usage {
         &self.indexed.session.usage
     }
-    /// When each model response was recorded (ms), in transcript order
+    /// When each model response was recorded (ms), in transcript order: the
+    /// latest `FOLLOW_TURNS`
     pub fn turns(&self) -> &[u64] {
         self.indexed.turns.as_deref().unwrap_or(&[])
+    }
+    /// Responses whose time was dropped from `turns`
+    pub fn turns_dropped(&self) -> u64 {
+        self.indexed.turns_dropped
+    }
+}
+/// Opens `path` for reading only when its real location is a regular file
+/// inside `root`, which must be a real location itself: a symlinked folder below the root,
+/// or one swapped in while it is opened, cannot lead out of it (on unix the
+/// path is walked from the root with `openat`, refusing every symlink).
+pub fn open_inside(root: &Path, path: &Path) -> Result<File, String> {
+    let outside = || "Transcript is outside its agent's folder".to_string();
+    // The root as given must be its own real location: a root swapped for a link is refused
+    if dunce::canonicalize(root).map_err(|e| e.to_string())? != root {
+        return Err(outside());
+    }
+    let root = root.to_path_buf();
+    let parent = dunce::canonicalize(path.parent().ok_or_else(outside)?).map_err(|e| e.to_string())?;
+    let below = parent.strip_prefix(&root).map_err(|_| outside())?.to_path_buf();
+    let name = path.file_name().ok_or_else(outside)?;
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        let c = |s: &std::ffi::OsStr| CString::new(s.as_bytes()).map_err(|e| e.to_string());
+        let fail = || std::io::Error::last_os_error().to_string();
+        // SAFETY: plain open/openat calls; each descriptor is owned at once
+        let mut dir = unsafe {
+            let fd = libc::open(c(root.as_os_str())?.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(fail());
+            }
+            OwnedFd::from_raw_fd(fd)
+        };
+        for part in below.components() {
+            let std::path::Component::Normal(part) = part else { return Err(outside()) };
+            dir = unsafe {
+                let fd = libc::openat(dir.as_raw_fd(), c(part)?.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(fail());
+                }
+                OwnedFd::from_raw_fd(fd)
+            };
+        }
+        let file = unsafe {
+            let fd = libc::openat(dir.as_raw_fd(), c(name)?.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(fail());
+            }
+            File::from_raw_fd(fd)
+        };
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("Transcript is not a regular file".into());
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let real = root.join(&below).join(name);
+        let file = open_regular(&real)?;
+        // Opened by name: look again that it is still where it was
+        if dunce::canonicalize(&real).ok().is_none_or(|p| !p.starts_with(&root)) {
+            return Err(outside());
+        }
+        Ok(file)
     }
 }
 /// A transcript, opened only when it is a regular file: a symlink is
@@ -977,7 +1128,7 @@ impl Follow {
 /// wait for good (MCR-149: a hosted agent can report any path in its folder).
 /// On unix it is opened non-blocking, so a file swapped for a pipe between
 /// the look and the open does not wait either, and checked again once open.
-fn open_regular(path: &Path) -> Result<File, String> {
+pub fn open_regular(path: &Path) -> Result<File, String> {
     let kind = fs::symlink_metadata(path).map_err(|e| e.to_string())?.file_type();
     if kind.is_symlink() {
         return Err("Transcript replaced by a symlink".into());
@@ -1502,7 +1653,7 @@ pub fn events_before(path: &Path, provider: &str, before: u64) -> Result<Vec<Eve
         return Err("Transcript was replaced by a symlink".into());
     }
     let mut page = Indexed::new(path, provider);
-    let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+    let mut reader = BufReader::new(open_regular(path)?);
     let mut line = Vec::new();
     while page.session.event_count < before {
         line.clear();
@@ -1715,6 +1866,88 @@ mod tests {
         assert_eq!(i.session.usage.input, 27);
         assert_eq!(i.session.usage.output, 9);
     }
+    /// A transcript folder for `Follow` tests: its real location, so it is a valid root
+    fn follow_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("mcr-follow-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("-w")).unwrap();
+        let root = dunce::canonicalize(root).unwrap();
+        let path = root.join("-w/0b8c9630-d8ae-4b6f-a765-44266a0929e0.jsonl");
+        (root, path)
+    }
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(10)
+    }
+    /// MCR-149 review: what `Follow` keeps is numbers: no title, events,
+    /// ticket keys, tool or agent names, while the usage is counted as the index counts it.
+    #[test]
+    fn follow_keeps_no_transcript_text() {
+        let (root, path) = follow_fixture("text");
+        append(&path, json!({"type":"user","timestamp":"2026-01-01T10:00:00Z","agentId":"helper","message":{"role":"user","content":"Please fix MCR-123 in the parser today"}}));
+        append(&path, json!({"type":"assistant","timestamp":"2026-01-01T10:00:01Z","message":{"id":"m1","model":"opus","stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":2},
+            "content":[{"type":"text","text":"Looking at INFRA-77 now"},{"type":"tool_use","id":"c1","name":"mcp__teob-memory__memory_search","input":{"q":"secret plans"}}]}}));
+        append(&path, json!({"type":"summary","summary":"Work on MCR-123"}));
+        let mut f = Follow::new(&root, &path, "claude");
+        assert!(f.read(soon()).unwrap());
+        let s = &f.indexed.session;
+        assert!(s.title.is_empty() && s.tickets.is_empty() && s.memory_refs.is_empty() && s.tools.is_empty() && s.events.is_empty() && s.name.is_empty());
+        assert!(s.context.tool_bytes.is_empty() && s.context.skills.is_empty() && f.indexed.calls.is_empty());
+        assert_eq!((f.usage().input, f.usage().output, f.turns().len()), (10, 2, 1));
+    }
+    /// MCR-149 review: what `Follow` keeps per session is bounded, and the
+    /// counts stay right.
+    #[test]
+    fn follow_keeps_bounded_turn_times_and_keys() {
+        let (root, path) = follow_fixture("bounds");
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).create(true).open(&path).unwrap();
+            for n in 0..FOLLOW_TURNS + 5 {
+                let row = json!({"type":"assistant","timestamp":"2026-01-01T10:00:01Z","message":{"id":format!("m{n}"),"model":"opus","usage":{"input_tokens":1,"output_tokens":1}}});
+                // Each response twice, as its content blocks are
+                writeln!(file, "{row}\n{row}").unwrap();
+            }
+        }
+        let mut f = Follow::new(&root, &path, "claude");
+        assert!(f.read(soon()).unwrap());
+        assert_eq!((f.turns().len(), f.turns_dropped()), (FOLLOW_TURNS, 5));
+        assert!(f.indexed.records.len() <= FOLLOW_RECORDS && f.indexed.record_order.len() <= FOLLOW_RECORDS);
+        assert_eq!(f.usage().input, (FOLLOW_TURNS + 5) as u64);
+    }
+    /// MCR-149 review: a Claude compaction boundary without a summary is a
+    /// compaction (the reader passes system rows), and a response repeated
+    /// later keeps its first time.
+    #[test]
+    fn a_compaction_boundary_alone_counts_and_a_repeat_keeps_the_first_time() {
+        let (root, path) = follow_fixture("boundary");
+        let reply = |at: &str| json!({"type":"assistant","timestamp":at,"message":{"id":"m1","model":"opus","usage":{"input_tokens":10,"output_tokens":1}}});
+        append(&path, reply("2026-01-01T10:00:00Z"));
+        append(&path, json!({"type":"system","subtype":"compact_boundary","timestamp":"2026-01-01T10:01:00Z","compactMetadata":{"preTokens":10,"postTokens":4}}));
+        append(&path, reply("2026-01-01T10:46:00Z"));
+        let mut f = Follow::new(&root, &path, "claude");
+        assert!(f.read(soon()).unwrap());
+        let c = f.context();
+        assert_eq!((c.compactions, c.now, c.now_estimated, f.turns().len()), (1, 4, false, 1));
+        assert_eq!(c.cache_at, millis("2026-01-01T10:00:00Z"));
+    }
+    /// MCR-149 review: past its deadline `Follow` opens and reads nothing,
+    /// and says it is not caught up; a pipe or a link is never opened.
+    #[cfg(unix)]
+    #[test]
+    fn follow_does_nothing_past_its_deadline_and_opens_regular_files_only() {
+        let (root, path) = follow_fixture("deadline");
+        let mut f = Follow::new(&root, &path, "claude");
+        // The file does not exist: an open would fail
+        assert_eq!(f.read(std::time::Instant::now()), Ok(false));
+        assert!(f.read(soon()).is_err());
+        let c_path = std::ffi::CString::new(path.display().to_string()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(f.read(soon()).unwrap_err().contains("regular"));
+        assert!(open_regular(&path).unwrap_err().contains("regular"));
+        let link = root.join("-w/link.jsonl");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(open_inside(&root, &link).is_err());
+    }
     #[test]
     fn a_codex_response_the_cache_missed_after_a_pause_is_a_cold_wakeup() {
         let mut x = Indexed::new(Path::new("x.jsonl"), "codex");
@@ -1732,7 +1965,8 @@ mod tests {
         x.row(reply("2026-01-01T19:30:01Z", 62_000, 2_000));
         let ctx = &x.session.context;
         assert_eq!((ctx.cold_wakeups, ctx.cold_tokens, ctx.cache_ttl), (1, 60_000, 0));
-        assert_eq!(ctx.cache_at, millis("2026-01-01T19:30:01Z"));
+        // A repeat is not a newer response: the time stays the first's (MCR-149 review)
+        assert_eq!(ctx.cache_at, millis("2026-01-01T19:30:00Z"));
         // After a compaction the prompt is new: the miss is not the pause's
         x.row(json!({"timestamp":"2026-01-02T09:00:00Z","type":"compacted","payload":{"message":"compacted"}}));
         x.row(reply("2026-01-02T09:00:30Z", 9_000, 0));
@@ -1753,12 +1987,13 @@ mod tests {
         assert_eq!(c.session.context.now, 700, "the size after a compaction is the one the boundary records");
         c.row(json!({"type":"system","subtype":"compact_boundary","compactMetadata":{"preTokens":9_010}}));
         c.row(json!({"type":"user","isCompactSummary":true,"message":{"content":"x".repeat(400)}}));
-        assert_eq!(c.session.context.now, 100, "without a recorded size it is estimated from the summary");
+        assert_eq!((c.session.context.now, c.session.context.now_estimated), (100, true), "without a recorded size it is estimated from the summary");
         c.row(turn("m3", 50_000, true));
         c.row(turn("m4", 3_000, false));
         let ctx = &c.session.context;
-        // A subagent's turn inside the file is not this session's context
-        assert_eq!((ctx.first, ctx.peak, ctx.now, ctx.compactions), (1_010, 9_010, 3_010, 2));
+        // A subagent's turn inside the file is not this session's context. A
+        // compaction is its boundary, and a summary no boundary announced: three
+        assert_eq!((ctx.first, ctx.peak, ctx.now, ctx.compactions, ctx.now_estimated), (1_010, 9_010, 3_010, 3, false));
         assert_eq!(ctx.tool_bytes.get("Read"), Some(&10));
         assert_eq!(ctx.skills.get("deploy"), Some(&1), "a skill is counted when invoked, not when a file mentions it");
 
