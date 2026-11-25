@@ -107,24 +107,33 @@ pub enum Firewall {
     Unknown,
 }
 
+/// The answers of `socketfilterfw --getglobalstate` that say what the
+/// firewall is, each with the only state it may carry. The words are the
+/// binary's own (macOS 27.2, `strings` of the binary): `Firewall %s. (State
+/// = %lu)` with "is enabled" for 1, "is blocking all non-essential incoming
+/// connections" for 2 and "is disabled" for 0, and the older formatter's
+/// `Firewall is enabled. (State = %d) ` and `Firewall is disabled. (State =
+/// %d)`, whose space after the `)` is taken off first. Its other phrases
+/// ("is in bootstrap mode", "is in undefined state", ...) say nothing for
+/// sure and are not here (review 17289 P2)
+const FIREWALL_ANSWERS: [(&str, Firewall); 3] = [
+    ("Firewall is enabled. (State = 1)", Firewall::On),
+    ("Firewall is blocking all non-essential incoming connections. (State = 2)", Firewall::On),
+    ("Firewall is disabled. (State = 0)", Firewall::Off),
+];
+
 /// The firewall's global state from `socketfilterfw --getglobalstate`:
-/// state 1 (on) and 2 (essential services only) are on. Only one complete
-/// answer counts (review 17287 P2): a single line `Firewall is … (State = N)`
-/// with one state, ended by its `)`, whose words agree with it ("disabled"
-/// for 0 alone). A truncated, repeated or contradictory answer is unknown,
-/// which gives the sockets-only words
+/// state 1 (on) and 2 (essential services only) are on. Only one whole
+/// answer of `FIREWALL_ANSWERS` counts, phrase and state together, with its
+/// newline and the older formatter's space after the `)`. Anything else (a
+/// truncated, repeated or contradictory answer, another phrase with a
+/// positive state, a failed run) is unknown, which gives the sockets-only
+/// words
 pub fn firewall_from(success: bool, out: &str) -> Firewall {
     let line = out.strip_suffix('\n').unwrap_or(out);
-    if !success || line.contains(['\n', '\r']) || !line.starts_with("Firewall is ") || line.matches("State").count() != 1 {
-        return Firewall::Unknown;
-    }
-    let Some(state) = line.strip_suffix(')').and_then(|l| l.rsplit_once(". (State = ")).map(|(_, n)| n) else {
-        return Firewall::Unknown;
-    };
-    let disabled = line.contains("disabled");
-    match state {
-        "1" | "2" if !disabled => Firewall::On,
-        "0" if disabled && !line.contains("enabled") => Firewall::Off,
+    let line = line.strip_suffix(' ').unwrap_or(line);
+    match FIREWALL_ANSWERS.iter().find(|(answer, _)| *answer == line) {
+        Some((_, state)) if success => *state,
         _ => Firewall::Unknown,
     }
 }
@@ -659,24 +668,46 @@ mod tests {
 
     #[test]
     fn the_firewall_is_on_only_when_one_complete_answer_says_so() {
+        // Every recognised wording, as the binary prints it (with its newline)
+        // and without the newline
         assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)\n"), Firewall::On);
         assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)"), Firewall::On);
         assert_eq!(firewall_from(true, "Firewall is blocking all non-essential incoming connections. (State = 2)\n"), Firewall::On);
         assert_eq!(firewall_from(true, "Firewall is disabled. (State = 0)\n"), Firewall::Off);
-        // A failed run, another answer, a state out of range
+        // The older formatter: a space after the `)` (review 17289 P2)
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1) \n"), Firewall::On);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1) "), Firewall::On);
+        assert_eq!(firewall_from(true, "Firewall is disabled. (State = 0)\n"), Firewall::Off);
+        assert_eq!(firewall_from(true, "Firewall is disabled. (State = 0) \n"), Firewall::Off);
+        // A positive state with a phrase that does not say on (review 17289 P2)
+        assert_eq!(firewall_from(true, "Firewall is not enabled. (State = 1)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is in undefined state. (State = 2)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is in bootstrap mode. (State = 1)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is in undefined block all state. (State = 2)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall has block all state set to disabled. (State = 1)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall has unknown block all state. (State = 2)\n"), Firewall::Unknown);
+        // A recognised phrase with another state than its own
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 2)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is blocking all non-essential incoming connections. (State = 1)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is disabled. (State = 1)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 0)\n"), Firewall::Unknown);
+        // The block-all switch's own message is no answer about the state
+        assert_eq!(firewall_from(true, "Firewall is set to block all non-essential incoming connections \n"), Firewall::Unknown);
+        // A failed run, another answer, a state out of range, other spacing
         assert_eq!(firewall_from(false, "Firewall is enabled. (State = 1)\n"), Firewall::Unknown);
         assert_eq!(firewall_from(true, "something else\n"), Firewall::Unknown);
         assert_eq!(firewall_from(true, "Firewall is enabled. (State = 7)\n"), Firewall::Unknown);
         assert_eq!(firewall_from(true, ""), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)  \n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, " Firewall is enabled. (State = 1)\n"), Firewall::Unknown);
+        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)\n\n"), Firewall::Unknown);
         // Truncated (review 17287 P2)
         for cut in ["Firewall is enabled. (State = 1", "Firewall is enabled. (State = ", "Firewall is enabled. (State", "Firewall is enabled."] {
             assert_eq!(firewall_from(true, cut), Firewall::Unknown, "{cut}");
         }
-        // Two answers, or words and state that disagree
+        // Two answers, or two states on one line
         assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)\nFirewall is disabled. (State = 0)\n"), Firewall::Unknown);
         assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1) (State = 0)"), Firewall::Unknown);
-        assert_eq!(firewall_from(true, "Firewall is disabled. (State = 1)\n"), Firewall::Unknown);
-        assert_eq!(firewall_from(true, "Firewall is enabled. (State = 0)\n"), Firewall::Unknown);
         assert_eq!(firewall_from(true, "Firewall is enabled. (State = 1)\r\n"), Firewall::Unknown);
     }
 
