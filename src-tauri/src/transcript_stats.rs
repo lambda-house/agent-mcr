@@ -6,13 +6,14 @@
 //! any path, a named pipe or a linked folder included.
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Response times and deduplication keys kept per session: a response's
 /// repeated rows (its content blocks, a repeated `token_count`) come within a
@@ -31,6 +32,17 @@ const MAX_LINE: u64 = 16 * 1024 * 1024;
 /// reasoning is part of the output: neither is added again
 const CLAUDE_EQ: (f64, f64, f64, f64) = (1.25, 2.0, 0.1, 5.0);
 const CODEX_EQ: (f64, f64) = (0.1, 8.0);
+
+/// A response id as it is kept for deduplication: the first 16 bytes of its
+/// SHA-256, so what is kept per id is bounded whatever the transcript says
+type Key = [u8; 16];
+
+fn key_of(id: &str) -> Key {
+    let digest = Sha256::digest(id.as_bytes());
+    let mut key = [0; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
 
 /// An RFC3339 timestamp in milliseconds; 0 when it is missing or malformed.
 fn millis(at: &str) -> u64 {
@@ -60,9 +72,11 @@ pub struct Stats {
     turns: VecDeque<u64>,
     pub turns_dropped: u64,
     pub model: String,
-    /// Per response id, the largest usage seen: Claude writes a row per content block
-    keys: HashMap<String, [u64; 5]>,
-    order: VecDeque<String>,
+    /// Per response id, the largest usage seen: Claude writes a row per
+    /// content block. An id is kept as a fixed-size hash (`key_of`), never as
+    /// its text, so a long id costs no more than a short one
+    keys: HashMap<Key, [u64; 5]>,
+    order: VecDeque<Key>,
     /// The last Codex `last_token_usage` counted
     last_codex: (u64, u64, u64),
     /// A Claude compaction boundary came and its summary has not yet
@@ -119,9 +133,9 @@ impl Stats {
             let n = |v: &Value| v.as_u64().unwrap_or(0);
             let (written, hour) = (n(&u["cache_creation_input_tokens"]), n(&u["cache_creation"]["ephemeral_1h_input_tokens"]));
             let now = [n(&u["input_tokens"]), written, hour.min(written), n(&u["cache_read_input_tokens"]), n(&u["output_tokens"])];
-            let key = m["id"].as_str().unwrap_or("").to_string();
+            let key = key_of(m["id"].as_str().unwrap_or(""));
             let new = !self.keys.contains_key(&key);
-            let seen = self.keys.entry(key.clone()).or_insert([0; 5]);
+            let seen = self.keys.entry(key).or_insert([0; 5]);
             let delta: Vec<u64> = now.iter().zip(seen.iter()).map(|(a, b)| a.saturating_sub(*b)).collect();
             for (s, a) in seen.iter_mut().zip(now) {
                 *s = (*s).max(a);
@@ -214,24 +228,48 @@ pub struct Follow {
     offset: u64,
     /// The file it read, so that a replaced file is read again from its start
     identity: Option<(u64, u64)>,
+    /// The file's modification time when the last read ended, and its
+    /// anchors then (`anchors`): a file rewritten in place, on the same inode
+    /// and at the same or a greater length, is read again from its start
+    modified: Option<SystemTime>,
+    anchors: (u64, u64),
+    /// How often it started over at the beginning of a rewritten file
+    restarts: u64,
     pub stats: Stats,
 }
 
 impl Follow {
     pub fn new(root: &Path, rel: &Path, claude: bool) -> Self {
-        Self { root: root.to_path_buf(), rel: rel.to_path_buf(), offset: 0, identity: None, stats: Stats::new(claude) }
+        Self { root: root.to_path_buf(), rel: rel.to_path_buf(), offset: 0, identity: None, modified: None, anchors: (0, 0), restarts: 0, stats: Stats::new(claude) }
+    }
+    /// Whether what was read is no longer what the file holds: another file
+    /// (inode), a shorter one, or one changed since the last read without
+    /// growing (agents only append) or with other bytes at its anchors.
+    /// Everything is looked at through the opened handle.
+    fn rewritten(&self, file: &mut File, meta: &std::fs::Metadata) -> Result<bool, String> {
+        if self.offset == 0 {
+            return Ok(false);
+        }
+        if self.identity != file_identity(meta) || meta.len() < self.offset {
+            return Ok(true);
+        }
+        if meta.modified().ok() == self.modified {
+            return Ok(false);
+        }
+        Ok(meta.len() == self.offset || anchors(file, self.offset)? != self.anchors)
     }
     /// Reads what was appended for about `slice`; true once it has read up
     /// to the last whole record
     pub fn read(&mut self, slice: Duration) -> Result<bool, String> {
         let began = Instant::now();
-        let file = open_confined(&self.root, &self.rel).map_err(|e| e.to_string())?;
+        let mut file = open_confined(&self.root, &self.rel).map_err(|e| e.to_string())?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
-        let identity = file_identity(&meta);
-        if self.identity.is_some_and(|i| Some(i) != identity) || meta.len() < self.offset {
+        if self.rewritten(&mut file, &meta)? {
+            let restarts = self.restarts + 1;
             *self = Self::new(&self.root, &self.rel, self.stats.claude);
+            self.restarts = restarts;
         }
-        self.identity = identity;
+        self.identity = file_identity(&meta);
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.offset)).map_err(|e| e.to_string())?;
         let mut line = Vec::new();
@@ -243,6 +281,7 @@ impl Follow {
                     return Err("Transcript record exceeds 16 MiB".into());
                 }
                 // The end, or a record its writer has not finished
+                self.mark(reader.get_mut())?;
                 return Ok(true);
             }
             self.offset += n as u64;
@@ -258,10 +297,29 @@ impl Follow {
                 }
             }
             if began.elapsed() >= slice {
+                self.mark(reader.get_mut())?;
                 return Ok(false);
             }
         }
     }
+    /// Remembers the file as this read leaves it: its time and anchors
+    fn mark(&mut self, file: &mut File) -> Result<(), String> {
+        self.modified = file.metadata().map_err(|e| e.to_string())?.modified().ok();
+        self.anchors = anchors(file, self.offset)?;
+        Ok(())
+    }
+}
+
+/// Hashes of a file's first 4 KiB and of the 256 bytes before `offset`
+/// (FNV-1a), read through the handle.
+fn anchors(file: &mut File, offset: u64) -> Result<(u64, u64), String> {
+    fn hash(file: &mut File, start: u64, length: u64) -> Result<u64, String> {
+        file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(length as usize);
+        file.take(length).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)))
+    }
+    Ok((hash(file, 0, offset.min(4096))?, hash(file, offset.saturating_sub(256), offset.min(256))?))
 }
 
 /// What the figures of one session show, as of a read to the end of its
@@ -946,5 +1004,71 @@ mod tests {
         // Sessions no longer kept are no longer followed
         contexts.ask(Vec::new(), |id| id == "ex", Duration::ZERO);
         assert!(contexts.follows("ex") && !contexts.follows("gone"));
+    }
+
+    /// Rewrites a file in place: same inode, same length, other bytes.
+    fn rewrite_in_place(path: &Path, from: &str, to: &str) {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(from.len(), to.len());
+        let inode = std::fs::metadata(path).map(|m| file_identity(&m)).unwrap();
+        // The modification time must be able to move
+        std::thread::sleep(Duration::from_millis(20));
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.write_all(text.replacen(from, to, 1).as_bytes()).unwrap();
+        drop(f);
+        let meta = std::fs::metadata(path).unwrap();
+        assert_eq!((file_identity(&meta), meta.len()), (inode, text.len() as u64));
+    }
+
+    /// MCR-149 round 4: a transcript rewritten in place between two reads,
+    /// on the same inode and at the same length, is read again from its
+    /// start; an append is read on without starting over.
+    #[test]
+    fn a_rewrite_in_place_is_read_again_and_an_append_is_not() {
+        let (root, rel) = fixture("rewrite");
+        let path = root.join(&rel);
+        // A record past the anchors' first 4 KiB, so only the time can tell
+        let filler: Vec<Value> = (0..40).map(|n| json!({"type":"user","timestamp":"2026-01-01T09:00:00Z","message":{"content":"x".repeat(100 + n)}})).collect();
+        append(&path, &filler);
+        append(&path, &[reply("m1", "2026-01-01T10:00:00Z", 100, 0, 0, 1)]);
+        append(&path, &[json!({"type":"user","timestamp":"2026-01-01T10:00:01Z","message":{"content":"y".repeat(400)}})]);
+        let mut f = Follow::new(&root, &rel, true);
+        read_all(&mut f);
+        assert_eq!((f.stats.now, f.restarts), (100, 0));
+        rewrite_in_place(&path, "\"input_tokens\":100", "\"input_tokens\":900");
+        read_all(&mut f);
+        assert_eq!((f.stats.now, f.stats.turn_count(), f.restarts), (900, 1, 1), "a same-length rewrite was not seen");
+        // Rewritten where the anchor before the end lies, and appended to: read again too
+        append(&path, &[reply("m2", "2026-01-01T10:01:00Z", 950, 0, 0, 1)]);
+        read_all(&mut f);
+        assert_eq!((f.stats.now, f.stats.turn_count(), f.restarts), (950, 2, 1), "an append is read on");
+        rewrite_in_place(&path, "\"input_tokens\":950", "\"input_tokens\":970");
+        append(&path, &[json!({"type":"user","timestamp":"2026-01-01T10:02:00Z","message":{"content":"z"}})]);
+        read_all(&mut f);
+        assert_eq!((f.stats.now, f.stats.turn_count(), f.restarts), (970, 2, 2));
+
+        // Through the worker: a request after the rewrite is current with the new figures
+        let (want, path) = want_in("rewrite");
+        append(&path, &[reply("m1", "2026-01-01T10:00:00Z", 100, 0, 0, 1)]);
+        let contexts = Contexts::new();
+        let ask = || contexts.ask(vec![("ex".into(), want.clone())], |_| true, Duration::from_secs(10)).remove("ex").unwrap();
+        assert!(matches!(ask(), Answer::Current(Some(f)) if f.now == 100));
+        rewrite_in_place(&path, "\"input_tokens\":100", "\"input_tokens\":900");
+        assert!(matches!(ask(), Answer::Current(Some(f)) if f.now == 900));
+    }
+
+    /// MCR-149 round 4: a response id is kept as a 16-byte hash, so a
+    /// megabyte-long id costs what a short one does and still deduplicates.
+    #[test]
+    fn dedup_keys_are_fixed_size_hashes() {
+        let mut s = Stats::new(true);
+        let long = "i".repeat(1 << 20);
+        let row = |id: &str, input: u64| json!({"type":"assistant","timestamp":"2026-01-01T10:00:00Z","message":{"id":id,"model":"m","usage":{"input_tokens":input,"output_tokens":0}}});
+        s.row(&row(&long, 10));
+        s.row(&row(&long, 10));
+        s.row(&row(&format!("{long}x"), 5));
+        assert_eq!((s.turn_count(), s.input_equivalent(), s.keys.len(), s.order.len()), (2, 15, 2, 2));
+        assert!(format!("{s:?}").len() < 4096, "the id's text is kept");
+        assert_eq!(std::mem::size_of::<Key>(), 16);
     }
 }

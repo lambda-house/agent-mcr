@@ -798,12 +798,27 @@ fn file_ms(time: std::io::Result<std::time::SystemTime>) -> u64 {
     time.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Tests: a lookup of subagents under this home folder waits here, inside
+/// the I/O functions themselves, until the sender is used or dropped
+#[cfg(test)]
+static SUBAGENT_STALL: Mutex<Option<(PathBuf, std::sync::mpsc::Receiver<()>)>> = Mutex::new(None);
+
+#[cfg(test)]
+fn subagent_stall(home: &Path) {
+    let stall = lock(&SUBAGENT_STALL).take_if(|(at, _)| at == home);
+    if let Some((_, rx)) = stall {
+        let _ = rx.recv();
+    }
+}
+
 /// Subagents a Codex conversation started that wrote something since `since`,
 /// newest first: the transcripts whose head names it as their parent thread.
 /// Only the head (who started it, its name) and the type of the last record
 /// are read, never what it said. Each file is opened once, confined to the
 /// real transcript folder (`open_confined`), and its times come from the handle.
 pub fn codex_subagents(home: &Path, thread: &str, since: u64) -> Vec<Subagent> {
+    #[cfg(test)]
+    subagent_stall(home);
     if !is_uuid(thread) {
         return Vec::new();
     }
@@ -857,6 +872,114 @@ pub fn codex_subagents(home: &Path, thread: &str, since: u64) -> Vec<Subagent> {
 
 const MAX_SUBAGENTS: usize = 20;
 
+/// Where a session's subagents are looked up.
+#[derive(Clone, Debug, PartialEq)]
+struct SubagentWant {
+    home: PathBuf,
+    profile: String,
+    transcript: Option<String>,
+    conversation: Option<String>,
+}
+
+struct SubagentEntry {
+    want: SubagentWant,
+    found: Vec<Subagent>,
+    /// When the last lookup ended
+    looked: Option<Instant>,
+    /// A request found it due: the worker looks it up
+    asked: bool,
+    busy: bool,
+}
+
+/// How long a session's subagent list is used before it is looked up again.
+const SUBAGENTS_FRESH: Duration = Duration::from_secs(5);
+
+/// The subagents of the running sessions (MCR-149 round 4). The session list
+/// and every tool built on it (`whoami`, `overview`, `session_status`) serve
+/// the last list found and never wait for a lookup: the agents' files are
+/// read by one worker thread, started at the first request and ended once
+/// the harness is gone, and the map's lock is never held across file I/O.
+struct Subagents {
+    map: Mutex<BTreeMap<String, SubagentEntry>>,
+    wake: Condvar,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl Subagents {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { map: Mutex::new(BTreeMap::new()), wake: Condvar::new(), started: std::sync::atomic::AtomicBool::new(false) })
+    }
+
+    /// The subagents last found for these sessions, at once. A list older
+    /// than `SUBAGENTS_FRESH` is looked up again in the background; sessions
+    /// not named here are forgotten.
+    fn get(self: &Arc<Self>, wants: Vec<(String, SubagentWant)>) -> BTreeMap<String, Vec<Subagent>> {
+        let mut map = lock(&self.map);
+        map.retain(|id, _| wants.iter().any(|(w, _)| w == id));
+        let mut due = false;
+        let out = wants
+            .into_iter()
+            .map(|(id, want)| {
+                let e = map.entry(id.clone()).or_insert_with(|| SubagentEntry { want: want.clone(), found: Vec::new(), looked: None, asked: false, busy: false });
+                if e.want != want {
+                    *e = SubagentEntry { want, found: Vec::new(), looked: None, asked: false, busy: false };
+                }
+                if !e.busy && e.looked.is_none_or(|at| at.elapsed() > SUBAGENTS_FRESH) {
+                    e.asked = true;
+                    due = true;
+                }
+                (id, e.found.clone())
+            })
+            .collect();
+        drop(map);
+        if due {
+            self.start();
+            self.wake.notify_all();
+        }
+        out
+    }
+
+    fn start(self: &Arc<Self>) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        if let Err(e) = std::thread::Builder::new().name("subagents".into()).spawn(move || Self::work(me)) {
+            eprintln!("harness: the subagents' worker did not start: {e}");
+            self.started.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn work(me: std::sync::Weak<Self>) {
+        loop {
+            let Some(this) = me.upgrade() else { return };
+            let job = {
+                let mut map = lock(&this.map);
+                match map.iter_mut().filter(|(_, e)| e.asked && !e.busy).min_by_key(|(_, e)| e.looked) {
+                    Some((id, e)) => {
+                        e.asked = false;
+                        e.busy = true;
+                        Some((id.clone(), e.want.clone()))
+                    }
+                    None => {
+                        let _ = this.wake.wait_timeout(map, Duration::from_secs(1));
+                        None
+                    }
+                }
+            };
+            let Some((id, want)) = job else { continue };
+            let recent = now_ms().saturating_sub(3_600_000);
+            let found = adapter(&want.profile).subagents(&want.home, want.transcript.as_deref(), want.conversation.as_deref(), recent);
+            let mut map = lock(&this.map);
+            if let Some(e) = map.get_mut(&id).filter(|e| e.busy && e.want == want) {
+                e.found = found;
+                e.looked = Some(Instant::now());
+                e.busy = false;
+            }
+        }
+    }
+}
+
 /// Subagents of the Claude session with this transcript that wrote something
 /// since `since`, newest first. Claude Code keeps them next to the transcript,
 /// in `<session id>/subagents/agent-<id>.jsonl` with a `.meta.json`. Only the
@@ -865,6 +988,8 @@ const MAX_SUBAGENTS: usize = 20;
 /// real location of Claude's transcript folder (`open_confined`), so a folder
 /// swapped for a link after the listing leads nowhere.
 pub fn subagents(home: &Path, transcript: &str, since: u64) -> Vec<Subagent> {
+    #[cfg(test)]
+    subagent_stall(home);
     let transcript = Path::new(transcript);
     if transcript.extension().is_none_or(|e| e != "jsonl") || transcript.components().any(|c| c == std::path::Component::ParentDir) {
         return Vec::new();
@@ -2718,8 +2843,9 @@ pub struct Harness {
     processes: Mutex<(Option<Instant>, Arc<Vec<Process>>)>,
     /// Per running shell: its processor time and when that last moved
     activity: Mutex<BTreeMap<i32, (f64, u64)>>,
-    /// Subagents per session, looked up in the agents' files at most every five seconds
-    subagents: Mutex<BTreeMap<String, (Instant, Vec<Subagent>)>>,
+    /// Subagents per session, looked up in the agents' files at most every
+    /// five seconds by their own worker thread, never on a request's thread
+    subagents: Arc<Subagents>,
     /// The Slack connector (D14)
     slack: Arc<Slack>,
     /// The memory server (D16): the sign-in and the router of the `mcr-memory` MCP server
@@ -2894,7 +3020,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Mutex::new(BTreeMap::new()), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -3071,7 +3197,6 @@ impl Harness {
         let ids: BTreeSet<&str> = infos.iter().filter_map(|i| i["id"].as_str()).collect();
         let processes = self.processes();
         lock(&self.activity).retain(|pid, _| processes.iter().any(|p| p.pid == *pid));
-        lock(&self.subagents).retain(|id, _| ids.contains(id.as_str()));
         // Whether the folders of ended sessions are still there (MCR-107), asked
         // before the store is locked: a folder on a share that went away can
         // make the question hang, and nothing else may wait for it
@@ -3082,27 +3207,24 @@ impl Harness {
             .filter(|cwd| !self.folder_there(cwd))
             .map(str::to_owned)
             .collect();
-        let home = dirs::home_dir();
-        let recent = now_ms().saturating_sub(3_600_000);
-        // Subagents are looked up in the agents' files before the store is
-        // locked and without holding their cache: files are never read under a lock
-        if let Some(home) = &home {
-            let due: Vec<(String, String, Option<String>, Option<String>)> = {
-                let store = lock(&self.store);
-                let cached = lock(&self.subagents);
-                infos
-                    .iter()
-                    .filter(|i| i["exit"].is_null())
-                    .filter_map(|i| i["id"].as_str())
-                    .filter(|id| cached.get(*id).is_none_or(|e| e.0.elapsed() > Duration::from_secs(5)))
-                    .filter_map(|id| store.sessions.get(id).map(|t| (id.to_string(), t.profile.clone(), t.transcript.clone(), t.agent_session.clone())))
-                    .collect()
-            };
-            for (id, profile, transcript, conversation) in due {
-                let found = adapter(&profile).subagents(home, transcript.as_deref(), conversation.as_deref(), recent);
-                lock(&self.subagents).insert(id, (Instant::now(), found));
+        // Subagents as last looked up; the lookup itself, in the agents'
+        // files, is the worker's (MCR-149 round 4): no file is read here
+        let home = self.launch_home().ok();
+        let subagents: BTreeMap<String, Vec<Subagent>> = match &home {
+            Some(home) => {
+                let wants: Vec<(String, SubagentWant)> = {
+                    let store = lock(&self.store);
+                    infos
+                        .iter()
+                        .filter(|i| i["exit"].is_null())
+                        .filter_map(|i| i["id"].as_str())
+                        .filter_map(|id| store.sessions.get(id).map(|t| (id.to_string(), SubagentWant { home: home.clone(), profile: t.profile.clone(), transcript: t.transcript.clone(), conversation: t.agent_session.clone() })))
+                        .collect()
+                };
+                self.subagents.get(wants)
             }
-        }
+            None => BTreeMap::new(),
+        };
         let store = lock(&self.store);
         Ok(infos
             .iter()
@@ -3138,7 +3260,7 @@ impl Harness {
                     out["shells"] = json!(self.with_activity(shells(&processes, pid as i32, now_ms()), now_ms()));
                 }
                 if info["exit"].is_null() && home.is_some() {
-                    out["subagents"] = json!(lock(&self.subagents).get(id).map(|e| e.1.clone()).unwrap_or_default());
+                    out["subagents"] = json!(subagents.get(id).cloned().unwrap_or_default());
                 }
                 out
             })
@@ -11368,6 +11490,72 @@ mod tests {
         });
         assert_eq!(h.contexts(&["sh"])["sh"], Value::Null);
         assert!(!h.contexts.follows("sh"));
+    }
+
+    /// MCR-149 round 4: the public tools serve the subagents last found and
+    /// never wait for a lookup in the agents' files. With the subagents'
+    /// worker held inside a lookup, `whoami` and `overview` answer within the
+    /// context budget; once it goes on, the list it found is served.
+    #[test]
+    #[cfg(unix)]
+    fn a_stalled_subagent_lookup_does_not_hold_the_public_tools() {
+        let dir = socket_test_dir("mcr-sub-");
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dunce::canonicalize(state_dir(None)).unwrap();
+        let conversation = "0b8c9630-d8ae-4b6f-a765-44266a0929e0";
+        let transcript = home.join(format!(".claude/projects/-w/{conversation}.jsonl"));
+        append_rows(&transcript, &[claude_response("m1", now_ms() - 60_000, 10, 0, 0, 1)]);
+        let agents = home.join(format!(".claude/projects/-w/{conversation}/subagents"));
+        append_rows(&agents.join("agent-a1.jsonl"), &[json!({"type": "assistant", "message": {"stop_reason": "end_turn"}})]);
+        let listener = Listener::bind(dir.join("runner.sock")).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut line = String::new();
+                if BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                let answer = match req["op"].as_str() {
+                    Some("hello") => json!({"protocol": runner::PROTOCOL}),
+                    Some("list") => json!({"sessions": [{"id": "lead", "cwd": "/w", "meta": {"profile": "claude"}}]}),
+                    _ => json!({}),
+                };
+                let _ = writeln!(stream, "{answer}");
+            }
+        });
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(home.clone());
+        h.update(|s| {
+            s.sessions.insert("lead".into(), Tracked { profile: "claude".into(), state: "idle".into(), transcript: Some(transcript.display().to_string()), agent_session: Some(conversation.into()), ..Tracked::default() });
+        });
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *lock(&SUBAGENT_STALL) = Some((home.clone(), rx));
+        let limit = CONTEXT_BUDGET + Duration::from_millis(1_000);
+        for tool in ["whoami", "overview", "whoami"] {
+            let began = Instant::now();
+            let out = h.agent_tool("lead", tool, &json!({})).unwrap();
+            let took = began.elapsed();
+            assert!(took < limit, "{tool} waited {took:?} on a stalled subagent lookup");
+            let me = if tool == "overview" { &out["sessions"][0] } else { &out };
+            assert_eq!(me["context"]["tokens"].as_u64(), Some(10), "{tool}: {me}");
+            if tool == "whoami" {
+                assert_eq!(me["subagents"], json!([]));
+            }
+        }
+        drop(tx);
+        // The worker goes on; the list it found is what the next answers serve
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let me = h.agent_tool("lead", "whoami", &json!({})).unwrap();
+            if me["subagents"].as_array().is_some_and(|a| a.len() == 1) {
+                assert_eq!(me["subagents"][0]["id"], "a1");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the subagents were never served: {}", me["subagents"]);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// MCR-149 review: a named pipe among a Claude session's subagent files
