@@ -29,6 +29,7 @@ mod changes;
 mod task_copy;
 mod harness;
 mod git;
+mod worktrees;
 mod auto_mode;
 #[cfg(target_os = "macos")]
 mod codex_sockets;
