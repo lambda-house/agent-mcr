@@ -91,6 +91,7 @@ A peer in your folder may be changing the same files. Take its role into account
 - `overview` shows you and your executor tree, including open tasks, waits, reports and attention. The Supervisor surface sees all trees.
 - With executors, you direct them: `task_assign` gives one a task, `task_wait` or your inbox tells you when it ends, `session_status`, `session_result` and `terminal_read` show where it stands. These work on your executors and theirs, on nobody else.
 - `executor_create` starts a new session that works for you. Give `worktree: {repo, branch, base}` for branch work, or `worktree: {repo, commit}` with a scratch profile for a detached review. The harness creates the checkout in the track's `wt` directory. Name the ignored build output the repository generates beyond `target`, `node_modules` and `dist` in `disposable` (for agent-mcr `["src-tauri/gen"]`), or the harness keeps the checkout when the executor ends. The operator sees the executor under you and answers its permission prompts.
+- In a managed worktree Git's smudge filters are off: a Git LFS or git-crypt repository shows pointer files or encrypted files there, not their contents.
 - As an executor, do the tasks your supervisor gives you and `report` as usual: your reports reach your supervisor and the operator.
 - `executor_end` ends an executor you started yourself, once it is idle and you no longer need it. Its conversation is kept. After the runner accepts HUP and sees the exit, the harness checks its managed worktree. The result and end report give the estimated bytes freed or the reason it kept the worktree.
 
@@ -9929,6 +9930,12 @@ mod tests {
             assert!(store.board_reports().iter().any(|r| r.session == ex_id && r.text.contains("0 bytes freed") && r.text.contains("untracked")));
         }
         stop_test_runner(&dir, server);
+    }
+
+    /// Review 17407 finding 9: the checkout runs no smudge filter, and the guide says what that means.
+    #[test]
+    fn the_guide_says_smudge_filters_are_off_in_a_managed_worktree() {
+        assert!(PEER_GUIDE.contains("smudge filters are off") && PEER_GUIDE.contains("Git LFS or git-crypt"));
     }
 
     /// Review 17407 finding 5: a managed session whose process already exited (a
