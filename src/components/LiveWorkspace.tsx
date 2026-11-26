@@ -546,18 +546,22 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
   /**
-   * The one place an acknowledgement for the operator's look leaves (MCR-180): none while a
-   * banner's ask is pending, for any session, or for a session not looked at by their own choice
-   * since a banner. Read at the call, not from a render, so no path or stale closure gets past it
+   * The one place an acknowledgement leaves Live (MCR-180), read at the call, not from a render,
+   * so no path or stale closure gets past it. None while a banner's ask is pending, for any
+   * session. `operator`: their own explicit act (Mark report as seen), which first ends a pending
+   * ask, as any choice of theirs does. `look`: the selected session they look at, never one not
+   * looked at by their own choice since a banner
    */
-  const autoAck = (id: string, since: number) => {
-    if (useBannerIntent.getState().intent || passiveNow.current === id) return;
+  const sendAck = (id: string, since: number, by: 'operator' | 'look') => {
+    if (by === 'operator') cancelBanner();
+    if (useBannerIntent.getState().intent) return;
+    if (by === 'look' && passiveNow.current === id) return;
     if (acknowledging.current.get(id) === since) return;
     acknowledging.current.set(id, since);
     void harnessApi.ack(id, since).then(refresh).catch(e => setError(err(e))).finally(() => acknowledging.current.delete(id));
   };
-  const autoAcker = useRef(autoAck);
-  autoAcker.current = autoAck;
+  const autoAcker = useRef((id: string, since: number) => sendAck(id, since, 'look'));
+  autoAcker.current = (id, since) => sendAck(id, since, 'look');
   useEffect(() => {
     const acknowledge = () => {
       if (!active || document.hidden || !document.hasFocus()) return;
@@ -754,7 +758,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     { label: 'Copy reference', icon: <Copy size={13}/>, run: () => copyReference(h) },
     ...(canRestart(h) ? [{ label: 'Restart (reload settings)', icon: <RotateCw size={13}/>, run: () => restart(h) }] : []),
     ...(!h.exit ? [{ label: 'Close session', icon: <X size={13}/>, run: () => close(h) }] : []),
-    ...(h.exit && h.harness?.attention?.report ? [{ label: 'Mark report as seen', icon: <Check size={13}/>, run: () => act(() => harnessApi.ack(h.id, h.harness!.attention!.since)) }] : []),
+    ...(h.exit && h.harness?.attention?.report ? [{ label: 'Mark report as seen', icon: <Check size={13}/>, run: () => sendAck(h.id, h.harness!.attention!.since, 'operator') }] : []),
   ];
   const names = new Map(hosted.map(h => [h.id, sessionLabel(h)]));
   const addFolder = (raw: string) => {

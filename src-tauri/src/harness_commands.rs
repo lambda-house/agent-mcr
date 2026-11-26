@@ -275,12 +275,14 @@ fn clicked_in(answer: &Value) -> Option<crate::banner::Click> {
 }
 
 /// The latest banner click for the page, once (MCR-180): `null` when there
-/// is nothing new, `{"session": id}` to show that session, `{"session":
-/// null}` to take back one the page may still be about to show. The page
-/// asks when it starts listening and at each `harness-open-session`.
+/// is nothing new, `{"session": id, "at": stamp}` to show that session,
+/// `{"session": null, "at": stamp}` to take back one the page may still be
+/// about to show. The page asks when it starts listening and at each
+/// `harness-open-session`, and keeps only replies newer than the newest
+/// stamp it has seen: two takes may come back in either order.
 #[tauri::command]
 pub fn harness_open_session_take() -> Option<Value> {
-    crate::banner::take_open().map(|session| json!({ "session": session.filter(|s| valid_id(s).is_ok()) }))
+    crate::banner::take_open().map(|c| json!({ "session": c.session.filter(|s| valid_id(s).is_ok()), "at": c.at }))
 }
 
 /// Sessions, their state and resuming go through the harness service.

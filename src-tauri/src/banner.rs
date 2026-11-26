@@ -117,9 +117,9 @@ pub fn click_from(answer: &serde_json::Value) -> Option<Click> {
 /// comes later opens nothing.
 #[derive(Default)]
 struct Open {
-    /// The latest click, until the page takes it: `Some(None)` takes back
-    /// what the page may still be about to open
-    pending: Option<Option<String>>,
+    /// The latest click, until the page takes it; one about no session
+    /// takes back what the page may still be about to open
+    pending: Option<Click>,
     latest: u64,
 }
 
@@ -134,7 +134,7 @@ pub fn offer(click: Click) -> bool {
         return false;
     }
     open.latest = click.at;
-    open.pending = Some(click.session);
+    open.pending = Some(click);
     true
 }
 
@@ -144,9 +144,12 @@ pub fn open_pending() -> bool {
     lock(&OPEN).pending.is_some()
 }
 
-/// In the app: the latest click for the page, once: `Some(Some(id))` opens
-/// that session, `Some(None)` takes back an earlier one, `None` is nothing new.
-pub fn take_open() -> Option<Option<String>> {
+/// In the app: the latest click for the page, once, with its stamp: the
+/// page may have two takes on their way, and their replies may come back in
+/// either order, so it keeps only the newest stamp it has seen. A click with
+/// a session opens it, one without takes back an earlier one; `None` is
+/// nothing new.
+pub fn take_open() -> Option<Click> {
     lock(&OPEN).pending.take()
 }
 
@@ -317,31 +320,32 @@ mod tests {
     // OPEN is one slot per process too
     #[test]
     fn the_app_hands_the_page_only_the_latest_click_of_either_route_once() {
-        let opens = |id: &str| Some(Some(id.to_owned()));
+        let opens = |id: &str| Some(id.to_owned());
+        let taken = || take_open().map(|c| c.session);
         // The app's own click B, then the service's older A: A opens nothing
         assert!(!open_pending());
         assert!(offer(click(Some("b"), 20)));
         assert!(!offer(click(Some("a"), 10)));
         assert!(open_pending(), "a list read says the page has a click to take");
-        assert_eq!(take_open(), opens("b"));
+        assert_eq!(taken(), Some(opens("b")));
         assert!(!open_pending());
-        assert_eq!(take_open(), None);
+        assert_eq!(taken(), None);
         // Taken already: an older click that comes later still opens nothing
         assert!(!offer(click(Some("a"), 15)));
-        assert_eq!(take_open(), None);
+        assert_eq!(taken(), None);
         // A later click about no session replaces one the page has not taken
         assert!(offer(click(Some("c"), 30)));
         assert!(offer(click(None, 31)));
-        assert_eq!(take_open(), Some(None));
+        assert_eq!(taken(), Some(None));
         // and reaches the page after it took one, to take that back (MCR-180 round 4)
         assert!(offer(click(Some("d"), 40)));
-        assert_eq!(take_open(), opens("d"));
+        assert_eq!(taken(), Some(opens("d")));
         assert!(offer(click(None, 41)));
-        assert_eq!(take_open(), Some(None));
+        assert_eq!(taken(), Some(None));
         // A newer click from the service after the app's own: the service's opens
         assert!(offer(click(Some("e"), 50)));
         assert!(offer(click(Some("f"), 51)));
-        assert_eq!(take_open(), opens("f"));
+        assert_eq!(take_open(), Some(click(Some("f"), 51)), "the page gets the stamp too");
     }
 
     #[test]

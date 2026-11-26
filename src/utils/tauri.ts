@@ -250,18 +250,25 @@ export async function getAgentWorkspace(): Promise<AgentWorkspace> {
  * @returns unlisten function (no-op outside Tauri)
  */
 let openSession: ((id: string | null) => void) | null = null;
+/** The stamp of the newest click handed to the page: a reply older than it is stale */
+let newestTaken = 0;
 
 /**
  * Take the latest banner click the app holds for the page, and hand it to
  * the `onOpenSession` handler (MCR-180). From the call until the handler
- * has it, `taking` holds every ask's decision: this click is newer.
+ * has it, `taking` holds every ask's decision: this click is newer. Two
+ * takes may be on their way and come back in either order: a reply whose
+ * native stamp is not newer than one already handed over is dropped, so an
+ * older click never undoes a newer one.
  */
 export async function takeOpenSession(): Promise<void> {
   if (!isTauri()) return;
   beginTake();
   try {
-    const click = await invoke<{ session: string | null } | null>('harness_open_session_take');
-    if (click && typeof click === 'object') openSession?.(typeof click.session === 'string' && click.session ? click.session : null);
+    const click = await invoke<{ session: string | null; at: number } | null>('harness_open_session_take');
+    if (!click || typeof click !== 'object' || typeof click.at !== 'number' || click.at <= newestTaken) return;
+    newestTaken = click.at;
+    openSession?.(typeof click.session === 'string' && click.session ? click.session : null);
   } catch { /* nothing taken */ } finally {
     endTake();
   }

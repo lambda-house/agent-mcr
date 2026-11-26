@@ -1052,6 +1052,17 @@ describe('a session a clicked banner asks for (MCR-180)', () => {
     expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
   });
 
+  it('sends no acknowledgement at a focus in the same moment as the ask, before Live has rendered it (round 6)', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, withReport(running, 'done', 'Finished the tests')]);
+    vi.mocked(document.hasFocus).mockReturnValue(false);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
+    vi.mocked(document.hasFocus).mockReturnValue(true);
+    // The store has the ask; the focus listener of the last render runs before any new render
+    await act(async () => { askBanner('e1'); window.dispatchEvent(new Event('focus')); }); await flush();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+  });
+
   it('a row click on it is the operator\'s own choice, as before', async () => {
     vi.mocked(harnessApi.list).mockResolvedValue([ended, withReport(running, 'done', 'Finished the tests')]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await ask('r1');

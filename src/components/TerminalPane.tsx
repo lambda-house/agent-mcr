@@ -142,9 +142,10 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   passiveNow.current = passive && !activated.current;
   /**
    * Whether nothing may leave this view (MCR-180): it is passive, or a banner's ask is pending,
-   * read from the store at the moment of leaving, not from a render. Asked at the two places
-   * where anything leaves a terminal: the keyboard (`focusTerm`) and the input to the session
-   * (`flushInput`, and `onData` before it queues)
+   * read from the store at the moment of leaving, not from a render. Only the operator's own
+   * pointer, key or drop in this terminal (`take`), or the ask's end, lets go of it. Asked where
+   * anything leaves a terminal: the keyboard (`focusTerm`, and a focus from anywhere else, which
+   * is turned back) and the input to the session (the write in `flushInput`, and `onData`)
    */
   const held = () => passiveNow.current || useBannerIntent.getState().intent !== null;
   const focusTerm = (t: Terminal | null) => { if (t && !held()) t.focus(); };
@@ -167,7 +168,15 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     };
     const events = ['pointerdown', 'mousedown', 'keydown', 'drop'] as const;
     events.forEach(e => element.addEventListener(e, take, true));
-    return () => events.forEach(e => element.removeEventListener(e, take, true));
+    // Any other way the keyboard comes here while held (a dialog giving it back, the window coming
+    // forward) is turned back before xterm hears of it: captured here, before its own handler
+    const refuse = (e: FocusEvent) => {
+      if (!held()) return;
+      e.stopPropagation();
+      if (e.target instanceof HTMLElement) e.target.blur();
+    };
+    element.addEventListener('focus', refuse, true);
+    return () => { events.forEach(e => element.removeEventListener(e, take, true)); element.removeEventListener('focus', refuse, true); };
   }, []);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
@@ -379,14 +388,20 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     resend.current = () => { void sendSize(t.cols, t.rows); };
     // Key presses only: xterm's own replies to the agent's queries are not the person
     let lastKey = 0;
-    const keyed = t.onKey(() => { lastKey = Date.now(); });
+    // The next data is the operator's own: a key (xterm fires onKey before its data), a paste,
+    // text from an input method. Anything else is the terminal's own (reports, answers)
+    let operatorNext = false;
+    const keyed = t.onKey(() => { lastKey = Date.now(); operatorNext = true; });
+    const typing = () => { operatorNext = true; };
+    const typingEvents = ['paste', 'input', 'compositionend'] as const;
+    typingEvents.forEach(e => element.addEventListener(e, typing, true));
     // Where the terminal is in the session's output: the offset of the next byte it has not seen
     let offset: number | null = kept?.offset ?? null;
     // This terminal is not to be kept or used again: the runner could not go on where it left off
     let discard = false;
     let reconnecting = false;
     let writingInput = false;
-    const inputQueue: { handle: number; data: string; retry: boolean }[] = [];
+    const inputQueue: { handle: number; data: string; retry: boolean; operator: boolean }[] = [];
     const loseInput = () => {
       inputLost.current = true;
       pendingEnter.current = null;
@@ -406,15 +421,19 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       try {
         // Process even dropped input in order so its Enter ends the sequence.
         for (let next = inputQueue.shift(); next && !disposed; next = inputQueue.shift()) {
-          const { handle, data, retry } = next;
+          const { handle, data, retry, operator } = next;
           const enter = data === '\r';
           if (discard || reconnecting || (enter && inputLost.current)) {
             dropInput(data);
             continue;
           }
-          // Nothing leaves while held, also what was queued before (MCR-180): a focus report
-          // queued behind a key would otherwise go out once that key is written
-          if (held()) continue;
+          // Nothing leaves while held (MCR-180), also what was queued before: a report queued behind
+          // a key is dropped quietly; the operator's own keys are dropped with the notice, and the
+          // next Enter only ends the lost keys, so a partial line is never submitted
+          if (held()) {
+            if (operator) heldDrop(data);
+            continue;
+          }
           try {
             await harnessApi.input(handle, data);
             if (enter && !disposed) setNotice(n => n === INPUT_DROPPED_NOTICE ? '' : n);
@@ -438,9 +457,14 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
         if (!disposed && (discard || reconnecting)) setFresh(n => n + 1);
       }
     };
-    const sendInput = (handle: number, data: string, retry: boolean) => {
-      inputQueue.push({ handle, data, retry });
+    const sendInput = (handle: number, data: string, retry: boolean, operator: boolean) => {
+      inputQueue.push({ handle, data, retry, operator });
       void flushInput();
+    };
+    // The operator's keys that a hold stopped: they are told, and an Enter after lost keys ends them
+    const heldDrop = (data: string) => {
+      if (data !== '\r') loseInput();
+      setNotice(INPUT_DROPPED_NOTICE);
     };
     view.listen({
       start: from => {
@@ -475,7 +499,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
         const enter = pendingEnter.current;
         if (enter?.id === id && view.handle !== null) {
           pendingEnter.current = null;
-          if (shown.current) sendInput(view.handle, '\r', enter.retry);
+          if (shown.current) sendInput(view.handle, '\r', enter.retry, true);
         }
         void sendSize(t.cols, t.rows);
       },
@@ -487,11 +511,16 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     if (!transferred) view.open(id, offset);
 
     const typed = t.onData(data => {
+      const operator = operatorNext;
+      operatorNext = false;
       if (disposed) return;
       // Held: the terminal's own answers and reports are dropped, never typed into the agent
-      if (held()) return;
+      if (held()) {
+        if (operator) heldDrop(data);
+        return;
+      }
       if (view.handle !== null && ((!discard && !reconnecting) || (shown.current && writingInput))) {
-        sendInput(view.handle, data, true);
+        sendInput(view.handle, data, true, operator);
       } else if (shown.current) {
         if (data === '\r' && !discard && !reconnecting && !inputLost.current) {
           pendingEnter.current = { id, retry: true };
@@ -506,7 +535,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       e.preventDefault(); e.stopPropagation();
       image.arrayBuffer()
         .then(bytes => harnessApi.saveImage(id, bytes))
-        .then(path => t.paste(`${shellQuote(path)} `))
+        .then(path => { operatorNext = true; t.paste(`${shellQuote(path)} `); })
         .catch(error => setNotice(`Image paste failed: ${err(error)}`));
     };
     // Capture phase: before xterm's own textarea handler pastes nothing
@@ -520,7 +549,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       e.preventDefault(); e.stopPropagation();
       const reference = e.dataTransfer?.getData('text/plain');
       // Typed tasks are checked for a leading !, # or /; this always starts with the pointer
-      if (reference?.startsWith('mcr:')) { t.paste(`${reference} `); t.focus(); }
+      if (reference?.startsWith('mcr:')) { operatorNext = true; t.paste(`${reference} `); focusTerm(t); }
     };
     element.addEventListener('dragover', onDragOver, true);
     element.addEventListener('drop', onDrop, true);
@@ -558,6 +587,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       element.removeEventListener('contextmenu', onContextMenu, true);
       t.textarea?.removeEventListener('focus', claim);
       if (terminalTask.current === mine) terminalTask.current = null;
+      typingEvents.forEach(e => element.removeEventListener(e, typing, true));
       typed.dispose(); keyed.dispose(); resized.dispose(); links.dispose(); rendered.dispose(); switched.dispose(); reflowed.dispose();
       // The marks are this mount's: the next one marks the rows it draws
       [...marks].forEach(unmark);
@@ -615,7 +645,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   const copied = () => { setTask(null); say('Copied as a task: paste it into the session that is to do it.'); };
 
   return <div className="hs-terminal-wrap">
-    <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
+    <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => focusTerm(term.current)} /></div>
     {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended.'}</div>}
     {menu && <div className="hs-menu tc-menu" role="menu" style={{ top: menu.y, left: menu.x }} onMouseDown={e => e.stopPropagation()}>
       <button type="button" role="menuitem" onClick={() => { const text = menu.text; setMenu(null); copyText(text); }}>Copy</button>
