@@ -120,7 +120,8 @@ pub trait Host: Send + Sync {
     fn peers(&self) -> Vec<Peer>;
     /// Put something in a session's inbox, as data. `slack` describes it.
     fn inbox(&self, session: &str, from: &str, text: &str, slack: Value) -> Option<String>;
-    fn notify(&self, title: &str, text: &str);
+    /// A banner for the operator; a click on it opens `session`
+    fn notify(&self, title: &str, text: &str, session: Option<&str>);
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -1079,7 +1080,7 @@ impl Slack {
                     return Err("Refused: the post could not be stored on this Mac, so it is not kept. Report to the operator.".into());
                 }
                 if post.state == "waiting" {
-                    host.notify(&format!("Agent MCR: {} wants to post to #{channel}", post.session_name), &post.text);
+                    host.notify(&format!("Agent MCR: {} wants to post to #{channel}", post.session_name), &post.text, Some(&post.session));
                 }
                 Ok(json!({
                     "post": post.id, "state": post.state, "channel": channel,
@@ -1763,7 +1764,7 @@ mod tests {
             inbox.push((session.into(), from.into(), text.into(), slack));
             Some(format!("m{}", inbox.len()))
         }
-        fn notify(&self, title: &str, _: &str) {
+        fn notify(&self, title: &str, _: &str, _: Option<&str>) {
             lock(&self.notices).push(title.into());
         }
     }

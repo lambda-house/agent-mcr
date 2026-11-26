@@ -257,6 +257,25 @@ pub fn window_opened() {
     });
 }
 
+/// A banner click that macOS handed to the service instead of the app
+/// (MCR-180): asked a few times after the window comes forward, because the
+/// click and the activation arrive in either order. Only a running service
+/// is asked; this never starts the background units.
+#[cfg(target_os = "macos")]
+pub fn banner_click_from_service(opened: impl Fn(String) + Send + 'static) {
+    std::thread::spawn(move || {
+        for wait in [0, 400, 1200] {
+            std::thread::sleep(std::time::Duration::from_millis(wait));
+            let Ok(mut client) = config_dir().and_then(|dir| Client::connect(&harness::socket(&dir))) else { return };
+            let Ok(answer) = client.call(json!({"op": "banner_clicked"})) else { return };
+            if let Some(session) = answer["session"].as_str().filter(|s| valid_id(s).is_ok()) {
+                opened(session.to_string());
+                return;
+            }
+        }
+    });
+}
+
 /// Sessions, their state and resuming go through the harness service.
 fn service(req: Value) -> Result<Value, String> {
     harness::call(&config_dir()?, with_window_generation(req))

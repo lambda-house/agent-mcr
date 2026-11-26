@@ -27,6 +27,7 @@ mod cockpit;
 mod secret_shape;
 mod task_copy;
 mod harness;
+mod banner;
 mod auto_mode;
 #[cfg(target_os = "macos")]
 mod codex_sockets;
@@ -1153,6 +1154,20 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// A banner about a session was clicked (MCR-180): the main window comes
+/// forward and shows that session in Live.
+fn open_banner_session(app: &tauri::AppHandle, session: String) {
+    let main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = main.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        let _ = main.emit_to("main", "harness-open-session", session);
+    });
+}
+
 /// Workaround for the torn / corrupted rendering seen on Raspberry Pi and other
 /// ARM GL drivers: https://github.com/tauri-apps/tauri/issues/9289
 ///
@@ -1275,10 +1290,23 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(navigation_guard())
         .setup(|app| {
+            // Before launching ends: a click on a banner that started the app is handed over then
+            let handle = app.handle().clone();
+            banner::listen_in_app(move |session| open_banner_session(&handle, session));
             install_app_menu(app)?;
             harness_commands::window_opened();
             session_analysis_commands::start_scanner(app.handle().clone());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // A click macOS handed to the harness service is taken from there
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::WindowEvent::Focused(true)) && window.label() == "main" {
+                let handle = window.app_handle().clone();
+                harness_commands::banner_click_from_service(move |session| open_banner_session(&handle, session));
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
         })
         .register_uri_scheme_protocol("localfile", |ctx, request| {
             serve_local_image(&ctx.app_handle().state::<AccessState>(), request.uri().path())

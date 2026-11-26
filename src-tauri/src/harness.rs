@@ -3034,45 +3034,9 @@ pub fn call(dir: &Path, req: Value) -> Result<Value, String> {
     Client::connect(&socket(dir))?.call(req)
 }
 
-/// Banners under the app's own name: a click opens Agent MCR, not another program.
-#[cfg(target_os = "macos")]
-mod banner {
-    use block2::RcBlock;
-    use objc2::runtime::Bool;
-    use objc2_foundation::{NSError, NSString};
-    use objc2_user_notifications::{UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest, UNNotificationSound, UNUserNotificationCenter};
-
-    /// The notification centre raises an exception in a process outside an app bundle
-    fn bundled() -> bool {
-        std::env::current_exe().ok().is_some_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
-    }
-
-    #[allow(unused_unsafe)]
-    pub fn post(title: &str, text: &str) {
-        if !bundled() { return; }
-        unsafe {
-            let center = UNUserNotificationCenter::currentNotificationCenter();
-            let content = UNMutableNotificationContent::new();
-            content.setTitle(&NSString::from_str(title));
-            content.setBody(&NSString::from_str(text));
-            content.setSound(Some(&UNNotificationSound::defaultSound()));
-            let request = UNNotificationRequest::requestWithIdentifier_content_trigger(&NSString::from_str(&crate::runner::random_id()), &content, None);
-            let adder = center.clone();
-            // macOS asks the person once; later calls return the stored answer
-            let decided = RcBlock::new(move |granted: Bool, _error: *mut NSError| {
-                if granted.as_bool() { adder.addNotificationRequest_withCompletionHandler(&request, None); }
-                else { eprintln!("harness: notifications are not allowed for Agent MCR"); }
-            });
-            center.requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &decided);
-        }
-    }
-}
-
-fn notify_user(title: &str, text: &str) {
-    #[cfg(target_os = "macos")]
-    banner::post(title, &text.chars().take(200).collect::<String>());
-    #[cfg(not(target_os = "macos"))]
-    let _ = (title, text);
+/// A macOS banner; `session` is the one a click on it opens (MCR-180).
+fn notify_user(title: &str, text: &str, session: Option<&str>) {
+    crate::banner::post(title, text, session);
 }
 
 impl Harness {
@@ -3100,7 +3064,7 @@ impl Harness {
             frozen = kept.is_none();
             let notice = StoreNotice { at: now_ms(), kind: if whole { "unread" } else { "partial" }.into(), kept: kept.map(|p| p.display().to_string()).unwrap_or_default(), lost, why, frozen };
             eprintln!("harness: {}", notice.line(&file));
-            notify_user("Agent MCR could not read its state file whole", &notice.line(&file));
+            notify_user("Agent MCR could not read its state file whole", &notice.line(&file), None);
             store.notice = Some(notice);
         }
         // No bridge is connected to a service that just started; they come back on their own
@@ -4107,7 +4071,7 @@ impl Harness {
                     Some(label(tracked))
                 });
                 if let Some(who) = raise {
-                    notify_user(&format!("Agent MCR: {who} is waiting for you"), "Its terminal is not at the prompt");
+                    notify_user(&format!("Agent MCR: {who} is waiting for you"), "Its terminal is not at the prompt", Some(session));
                 }
             }
             return;
@@ -4316,7 +4280,7 @@ impl Harness {
             return;
         }
         for (id, who, supervisor) in self.update(|s| s.overdue_holds(now)) {
-            notify_user(&format!("Agent MCR: {who} is held by your unsent line"), HELD_MARK);
+            notify_user(&format!("Agent MCR: {who} is held by your unsent line"), HELD_MARK, Some(&id));
             if let Some(supervisor) = supervisor {
                 self.notice(&supervisor, format!("Your executor {who:?} (mcr:{id}) is idle but takes no message or task: {HELD_NOTE}. The operator was told."));
             }
@@ -4422,7 +4386,7 @@ impl Harness {
         }
         let root = self.sessions().ok().and_then(|all| all.into_iter().find(|s| s["exit"].is_null() && s["meta"]["role"] == "supervisor")).and_then(|s| s["id"].as_str().map(str::to_owned));
         let mut told: Vec<String> = Vec::new();
-        let mut banners: Vec<(String, String)> = Vec::new();
+        let mut banners: Vec<(String, String, String)> = Vec::new();
         self.update(|s| {
             let ids: Vec<String> = s.waits.values().filter(|w| due(w)).map(|w| w.id.clone()).collect();
             for id in ids {
@@ -4450,7 +4414,7 @@ impl Harness {
                         t.attention = Some(Attention { kind: "assessment".into(), text: format!("{LATE_WAIT}. Its words: {:?}", wait.on), since: now, ..Attention::default() });
                         raised = true;
                     }
-                    banners.push((format!("Agent MCR: {name} waits longer than it expected"), format!("Its words: {:?}", wait.on)));
+                    banners.push((format!("Agent MCR: {name} waits longer than it expected"), format!("Its words: {:?}", wait.on), wait.session.clone()));
                 }
                 if let Some(w) = s.waits.get_mut(&id) {
                     w.escalated = step;
@@ -4462,8 +4426,8 @@ impl Harness {
         for to in told {
             self.nudge(&to);
         }
-        for (title, text) in banners {
-            notify_user(&title, &text);
+        for (title, text, session) in banners {
+            notify_user(&title, &text, Some(&session));
         }
     }
 
@@ -4789,7 +4753,7 @@ impl Harness {
                     } else {
                         (format!("Agent MCR: {} finished a piece of work", report.name), "Recorded and shown to the operator. The mark stays until they look at your session.")
                     };
-                    notify_user(&title, &said);
+                    notify_user(&title, &said, Some(&report.session));
                     match need_id {
                         Some(id) if kind == "needs_human" => json!({ "report": report.id, "kind": kind, "need": id, "note": "Recorded and shown to the operator in the cockpit, with its choices. A choice they click is placed unsent in the input box of the session that acts (actor, or you) as \"Decision <part>/<id>: <choice>\" or \"Go <part>/<id>: <choice>\", and they press Enter there; an owner word they type themselves. End your turn. When it is answered or no longer true, close it: report kind closed." }),
                         Some(id) => json!({ "report": report.id, "kind": kind, "need": id, "closed": "done", "note": note }),
@@ -5464,7 +5428,7 @@ impl Harness {
     fn tell_waiting(&self, id: &str) {
         let Some(t) = lock(&self.store).sessions.get(id).cloned() else { return };
         let who = label(&t);
-        notify_user(&format!("Agent MCR: {who} is waiting for you"), t.attention.as_ref().map(|a| a.text.as_str()).unwrap_or(""));
+        notify_user(&format!("Agent MCR: {who} is waiting for you"), t.attention.as_ref().map(|a| a.text.as_str()).unwrap_or(""), Some(id));
         if let Some(supervisor) = &t.supervisor {
             self.notice(supervisor, waiting_notice(&who, id, t.attention.as_ref()));
         }
@@ -5526,6 +5490,8 @@ impl Harness {
                 "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
             })),
             "sessions" => Ok(json!({ "sessions": self.sessions()? })),
+            // A banner clicked that macOS handed to the service: the app opens its session (MCR-180)
+            "banner_clicked" => Ok(json!({ "session": crate::banner::take_clicked() })),
             "create" => self.create(req),
             // The operator connects a session to a supervising one, or detaches it
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
@@ -6194,8 +6160,8 @@ impl slack::Host for Harness {
         Some(id)
     }
 
-    fn notify(&self, title: &str, text: &str) {
-        notify_user(title, text);
+    fn notify(&self, title: &str, text: &str, session: Option<&str>) {
+        notify_user(title, text, session);
     }
 }
 
@@ -6515,6 +6481,7 @@ pub fn serve(dir: &Path) -> Result<(), String> {
         }
     }
     let harness = Arc::new(Harness::open(dir));
+    crate::banner::listen_in_service();
 
     let watching = harness.clone();
     std::thread::spawn(move || watching.watch_runner());

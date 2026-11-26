@@ -31,7 +31,9 @@ const date = (s: string) => s ? new Date(s).toLocaleString() : 'Unknown';
 function Metric({ label, value, hint }: { label: string; value: string; hint: string }) {
   return <div className="sc-metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>;
 }
-export default function SessionWorkspace({ onClose, active = true }: { onClose: () => void; active?: boolean }) {
+export default function SessionWorkspace({ onClose, active = true, open }: { onClose: () => void; active?: boolean;
+  /** A session to show in Live, asked from outside the workspace (a clicked banner, MCR-180) */
+  open?: { id: string; at: number } }) {
   usePluginVersion();
   const topTabs = pluginRegistry.getTopTabs();
   const globalOverlays = pluginRegistry.getGlobalOverlays();
@@ -40,6 +42,13 @@ export default function SessionWorkspace({ onClose, active = true }: { onClose: 
   const titleBar = useTitleBar();
   const [focus, setFocus] = useState<{ id: string; at: number }>();
   const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
+  // One opening per click: the click's time tells two clicks on the same banner apart
+  const openId = open?.id, openAt = open?.at;
+  useEffect(() => {
+    if (!openId || openAt === undefined) return;
+    setFocus({ id: openId, at: openAt });
+    setView('live');
+  }, [openId, openAt]); // eslint-disable-line react-hooks/exhaustive-deps
   const activePluginTab = topTabs.find(t => t.id === view);
   // Posts that wait for the person's approval: shown on the Slack tab from every view
   const [slackWaiting, setSlackWaiting] = useState(0);

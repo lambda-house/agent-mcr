@@ -7,6 +7,7 @@ import {
   openExternal,
   followLocalLink,
   onAgentFilesChanged,
+  onOpenSession,
 } from './utils/tauri';
 import { buildMenu, menuCommands, commandForKey } from './utils/commands';
 import { getFileName, resolveLinkPath } from './utils/files';
@@ -66,6 +67,22 @@ async function reloadChangedDocuments(names: string[]): Promise<void> {
 const App: React.FC = () => {
   const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath);
   const [sessionsMounted, setSessionsMounted] = useState(sessionsVisible);
+  // A clicked banner's session (MCR-180): Sessions comes forward and Live shows it
+  const [openSession, setOpenSession] = useState<{ id: string; at: number }>();
+  useEffect(() => {
+    if (documentWindowPath || !isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    onOpenSession((id) => {
+      setSessionsMounted(true);
+      setSessionsVisible(true);
+      setOpenSession({ id, at: Date.now() });
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch((error) => console.error('Failed to listen for banner clicks:', error));
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
   // Subscribe field by field so that high frequency updates (scroll offsets,
   // active heading) do not re-render the whole application.
   const panelWidth = useStore((s) => s.panelWidth);
@@ -401,7 +418,7 @@ const App: React.FC = () => {
   return (
     <div className="app-container">
       <div className="workspace-surface" hidden={!sessionsVisible}>
-        {sessionsMounted && <SessionWorkspace active={sessionsVisible} onClose={() => setSessionsVisible(false)} />}
+        {sessionsMounted && <SessionWorkspace active={sessionsVisible} onClose={() => setSessionsVisible(false)} open={openSession} />}
       </div>
       {!sessionsVisible && <div className="workspace-surface">
       <Toolbar

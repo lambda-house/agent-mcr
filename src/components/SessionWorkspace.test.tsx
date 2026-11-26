@@ -146,6 +146,23 @@ describe('Sessions workspace', () => {
       expect(selected).toHaveBeenCalledWith('session:selected', { id: 'resumed' });
     } finally { selected.mockRestore(); }
   });
+  it('shows the session of a clicked banner in Live, from Journal too, once per click (MCR-180)', async () => {
+    const selected = vi.spyOn(pluginRegistry, 'emitEvent');
+    try {
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
+      expect(button('journal').getAttribute('aria-current')).toBe('page');
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}} open={{ id: 'clicked', at: 1 }}/>)); await flush();
+      expect(button('live').getAttribute('aria-current')).toBe('page');
+      expect(selected).toHaveBeenCalledWith('session:selected', { id: 'clicked' });
+      // The same click rendered again opens nothing more; a second click on it does
+      const opened = () => selected.mock.calls.filter(c => c[0] === 'session:selected' && (c[1] as { id: string }).id === 'clicked').length;
+      const once = opened();
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}} open={{ id: 'clicked', at: 1 }}/>)); await flush();
+      expect(opened()).toBe(once);
+      await act(async () => root.render(<SessionWorkspace onClose={() => {}} open={{ id: 'clicked', at: 2 }}/>)); await flush();
+      expect(opened()).toBe(once + 1);
+    } finally { selected.mockRestore(); }
+  });
   it('mounts the global overlays only while Sessions is shown, so their keys stay free over Documents', async () => {
     const onKey = vi.fn();
     function Overlay() { useEffect(() => { window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, []); return <div data-overlay="test"/>; }
