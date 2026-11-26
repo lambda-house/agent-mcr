@@ -376,17 +376,24 @@ impl Managed {
         let bytes = disk_bytes(&self.path, deadline)?;
         self.verify_owner(deadline)?;
         // Git rechecks the worktree's contents and rejects locked trees. Never force removal.
-        // Run it from this worktree so its scoped filter settings are disabled.
-        checked(
-            &self.path,
+        // Run it from the main checkout: Windows does not delete a process's
+        // current directory. The worktree's own scoped filter settings are disabled too.
+        let removed = git::run_from(
+            &self.repo,
+            &[&self.path, &self.repo],
             &[
                 "worktree".as_ref(),
                 "remove".as_ref(),
                 "--".as_ref(),
                 self.path.as_os_str(),
             ],
-            deadline,
-        )?;
+            deadline.saturating_duration_since(Instant::now()),
+            OUTPUT_LIMIT,
+        )
+        .map_err(|e| e.to_string())?;
+        if !removed.status.success() {
+            return Err(failure(&removed));
+        }
         Ok(bytes)
     }
 
@@ -625,6 +632,19 @@ pub mod tests {
         Instant::now() + Duration::from_secs(5)
     }
 
+    /// The folders `worktree remove` ran in on this thread so far. Windows
+    /// cannot delete a process's current directory, so it must not run inside
+    /// the worktree it removes.
+    fn removed_from() -> Vec<PathBuf> {
+        git::tests::RAN.with(|ran| {
+            ran.borrow()
+                .iter()
+                .filter(|(_, args)| args.len() > 1 && args[0] == "worktree" && args[1] == "remove")
+                .map(|(cwd, _)| cwd.clone())
+                .collect()
+        })
+    }
+
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let repo = canonical(root.path()).unwrap().join("repo space");
@@ -672,6 +692,7 @@ pub mod tests {
         let bytes = managed.cleanup(deadline()).unwrap();
         assert!(bytes >= 32 * 1024);
         assert!(!managed.path.exists());
+        assert_eq!(removed_from(), [repo.clone()]);
         assert!(repo.join("tracked").exists());
         assert!(!git(&repo, &["rev-parse", "--verify", "refs/heads/feature/one"]).is_empty());
     }
@@ -749,6 +770,7 @@ pub mod tests {
             !path.exists(),
             "a launch that never spawned rolls back its scratch checkout"
         );
+        assert_eq!(removed_from(), [repo.clone()], "the rollback runs from the main checkout");
         let managed = make(&repo, request).keep();
         fs::write(managed.path.join("tracked"), "change").unwrap();
         git(&managed.path, &["commit", "-qam", "detached work"]);

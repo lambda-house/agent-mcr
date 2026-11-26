@@ -49,7 +49,28 @@ pub fn run(
     timeout: Duration,
     max_output: usize,
 ) -> Result<Output, Error> {
-    if !cwd.is_absolute() {
+    run_from(cwd, &[cwd], args, timeout, max_output)
+}
+
+/// As `run`, with the filters configured in each folder of `config_from`
+/// disabled. For an operation that reaches into another checkout from `cwd`,
+/// such as `worktree remove`, which Windows cannot run from inside the folder
+/// it deletes.
+pub fn run_from(
+    cwd: &Path,
+    config_from: &[&Path],
+    args: &[impl AsRef<OsStr>],
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Output, Error> {
+    #[cfg(test)]
+    tests::RAN.with(|ran| {
+        ran.borrow_mut().push((
+            cwd.to_path_buf(),
+            args.iter().map(|a| a.as_ref().to_os_string()).collect(),
+        ))
+    });
+    if !cwd.is_absolute() || config_from.iter().any(|dir| !dir.is_absolute()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "requires an absolute working directory",
@@ -61,44 +82,50 @@ pub fn run(
     if let Some((operation, operands)) = args.split_first() {
         // Worktree checkout and even status/diff can invoke configured filters.
         // Inspect only their names, and disable them before running the operation.
-        let mut config = local_command(cwd);
-        config.args([
-            "config",
-            "--name-only",
-            "--null",
-            "--get-regexp",
-            "^filter\\.",
-        ]);
-        let found = capture(config, timeout, 64 * 1024)?;
-        match found.status.code() {
-            Some(0) => {
-                let names = std::str::from_utf8(&found.stdout).map_err(io::Error::other)?;
-                let filters: BTreeSet<_> = names
-                    .split_terminator('\0')
-                    .filter_map(|key| key.rsplit_once('.').map(|(name, _)| name))
-                    .collect();
-                // Keep keys and values separate. Git's -c syntax splits on
-                // the first '=' even when it belongs to a filter driver name.
-                let mut index = 0;
-                for filter in filters {
-                    for (setting, value) in [
-                        ("clean", ""),
-                        ("smudge", ""),
-                        ("process", ""),
-                        ("required", "false"),
-                    ] {
-                        command.env(
-                            format!("GIT_CONFIG_KEY_{index}"),
-                            format!("{filter}.{setting}"),
-                        );
-                        command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
-                        index += 1;
-                    }
+        let mut filters = BTreeSet::new();
+        for dir in config_from {
+            let mut config = local_command(dir);
+            config.args([
+                "config",
+                "--name-only",
+                "--null",
+                "--get-regexp",
+                "^filter\\.",
+            ]);
+            let found = capture(config, timeout.saturating_sub(start.elapsed()), 64 * 1024)?;
+            match found.status.code() {
+                Some(0) => {
+                    let names = String::from_utf8(found.stdout).map_err(io::Error::other)?;
+                    filters.extend(
+                        names
+                            .split_terminator('\0')
+                            .filter_map(|key| key.rsplit_once('.').map(|(name, _)| name.to_owned())),
+                    );
                 }
-                command.env("GIT_CONFIG_COUNT", index.to_string());
+                Some(1) if found.stderr.is_empty() => {}
+                _ => return Err(io::Error::other("cannot inspect Git filter configuration").into()),
             }
-            Some(1) if found.stderr.is_empty() => {}
-            _ => return Err(io::Error::other("cannot inspect Git filter configuration").into()),
+        }
+        if !filters.is_empty() {
+            // Keep keys and values separate. Git's -c syntax splits on
+            // the first '=' even when it belongs to a filter driver name.
+            let mut index = 0;
+            for filter in filters {
+                for (setting, value) in [
+                    ("clean", ""),
+                    ("smudge", ""),
+                    ("process", ""),
+                    ("required", "false"),
+                ] {
+                    command.env(
+                        format!("GIT_CONFIG_KEY_{index}"),
+                        format!("{filter}.{setting}"),
+                    );
+                    command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+                    index += 1;
+                }
+            }
+            command.env("GIT_CONFIG_COUNT", index.to_string());
         }
         command.arg(operation);
         let operation = operation.as_ref();
@@ -275,8 +302,13 @@ fn stop(child: &mut Child) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+
+    thread_local! {
+        /// The folder and arguments of each run on this thread.
+        pub static RAN: std::cell::RefCell<Vec<(std::path::PathBuf, Vec<std::ffi::OsString>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
