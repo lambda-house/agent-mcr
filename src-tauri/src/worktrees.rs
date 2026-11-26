@@ -662,6 +662,29 @@ fn disk_bytes(path: &Path, deadline: Instant) -> Result<u64, String> {
             return Err("the worktree contains a nested Git checkout".into());
         }
         let meta = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        // Git lists no named pipe, socket or device, so neither its status nor
+        // its list of ignored files can vouch for one: keep the checkout.
+        let kind = meta.file_type();
+        if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
+            #[cfg(unix)]
+            let what = {
+                use std::os::unix::fs::FileTypeExt;
+                if kind.is_fifo() {
+                    "a named pipe"
+                } else if kind.is_socket() {
+                    "a socket"
+                } else if kind.is_block_device() {
+                    "a block device"
+                } else if kind.is_char_device() {
+                    "a character device"
+                } else {
+                    "a special file"
+                }
+            };
+            #[cfg(not(unix))]
+            let what = "a special file";
+            return Err(format!("the worktree contains {what}"));
+        }
         #[cfg(unix)]
         if meta.dev() != device {
             return Err("the worktree contains a mounted filesystem".into());
@@ -853,6 +876,55 @@ pub mod tests {
         assert!(kept.cleanup(deadline()).unwrap_err().contains("disposable paths"));
         assert!(kept.path.join("src-tauri/gen/other.json").is_file());
         assert!(kept.path.join("src-tauri/gen/schemas/acl.json").is_file());
+    }
+
+    #[cfg(unix)]
+    fn fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ignored_named_pipe_beside_a_disposable_path_keeps_the_checkout() {
+        let (_root, repo) = fixture();
+        // Review 17412: Git lists no named pipe, so the walk must refuse it
+        fs::create_dir(repo.join("src-tauri")).unwrap();
+        fs::write(repo.join("src-tauri/build.rs"), "fn main() {}").unwrap();
+        let mut ignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
+        ignore.push_str("*.log\n");
+        fs::write(repo.join(".gitignore"), ignore).unwrap();
+        git(&repo, &["add", "--", ".gitignore", "src-tauri/build.rs"]);
+        git(&repo, &["commit", "-qm", "src-tauri"]);
+        let kept = make(
+            &repo,
+            json!({"repo": repo, "branch": "kept", "base": "main", "disposable": ["src-tauri/gen/schemas"]}),
+        )
+        .keep();
+        fs::create_dir_all(kept.path.join("src-tauri/gen/schemas")).unwrap();
+        fs::write(kept.path.join("src-tauri/gen/schemas/acl.json"), "{}").unwrap();
+        let pipe = kept.path.join("src-tauri/gen/ipc.log");
+        fifo(&pipe);
+        let error = kept.cleanup(deadline()).unwrap_err();
+        assert!(error.contains("named pipe"), "{error}");
+        assert!(fs::symlink_metadata(&pipe).is_ok());
+        assert!(kept.path.join("src-tauri/gen/schemas/acl.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_in_build_output_keeps_the_checkout() {
+        let (_root, repo) = fixture();
+        let kept = make(&repo, json!({"repo": repo, "branch": "kept", "base": "main"})).keep();
+        fs::create_dir(kept.path.join("target")).unwrap();
+        fs::write(kept.path.join("target/object"), "built").unwrap();
+        let pipe = kept.path.join("target/server.pipe");
+        fifo(&pipe);
+        let error = kept.cleanup(deadline()).unwrap_err();
+        assert!(error.contains("named pipe"), "{error}");
+        assert!(fs::symlink_metadata(&pipe).is_ok());
+        assert!(kept.path.join("target/object").is_file());
     }
 
     #[test]
