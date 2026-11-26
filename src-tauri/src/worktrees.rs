@@ -25,6 +25,8 @@ pub struct Branch {
     repo: PathBuf,
     branch: String,
     base: String,
+    #[serde(default)]
+    disposable: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +34,8 @@ pub struct Branch {
 pub struct Scratch {
     repo: PathBuf,
     commit: String,
+    #[serde(default)]
+    disposable: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -41,6 +45,36 @@ pub struct Managed {
     admin: PathBuf,
     owner: String,
     checkout: Checkout,
+    /// Relative paths below the worktree whose ignored files may go with it,
+    /// besides any `target`, `node_modules` or `dist` folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    disposable: Vec<String>,
+}
+
+const MAX_DISPOSABLE: usize = 32;
+
+/// Exact relative paths under the worktree root, written with `/`: no
+/// absolute path, drive, backslash, empty, `.` or `..` part, and no `.git`.
+fn disposable_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.len() > MAX_DISPOSABLE {
+        return Err(format!("worktree.disposable takes at most {MAX_DISPOSABLE} paths"));
+    }
+    paths
+        .iter()
+        .map(|path| {
+            let fine = !path.is_empty()
+                && path.len() <= 256
+                && !path.chars().any(|c| c.is_control() || c == '\\' || c == ':')
+                && path
+                    .split('/')
+                    .all(|part| !matches!(part, "" | "." | ".." | ".git"));
+            if fine {
+                Ok(path.clone())
+            } else {
+                Err(format!("worktree.disposable: {path:?} must be a relative path below the worktree, with / between names and no empty, ., .. or .git part"))
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -93,10 +127,11 @@ pub fn create(
     home: &Path,
     owner: &str,
 ) -> Result<Pending, String> {
-    let repo = match &request {
-        Request::Branch(branch) => &branch.repo,
-        Request::Scratch(scratch) => &scratch.repo,
+    let (repo, disposable) = match &request {
+        Request::Branch(branch) => (&branch.repo, &branch.disposable),
+        Request::Scratch(scratch) => (&scratch.repo, &scratch.disposable),
     };
+    let disposable = disposable_paths(disposable)?;
     if !repo.is_absolute() {
         return Err("worktree.repo must be an absolute path".into());
     }
@@ -258,6 +293,7 @@ pub fn create(
                 admin,
                 owner: owner.to_owned(),
                 checkout,
+                disposable,
             }),
             head: start.clone(),
         };
@@ -333,7 +369,8 @@ impl Managed {
             return Err("the worktree has uncommitted or untracked changes".into());
         }
         // Ignore rules often cover local configuration as well as build output.
-        // Only the generated directories named here may go away with the checkout.
+        // Only the generated directories named here, and the paths the request
+        // named as disposable, may go away with the checkout.
         let ignored = checked(
             &self.path,
             &[
@@ -355,14 +392,21 @@ impl Managed {
                     .iter()
                     .rposition(|b| *b == b'/')
                     .map_or(&b""[..], |last| &path[..last]);
-                !directory
-                    .split(|b| *b == b'/')
-                    .any(|part| matches!(part, b"target" | b"node_modules" | b"dist"))
+                let entry = path.strip_suffix(b"/").unwrap_or(path);
+                let disposable = self.disposable.iter().any(|d| {
+                    entry.strip_prefix(d.as_bytes()).is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+                });
+                !disposable
+                    && !directory
+                        .split(|b| *b == b'/')
+                        .any(|part| matches!(part, b"target" | b"node_modules" | b"dist"))
             })
         {
-            return Err(
-                "the worktree has ignored files outside target, node_modules, or dist".into(),
-            );
+            return Err(if self.disposable.is_empty() {
+                "the worktree has ignored files outside target, node_modules, or dist (name generated paths in worktree.disposable)".into()
+            } else {
+                "the worktree has ignored files outside target, node_modules, dist and its disposable paths".into()
+            });
         }
         let index = checked(&self.path, &["ls-files", "-v", "-z"], deadline)?;
         if index
@@ -619,7 +663,7 @@ pub mod tests {
         git(repo, &["config", "--local", "commit.gpgSign", "false"]);
         fs::write(
             repo.join(".gitignore"),
-            "target/\nnode_modules/\ndist/\n.env\n",
+            "target/\nnode_modules/\ndist/\n.env\nsrc-tauri/gen/schemas/\n",
         )
         .unwrap();
         fs::write(repo.join("tracked"), "original").unwrap();
@@ -695,6 +739,59 @@ pub mod tests {
         assert_eq!(removed_from(), [repo.clone()]);
         assert!(repo.join("tracked").exists());
         assert!(!git(&repo, &["rev-parse", "--verify", "refs/heads/feature/one"]).is_empty());
+    }
+
+    #[test]
+    fn ignored_files_under_a_disposable_path_go_with_the_checkout() {
+        let (_root, repo) = fixture();
+        // As in agent-mcr: src-tauri is tracked, its gen/schemas ignored
+        fs::create_dir(repo.join("src-tauri")).unwrap();
+        fs::write(repo.join("src-tauri/build.rs"), "fn main() {}").unwrap();
+        git(&repo, &["add", "--", "src-tauri/build.rs"]);
+        git(&repo, &["commit", "-qm", "src-tauri"]);
+        let generated = |path: &Path| {
+            fs::create_dir_all(path.join("src-tauri/gen/schemas")).unwrap();
+            fs::write(path.join("src-tauri/gen/schemas/acl.json"), "{}").unwrap();
+        };
+        let kept = make(&repo, json!({"repo": repo, "branch": "kept", "base": "main"})).keep();
+        generated(&kept.path);
+        assert!(kept.cleanup(deadline()).unwrap_err().contains("worktree.disposable"));
+        assert!(kept.path.join("src-tauri/gen/schemas/acl.json").is_file());
+        let listed = make(
+            &repo,
+            json!({"repo": repo, "branch": "listed", "base": "main", "disposable": ["src-tauri/gen"]}),
+        )
+        .keep();
+        generated(&listed.path);
+        // A name that only starts like a disposable path is not below it
+        fs::create_dir_all(listed.path.join("src-tauri/generated")).unwrap();
+        fs::write(listed.path.join("src-tauri/generated/.env"), "secret").unwrap();
+        assert!(listed.cleanup(deadline()).unwrap_err().contains("disposable paths"));
+        fs::remove_dir_all(listed.path.join("src-tauri/generated")).unwrap();
+        listed.cleanup(deadline()).unwrap();
+        assert!(!listed.path.exists());
+        // The record keeps the list across a store round trip
+        let stored: Managed = serde_json::from_value(serde_json::to_value(&kept).unwrap()).unwrap();
+        assert!(stored.disposable.is_empty());
+    }
+
+    #[test]
+    fn refuses_disposable_paths_that_leave_the_worktree() {
+        let (_root, repo) = fixture();
+        for bad in ["", "/abs", "../up", "a/../b", "a//b", "./a", "a/", "a\\b", "C:/x", ".git", "a/.git/hooks"] {
+            let request = serde_json::from_value(
+                json!({"repo": repo, "branch": "feature", "base": "main", "disposable": [bad]}),
+            )
+            .unwrap();
+            let track = repo.parent().unwrap();
+            let error = create(request, None, Some(track), track, "test").err().unwrap();
+            assert!(error.contains("worktree.disposable"), "{bad:?}: {error}");
+        }
+        assert!(serde_json::from_value::<Request>(
+            json!({"repo": repo, "commit": "HEAD", "disposable": "src-tauri/gen"})
+        )
+        .is_err());
+        assert!(!repo.parent().unwrap().join("wt").exists());
     }
 
     #[test]

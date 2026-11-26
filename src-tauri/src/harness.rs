@@ -90,7 +90,7 @@ A peer in your folder may be changing the same files. Take its role into account
 - A session can work for another: `list_peers` marks `your supervisor` and `your executor`, and `whoami` lists both.
 - `overview` shows you and your executor tree, including open tasks, waits, reports and attention. The Supervisor surface sees all trees.
 - With executors, you direct them: `task_assign` gives one a task, `task_wait` or your inbox tells you when it ends, `session_status`, `session_result` and `terminal_read` show where it stands. These work on your executors and theirs, on nobody else.
-- `executor_create` starts a new session that works for you. Give `worktree: {repo, branch, base}` for branch work, or `worktree: {repo, commit}` with a scratch profile for a detached review. The harness creates the checkout in the track's `wt` directory. The operator sees the executor under you and answers its permission prompts.
+- `executor_create` starts a new session that works for you. Give `worktree: {repo, branch, base}` for branch work, or `worktree: {repo, commit}` with a scratch profile for a detached review. The harness creates the checkout in the track's `wt` directory. Name the ignored build output the repository generates beyond `target`, `node_modules` and `dist` in `disposable` (for agent-mcr `["src-tauri/gen"]`), or the harness keeps the checkout when the executor ends. The operator sees the executor under you and answers its permission prompts.
 - As an executor, do the tasks your supervisor gives you and `report` as usual: your reports reach your supervisor and the operator.
 - `executor_end` ends an executor you started yourself, once it is idle and you no longer need it. Its conversation is kept. After the runner accepts HUP and sees the exit, the harness checks its managed worktree. The result and end report give the estimated bytes freed or the reason it kept the worktree.
 
@@ -7148,12 +7148,13 @@ fn agent_info() -> Value {
 
 fn worktree_schema() -> Value {
     let repo = json!({"type": "string", "description": "Absolute path to a Git checkout for this track"});
+    let disposable = json!({"type": "array", "items": {"type": "string"}, "description": "Relative paths below the worktree root (no .. or absolute path) whose ignored files may be deleted with the checkout, besides target, node_modules and dist: the build output the repository generates, for agent-mcr src-tauri/gen. Other ignored files keep the checkout"});
     json!({
         "type": "object",
         "description": "Create a linked checkout under wt in cwd, or beside the repository if cwd is omitted. A scratch profile requires repo and commit. A branch checkout takes repo, branch and base.",
         "oneOf": [
-            {"properties": {"repo": repo, "branch": {"type": "string"}, "base": {"type": "string"}}, "required": ["repo", "branch", "base"], "additionalProperties": false},
-            {"properties": {"repo": repo, "commit": {"type": "string"}}, "required": ["repo", "commit"], "additionalProperties": false}
+            {"properties": {"repo": repo, "branch": {"type": "string"}, "base": {"type": "string"}, "disposable": disposable}, "required": ["repo", "branch", "base"], "additionalProperties": false},
+            {"properties": {"repo": repo, "commit": {"type": "string"}, "disposable": disposable}, "required": ["repo", "commit"], "additionalProperties": false}
         ]
     })
 }

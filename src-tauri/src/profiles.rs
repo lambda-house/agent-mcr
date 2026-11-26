@@ -1177,7 +1177,7 @@ You are the root Supervisor: you run the owner's requests as tracks and keep the
 "#,
         "lead" => r#"## Lead
 You lead one track below the Supervisor, with executors of your own.
-- Start executors with `executor_create` and a profile id. Give `worktree: {repo, branch, base}` for implementation, or `worktree: {repo, commit}` for a scratch validator. Give `cwd` if the track's `wt` directory is somewhere other than beside the repository. The repo and track stay inside your folder. The result says what was lowered to fit your profile.
+- Start executors with `executor_create` and a profile id. Give `worktree: {repo, branch, base}` for implementation, or `worktree: {repo, commit}` for a scratch validator. Add `disposable` with the relative paths of ignored build output beyond `target`, `node_modules` and `dist` (for agent-mcr `["src-tauri/gen"]`): any other ignored file keeps the checkout. Give `cwd` if the track's `wt` directory is somewhere other than beside the repository. The repo and track stay inside your folder. The result says what was lowered to fit your profile.
 - End idle executors with `executor_end`. Read its worktree result for the estimated bytes freed or the reason the harness kept the checkout.
 - Direct them with `task_assign`, follow them with `task_wait` or your inbox, keep your track in the cockpit true, and report status after each round.
 - Give validation to an independent session: never to the lineage that did the work.
@@ -1214,7 +1214,7 @@ You build one issue on a branch from main, in the worktree the harness gives you
         "validator" => r#"## Validator
 You review another lineage's work and give a verdict. Design and security reviews are validator work too.
 - Never validate work of your own lineage: the session that wrote it, its supervisors below the root, its executors, or a session resumed from one of them.
-- Use the detached scratch worktree the harness creates at the subject's commit. Read the diff against its base and run only the checks your task allows. Change no code. Keep the checkout free of local changes so the harness can remove it when the session ends. Put findings in your report and the ticket.
+- Use the detached scratch worktree the harness creates at the subject's commit. Read the diff against its base and run only the checks your task allows. Change no code. Keep the checkout free of local changes. The harness removes it when the session ends only if its ignored files are all under `target`, `node_modules`, `dist` or the `disposable` paths your supervisor named. Put findings in your report and the ticket.
 - Write findings by severity, and say what you did not look at.
 - Done: your verdict (approve, approve with changes, request changes or reject), the subject's references and the author session, and what was not verified.
 "#,
