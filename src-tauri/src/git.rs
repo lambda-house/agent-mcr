@@ -92,11 +92,17 @@ pub fn run(
             _ => return Err(io::Error::other("cannot inspect Git filter configuration").into()),
         }
         command.arg(operation);
-        if ["diff", "show", "log"]
+        let operation = operation.as_ref();
+        let shows_diff = ["diff", "show", "log"]
             .iter()
-            .any(|name| operation.as_ref() == OsStr::new(name))
-        {
+            .any(|name| operation == OsStr::new(name));
+        if shows_diff {
             command.args(["--no-ext-diff", "--no-textconv"]);
+        }
+        if shows_diff || operation == OsStr::new("status") {
+            // Gitlinks still show a commit difference. Their worktree contents
+            // would require a separate config inspection in each submodule.
+            command.arg("--ignore-submodules=dirty");
         }
         command.args(operands);
     }
@@ -386,7 +392,7 @@ mod tests {
             ),
         ] {
             setup(&["config", "--local", key, value]);
-            if key.starts_with("filter.") {
+            if key.starts_with("filter.") && !key.ends_with(".smudge") {
                 setup(&["config", "--local", "filter.a=b.required", "true"]);
             }
             let baseline = raw(args);
@@ -400,10 +406,100 @@ mod tests {
             assert!(output.status.success(), "{key}: {output:?}");
             assert!(!marker.exists(), "{key} ran");
             setup(&["config", "--local", "--unset", key]);
-            if key.starts_with("filter.") {
+            if key.starts_with("filter.") && !key.ends_with(".smudge") {
                 setup(&["config", "--local", "--unset", "filter.a=b.required"]);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_does_not_run_submodule_summary() {
+        use std::fs;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        let module = repo.join("module");
+        fs::create_dir_all(&module).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = run(cwd, args, TIMEOUT, 4096).unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        for cwd in [&repo, &module] {
+            git(cwd, &["init", "-q"]);
+            git(cwd, &["config", "--local", "user.name", "Test"]);
+            git(
+                cwd,
+                &["config", "--local", "user.email", "test@example.invalid"],
+            );
+            git(cwd, &["config", "--local", "commit.gpgSign", "false"]);
+        }
+        git(&module, &["commit", "--allow-empty", "-qm", "first"]);
+        let commit = git(&module, &["rev-parse", "HEAD"]);
+        fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"module\"]\n  path = module\n  url = ./module\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "--", ".gitmodules"]);
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{commit},module"),
+            ],
+        );
+        git(&repo, &["commit", "-qm", "add gitlink"]);
+        git(
+            &module,
+            &["commit", "--allow-empty", "-qm", "module changed"],
+        );
+        git(
+            &repo,
+            &["config", "--local", "status.submoduleSummary", "true"],
+        );
+        let raw = Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["status", "--ignore-submodules=dirty"])
+            .output()
+            .unwrap();
+        assert!(raw.status.success());
+        assert!(String::from_utf8_lossy(&raw.stdout).contains("* module "));
+        let safe = run(&repo, &["status"], TIMEOUT, 4096).unwrap();
+        assert!(safe.status.success());
+        let status = String::from_utf8_lossy(&safe.stdout);
+        assert!(status.contains("module"));
+        assert!(!status.contains("* module "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_configuration_is_disabled() {
+        let fixture = tempfile::tempdir().unwrap();
+        let system = fixture.path().join("system.gitconfig");
+        std::fs::write(&system, "[mcr]\n  probe = system\n").unwrap();
+        let args = ["config", "--get", "mcr.probe"];
+        let raw = Command::new("git")
+            .current_dir(fixture.path())
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(raw.status.success());
+        assert_eq!(raw.stdout, b"system\n");
+        let safe = local_command(fixture.path())
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(safe.status.code(), Some(1));
+        assert!(safe.stdout.is_empty());
     }
 
     #[cfg(unix)]
