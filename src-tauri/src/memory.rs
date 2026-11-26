@@ -797,7 +797,7 @@ impl Memory {
         #[cfg(test)]
         let vault: Box<dyn Vault> = Box::new(crate::vault::Held::default());
         #[cfg(not(test))]
-        let vault: Box<dyn Vault> = Box::new(crate::vault::Keychain { service: KEYCHAIN_SERVICE, what: "Memory tokens" });
+        let vault: Box<dyn Vault> = Box::new(crate::vault::Keychain::new(KEYCHAIN_SERVICE, "Memory tokens"));
         Self::with(dir, ENDPOINT, vault, None)
     }
 

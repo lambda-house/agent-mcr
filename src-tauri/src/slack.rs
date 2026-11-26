@@ -392,7 +392,7 @@ fn text_blocks(text: &str) -> Vec<Value> {
 
 impl Slack {
     pub fn open(dir: &Path) -> Self {
-        Self::with(dir, Box::new(Https::default()), Box::new(Keychain { service: KEYCHAIN_SERVICE, what: "Slack tokens" }), 10_000)
+        Self::with(dir, Box::new(Https::default()), Box::new(Keychain::new(KEYCHAIN_SERVICE, "Slack tokens")), 10_000)
     }
 
     fn with(dir: &Path, web: Box<dyn Web>, vault: Box<dyn Vault>, settle_after: u64) -> Self {

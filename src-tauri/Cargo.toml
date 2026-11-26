@@ -44,6 +44,10 @@ security-framework = "3.7.0"
 glib-sys = "0.22.9"
 glib = "0.22.10"
 gobject-sys = "0.22.9"
+# The vault on Linux (MCR-177): the desktop's Secret Service over D-Bus. zbus 5 as
+# the Tauri plugins already use it; secret-service 6 moved to zbus 6
+secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1.2"
