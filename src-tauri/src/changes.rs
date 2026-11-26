@@ -15,9 +15,12 @@
 //! The shared runner (`git::run`, MCR-174) switches those off for every
 //! call, and clears inherited `GIT_*` variables, hooks, optional locks (the
 //! index is never written), lazy fetches and prompts, with a deadline and a
-//! cap on each output stream. One case it misses is refused here
-//! (`unswitchable`), and `a_repositorys_config_runs_no_program_while_it_is_read`
-//! checks the runner against all of them.
+//! cap on each output stream, filter drivers whose names hold `=` included,
+//! and with `log.showSignature=false`, so a signed commit runs no gpg (the
+//! pane's formats use no `%G` placeholder either). The pane calls only the
+//! subcommands the runner guards (`rev-parse`, `symbolic-ref`,
+//! `merge-base`, `log`, `status`, `diff`); the tests below check the runner
+//! against each program a repository's config could run.
 //!
 //! Lines of a diff that have the shape of a credential (`secret_shape`, the
 //! detector of the cockpit and of Copy as task) are not sent to the page:
@@ -37,6 +40,8 @@ pub const FILE_DIFF: usize = 256 * 1024;
 const LIST_LIMIT: usize = 1024 * 1024;
 /// Bytes of a one-line answer (a sha, a ref name, counts)
 const LINE_LIMIT: usize = 64 * 1024;
+/// Bytes of the ahead/behind marks: two per commit
+const COUNT_LIMIT: usize = 8 * 1024 * 1024;
 pub const MAX_FILES: usize = 500;
 pub const MAX_COMMITS: usize = 100;
 
@@ -186,9 +191,6 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
         return Ok(Changes { repo: None, note: Some("This folder is not in a git work tree.".into()) });
     }
     let dir = Path::new(&root);
-    if let Some(note) = unswitchable(git, dir)? {
-        return Ok(Changes { repo: None, note: Some(note) });
-    }
     let r = Reader { git, dir };
     let mut repo = Repo { root: root.clone(), ..Repo::default() };
     repo.branch = r.line(&["symbolic-ref", "--quiet", "--short", "HEAD"])?.filter(|b| !b.is_empty());
@@ -257,25 +259,6 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
     Ok(Changes { repo: Some(repo), note: None })
 }
 
-/// A filter driver the shared runner cannot switch off: it passes `-c
-/// filter.<name>.clean=`, and git splits a `-c` at its first `=`, so a
-/// driver named `a=b` (which `.gitattributes` can select as `filter=a=b`)
-/// would stay on. A name with `=` or a line break refuses the whole read.
-/// Remove this when `git::run` passes those overrides in a form that keeps
-/// key and value apart.
-fn unswitchable(git: &dyn Git, dir: &Path) -> Result<Option<String>, String> {
-    let names = git.run(dir, &["config", "-z", "--name-only", "--get-regexp", r"^filter\."].map(String::from), LIST_LIMIT)?;
-    let Some(names) = names else { return Ok(None) };
-    let refused = || Some("The repository's config has a filter this pane cannot switch off, so it reads nothing here: run git status in a terminal.".to_string());
-    if names.truncated {
-        return Ok(refused());
-    }
-    let odd = String::from_utf8_lossy(&names.stdout).split('\0').filter(|k| !k.is_empty()).any(|key| {
-        key.strip_prefix("filter.").and_then(|rest| rest.rsplit_once('.')).is_some_and(|(driver, _)| driver.contains(['=', '\n']))
-    });
-    Ok(if odd { refused() } else { None })
-}
-
 /// What `git status` says: XY letters per tracked path, the untracked paths
 #[derive(Default)]
 struct Status {
@@ -315,11 +298,18 @@ impl Reader<'_> {
         Ok(self.line(&["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"])?.map(|_| "origin/main".into()))
     }
 
-    /// (behind, ahead) of HEAD against `other`
+    /// (behind, ahead) of HEAD against `other`. `log` marks each commit of
+    /// the symmetric range `<` (only in `other`) or `>` (only in HEAD):
+    /// `rev-list --count` is not among the runner's guarded subcommands.
     fn counts(&self, other: &str) -> Result<(u64, u64), String> {
-        let out = self.line(&["rev-list", "--left-right", "--count", &format!("{other}...HEAD")])?.unwrap_or_default();
-        let mut n = out.split_whitespace().map(|n| n.parse::<u64>().unwrap_or(0));
-        Ok((n.next().unwrap_or(0), n.next().unwrap_or(0)))
+        let range = format!("{other}...HEAD");
+        let Some(out) = self.run(&["log", "--no-color", "--no-show-signature", "--left-right", "--format=%m", &range, "--"], COUNT_LIMIT)? else { return Ok((0, 0)) };
+        if out.truncated {
+            return Err(format!("{other} and HEAD are too far apart to count here."));
+        }
+        let marks = String::from_utf8_lossy(&out.stdout);
+        let count = |m: &str| marks.lines().filter(|l| *l == m).count() as u64;
+        Ok((count("<"), count(">")))
     }
 
     fn commits(&self, base: &str) -> Result<(Vec<Commit>, bool), String> {
@@ -765,25 +755,100 @@ mod tests {
         assert!(mark("fsmonitor").exists() || mark("process").exists(), "the unguarded status ran nothing: the test proves nothing");
     }
 
-    /// `git -c` splits at the first `=`: the runner's override cannot reach a
-    /// driver named `a=b`, which `.gitattributes` can select. The read refuses
-    /// and runs nothing.
+    /// A filter driver named `a=b`, which `.gitattributes` can select, is
+    /// switched off by the runner alone (it passes the override through
+    /// `GIT_CONFIG_KEY_n`, which `-c` could not: git splits a `-c` at its
+    /// first `=`). The pane reads the tree and the filter never runs.
     #[cfg(unix)]
     #[test]
-    fn a_filter_name_the_runner_cannot_switch_off_refuses_the_read() {
+    fn a_filter_named_with_an_equals_sign_does_not_run_while_the_pane_reads() {
         let (tmp, work) = clone();
         let mark = tmp.path().join("ran-a=b");
         write(&work, ".gitattributes", "*.txt filter=a=b\n");
         git(&work, &["add", "."]);
         git(&work, &["commit", "-qm", "attributes"]);
         git(&work, &["config", "filter.a=b.clean", &format!("touch '{}'; cat", mark.display())]);
+        git(&work, &["config", "filter.a=b.required", "true"]);
         write(&work, "a.txt", "one\nchanged\n");
-        let c = read(&SharedGit::started(), &work).unwrap();
-        assert!(c.repo.is_none() && c.note.unwrap().contains("cannot switch off"));
+        let r = repo(&work);
+        assert_eq!(r.uncommitted.files[0].path, "a.txt");
+        assert!(r.uncommitted.files[0].diff.as_deref().unwrap().contains("+changed"));
         assert!(!mark.exists(), "the a=b filter ran");
-        // The case is real: the runner's own override leaves it on
-        let _ = crate::git::run(&work, &["diff", "--numstat", "HEAD"], std::time::Duration::from_secs(5), LIST_LIMIT);
-        assert!(mark.exists(), "the runner switched the a=b filter off: unswitchable() can go");
+        // The case is real: plain git runs it
+        let _ = Command::new("git").args(["diff", "--numstat", "HEAD"]).current_dir(&work).output().unwrap();
+        assert!(mark.exists(), "plain git ran no a=b filter: the test proves nothing");
+    }
+
+    /// A signed commit ahead of the base, with `log.showSignature` on and a
+    /// `gpg.program` in the repository's config: the pane lists the commit
+    /// and runs no gpg (the runner sets `log.showSignature=false`, the
+    /// pane's formats have no `%G`).
+    #[cfg(unix)]
+    #[test]
+    fn a_signed_commit_runs_no_gpg_program_while_the_pane_reads() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, work) = clone();
+        let mark = tmp.path().join("ran-gpg");
+        let probe = tmp.path().join("gpg-probe");
+        std::fs::write(&probe, format!("#!/bin/sh\ntouch '{}'; exit 1\n", mark.display())).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write(&work, "s.txt", "signed\n");
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "signed work"]);
+        // A signature header needs no key for log to hand it to gpg
+        let head = Command::new("git").args(["cat-file", "commit", "HEAD"]).current_dir(&work).output().unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        let (headers, message) = head.split_once("\n\n").unwrap();
+        let signed = format!("{headers}\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\n{message}");
+        let mut hash = Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(&work)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        hash.stdin.take().unwrap().write_all(signed.as_bytes()).unwrap();
+        let hash = hash.wait_with_output().unwrap();
+        assert!(hash.status.success());
+        let sha = String::from_utf8(hash.stdout).unwrap().trim().to_string();
+        git(&work, &["update-ref", "HEAD", &sha]);
+        git(&work, &["config", "gpg.program", probe.to_str().unwrap()]);
+        git(&work, &["config", "log.showSignature", "true"]);
+        let r = repo(&work);
+        assert_eq!(r.head.as_deref(), Some(sha.as_str()));
+        assert_eq!(r.base.as_ref().map(|b| (b.ahead, b.behind)), Some((1, 0)));
+        assert_eq!(r.commits.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), vec!["signed work"]);
+        assert!(r.committed.files.iter().any(|f| f.path == "s.txt"));
+        assert!(!mark.exists(), "gpg ran");
+        // The case is real: plain git log runs it
+        let _ = Command::new("git").args(["log", "-1"]).current_dir(&work).output().unwrap();
+        assert!(mark.exists(), "plain git log ran no gpg: the test proves nothing");
+    }
+
+    /// Every call the pane makes uses a subcommand the runner guards
+    #[test]
+    fn the_pane_calls_only_subcommands_the_runner_guards() {
+        struct Seen(std::cell::RefCell<Vec<String>>);
+        impl Git for Seen {
+            fn run(&self, dir: &Path, args: &[String], limit: usize) -> Result<Option<Out>, String> {
+                self.0.borrow_mut().push(args[0].clone());
+                SharedGit::started().run(dir, args, limit)
+            }
+        }
+        let (_tmp, work) = clone();
+        write(&work, "a.txt", "dirty\n");
+        write(&work, "new.txt", "new\n");
+        git(&work, &["checkout", "-qb", "feature"]);
+        git(&work, &["add", "new.txt"]);
+        git(&work, &["commit", "-qm", "feature"]);
+        git(&work, &["branch", "--set-upstream-to=origin/main"]);
+        let seen = Seen(Default::default());
+        read(&seen, &work).unwrap().repo.expect("a work tree");
+        let used: std::collections::BTreeSet<String> = seen.0.into_inner().into_iter().collect();
+        let guarded = ["rev-parse", "symbolic-ref", "merge-base", "log", "status", "diff"];
+        assert!(used.iter().all(|u| guarded.contains(&u.as_str())), "{used:?}");
+        assert!(used.contains("log") && used.contains("diff") && used.contains("status"), "{used:?}");
     }
 
     #[test]
