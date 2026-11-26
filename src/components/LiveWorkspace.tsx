@@ -222,11 +222,18 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
  * Agent terminals hosted by the runner. They keep running when this view, the
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
  */
-export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = EMPTY_TITLES, sessionAccess = false, onSearch, focus }: {
+export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = EMPTY_TITLES, sessionAccess = false, onSearch, focus, reveal }: {
   active: boolean; recentDirectories: string[];
   sessionAccess?: boolean;
   /** A session to show, asked for from another view; `at` makes a repeated ask count */
   focus?: { id: string; at: number };
+  /**
+   * A session a clicked banner asks to show (MCR-180). It is shown only once
+   * the list is read and only while it runs, and passively: the operator did
+   * not choose it here, so nothing is acknowledged and its terminal does not
+   * take the keyboard until they click the row or the pane
+   */
+  reveal?: { id: string; at: number };
   /** Display titles by conversation id, when the Sessions index has them */
   titles?: Record<string, string>;
   /** Open the search view narrowed to a folder */
@@ -299,6 +306,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const closing = useRef(new Map<string, boolean>());
   // The service's list has been read since this view mounted: before that an empty list says nothing
   const listRead = useRef(false);
+  // The same for effects that must wait for the first read of the list
+  const [listLoaded, setListLoaded] = useState(false);
   const listStamp = useRef('');
   const listRequest = useRef(0);
   const listShown = useRef(0);
@@ -309,7 +318,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const closed = useCallback(() => {
     listStamp.current = '';
     listShown.current = ++listRequest.current;
-    setStatus(null); setHosted([]); setOpened([]); setSelected(''); setError('');
+    setStatus(null); setHosted([]); setOpened([]); setSelected(''); setError(''); setListLoaded(false);
     harnessApi.background().then(b => { if (mounted.current) setGate(b.consent === 'stopped' ? 'stopped' : 'new'); }).catch(() => { if (mounted.current) setGate('new'); });
   }, []);
   const connect = useCallback(() => {
@@ -335,6 +344,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       // An overlapping read replaced the base for this unchanged reply.
       if (!answer.sessions && stamp !== listStamp.current) return refreshList();
       listRead.current = true;
+      setListLoaded(true);
       if (ENDED_ROW_GRACE_MS > 0) setListNow(Date.now());
       if (answer.sessions) {
         listStamp.current = answer.stamp;
@@ -443,8 +453,22 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   }, []);
 
   const select = (id: string) => {
+    setPassive('');
     openItem({ kind: 'session', id });
   };
+  // The session a banner showed, until the operator chooses it or another one (MCR-180)
+  const [passive, setPassive] = useState('');
+  useEffect(() => { if (passive && selected !== passive) setPassive(''); }, [selected, passive]);
+  const [toReveal, setToReveal] = useState<{ id: string; at: number } | null>(null);
+  useEffect(() => { if (reveal) setToReveal({ id: reveal.id, at: reveal.at }); }, [reveal?.id, reveal?.at]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!toReveal || !listLoaded) return;
+    setToReveal(null);
+    // A session that ended or that the harness forgot is not opened over what the pane shows
+    if (!hosted.some(h => h.id === toReveal.id && !h.exit)) { setError('The session that notification is about is no longer running.'); return; }
+    openItem({ kind: 'session', id: toReveal.id });
+    setPassive(toReveal.id);
+  }, [toReveal, listLoaded, hosted, openItem]);
   // Back and Forward (MCR-108): every change of the shown session is a place in the history, whatever made it
   const [history, setHistory] = useState(EMPTY_HISTORY);
   // The session Back or Forward is going to: that change is a step, not a new place
@@ -490,6 +514,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   useEffect(() => {
     const acknowledge = () => {
       if (!active || document.hidden || !document.hasFocus()) return;
+      // Shown by a banner: not yet looked at by the operator's own choice (MCR-180)
+      if (selected === passive) return;
       const attention = hosted.find(h => h.id === selected && !h.exit)?.harness?.attention;
       if (attention?.kind !== 'notification' || acknowledging.current.get(selected) === attention.since) return;
       acknowledging.current.set(selected, attention.since);
@@ -499,8 +525,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     window.addEventListener('focus', acknowledge);
     document.addEventListener('visibilitychange', acknowledge);
     return () => { window.removeEventListener('focus', acknowledge); document.removeEventListener('visibilitychange', acknowledge); };
-  }, [active, hosted, selected, refresh]);
+  }, [active, hosted, selected, refresh, passive]);
   const focusPane = (leafId: string, item: PaneItem | null) => {
+    setPassive('');
     setFocusedPane(leafId);
     if (item?.kind === 'session' && item.id) {
       setSelected(item.id);
@@ -1222,7 +1249,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
               const el = slotEls.get(id);
               if (!el) return null;
               const selectedPane = selected === id && focusedItem?.kind === 'session' && focusedItem.id === id;
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane && passive !== id} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );

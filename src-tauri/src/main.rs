@@ -1154,9 +1154,15 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// A banner about a session was clicked (MCR-180): the main window comes
-/// forward and shows that session in Live.
-fn open_banner_session(app: &tauri::AppHandle, session: String) {
+/// A banner was clicked (MCR-180). One about a session: the main window
+/// comes forward, and the page is told to take the session
+/// (`harness_open_session_take`); the page also takes it when it starts
+/// listening, because a click that launched the app comes before that. One
+/// about no session takes back an earlier click the page has not taken.
+fn open_banner_session(app: &tauri::AppHandle, session: Option<String>) {
+    let some = session.is_some();
+    banner::set_open(session);
+    if !some { return; }
     let main = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(window) = main.get_webview_window("main") {
@@ -1164,7 +1170,7 @@ fn open_banner_session(app: &tauri::AppHandle, session: String) {
             let _ = window.show();
             let _ = window.set_focus();
         }
-        let _ = main.emit_to("main", "harness-open-session", session);
+        let _ = main.emit_to("main", "harness-open-session", ());
     });
 }
 
@@ -1293,17 +1299,23 @@ fn main() {
             // Before launching ends: a click on a banner that started the app is handed over then
             let handle = app.handle().clone();
             banner::listen_in_app(move |session| open_banner_session(&handle, session));
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                banner::watch_service(harness_commands::ask_service_for_click, move |session| open_banner_session(&handle, Some(session)));
+            }
             install_app_menu(app)?;
             harness_commands::window_opened();
             session_analysis_commands::start_scanner(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
-            // A click macOS handed to the harness service is taken from there
+            // While the main window has the focus, clicks macOS handed to the harness service are asked for
             #[cfg(target_os = "macos")]
-            if matches!(event, tauri::WindowEvent::Focused(true)) && window.label() == "main" {
-                let handle = window.app_handle().clone();
-                harness_commands::banner_click_from_service(move |session| open_banner_session(&handle, session));
+            if let tauri::WindowEvent::Focused(focused) = event {
+                if window.label() == "main" {
+                    banner::window_focused(*focused);
+                }
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (window, event);
@@ -1313,6 +1325,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             harness_commands::harness_status,
+            harness_commands::harness_open_session_take,
             harness_commands::harness_preferences,
             harness_commands::harness_background,
             harness_commands::harness_background_allow,

@@ -42,11 +42,13 @@ export default function SessionWorkspace({ onClose, active = true, open }: { onC
   const titleBar = useTitleBar();
   const [focus, setFocus] = useState<{ id: string; at: number }>();
   const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
-  // One opening per click: the click's time tells two clicks on the same banner apart
+  // One opening per click: the click's time tells two clicks on the same banner apart.
+  // Live shows it as a banner asks, not as the operator's own click (MCR-180)
+  const [reveal, setReveal] = useState<{ id: string; at: number }>();
   const openId = open?.id, openAt = open?.at;
   useEffect(() => {
     if (!openId || openAt === undefined) return;
-    setFocus({ id: openId, at: openAt });
+    setReveal({ id: openId, at: openAt });
     setView('live');
   }, [openId, openAt]); // eslint-disable-line react-hooks/exhaustive-deps
   const activePluginTab = topTabs.find(t => t.id === view);
@@ -170,7 +172,7 @@ export default function SessionWorkspace({ onClose, active = true, open }: { onC
         </div>
       </details>}
     </header>
-    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} sessionAccess={enabled === true} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
+    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} sessionAccess={enabled === true} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus} reveal={reveal}/></div>
     {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
     {/* Only while Sessions is shown: an overlay may listen for keys (the command panel's Cmd+S), and over Documents those are the editor's */}
     {active && globalOverlays.map(o => o.render({

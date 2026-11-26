@@ -257,23 +257,21 @@ pub fn window_opened() {
     });
 }
 
-/// A banner click that macOS handed to the service instead of the app
-/// (MCR-180): asked a few times after the window comes forward, because the
-/// click and the activation arrive in either order. Only a running service
-/// is asked; this never starts the background units.
+/// One question to a running service for a banner click macOS handed to
+/// it instead of the app (MCR-180). Connects only: it never starts the
+/// background units.
 #[cfg(target_os = "macos")]
-pub fn banner_click_from_service(opened: impl Fn(String) + Send + 'static) {
-    std::thread::spawn(move || {
-        for wait in [0, 400, 1200] {
-            std::thread::sleep(std::time::Duration::from_millis(wait));
-            let Ok(mut client) = config_dir().and_then(|dir| Client::connect(&harness::socket(&dir))) else { return };
-            let Ok(answer) = client.call(json!({"op": "banner_clicked"})) else { return };
-            if let Some(session) = answer["session"].as_str().filter(|s| valid_id(s).is_ok()) {
-                opened(session.to_string());
-                return;
-            }
-        }
-    });
+pub fn ask_service_for_click() -> Option<String> {
+    let mut client = config_dir().and_then(|dir| Client::connect(&harness::socket(&dir))).ok()?;
+    let answer = client.call(json!({"op": "banner_clicked"})).ok()?;
+    answer["session"].as_str().filter(|s| valid_id(s).is_ok()).map(str::to_owned)
+}
+
+/// The session a clicked banner asks the page to show, once (MCR-180). The
+/// page asks when it starts listening and at each `harness-open-session`.
+#[tauri::command]
+pub fn harness_open_session_take() -> Option<String> {
+    crate::banner::take_open().filter(|s| valid_id(s).is_ok())
 }
 
 /// Sessions, their state and resuming go through the harness service.

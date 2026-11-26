@@ -248,11 +248,19 @@ export async function getAgentWorkspace(): Promise<AgentWorkspace> {
  * in bursts, one per file event).
  * @returns unlisten function (no-op outside Tauri)
  */
-/** A macOS banner about a session was clicked: the id of that session (MCR-180). */
+/**
+ * A macOS banner about a session was clicked: the id of that session
+ * (MCR-180). The app keeps the click until it is taken, and says only that
+ * there is one: a click that launched the app came before this listener, so
+ * it is taken once at once as well.
+ */
 export async function onOpenSession(handler: (id: string) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import('@tauri-apps/api/event');
-  return listen<string>('harness-open-session', (event) => { if (typeof event.payload === 'string' && event.payload) handler(event.payload); });
+  const take = () => invoke<string | null>('harness_open_session_take').then(id => { if (typeof id === 'string' && id) handler(id); }).catch(() => {});
+  const stop = await listen('harness-open-session', () => { void take(); });
+  void take();
+  return stop;
 }
 
 export async function onAgentFilesChanged(handler: () => void): Promise<() => void> {

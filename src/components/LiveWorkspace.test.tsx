@@ -31,12 +31,12 @@ const renders: string[] = [];
 const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); }, protect: vi.fn(), forget: vi.fn() }));
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
-  return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void }) => {
+  return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused, focusOnMount }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void; focusOnMount?: boolean }) => {
     renders.push(id);
     useEffect(() => { mounts.push(id); return () => { unmounts.push(id); }; }, [id]);
     useEffect(() => { givenIsSession.push(isSession); }, [isSession]);
     useEffect(() => { if (focusAt) { focused.push(id); onFocused?.(); } }, [focusAt]); // eslint-disable-line react-hooks/exhaustive-deps
-    return <div data-terminal={id} data-focus-at={focusAt ?? ''} data-links={['r1', 'e1', 's1', 'nobody'].filter(x => isSession?.(x)).join(' ')}><button aria-label={`quit ${id}`} onClick={onQuit}/><button aria-label={`link in ${id}`} onClick={() => onSession?.(linkTo)}/></div>;
+    return <div data-terminal={id} data-focus-at={focusAt ?? ''} data-focus-mount={String(!!focusOnMount)} data-links={['r1', 'e1', 's1', 'nobody'].filter(x => isSession?.(x)).join(' ')}><button aria-label={`quit ${id}`} onClick={onQuit}/><button aria-label={`link in ${id}`} onClick={() => onSession?.(linkTo)}/></div>;
   } };
 });
 
@@ -1018,5 +1018,49 @@ describe('Live workspace', () => {
     expect(host.querySelector('.hs-gate')).toBeNull();
     expect(host.textContent).not.toContain('Runner pid');
     expect(host.querySelector('.hs-dir')).not.toBeNull();
+  });
+});
+
+describe('a session a clicked banner asks for (MCR-180)', () => {
+  const pane = (id: string) => host.querySelector(`.hs-pane:not([hidden]) [data-terminal="${id}"]`);
+
+  it('shows it passively: no acknowledgement and no keyboard until the operator clicks its pane', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, withReport(running, 'done', 'Finished the tests')]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
+    expect(pane('r1')?.getAttribute('data-focus-mount')).toBe('false');
+    // The window comes forward with it: still not the operator's own look
+    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+    await act(async () => { host.querySelector('.hs-pane')!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); }); await flush();
+    expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
+  });
+
+  it('a row click on it is the operator\'s own choice, as before', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, withReport(running, 'done', 'Finished the tests')]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+    await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
+    expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
+  });
+
+  it('waits for the first read of the list before it opens anything', async () => {
+    let answer!: () => void;
+    const first = new Promise<void>(resolve => { answer = resolve; });
+    const listed = vi.mocked(harnessApi.listSince).getMockImplementation()!;
+    vi.mocked(harnessApi.listSince).mockImplementation(async held => { await first; return listed(held); });
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
+    expect(pane('r1')).toBeNull();
+    await act(async () => answer()); await flush();
+    expect(pane('r1')).not.toBeNull();
+    expect(host.querySelector('.hs-error')).toBeNull();
+  });
+
+  it.each([['an ended session', 'e1'], ['a session the harness forgot', 'gone']])('does not open %s over what the pane shows, and says so', async (_, id) => {
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => host.querySelector<HTMLButtonElement>('.hs-item')!.click()); await flush();
+    const shown = [...host.querySelectorAll('.hs-pane:not([hidden]) [data-terminal]')].map(e => e.getAttribute('data-terminal'));
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id, at: 2 }}/>)); await flush();
+    expect([...host.querySelectorAll('.hs-pane:not([hidden]) [data-terminal]')].map(e => e.getAttribute('data-terminal'))).toEqual(shown);
+    expect(host.querySelector('.hs-error')?.textContent).toContain('no longer running');
   });
 });
