@@ -14,6 +14,7 @@ import { useHostedByConversation } from './SessionRow';
 import { harnessApi, slackApi } from '../utils/harness';
 import SessionMemoryBrowser from './SessionMemoryBrowser';
 import LiveWorkspace from './LiveWorkspace';
+import { useBannerIntent } from '../utils/bannerIntent';
 import BoardView from './BoardView';
 import SlackView from './SlackView';
 
@@ -31,9 +32,7 @@ const date = (s: string) => s ? new Date(s).toLocaleString() : 'Unknown';
 function Metric({ label, value, hint }: { label: string; value: string; hint: string }) {
   return <div className="sc-metric"><span>{label}</span><strong>{value}</strong><small>{hint}</small></div>;
 }
-export default function SessionWorkspace({ onClose, active = true, open }: { onClose: () => void; active?: boolean;
-  /** A session to show in Live, asked from outside the workspace (a clicked banner, MCR-180) */
-  open?: { id: string; at: number } }) {
+export default function SessionWorkspace({ onClose, active = true }: { onClose: () => void; active?: boolean }) {
   usePluginVersion();
   const topTabs = pluginRegistry.getTopTabs();
   const globalOverlays = pluginRegistry.getGlobalOverlays();
@@ -42,15 +41,15 @@ export default function SessionWorkspace({ onClose, active = true, open }: { onC
   const titleBar = useTitleBar();
   const [focus, setFocus] = useState<{ id: string; at: number }>();
   const setView = (v: string) => { setViewState(v); try { localStorage.setItem(VIEW_KEY, v); } catch { /* per-viewer convenience only */ } };
-  // One opening per click: the click's time tells two clicks on the same banner apart.
-  // Live shows it as a banner asks, not as the operator's own click (MCR-180)
-  const [reveal, setReveal] = useState<{ id: string; at: number }>();
-  const openId = open?.id, openAt = open?.at;
-  useEffect(() => {
-    if (!openId || openAt === undefined) return;
-    setReveal({ id: openId, at: openAt });
-    setView('live');
-  }, [openId, openAt]); // eslint-disable-line react-hooks/exhaustive-deps
+  // A clicked banner's ask (MCR-180) shows Live in the same render that first sees it, so Live
+  // is active with the ask from its first render, never with only the selection it had before
+  const banner = useBannerIntent(s => s.intent);
+  const [bannerShown, setBannerShown] = useState(0);
+  if (banner && banner.at !== bannerShown) {
+    setBannerShown(banner.at);
+    if (view !== 'live') setViewState('live');
+  }
+  useEffect(() => { if (bannerShown) setView('live'); }, [bannerShown]); // eslint-disable-line react-hooks/exhaustive-deps
   const activePluginTab = topTabs.find(t => t.id === view);
   // Posts that wait for the person's approval: shown on the Slack tab from every view
   const [slackWaiting, setSlackWaiting] = useState(0);
@@ -172,7 +171,7 @@ export default function SessionWorkspace({ onClose, active = true, open }: { onC
         </div>
       </details>}
     </header>
-    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} sessionAccess={enabled === true} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus} reveal={reveal}/></div>
+    <div className="hs-live-wrap" hidden={view !== 'live'}><LiveWorkspace active={active && view === 'live'} sessionAccess={enabled === true} recentDirectories={recentDirectories} titles={titles} onSearch={enabled ? searchFolder : undefined} focus={focus}/></div>
     {activePluginTab && activePluginTab.render({ active: active && view === activePluginTab.id })}
     {/* Only while Sessions is shown: an overlay may listen for keys (the command panel's Cmd+S), and over Documents those are the editor's */}
     {active && globalOverlays.map(o => o.render({

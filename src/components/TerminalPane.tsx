@@ -119,10 +119,10 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   /** It took the keyboard for `focusAt`: the request is served and must not be handed to a later mount */
   onFocused?: () => void;
   /**
-   * Shown by a clicked banner, not by the operator (MCR-180): nothing goes
-   * from this view to the session, not even the focus reports xterm sends by
-   * itself when the output turns them on, until the operator gives it the
-   * keyboard. Then `onActive`
+   * While a clicked banner's ask is pending, and for the view it showed
+   * (MCR-180): nothing goes from this view to the session, not even the focus
+   * reports xterm sends by itself, until the operator clicks or types in it.
+   * Then `onActive`
    */
   passive?: boolean;
   onActive?: () => void;
@@ -142,8 +142,9 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   // Looks at the pointers on screen again (MCR-106)
   const pointers = useRef<() => void>(() => {});
   const host = useRef<HTMLDivElement>(null);
-  // The operator gives a passive view the keyboard: capture, before xterm's own
-  // focus handler sends its focus report, so that report goes out
+  // The operator's own pointer or key in a passive view makes it theirs: captured before
+  // xterm's handlers, so the key itself and the focus report of their click go out.
+  // Not a focus event: a window coming forward focuses the terminal that had the keyboard
   useEffect(() => {
     const element = host.current;
     if (!element) return;
@@ -153,8 +154,10 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       passiveNow.current = false;
       sessions.current.onActive?.();
     };
-    element.addEventListener('focus', take, true);
-    return () => element.removeEventListener('focus', take, true);
+    element.addEventListener('pointerdown', take, true);
+    element.addEventListener('mousedown', take, true);
+    element.addEventListener('keydown', take, true);
+    return () => { element.removeEventListener('pointerdown', take, true); element.removeEventListener('mousedown', take, true); element.removeEventListener('keydown', take, true); };
   }, []);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);

@@ -14,9 +14,9 @@
 //! (`FOCUS_ASKS`); once when a click reaches the app itself, to settle the
 //! order with one the service may hold; and with the Live list read it
 //! already makes (`sessions` with `bannerClick`). There is no poll of its
-//! own. The app keeps what it has to open until its page takes it
+//! own. The app keeps the latest click until its page takes it
 //! (`take_open`): a click that launched the app arrives before the page
-//! listens.
+//! listens, and one about no session takes back what the page took.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -112,32 +112,36 @@ pub fn click_from(answer: &serde_json::Value) -> Option<Click> {
     Some(Click { session: answer["session"].as_str().map(str::to_owned), at })
 }
 
-/// In the app: the session the page is to open, and the stamp of the latest
-/// click seen by either route, kept after the page took it, so an older
-/// click that comes later opens nothing.
+/// In the app: what the page is to take, and the stamp of the latest click
+/// seen by either route, kept after the page took it, so an older click that
+/// comes later opens nothing.
 #[derive(Default)]
 struct Open {
-    session: Option<String>,
+    /// The latest click, until the page takes it: `Some(None)` takes back
+    /// what the page may still be about to open
+    pending: Option<Option<String>>,
     latest: u64,
 }
 
-static OPEN: Mutex<Open> = Mutex::new(Open { session: None, latest: 0 });
+static OPEN: Mutex<Open> = Mutex::new(Open { pending: None, latest: 0 });
 
-/// In the app: a click from either route. Whether it is the latest and
-/// about a session, so that the page is to be told.
+/// In the app: a click from either route. Whether it is the latest, so that
+/// the page is to be told: one about a session to open it, one about no
+/// session to take back one the page took already and has not opened yet.
 pub fn offer(click: Click) -> bool {
     let mut open = lock(&OPEN);
     if click.at <= open.latest {
         return false;
     }
     open.latest = click.at;
-    open.session = click.session;
-    open.session.is_some()
+    open.pending = Some(click.session);
+    true
 }
 
-/// In the app: the session the page is to open, once.
-pub fn take_open() -> Option<String> {
-    lock(&OPEN).session.take()
+/// In the app: the latest click for the page, once: `Some(Some(id))` opens
+/// that session, `Some(None)` takes back an earlier one, `None` is nothing new.
+pub fn take_open() -> Option<Option<String>> {
+    lock(&OPEN).pending.take()
 }
 
 #[cfg(target_os = "macos")]
@@ -306,23 +310,29 @@ mod tests {
 
     // OPEN is one slot per process too
     #[test]
-    fn the_app_opens_only_the_latest_click_of_either_route_once() {
+    fn the_app_hands_the_page_only_the_latest_click_of_either_route_once() {
+        let opens = |id: &str| Some(Some(id.to_owned()));
         // The app's own click B, then the service's older A: A opens nothing
         assert!(offer(click(Some("b"), 20)));
         assert!(!offer(click(Some("a"), 10)));
-        assert_eq!(take_open().as_deref(), Some("b"));
+        assert_eq!(take_open(), opens("b"));
         assert_eq!(take_open(), None);
         // Taken already: an older click that comes later still opens nothing
         assert!(!offer(click(Some("a"), 15)));
         assert_eq!(take_open(), None);
-        // A later click about no session takes back one the page has not taken
+        // A later click about no session replaces one the page has not taken
         assert!(offer(click(Some("c"), 30)));
-        assert!(!offer(click(None, 31)));
-        assert_eq!(take_open(), None);
-        // A newer click from the service after the app's own: the service's opens
+        assert!(offer(click(None, 31)));
+        assert_eq!(take_open(), Some(None));
+        // and reaches the page after it took one, to take that back (MCR-180 round 4)
         assert!(offer(click(Some("d"), 40)));
-        assert!(offer(click(Some("e"), 41)));
-        assert_eq!(take_open().as_deref(), Some("e"));
+        assert_eq!(take_open(), opens("d"));
+        assert!(offer(click(None, 41)));
+        assert_eq!(take_open(), Some(None));
+        // A newer click from the service after the app's own: the service's opens
+        assert!(offer(click(Some("e"), 50)));
+        assert!(offer(click(Some("f"), 51)));
+        assert_eq!(take_open(), opens("f"));
     }
 
     #[test]

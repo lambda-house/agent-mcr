@@ -12,7 +12,7 @@ describe('a clicked banner reaches the page (MCR-180)', () => {
   afterEach(() => { delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__; });
 
   it('takes a click that came before it listened, once it listens', async () => {
-    native.invoke.mockResolvedValueOnce('s1');
+    native.invoke.mockResolvedValueOnce({ session: 's1' });
     const opened = vi.fn();
     await onOpenSession(opened); await flush();
     expect(native.invoke).toHaveBeenCalledWith('harness_open_session_take');
@@ -24,12 +24,16 @@ describe('a clicked banner reaches the page (MCR-180)', () => {
     const opened = vi.fn();
     const stop = await onOpenSession(opened); await flush();
     expect(opened).not.toHaveBeenCalled();
-    native.invoke.mockResolvedValueOnce('s2');
+    native.invoke.mockResolvedValueOnce({ session: 's2' });
     native.listeners.get('harness-open-session')!(); await flush();
     expect(opened.mock.calls).toEqual([['s2']]);
     // Another event for a click already taken (null) opens nothing more
     native.listeners.get('harness-open-session')!(); await flush();
     expect(opened).toHaveBeenCalledTimes(1);
+    // A click about no session reaches the page too, to take back the ask it took (round 4)
+    native.invoke.mockResolvedValueOnce({ session: null });
+    native.listeners.get('harness-open-session')!(); await flush();
+    expect(opened.mock.calls).toEqual([['s2'], [null]]);
     stop();
     expect(native.listeners.has('harness-open-session')).toBe(false);
   });

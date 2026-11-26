@@ -5067,7 +5067,18 @@ impl Harness {
 
     /// Where a connection comes from, by the caller's process alone.
     fn who(&self, peer: &peer::Peer) -> Caller {
-        let Ok(list) = self.runner(json!({"op": "list"})) else { return Caller::Unknown };
+        Self::who_in(self.runner(json!({"op": "list"})), peer)
+    }
+
+    /// `who` from a runner that already runs: it connects only and never
+    /// calls `runner::ensure`, so it starts nothing. A runner that is absent
+    /// or does not answer leaves the caller unknown (MCR-180).
+    fn who_if_running(&self, peer: &peer::Peer) -> Caller {
+        Self::who_in(Client::connect(&runner_socket(&self.dir)).and_then(|mut c| c.call(json!({"op": "list"}))), peer)
+    }
+
+    fn who_in(list: Result<Value, String>, peer: &peer::Peer) -> Caller {
+        let Ok(list) = list else { return Caller::Unknown };
         let live: Vec<(i32, &Value)> = list["sessions"]
             .as_array()
             .map(|all| all.iter().filter(|s| s["exit"].is_null()).filter_map(|s| Some((s["pid"].as_i64()? as i32, s))).collect())
@@ -5492,8 +5503,6 @@ impl Harness {
             // The app's list read also takes a banner click handed to the service (MCR-180)
             "sessions" if req["bannerClick"] == true => Ok(json!({ "sessions": self.sessions()?, "bannerClick": crate::banner::click_json(crate::banner::take_clicked()) })),
             "sessions" => Ok(json!({ "sessions": self.sessions()? })),
-            // A banner clicked that macOS handed to the service: the app opens its session (MCR-180)
-            "banner_clicked" => Ok(crate::banner::click_json(crate::banner::take_clicked())),
             "create" => self.create(req),
             // The operator connects a session to a supervising one, or detaches it
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
@@ -6099,11 +6108,15 @@ impl Harness {
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
                 self.control(&req)
-            } else if op == "banner_clicked" && who.is_none() && Stream::connect(runner_socket(&self.dir)).is_err() {
-                // Telling who asks reads the runner's list, which starts an absent runner (`runner`).
-                // The app asks this after every focus: it must start nothing, so without a runner
-                // there is no answer, and the click stays kept (MCR-180)
-                Ok(crate::banner::click_json(None))
+            } else if op == "banner_clicked" {
+                // The app asks this after every focus (MCR-180): it must start nothing, so who asks
+                // is told without `who`, whose runner call may start the runner. Without an
+                // answering runner there is no answer, and the click stays kept
+                match self.who_if_running(&peer) {
+                    Caller::Outside if peer.is_this_program() => Ok(crate::banner::click_json(crate::banner::take_clicked())),
+                    Caller::Unknown => Ok(crate::banner::click_json(None)),
+                    _ => Err("Refused: only the Agent MCR app takes banner clicks".into()),
+                }
             } else {
                 match (op, &*who.get_or_insert_with(|| self.who(&peer))) {
                     // A hook speaks for the session its process runs in, whatever it says
@@ -9672,26 +9685,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_question_for_a_banner_click_starts_no_runner() {
-        // The app asks after every focus (MCR-180). Telling who asks reads the runner's list,
-        // and that would start an absent runner: without one there is no answer and nothing taken
-        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+    fn the_question_for_a_banner_click_never_starts_the_runner() {
+        // The app asks after every focus (MCR-180). `who` reads the runner's list through
+        // `runner::ensure`, which says hello and starts a runner that does not answer it.
+        // The banner op tells who asks without it: an absent runner, or one that takes the
+        // connection and then fails the handshake, leaves no answer and is never greeted
+        let dir = socket_test_dir("mcr-bc-");
         std::fs::create_dir_all(&dir).unwrap();
         let harness = Arc::new(Harness::open(&dir));
         let (mut app, service) = Stream::pair().unwrap();
         let serving = harness.clone();
         std::thread::spawn(move || serving.handle(service, now_ms()));
         let mut answers = BufReader::new(app.try_clone().unwrap());
-        writeln!(app, "{}", json!({"op": "banner_clicked"})).unwrap();
-        let mut line = String::new();
-        answers.read_line(&mut line).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), json!({"session": null}));
+        let mut ask = |req: Value| {
+            writeln!(app, "{req}").unwrap();
+            let mut line = String::new();
+            answers.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        assert_eq!(ask(json!({"op": "banner_clicked"})), json!({"session": null}));
         assert!(!runner_socket(&dir).exists());
-        // Any other request still goes through who asks, as before
-        writeln!(app, "{}", json!({"op": "sessions"})).unwrap();
-        line.clear();
-        answers.read_line(&mut line).unwrap();
-        assert!(serde_json::from_str::<Value>(&line).unwrap()["error"].is_string(), "{line}");
+
+        // A runner that accepts and hangs up before it answers anything
+        let listener = Listener::bind(runner_socket(&dir)).unwrap();
+        let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = heard.clone();
+        let fake = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.unwrap();
+                let mut line = String::new();
+                let _ = BufReader::new(stream).read_line(&mut line);
+                let op = serde_json::from_str::<Value>(&line).ok().and_then(|r| r["op"].as_str().map(str::to_owned)).unwrap_or_default();
+                if op == "stop-test" {
+                    break;
+                }
+                log.lock().unwrap().push(op);
+            }
+        });
+        for _ in 0..3 {
+            assert_eq!(ask(json!({"op": "banner_clicked"})), json!({"session": null}));
+        }
+        Stream::connect(runner_socket(&dir)).and_then(|mut s| writeln!(s, "{}", json!({"op": "stop-test"}))).unwrap();
+        fake.join().unwrap();
+        assert_eq!(*heard.lock().unwrap(), vec!["list"; 3], "connect-only: one list call each, never a hello");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -3,6 +3,7 @@ import { act, Profiler, useEffect } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionWorkspace from './SessionWorkspace';
+import { askBanner, useBannerIntent } from '../utils/bannerIntent';
 import { sessionApi, type Session } from '../utils/sessions';
 import { harnessApi, type Hosted } from '../utils/harness';
 import { createPlugin, pluginRegistry } from '../plugins';
@@ -19,7 +20,7 @@ const session: Session = { id:'a',provider:'codex',parentId:null,name:'root',cwd
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve,0)); }); };
 const button = (text: string) => [...host.querySelectorAll('button')].find(b => b.textContent?.trim().toLowerCase() === text) || [...host.querySelectorAll('button')].find(b => b.textContent?.toLowerCase().includes(text))!;
-beforeEach(() => { vi.resetAllMocks(); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
+beforeEach(() => { vi.resetAllMocks(); useBannerIntent.setState({ intent: null }); localStorage.setItem('agent-mcr.sessions.view','history'); Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});host=document.createElement('div');document.body.appendChild(host);root=createRoot(host);vi.mocked(sessionApi.access).mockResolvedValue(true);vi.mocked(sessionApi.snapshot).mockResolvedValue({sessions:[{...session,events:[]}],scannedFiles:1,pendingFiles:0,indexedAt:Date.now(),errors:[]});vi.mocked(sessionApi.detail).mockResolvedValue(session);
   // The stamped read answers with what `snapshot` gives, each time as changed
   let stamps = 0; vi.mocked(sessionApi.journalSince).mockImplementation(async () => ({ stamp: `s${++stamps}`, snapshot: await sessionApi.snapshot() }));
   vi.mocked(harnessApi.listSince).mockImplementation(async stamp => ({ stamp: 'live', sessions: stamp ? null : [] }));
@@ -149,13 +150,13 @@ describe('Sessions workspace', () => {
   it('switches to Live for a clicked banner, from Journal too, once per click (MCR-180)', async () => {
     await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
     expect(button('journal').getAttribute('aria-current')).toBe('page');
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}} open={{ id: 'clicked', at: 1 }}/>)); await flush();
+    await act(async () => askBanner('clicked')); await flush();
     expect(button('live').getAttribute('aria-current')).toBe('page');
-    // The same click rendered again does not take the operator back to Live; a second click does
+    // The same ask rendered again does not take the operator back to Live; a second click does
     await act(async () => button('journal').click()); await flush();
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}} open={{ id: 'clicked', at: 1 }}/>)); await flush();
+    await act(async () => root.render(<SessionWorkspace onClose={() => {}}/>)); await flush();
     expect(button('journal').getAttribute('aria-current')).toBe('page');
-    await act(async () => root.render(<SessionWorkspace onClose={() => {}} open={{ id: 'clicked', at: 2 }}/>)); await flush();
+    await act(async () => askBanner('clicked')); await flush();
     expect(button('live').getAttribute('aria-current')).toBe('page');
   });
   it('mounts the global overlays only while Sessions is shown, so their keys stay free over Documents', async () => {

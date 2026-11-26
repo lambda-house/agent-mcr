@@ -21,6 +21,7 @@ import SettingsModal from './components/SettingsModal';
 import SaveAllDialog from './components/SaveAllDialog';
 import { agentFilesWatched, refreshAgentWorkspace } from './utils/agent';
 import SessionWorkspace from './components/SessionWorkspace';
+import { askBanner, cancelBanner } from './utils/bannerIntent';
 import { documentWindowPath } from './utils/documentWindow';
 
 // ============================================================
@@ -67,16 +68,17 @@ async function reloadChangedDocuments(names: string[]): Promise<void> {
 const App: React.FC = () => {
   const [sessionsVisible, setSessionsVisible] = useState(!documentWindowPath);
   const [sessionsMounted, setSessionsMounted] = useState(sessionsVisible);
-  // A clicked banner's session (MCR-180): Sessions comes forward and Live shows it
-  const [openSession, setOpenSession] = useState<{ id: string; at: number }>();
+  // A clicked banner (MCR-180): its ask is app-level state, set here before anything renders
+  // for it, so Sessions and Live see it in their first render; one about no session takes it back
   useEffect(() => {
     if (documentWindowPath || !isTauri()) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
     onOpenSession((id) => {
+      if (!id) { cancelBanner(); return; }
+      askBanner(id);
       setSessionsMounted(true);
       setSessionsVisible(true);
-      setOpenSession({ id, at: Date.now() });
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -418,7 +420,7 @@ const App: React.FC = () => {
   return (
     <div className="app-container">
       <div className="workspace-surface" hidden={!sessionsVisible}>
-        {sessionsMounted && <SessionWorkspace active={sessionsVisible} onClose={() => setSessionsVisible(false)} open={openSession} />}
+        {sessionsMounted && <SessionWorkspace active={sessionsVisible} onClose={() => setSessionsVisible(false)} />}
       </div>
       {!sessionsVisible && <div className="workspace-surface">
       <Toolbar

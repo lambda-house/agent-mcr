@@ -2,7 +2,8 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import LiveWorkspace, { ACK_SETTLE_MS } from './LiveWorkspace';
+import LiveWorkspace from './LiveWorkspace';
+import { askBanner, useBannerIntent } from '../utils/bannerIntent';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type Hosted } from '../utils/harness';
 import { pickDirectory } from '../utils/tauri';
 import { useStore } from '../store';
@@ -49,8 +50,6 @@ const withReport = (h: Hosted, report: 'done' | 'needs_human', text: string, sin
 
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
-/** Past the wait of an acknowledgement after the window came forward */
-const settle = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, ACK_SETTLE_MS + 30)); }); await flush(); };
 const button = (label: string) => host.querySelector(`button[aria-label="${label}"]`) as HTMLButtonElement;
 let slotHeight: number;
 let intersectionHeight: number;
@@ -906,10 +905,8 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(harnessApi.ack).not.toHaveBeenCalled();
     vi.mocked(document.hasFocus).mockReturnValue(true);
+    vi.mocked(harnessApi.list).mockResolvedValue([session]);
     await act(async () => window.dispatchEvent(new Event('focus'))); await flush();
-    // A banner's click may be what brought the window forward: the acknowledgement waits a moment (MCR-180)
-    expect(harnessApi.ack).not.toHaveBeenCalled();
-    await settle();
     expect(harnessApi.ack).toHaveBeenCalledWith('r1', 8);
   });
 
@@ -1026,6 +1023,9 @@ describe('Live workspace', () => {
 });
 
 describe('a session a clicked banner asks for (MCR-180)', () => {
+  beforeEach(() => { useBannerIntent.setState({ intent: null }); });
+  /** The page's banner handler sets the ask; the parents' part is in App.banner.test.tsx */
+  const ask = async (id: string) => { await act(async () => askBanner(id)); await flush(); };
   const pane = (id: string) => host.querySelector(`.hs-pane:not([hidden]) [data-terminal="${id}"]`);
   const shownIds = () => [...host.querySelectorAll('.hs-pane:not([hidden]) [data-terminal]')].map(e => e.getAttribute('data-terminal'));
   const other: Hosted = { ...running, id: 'r2', title: 'Other work', started: 3 };
@@ -1040,57 +1040,25 @@ describe('a session a clicked banner asks for (MCR-180)', () => {
 
   it('shows it passively: no acknowledgement and a terminal that sends nothing until the operator gives it the keyboard', async () => {
     vi.mocked(harnessApi.list).mockResolvedValue([ended, withReport(running, 'done', 'Finished the tests')]);
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await ask('r1');
     expect(pane('r1')?.getAttribute('data-focus-mount')).toBe('false');
     expect(pane('r1')?.getAttribute('data-passive')).toBe('true');
     // The window comes forward with it: still not the operator's own look
-    await act(async () => { window.dispatchEvent(new Event('focus')); }); await settle();
+    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush();
     expect(harnessApi.ack).not.toHaveBeenCalled();
     await act(async () => button('keyboard to r1').click()); await flush();
     expect(pane('r1')?.getAttribute('data-passive')).toBe('false');
-    await settle();
+    await flush();
     expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
   });
 
   it('a row click on it is the operator\'s own choice, as before', async () => {
     vi.mocked(harnessApi.list).mockResolvedValue([ended, withReport(running, 'done', 'Finished the tests')]);
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await ask('r1');
     expect(harnessApi.ack).not.toHaveBeenCalled();
     await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
     expect(pane('r1')?.getAttribute('data-passive')).toBe('false');
     expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
-  });
-
-  it('does not acknowledge the mark of the session selected before, when the window comes forward for a banner', async () => {
-    vi.mocked(harnessApi.list).mockResolvedValue([withReport(running, 'done', 'Finished the tests'), other]);
-    vi.mocked(document.hasFocus).mockReturnValue(false);
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
-    expect(pane('r1')).not.toBeNull();
-    // The click on the banner brings the window forward, then the page hears of it
-    vi.mocked(document.hasFocus).mockReturnValue(true);
-    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush();
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r2', at: 1 }}/>)); await flush();
-    expect(pane('r2')).not.toBeNull();
-    await settle();
-    expect(harnessApi.ack).not.toHaveBeenCalled();
-  });
-
-  it('does not acknowledge the session selected before when Live comes back for a banner', async () => {
-    vi.mocked(harnessApi.list).mockResolvedValue([withReport(running, 'done', 'Finished the tests'), other]);
-    vi.mocked(document.hasFocus).mockReturnValue(false);
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
-    await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
-    await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
-    vi.mocked(document.hasFocus).mockReturnValue(true);
-    const release = holdNextRead();
-    // Documents or Journal → Live with the ask, in one render
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r2', at: 1 }}/>)); await flush();
-    expect(harnessApi.ack).not.toHaveBeenCalled();
-    await release();
-    expect(pane('r2')).not.toBeNull();
-    await settle();
-    expect(harnessApi.ack).not.toHaveBeenCalled();
   });
 
   it('opens a session that started while Live was hidden, once a fresh read lists it', async () => {
@@ -1098,7 +1066,7 @@ describe('a session a clicked banner asks for (MCR-180)', () => {
     await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
     vi.mocked(harnessApi.list).mockResolvedValue([ended, running, other]);
     const release = holdNextRead();
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r2', at: 1 }}/>)); await flush();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await ask('r2');
     // The held list does not have it yet: no verdict on it
     expect(host.querySelector('.hs-error')).toBeNull();
     expect(pane('r2')).toBeNull();
@@ -1114,7 +1082,7 @@ describe('a session a clicked banner asks for (MCR-180)', () => {
     await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
     vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...other, exit: { code: 0, signal: null, at: 9 } }]);
     const release = holdNextRead();
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await ask('r1');
     vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...running, exit: { code: 0, signal: null, at: 9 } }]);
     await release();
     expect(shownIds()).toEqual(before);
@@ -1125,7 +1093,7 @@ describe('a session a clicked banner asks for (MCR-180)', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     await act(async () => host.querySelector<HTMLButtonElement>('.hs-item')!.click()); await flush();
     const shown = shownIds();
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id, at: 2 }}/>)); await flush();
+    await ask(id);
     expect(shownIds()).toEqual(shown);
     expect(host.querySelector('.hs-error')?.textContent).toContain('no longer running');
   });

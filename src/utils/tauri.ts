@@ -249,15 +249,19 @@ export async function getAgentWorkspace(): Promise<AgentWorkspace> {
  * @returns unlisten function (no-op outside Tauri)
  */
 /**
- * A macOS banner about a session was clicked: the id of that session
- * (MCR-180). The app keeps the click until it is taken, and says only that
- * there is one: a click that launched the app came before this listener, so
- * it is taken once at once as well.
+ * A macOS banner was clicked (MCR-180): the id of its session, or null for
+ * a banner about no session, which takes back an earlier click. The app
+ * keeps the latest click until it is taken, and says only that there is
+ * one: a click that launched the app came before this listener, so it is
+ * taken once at once as well.
  */
-export async function onOpenSession(handler: (id: string) => void): Promise<() => void> {
+export async function onOpenSession(handler: (id: string | null) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import('@tauri-apps/api/event');
-  const take = () => invoke<string | null>('harness_open_session_take').then(id => { if (typeof id === 'string' && id) handler(id); }).catch(() => {});
+  const take = () => invoke<{ session: string | null } | null>('harness_open_session_take').then(click => {
+    if (!click || typeof click !== 'object') return;
+    handler(typeof click.session === 'string' && click.session ? click.session : null);
+  }).catch(() => {});
   const stop = await listen('harness-open-session', () => { void take(); });
   void take();
   return stop;

@@ -21,6 +21,7 @@ import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
 import '../styles/harness.css';
 import { keepSame } from '../utils/keepSame';
+import { cancelBanner, settleBanner, useBannerIntent, type BannerIntent } from '../utils/bannerIntent';
 import { formatSessionTitle, type Session } from '../utils/sessions';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -39,12 +40,6 @@ const rowUsesClock = (h: Hosted, session?: Session) => {
   return !!(hasAge || h.waits?.length || h.shells?.length || h.subagents?.some(a => !a.finished) || session?.context?.cacheAt);
 };
 
-/**
- * How long an acknowledgement waits after the window came forward (MCR-180):
- * a click on a banner brings it forward before the page hears of the click,
- * and the session selected at that moment is not what the operator came for
- */
-export const ACK_SETTLE_MS = 1000;
 const LIST_WIDTH_KEY = 'hs-list-width';
 /** The session list is never narrower than this, and leaves the terminal at least as much. */
 export const LIST_MIN_WIDTH = 200;
@@ -228,18 +223,11 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
  * Agent terminals hosted by the runner. They keep running when this view, the
  * Sessions workspace or the whole app closes (docs/AGENT_HARNESS_DESIGN.md, D1).
  */
-export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = EMPTY_TITLES, sessionAccess = false, onSearch, focus, reveal }: {
+export default function LiveWorkspace({ active, recentDirectories, titles: indexTitles = EMPTY_TITLES, sessionAccess = false, onSearch, focus }: {
   active: boolean; recentDirectories: string[];
   sessionAccess?: boolean;
   /** A session to show, asked for from another view; `at` makes a repeated ask count */
   focus?: { id: string; at: number };
-  /**
-   * A session a clicked banner asks to show (MCR-180). It is shown only once
-   * the list is read and only while it runs, and passively: the operator did
-   * not choose it here, so nothing is acknowledged and its terminal does not
-   * take the keyboard until they click the row or the pane
-   */
-  reveal?: { id: string; at: number };
   /** Display titles by conversation id, when the Sessions index has them */
   titles?: Record<string, string>;
   /** Open the search view narrowed to a folder */
@@ -312,10 +300,12 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const closing = useRef(new Map<string, boolean>());
   // The service's list has been read since this view mounted: before that an empty list says nothing
   const listRead = useRef(false);
-  // A session a banner asks to show, until a list read that began after the ask has answered (MCR-180)
-  const pendingReveal = useRef<{ id: string; after: number } | null>(null);
-  const revealSeen = useRef<number | undefined>(undefined);
-  const revealer = useRef<(id: string, rows: Hosted[]) => void>(() => {});
+  // A clicked banner's ask (MCR-180), app-level state read in the first render: while it is set
+  // nothing is acknowledged and no terminal takes the keyboard or sends anything
+  const banner = useBannerIntent(s => s.intent);
+  // The ask and the list request it waits beyond: only a read that began after it decides
+  const pendingReveal = useRef<{ at: number; after: number } | null>(null);
+  const revealer = useRef<(asked: BannerIntent, rows: Hosted[]) => void>(() => {});
   const hostedNow = useRef<Hosted[]>([]);
   const listStamp = useRef('');
   const listRequest = useRef(0);
@@ -369,7 +359,9 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       const asked = pendingReveal.current;
       if (asked && request > asked.after) {
         pendingReveal.current = null;
-        revealer.current(asked.id, answer.sessions ?? hostedNow.current);
+        // Taken back meanwhile (a click about no session, the operator's own choice): nothing opens
+        const now = useBannerIntent.getState().intent;
+        if (now?.at === asked.at) revealer.current(now, answer.sessions ?? hostedNow.current);
       }
     } catch (e) {
       if (!mounted.current || request <= listShown.current) return;
@@ -469,7 +461,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
 
   const select = (id: string) => {
     // The operator's own choice: a banner's ask still on its way gives way to it
-    pendingReveal.current = null;
+    cancelBanner();
     setPassive('');
     openItem({ kind: 'session', id });
   };
@@ -477,19 +469,20 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const [passive, setPassive] = useState('');
   useEffect(() => { if (passive && selected !== passive) setPassive(''); }, [selected, passive]);
   hostedNow.current = hosted;
-  revealer.current = (id, rows) => {
+  revealer.current = ({ id, at }, rows) => {
+    // Decided in the same render as what it shows: there is no moment with neither the ask nor a passive view
+    settleBanner(at);
     // A session that ended or that the harness forgot is not opened over what the pane shows
     if (!rows.some(h => h.id === id && !h.exit)) { setError('The session that notification is about is no longer running.'); return; }
     openItem({ kind: 'session', id });
     setPassive(id);
   };
   useEffect(() => {
-    if (!reveal || revealSeen.current === reveal.at) return;
-    revealSeen.current = reveal.at;
-    pendingReveal.current = { id: reveal.id, after: listRequest.current };
+    if (!banner) return;
+    pendingReveal.current = { at: banner.at, after: listRequest.current };
     // Read now, also while Live was hidden; before the harness answered, its first read does it
     if (status) void refresh();
-  }, [reveal?.id, reveal?.at]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [banner?.at]); // eslint-disable-line react-hooks/exhaustive-deps
   // Back and Forward (MCR-108): every change of the shown session is a place in the history, whatever made it
   const [history, setHistory] = useState(EMPTY_HISTORY);
   // The session Back or Forward is going to: that change is a step, not a new place
@@ -532,36 +525,24 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   useEffect(() => { if (listRead.current) keep.retain(new Set(listedIds.split(' ').filter(Boolean))); }, [listedIds]);
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
-  // Until when an acknowledgement waits after the window came forward (MCR-180)
-  const settleUntil = useRef(0);
   useEffect(() => {
     const acknowledge = () => {
       if (!active || document.hidden || !document.hasFocus()) return;
-      // A banner's ask on its way, or shown by a banner: not looked at by the operator's own choice (MCR-180).
-      // The ask is read from the prop too: this effect can run before the one that takes it
-      if (pendingReveal.current || (reveal && revealSeen.current !== reveal.at) || selected === passive) return;
-      // A click on a banner brings the window forward before the page hears of it: the session
-      // selected then is not what the operator came to look at, so wait to see whether a banner follows
-      if (Date.now() < settleUntil.current) return;
+      // A banner's ask pending, for any session, or the view a banner showed: not the operator's own look (MCR-180)
+      if (useBannerIntent.getState().intent || selected === passive) return;
       const attention = hosted.find(h => h.id === selected && !h.exit)?.harness?.attention;
       if (attention?.kind !== 'notification' || acknowledging.current.get(selected) === attention.since) return;
       acknowledging.current.set(selected, attention.since);
       void harnessApi.ack(selected, attention.since).then(refresh).catch(e => setError(err(e))).finally(() => acknowledging.current.delete(selected));
     };
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const later = () => {
-      clearTimeout(timer);
-      const wait = settleUntil.current - Date.now();
-      if (wait > 0) timer = setTimeout(acknowledge, wait + 1);
-    };
-    const cameForward = () => { settleUntil.current = Date.now() + ACK_SETTLE_MS; later(); };
     acknowledge();
-    later();
-    window.addEventListener('focus', cameForward);
-    document.addEventListener('visibilitychange', cameForward);
-    return () => { clearTimeout(timer); window.removeEventListener('focus', cameForward); document.removeEventListener('visibilitychange', cameForward); };
-  }, [active, hosted, selected, refresh, passive, reveal]);
+    window.addEventListener('focus', acknowledge);
+    document.addEventListener('visibilitychange', acknowledge);
+    return () => { window.removeEventListener('focus', acknowledge); document.removeEventListener('visibilitychange', acknowledge); };
+  }, [active, hosted, selected, refresh, passive, banner]);
   const focusPane = (leafId: string, item: PaneItem | null) => {
+    // A click in a pane is the operator's own choice
+    cancelBanner();
     setPassive('');
     setFocusedPane(leafId);
     if (item?.kind === 'session' && item.id) {
@@ -1284,7 +1265,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
               const el = slotEls.get(id);
               if (!el) return null;
               const selectedPane = selected === id && focusedItem?.kind === 'session' && focusedItem.id === id;
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane && passive !== id} passive={passive === id} onActive={() => setPassive(p => p === id ? '' : p)} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane && !banner && passive !== id} passive={!!banner || passive === id} onActive={() => { cancelBanner(); setPassive(p => p === id ? '' : p); }} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );

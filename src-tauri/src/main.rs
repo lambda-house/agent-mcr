@@ -1155,17 +1155,20 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 /// A banner was clicked (MCR-180), by either route. Only the latest click
-/// counts (`banner::offer`); one about no session takes back an earlier one
-/// the page has not taken. One about a session: the page is told to take it
+/// counts (`banner::offer`). The page is told to take it
 /// (`harness_open_session_take`; it also takes it when it starts listening,
-/// because a click that launched the app comes before that), then the main
-/// window comes forward.
+/// because a click that launched the app comes before that): one about a
+/// session opens it, one about no session takes back an earlier one the
+/// page has not opened yet. For a session the main window comes forward
+/// after the word.
 fn banner_click(app: &tauri::AppHandle, click: banner::Click) {
+    let about_session = click.session.is_some();
     if !banner::offer(click) { return; }
     let main = app.clone();
     let _ = app.run_on_main_thread(move || {
-        // The word first: the page holds back an acknowledgement while a click is on its way
+        // The word first: the page holds back acknowledgements and terminal focus while a click is pending
         let _ = main.emit_to("main", "harness-open-session", ());
+        if !about_session { return; }
         if let Some(window) = main.get_webview_window("main") {
             let _ = window.unminimize();
             let _ = window.show();

@@ -274,11 +274,13 @@ fn clicked_in(answer: &Value) -> Option<crate::banner::Click> {
     Some(click)
 }
 
-/// The session a clicked banner asks the page to show, once (MCR-180). The
-/// page asks when it starts listening and at each `harness-open-session`.
+/// The latest banner click for the page, once (MCR-180): `null` when there
+/// is nothing new, `{"session": id}` to show that session, `{"session":
+/// null}` to take back one the page may still be about to show. The page
+/// asks when it starts listening and at each `harness-open-session`.
 #[tauri::command]
-pub fn harness_open_session_take() -> Option<String> {
-    crate::banner::take_open().filter(|s| valid_id(s).is_ok())
+pub fn harness_open_session_take() -> Option<Value> {
+    crate::banner::take_open().map(|session| json!({ "session": session.filter(|s| valid_id(s).is_ok()) }))
 }
 
 /// Sessions, their state and resuming go through the harness service.
