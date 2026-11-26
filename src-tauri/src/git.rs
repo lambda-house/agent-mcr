@@ -388,12 +388,15 @@ mod tests {
             (
                 "filter.a=b.smudge",
                 probe_cmd,
-                &["checkout", "--", "file"][..],
+                &["checkout-index", "--all", "--index"][..],
             ),
         ] {
             setup(&["config", "--local", key, value]);
             if key.starts_with("filter.") && !key.ends_with(".smudge") {
                 setup(&["config", "--local", "filter.a=b.required", "true"]);
+            }
+            if key.ends_with(".smudge") {
+                fs::remove_file(cwd.join("file")).unwrap();
             }
             let baseline = raw(args);
             assert!(
@@ -401,7 +404,11 @@ mod tests {
                 "{key} should run without guards: {baseline:?}"
             );
             fs::remove_file(&marker).unwrap();
-            fs::write(cwd.join("file"), "changed content\n").unwrap();
+            if key.ends_with(".smudge") {
+                fs::remove_file(cwd.join("file")).unwrap();
+            } else {
+                fs::write(cwd.join("file"), "changed content\n").unwrap();
+            }
             let output = run(cwd, args, TIMEOUT, 4096).unwrap();
             assert!(output.status.success(), "{key}: {output:?}");
             assert!(!marker.exists(), "{key} ran");
