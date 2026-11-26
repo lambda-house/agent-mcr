@@ -2391,11 +2391,11 @@ const HELD_LINE: &str = "Refused: the operator has an unsent line in that sessio
 const FOREIGN_LINE: &str = "Refused: that session's agent is in a conversation the session did not start, and input there would go to that conversation";
 
 /// The mark of input that waits because nothing proves the conversation on screen is the session's (MCR-179).
-const UNPROVEN_TASK: &str = "A task or a message notice waits for it, but the harness cannot see in its terminal that this is a new conversation \
-     of the session's own (it may be asking something, or another task may be open there): it types nothing until it can";
+const UNPROVEN_TASK: &str = "A task or a message notice waits for it, but the harness cannot see that the conversation in its terminal \
+     is the session's own (it may be asking something, or another task may be open there): it types nothing until it can";
 
 /// The screen no longer proved a new conversation at the moment of writing (review 17361, 3).
-const UNPROVEN_LINE: &str = "Refused: the terminal no longer shows a new conversation of that session's own";
+const UNPROVEN_LINE: &str = "Refused: nothing proves any more that the conversation in that session's terminal is its own";
 
 /// An agent that does not name its conversation (Codex), launched by this
 /// build, that has not said which conversation it is in yet: what is
@@ -2404,6 +2404,92 @@ const UNPROVEN_LINE: &str = "Refused: the terminal no longer shows a new convers
 fn conversation_unknown(t: &Tracked) -> bool {
     let agent = adapter(&t.profile);
     agent.is_agent() && !agent.names_conversation() && t.launched != 0 && t.agent_session.is_none()
+}
+
+/// A Codex session that said which conversation it is in, launched by this
+/// build, whose agent has no hooks of its own (Windows, or Codex's hooks off
+/// or not trusted): the operator can open another thread in its terminal
+/// (`/resume`, the Agent command center), and nothing says so before that
+/// thread's first turn ends, which a typed task or notice would start
+/// (review 17365, 1). Its own hooks report the switch as a start.
+fn conversation_unwatched(t: &Tracked) -> bool {
+    let agent = adapter(&t.profile);
+    agent.is_agent() && !agent.names_conversation() && t.launched != 0 && t.agent_session.is_some() && !t.own_hooks
+}
+
+/// The thread a Codex rollout is of, by its file name
+/// (`rollout-<time>-<thread id>.jsonl`).
+fn rollout_thread(path: &Path) -> Option<&str> {
+    let stem = path.file_name()?.to_str()?.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    Some(stem.get(stem.len().checked_sub(36)?..)?).filter(|id| is_uuid(id))
+}
+
+/// Proof from the rollouts the agent's process holds open that the
+/// conversation in its terminal is `own`: Codex 0.172 keeps the rollout of
+/// each thread it has loaded open for appending, and opens a thread's on
+/// resume, before any turn (`RolloutRecorderParams::Resume`). So the
+/// session's own must be open and no other but its subagents' (whose head
+/// names it as `parent_thread_id`). A file that is no rollout is not asked.
+fn own_rollouts_only(open: &[PathBuf], own: &str, parent_of: impl Fn(&Path) -> Option<String>) -> bool {
+    let rollouts: Vec<(&Path, &str)> = open.iter().filter_map(|p| Some((p.as_path(), rollout_thread(p)?))).collect();
+    rollouts.iter().any(|(_, id)| *id == own) && rollouts.iter().all(|(path, id)| *id == own || parent_of(path).as_deref() == Some(own))
+}
+
+/// The files a process holds open, by their paths; None where that cannot be read.
+#[cfg(target_os = "macos")]
+fn open_files(pid: i32) -> Option<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+    // `struct proc_fileinfo` and `vnode_fdinfowithpath` of <sys/proc_info.h>, which libc does not have
+    #[repr(C)]
+    struct FileInfo {
+        openflags: u32,
+        status: u32,
+        offset: i64,
+        kind: i32,
+        guardflags: u32,
+    }
+    #[repr(C)]
+    struct WithPath {
+        file: FileInfo,
+        vnode: libc::vnode_info_path,
+    }
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    let needed = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return None;
+    }
+    // Room for some opened since
+    let mut fds: Vec<libc::proc_fdinfo> = (0..needed as usize / entry + 32).map(|_| libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }).collect();
+    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), (fds.len() * entry) as libc::c_int) };
+    if got <= 0 {
+        return None;
+    }
+    fds.truncate(got as usize / entry);
+    let mut out = Vec::new();
+    for fd in fds.iter().filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32) {
+        let mut info: WithPath = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<WithPath>() as libc::c_int;
+        // A descriptor closed since the listing gives less, and is passed over
+        if unsafe { libc::proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, (&mut info as *mut WithPath).cast(), size) } != size {
+            continue;
+        }
+        let bytes: Vec<u8> = info.vnode.vip_path.iter().flatten().map(|c| *c as u8).take_while(|b| *b != 0).collect();
+        out.push(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+    }
+    Some(out)
+}
+
+#[cfg(target_os = "linux")]
+fn open_files(pid: i32) -> Option<Vec<PathBuf>> {
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(fds.flatten().filter_map(|fd| std::fs::read_link(fd.path()).ok()).collect())
+}
+
+/// Not read on other systems: no proof from the rollouts there.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_files(_pid: i32) -> Option<Vec<PathBuf>> {
+    None
 }
 
 /// A folder as Codex 0.172 shows it (`status/helpers.rs`,
@@ -3272,6 +3358,9 @@ pub struct Harness {
     /// Screens for tests, in place of the runner's
     #[cfg(test)]
     shown: Mutex<BTreeMap<String, String>>,
+    /// The files a session's process holds open, for tests, in place of the system's
+    #[cfg(test)]
+    open: Mutex<BTreeMap<String, Vec<PathBuf>>>,
     /// When a held session's screen was last read for an empty input box (`check_drafts`)
     drafts_checked: Mutex<BTreeMap<String, u64>>,
     /// Latest app generation seen by the service, ordered with draft updates.
@@ -3433,7 +3522,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] after_look: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] after_look: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), #[cfg(test)] open: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -4221,11 +4310,11 @@ impl Harness {
         if let Some(why) = write_refusal(lock(&self.store).sessions.get(session)) {
             return Err(why.into());
         }
-        // Before its agent said which conversation it is in, the screen's proof
-        // is read again here, just before the text, and not only when the work
-        // was claimed (review 17361, 3)
-        let unknown = lock(&self.store).sessions.get(session).is_some_and(conversation_unknown);
-        if own && unknown && !self.new_conversation_on_screen(session) {
+        // Where the conversation on screen must be proved the session's own
+        // (`own_conversation_shown`), the proof is read again here, just before
+        // the text, and not only when the work was claimed (review 17361, 3;
+        // review 17365, 1)
+        if own && !self.own_conversation_shown(session) {
             return Err(UNPROVEN_LINE.into());
         }
         // Agents always turn it on, and their old output may have left the scrollback
@@ -4440,7 +4529,9 @@ impl Harness {
             let store = lock(&self.store);
             let queued = store.tasks.values().filter(|t| t.session == session && t.state == "queued").map(|t| t.created).min();
             let t = store.sessions.get(session);
-            (queued, t.is_some_and(|t| adapter(&t.profile).detects_prompt() && t.state == "unknown"), t.is_some_and(conversation_unknown))
+            // A session that would take a task now, and must prove its conversation first (review 17365, 1)
+            let unwatched = t.is_some_and(|t| conversation_unwatched(t) && t.state == "idle");
+            (queued, t.is_some_and(|t| adapter(&t.profile).detects_prompt() && t.state == "unknown"), t.is_some_and(conversation_unknown) || unwatched)
         };
         let Some(queued) = queued else { return };
         // The operator is writing there, or its agent is in a conversation that
@@ -4451,7 +4542,7 @@ impl Harness {
         // Before its agent said which conversation it is in, only one the
         // screen proves new and the session's own takes a task (review 17342, 1)
         let at_prompt = match unproven {
-            true => self.new_conversation_on_screen(session),
+            true => self.own_conversation_shown(session),
             false => unsure && self.at_prompt(session),
         };
         let task = if unproven && !at_prompt { None } else { self.update(|s| s.next(session, at_prompt)) };
@@ -4516,14 +4607,15 @@ impl Harness {
             // An agent without state tracking (no turn-end hooks) is only seen
             // through its screen; a shell has no input box (`at_prompt` is false)
             let agent = adapter(&t.profile);
-            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown", agent.sees_prompt(), conversation_unknown(t))
+            // An idle session that must prove its conversation first (review 17365, 1)
+            (!agent.is_agent(), agent.silent_until_first_turn() && t.state == "unknown", agent.sees_prompt(), conversation_unknown(t) || (conversation_unwatched(t) && t.state == "idle"))
         };
         // Not read where no input box is known: this runs at every timer tick
         // while a message waits, and a snapshot is up to 4 MB. Before its
         // agent said which conversation it is in, only into one the screen
         // proves new and the session's own (review 17342, 1)
         let at_prompt = match unproven {
-            true => self.new_conversation_on_screen(session),
+            true => self.own_conversation_shown(session),
             false => reads_screen(untracked, unsure, sees) && self.at_prompt(session),
         };
         if unproven && !at_prompt {
@@ -5795,6 +5887,38 @@ impl Harness {
         let Some((profile, cwd)) = lock(&self.store).sessions.get(session).map(|t| (t.profile.clone(), t.cwd.clone())) else { return false };
         // Taller than a terminal is: the banner is at the top of a new conversation
         self.screen_lines(session, 200).is_some_and(|screen| adapter(&profile).fresh_conversation(&screen, &shown_folder(&cwd)))
+    }
+
+    /// Proof that what the harness types into a session reaches a
+    /// conversation of its own (MCR-179): before a Codex session said which
+    /// conversation it is in, a new one in its own folder on screen
+    /// (`new_conversation_on_screen`); after, while no hook of its own would
+    /// report a switch (`conversation_unwatched`), that, or the rollouts its
+    /// process holds open (`own_rollouts_only`, review 17365, 1). Other
+    /// sessions need none.
+    fn own_conversation_shown(&self, session: &str) -> bool {
+        let Some(t) = lock(&self.store).sessions.get(session).cloned() else { return false };
+        if conversation_unknown(&t) {
+            return self.new_conversation_on_screen(session);
+        }
+        if !conversation_unwatched(&t) {
+            return true;
+        }
+        let own = t.agent_session.unwrap_or_default();
+        let parent_of = |path: &Path| crate::agents::head_value(path, "parent_thread_id", 8192);
+        self.open_files_of(session).is_some_and(|open| own_rollouts_only(&open, &own, parent_of)) || self.new_conversation_on_screen(session)
+    }
+
+    /// The files the process of a running session holds open.
+    fn open_files_of(&self, session: &str) -> Option<Vec<PathBuf>> {
+        #[cfg(test)]
+        return lock(&self.open).get(session).cloned();
+        #[cfg(not(test))]
+        {
+            let list = self.runner(json!({"op": "list"})).ok()?;
+            let live = list["sessions"].as_array()?.iter().find(|s| s["id"] == session && s["exit"].is_null())?;
+            open_files(i32::try_from(live["pid"].as_i64()?).ok()?)
+        }
     }
 
     /// A look at a session's terminal for a prompt no hook reports (MCR-71):
@@ -12786,6 +12910,94 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Review 17365 (1): a Codex session without hooks of its own has said
+    /// which conversation it is in, and the operator opens another session's
+    /// old thread in its terminal. Nothing reports that before the thread's
+    /// first turn ends, so neither a queued task nor an inbox notice may go
+    /// in until the screen or the rollouts its process holds open prove that
+    /// the conversation there is still the session's own.
+    #[test]
+    fn a_thread_opened_in_a_hookless_codex_session_gets_no_input() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-unwatched-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        *lock(&harness.typed) = Some(Vec::new());
+        let launched = now_ms();
+        let v7 = |ms: u64, tail: &str| format!("{:08x}-{:04x}-7abc-8def-{tail}", ms >> 16, ms & 0xffff);
+        let own = v7(launched, "0123456789ab");
+        let child = v7(launched + 5, "0123456789cd");
+        let old = "01a2138f-db30-7f33-932d-71a5cae26b9a";
+        // The rollouts as Codex 0.172 names them; a subagent's head names its parent thread
+        let rollouts = dir.join("sessions");
+        std::fs::create_dir_all(&rollouts).unwrap();
+        let rollout = |id: &str, meta: Value| {
+            let path = rollouts.join(format!("rollout-2026-11-26T16-06-18-{id}.jsonl"));
+            std::fs::write(&path, format!("{}\n", json!({"type": "session_meta", "payload": meta}))).unwrap();
+            path
+        };
+        let own_file = rollout(&own, json!({"id": own, "cwd": "/work/infra-253"}));
+        let child_file = rollout(&child, json!({"id": child, "cwd": "/work/infra-253", "parent_thread_id": own}));
+        let old_file = rollout(old, json!({"id": old, "cwd": "/work/teob-rust"}));
+        let other_log = dir.join("codex-tui.log");
+        harness.update(|h| {
+            for id in ["ex", "mail"] {
+                // A turn of its own ended (notify), so it is idle and its conversation is known; no hook of its own ever ran
+                h.sessions.insert(id.into(), Tracked { profile: "codex".into(), state: "idle".into(), hooked: true, cwd: "/work/infra-253".into(), launched, agent_session: Some(own.clone()), ..Tracked::default() });
+            }
+            h.tasks.insert("t1".into(), Task { id: "t1".into(), session: "ex".into(), text: "Validate INFRA-253".into(), state: "queued".into(), created: 1, started: 0, finished: 0, result: None, by: String::new(), told: false });
+            h.post(Message { to: "mail".into(), text: "hello".into(), ..Message::default() });
+        });
+        let show = |id: &str, screen: &str, open: &[&PathBuf]| {
+            lock(&harness.shown).insert(id.to_string(), screen.to_string());
+            lock(&harness.open).insert(id.to_string(), open.iter().map(|p| p.to_path_buf()).collect());
+        };
+        let typed = || lock(&harness.typed).as_ref().unwrap().iter().map(|(id, _)| id.clone()).collect::<Vec<String>>();
+        // The old thread is open in its terminal, composer and all, and no turn ran in it yet
+        let opened = "\u{203a} resume\n\u{2022} Ran git status --porcelain\n\n\u{203a} Ask Codex to do anything\n\n  GPT-6.2-Sol high \u{b7} ~/work/teob-cc/teob-rust \u{b7} Validate CORE-850 round 2\n  \u{2190} for agents \u{b7} ? for shortcuts\n";
+        for open in [vec![&old_file], vec![&own_file, &old_file], vec![], vec![&other_log]] {
+            show("ex", opened, &open);
+            show("mail", opened, &open);
+            harness.pump("ex");
+            harness.nudge("mail");
+            assert!(typed().is_empty(), "typed with {open:?} open");
+            assert_eq!(lock(&harness.store).tasks["t1"].state, "queued");
+            assert!(lock(&harness.store).messages.values().all(|m| !m.notified));
+        }
+        // It waits with the mark that says so
+        assert_eq!(lock(&harness.store).sessions["ex"].attention.as_ref().map(|a| a.text.as_str()), Some(UNPROVEN_TASK));
+        // The proof is read again under the writer's lock, just before the text
+        assert_eq!(harness.deliver("ex", "Validate INFRA-253").unwrap_err(), UNPROVEN_LINE);
+        // Back in its own conversation (a subagent of its own may be open beside it): the task and the notice go in
+        let back = "\u{2022} Validated, nothing to change.\n\n\u{203a} Ask Codex to do anything\n\n  GPT-6.2-Sol high \u{b7} /work/infra-253 \u{b7} Validate INFRA-253\n  ? for shortcuts\n";
+        harness.update(|h| h.sessions.get_mut("ex").unwrap().attention = None);
+        show("ex", back, &[&own_file, &child_file]);
+        show("mail", back, &[&own_file]);
+        harness.pump("ex");
+        harness.nudge("mail");
+        assert!(typed().contains(&"ex".to_string()) && typed().contains(&"mail".to_string()), "{:?}", typed());
+        assert_eq!(lock(&harness.store).tasks["t1"].state, "working");
+        // A session whose own hooks report a switch is not asked for the proof
+        assert!(conversation_unwatched(&Tracked { profile: "codex".into(), launched, agent_session: Some(own.clone()), ..Tracked::default() }));
+        assert!(!conversation_unwatched(&Tracked { profile: "codex".into(), launched, agent_session: Some(own.clone()), own_hooks: true, ..Tracked::default() }));
+        assert!(!conversation_unwatched(&Tracked { profile: "claude".into(), launched, agent_session: Some(own.clone()), ..Tracked::default() }));
+        assert!(!conversation_unwatched(&Tracked { profile: "codex".into(), agent_session: Some(own.clone()), ..Tracked::default() }), "a record from before keeps the old rule");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A process's open files are read from the system (review 17365, 1).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_files_a_process_holds_open_are_listed() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-open-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-11-26T16-06-18-{}.jsonl", "01a2138f-db30-7f33-932d-71a5cae26b9a"));
+        let file = std::fs::File::create(&path).unwrap();
+        let open = open_files(std::process::id() as i32).unwrap();
+        let real = std::fs::canonicalize(&path).unwrap();
+        assert!(open.iter().any(|p| std::fs::canonicalize(p).is_ok_and(|p| p == real)), "{open:?}");
+        drop(file);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Review 17342 (3): the mark and the writes are ordered by the session's
     /// writer lock, and every last check refuses a foreign conversation.
     #[test]
@@ -12925,7 +13137,7 @@ mod tests {
         conversation_evidence(&home, id, &here.display().to_string(), &mut payload);
         assert_eq!(payload["conversation-here"], false);
         let mine = "01a2182c-f44c-7ef3-be26-22469e20be40";
-        std::fs::write(day.join(format!("rollout-2026-11-26T15-05-30-{mine}.jsonl")), format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{mine}\",\"cwd\":\"{}\"}}}}\n", here.display())).unwrap();
+        std::fs::write(day.join(format!("rollout-2026-11-26T15-05-30-{mine}.jsonl")), format!("{}\n", json!({"type": "session_meta", "payload": {"id": mine, "cwd": here.display().to_string()}}))).unwrap();
         let mut payload = json!({});
         conversation_evidence(&home, mine, &here.display().to_string(), &mut payload);
         assert_eq!(payload["conversation-here"], true);
