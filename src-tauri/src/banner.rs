@@ -138,6 +138,12 @@ pub fn offer(click: Click) -> bool {
     true
 }
 
+/// In the app: whether a click waits for the page to take it. A list read
+/// says so, because the page must not decide an older ask before it has it.
+pub fn open_pending() -> bool {
+    lock(&OPEN).pending.is_some()
+}
+
 /// In the app: the latest click for the page, once: `Some(Some(id))` opens
 /// that session, `Some(None)` takes back an earlier one, `None` is nothing new.
 pub fn take_open() -> Option<Option<String>> {
@@ -313,9 +319,12 @@ mod tests {
     fn the_app_hands_the_page_only_the_latest_click_of_either_route_once() {
         let opens = |id: &str| Some(Some(id.to_owned()));
         // The app's own click B, then the service's older A: A opens nothing
+        assert!(!open_pending());
         assert!(offer(click(Some("b"), 20)));
         assert!(!offer(click(Some("a"), 10)));
+        assert!(open_pending(), "a list read says the page has a click to take");
         assert_eq!(take_open(), opens("b"));
+        assert!(!open_pending());
         assert_eq!(take_open(), None);
         // Taken already: an older click that comes later still opens nothing
         assert!(!offer(click(Some("a"), 15)));

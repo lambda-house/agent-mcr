@@ -10,6 +10,7 @@ import LiveWorkspace from './LiveWorkspace';
 import TerminalPane, { keep } from './TerminalPane';
 import { harnessApi, type Hosted } from '../utils/harness';
 import { MAX_KEPT } from '../utils/terminalKeep';
+import { useBannerIntent } from '../utils/bannerIntent';
 
 const made = vi.hoisted(() => ({ terms: [] as unknown[] }));
 vi.mock('@xterm/xterm', async () => {
@@ -437,6 +438,22 @@ describe('a view a clicked banner shows (MCR-180)', () => {
     await act(async () => { host.querySelector('textarea')!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); reportFocus(true); });
     expect(onActive).toHaveBeenCalledOnce();
     expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\x1b[I']]);
+  });
+
+  it('sends nothing and takes no keyboard while a banner\'s ask is pending, though not passive itself (round 5)', async () => {
+    // Another pane of a split layout: Live does not mark it, the pending ask in the store holds it
+    useBannerIntent.setState({ intent: { id: 'elsewhere', at: 1 } });
+    try {
+      await act(async () => root.render(<TerminalPane id="beside" active focusOnMount/>)); await frame();
+      expect(document.activeElement).not.toBe(host.querySelector('textarea'));
+      await answer('\x1b[?1004h', 0);
+      await act(async () => { reportFocus(true); last().input('\x1b[1;1R', false); });
+      expect(harnessApi.input).not.toHaveBeenCalled();
+      // The operator's own key in it ends the ask, and the key goes out
+      await act(async () => { host.querySelector('textarea')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', bubbles: true })); last().input('x', true); });
+      expect(useBannerIntent.getState().intent).toBeNull();
+      expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, 'x']]);
+    } finally { useBannerIntent.setState({ intent: null }); }
   });
 
   it('a view the operator chose sends its focus report as before', async () => {

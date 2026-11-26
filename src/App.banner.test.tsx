@@ -18,7 +18,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string) => path,
 }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async (name: string, handler: () => void) => { native.listeners.set(name, handler); return () => native.listeners.delete(name); }) }));
-const made = vi.hoisted(() => ({ terms: [] as unknown[] }));
+const made = vi.hoisted(() => ({ terms: [] as unknown[], focuses: 0 }));
 vi.mock('@xterm/xterm', async () => {
   const { Terminal: Real } = await import('@xterm/headless');
   class Terminal extends Real {
@@ -31,7 +31,7 @@ vi.mock('@xterm/xterm', async () => {
     registerDecoration() { return undefined; }
     onRender() { return { dispose() {} }; }
     attachCustomKeyEventHandler() {}
-    focus() { this.textarea?.focus(); }
+    focus() { made.focuses++; this.textarea?.focus(); }
     refresh() {}
     hasSelection() { return false; }
     getSelection() { return ''; }
@@ -63,6 +63,8 @@ let listed: Hosted[];
 let views: { id: string; on: { start: (from: number | null) => void; data: (bytes: Uint8Array) => void } }[];
 /** While set, every list read waits for it */
 let held: Promise<void> | null;
+/** What the next list reads say of a click the app holds for the page */
+let bannerPending: boolean;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
 const frame = async () => { await act(async () => { await new Promise(resolve => requestAnimationFrame(() => resolve(null))); }); };
 const holdReads = () => { let release!: () => void; held = new Promise(resolve => { release = resolve; }); return async () => { held = null; await act(async () => release()); await flush(); await frame(); }; };
@@ -93,7 +95,7 @@ beforeEach(() => {
   Object.assign(window, { __TAURI_INTERNALS__: {} });
   localStorage.setItem('agent-mcr.sessions.view', 'live');
   keep.protect(new Set()); keep.retain(new Set());
-  native.clicks = []; native.listeners.clear(); made.terms = []; views = []; held = null;
+  native.clicks = []; native.listeners.clear(); made.terms = []; made.focuses = 0; views = []; held = null; bannerPending = false;
   useBannerIntent.setState({ intent: null });
   vi.stubGlobal('ResizeObserver', class {
     constructor(private callback: (entries: Partial<ResizeObserverEntry>[]) => void) {}
@@ -110,7 +112,7 @@ beforeEach(() => {
   vi.mocked(harnessApi.listSince).mockImplementation(async stamp => {
     if (held) await held;
     const now = JSON.stringify(listed);
-    return { stamp: now, sessions: now === stamp ? null : listed };
+    return { stamp: now, sessions: now === stamp ? null : listed, ...(bannerPending ? { bannerPending: true } : {}) };
   });
   vi.mocked(harnessApi.resumable).mockResolvedValue([]);
   vi.mocked(harnessApi.ack).mockResolvedValue();
@@ -131,6 +133,14 @@ afterEach(async () => {
  * they went to Documents, and the window has the focus now.
  */
 async function r1SelectedThenDocuments() {
+  const t1 = await r1Selected();
+  await act(async () => sessionsButton('Documents').click()); await flush();
+  expect(host.querySelector('[data-toolbar]')).not.toBeNull();
+  return t1;
+}
+
+/** r1 as above, its done mark standing, and Live still shown; the window has the focus now */
+async function r1Selected() {
   const focus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
   await act(async () => root.render(<App/>)); await flush(); await flush();
   await act(async () => row('Fixing tests').click()); await flush(); await frame();
@@ -138,8 +148,6 @@ async function r1SelectedThenDocuments() {
   await output('r1', t1, '\x1b[?1004hworking\r\n');
   expect(t1.modes.sendFocusMode).toBe(true);
   t1.textarea.blur();
-  await act(async () => sessionsButton('Documents').click()); await flush();
-  expect(host.querySelector('[data-toolbar]')).not.toBeNull();
   vi.mocked(harnessApi.input).mockClear();
   focus.mockReturnValue(true);
   return t1;
@@ -210,5 +218,76 @@ describe('a clicked banner, from the page handler down to the terminals (MCR-180
     await act(async () => root.render(<App/>)); await flush(); await flush(); await frame();
     expect(shown()).toEqual(['Other work']);
     expect(harnessApi.ack).not.toHaveBeenCalled();
+  });
+});
+
+describe('the three ways round 4 still let a banner act for the operator (review 17369)', () => {
+  it('keeps the session selected before unacknowledged when the banner\'s session has ended (17369 #1)', async () => {
+    await r1SelectedThenDocuments();
+    const release = holdReads();
+    await banner('r2');
+    listed = [done(running, 5), { ...other, exit: { code: 0, signal: null, at: 9 } }];
+    await release();
+    expect(host.querySelector('.hs-error')?.textContent).toContain('no longer running');
+    expect(shown()).toContain('Fixing tests');
+    await flush();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+    // The operator's own row click: as before
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
+  });
+
+  it('does not refocus a terminal that reconnects while the ask is pending (17369 #2)', async () => {
+    await r1Selected();
+    const t1 = termOf('Fixing tests');
+    // The operator types in r1; that key is still on its way when the banner comes
+    let fail!: (e: Error) => void;
+    vi.mocked(harnessApi.input).mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+    await act(async () => { t1.textarea.focus(); t1.input('a', true); });
+    const release = holdReads();
+    await banner('r2');
+    const before = made.focuses;
+    await act(async () => fail(new Error('The terminal is detached'))); await flush(); await frame(); await frame();
+    expect(made.focuses).toBe(before);
+    await release();
+  });
+
+  it('does not send a focus report that was queued behind a key while the ask is pending (17369 #2)', async () => {
+    await r1Selected();
+    const t1 = termOf('Fixing tests');
+    let sent!: () => void;
+    vi.mocked(harnessApi.input).mockImplementationOnce(() => new Promise<void>(resolve => { sent = resolve; }));
+    await act(async () => { t1.input('a', true); report(t1, true); });
+    const release = holdReads();
+    await banner('r2');
+    await act(async () => sent()); await flush();
+    expect(vi.mocked(harnessApi.input).mock.calls.map(c => c[1])).toEqual(['a']);
+    await release();
+  });
+
+  it('opens nothing when the click about no session is taken after the list read came back (17369 #3)', async () => {
+    await r1SelectedThenDocuments();
+    const release = holdReads();
+    await banner('r2');
+    // The state file's banner: the page hears of it, its take is on its way
+    let taken!: (click: unknown) => void;
+    native.clicks.push(new Promise(resolve => { taken = resolve; }));
+    await act(async () => native.listeners.get('harness-open-session')!()); await flush();
+    await release();
+    await act(async () => taken({ session: null })); await flush(); await frame();
+    expect(shown()).not.toContain('Other work');
+    expect(shown()).toContain('Fixing tests');
+  });
+
+  it('opens nothing when the list read that decides the ask says a newer click is waiting (17369 #3)', async () => {
+    await r1SelectedThenDocuments();
+    const release = holdReads();
+    await banner('r2');
+    // The service handed the list read a click about no session; the page has not heard of it yet
+    native.clicks.push({ session: null });
+    bannerPending = true;
+    await release();
+    expect(shown()).not.toContain('Other work');
+    expect(useBannerIntent.getState().intent).toBeNull();
   });
 });

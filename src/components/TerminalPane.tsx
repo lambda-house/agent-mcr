@@ -8,6 +8,7 @@ import { isPaletteKey, PLATFORM } from '../utils/platform';
 import { excerptFromSelection } from '../utils/taskCopy';
 import { isCopyKey, isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
 import TaskCopyDialog from './TaskCopyDialog';
+import { cancelBanner, useBannerIntent } from '../utils/bannerIntent';
 import { MAX_KEPT, TerminalKeep } from '../utils/terminalKeep';
 import { disableOutputScrollbarReveal, tryWebgl } from '../utils/terminalRenderer';
 
@@ -139,6 +140,14 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   wasPassive.current = passive;
   const passiveNow = useRef(passive);
   passiveNow.current = passive && !activated.current;
+  /**
+   * Whether nothing may leave this view (MCR-180): it is passive, or a banner's ask is pending,
+   * read from the store at the moment of leaving, not from a render. Asked at the two places
+   * where anything leaves a terminal: the keyboard (`focusTerm`) and the input to the session
+   * (`flushInput`, and `onData` before it queues)
+   */
+  const held = () => passiveNow.current || useBannerIntent.getState().intent !== null;
+  const focusTerm = (t: Terminal | null) => { if (t && !held()) t.focus(); };
   // Looks at the pointers on screen again (MCR-106)
   const pointers = useRef<() => void>(() => {});
   const host = useRef<HTMLDivElement>(null);
@@ -149,15 +158,16 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     const element = host.current;
     if (!element) return;
     const take = () => {
-      if (!passiveNow.current) return;
+      if (!held()) return;
       activated.current = true;
       passiveNow.current = false;
+      // The operator's own choice: a banner's ask still pending gives way to it
+      cancelBanner();
       sessions.current.onActive?.();
     };
-    element.addEventListener('pointerdown', take, true);
-    element.addEventListener('mousedown', take, true);
-    element.addEventListener('keydown', take, true);
-    return () => { element.removeEventListener('pointerdown', take, true); element.removeEventListener('mousedown', take, true); element.removeEventListener('keydown', take, true); };
+    const events = ['pointerdown', 'mousedown', 'keydown', 'drop'] as const;
+    events.forEach(e => element.addEventListener(e, take, true));
+    return () => events.forEach(e => element.removeEventListener(e, take, true));
   }, []);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
@@ -231,7 +241,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       refocus.current = false;
       requestAnimationFrame(() => {
         const focused = document.activeElement;
-        if (shown.current && !document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) t.focus();
+        if (shown.current && !document.hidden && term.current === t && (!focused || focused === document.body || !focused.isConnected)) focusTerm(t);
       });
     }
     // The command panel's key is the app's: xterm would send Ctrl+Shift+P to the agent as Ctrl+P.
@@ -402,6 +412,9 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
             dropInput(data);
             continue;
           }
+          // Nothing leaves while held, also what was queued before (MCR-180): a focus report
+          // queued behind a key would otherwise go out once that key is written
+          if (held()) continue;
           try {
             await harnessApi.input(handle, data);
             if (enter && !disposed) setNotice(n => n === INPUT_DROPPED_NOTICE ? '' : n);
@@ -475,8 +488,8 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
 
     const typed = t.onData(data => {
       if (disposed) return;
-      // Passive: the terminal's own answers and reports are dropped, never typed into the agent
-      if (passiveNow.current) return;
+      // Held: the terminal's own answers and reports are dropped, never typed into the agent
+      if (held()) return;
       if (view.handle !== null && ((!discard && !reconnecting) || (shown.current && writingInput))) {
         sendInput(view.handle, data, true);
       } else if (shown.current) {
@@ -578,7 +591,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
       try { fit.current?.fit(); } catch { /* hidden */ }
       resend.current();
       term.current.refresh(0, term.current.rows - 1);
-      if (takeFocus.current) term.current.focus();
+      if (takeFocus.current) focusTerm(term.current);
     });
     return () => cancelAnimationFrame(frame);
   }, [active, id]);
@@ -586,7 +599,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   useEffect(() => {
     if (!focusAt) return;
     // After the click that asked for it: that click leaves the keyboard in the terminal it was made in
-    const frame = requestAnimationFrame(() => { term.current?.focus(); sessions.current.onFocused?.(); });
+    const frame = requestAnimationFrame(() => { focusTerm(term.current); sessions.current.onFocused?.(); });
     return () => cancelAnimationFrame(frame);
   }, [focusAt]);
 

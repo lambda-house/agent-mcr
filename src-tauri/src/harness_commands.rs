@@ -548,6 +548,11 @@ fn read_list(app: &tauri::AppHandle, drafts: &Mutex<BTreeMap<String, Draft>>) ->
     if let Some(click) = list.as_object_mut().and_then(|l| l.remove("bannerClick")).as_ref().and_then(clicked_in) {
         crate::banner_click(app, click);
     }
+    // A click the page has not taken, this read's or an earlier one: newer than any ask the page
+    // holds, so Live takes it before this read decides one (MCR-180)
+    if crate::banner::open_pending() {
+        list["bannerPending"] = json!(true);
+    }
     if let Ok(mut drafts) = drafts.lock() {
         prune(&mut drafts, &list);
     }
@@ -569,7 +574,11 @@ fn list_since(mut list: Value, held: Option<&str>) -> Result<Value, String> {
     }
     let bytes = serde_json::to_vec(&sessions).map_err(|e| e.to_string())?;
     let stamp: String = Sha256::digest(bytes).iter().take(16).map(|b| format!("{b:02x}")).collect();
-    Ok(json!({ "sessions": (held != Some(stamp.as_str())).then_some(sessions), "stamp": stamp }))
+    let mut answer = json!({ "sessions": (held != Some(stamp.as_str())).then_some(sessions), "stamp": stamp });
+    if list["bannerPending"] == true {
+        answer["bannerPending"] = json!(true);
+    }
+    Ok(answer)
 }
 
 /// The app's count of a line the service has since ended by itself
@@ -1295,6 +1304,19 @@ mod tests {
         assert!(list_since(list(2, "working"), stamp).unwrap()["sessions"].is_null());
         assert_eq!(list_since(list(3, "idle"), stamp).unwrap()["sessions"][0]["harness"]["state"], "idle");
         assert_eq!(list_since(json!({"sessions": []}), stamp).unwrap()["sessions"], json!([]));
+    }
+
+    #[test]
+    fn an_unchanged_list_still_says_that_a_banner_click_waits_for_the_page() {
+        // MCR-180 round 5: Live takes that click before the read decides an older ask
+        let list = json!({"sessions": [{"id": "a"}]});
+        let first = list_since(list.clone(), None).unwrap();
+        assert!(first.get("bannerPending").is_none());
+        let mut waiting = list;
+        waiting["bannerPending"] = json!(true);
+        let same = list_since(waiting, first["stamp"].as_str()).unwrap();
+        assert!(same["sessions"].is_null());
+        assert_eq!(same["bannerPending"], true);
     }
 
     #[test]

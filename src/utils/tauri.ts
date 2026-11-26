@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { beginTake, endTake } from './bannerIntent';
 
 /**
  * Check if running inside Tauri environment
@@ -248,6 +249,24 @@ export async function getAgentWorkspace(): Promise<AgentWorkspace> {
  * in bursts, one per file event).
  * @returns unlisten function (no-op outside Tauri)
  */
+let openSession: ((id: string | null) => void) | null = null;
+
+/**
+ * Take the latest banner click the app holds for the page, and hand it to
+ * the `onOpenSession` handler (MCR-180). From the call until the handler
+ * has it, `taking` holds every ask's decision: this click is newer.
+ */
+export async function takeOpenSession(): Promise<void> {
+  if (!isTauri()) return;
+  beginTake();
+  try {
+    const click = await invoke<{ session: string | null } | null>('harness_open_session_take');
+    if (click && typeof click === 'object') openSession?.(typeof click.session === 'string' && click.session ? click.session : null);
+  } catch { /* nothing taken */ } finally {
+    endTake();
+  }
+}
+
 /**
  * A macOS banner was clicked (MCR-180): the id of its session, or null for
  * a banner about no session, which takes back an earlier click. The app
@@ -257,14 +276,11 @@ export async function getAgentWorkspace(): Promise<AgentWorkspace> {
  */
 export async function onOpenSession(handler: (id: string | null) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
+  openSession = handler;
   const { listen } = await import('@tauri-apps/api/event');
-  const take = () => invoke<{ session: string | null } | null>('harness_open_session_take').then(click => {
-    if (!click || typeof click !== 'object') return;
-    handler(typeof click.session === 'string' && click.session ? click.session : null);
-  }).catch(() => {});
-  const stop = await listen('harness-open-session', () => { void take(); });
-  void take();
-  return stop;
+  const stop = await listen('harness-open-session', () => { void takeOpenSession(); });
+  void takeOpenSession();
+  return () => { stop(); if (openSession === handler) openSession = null; };
 }
 
 export async function onAgentFilesChanged(handler: () => void): Promise<() => void> {

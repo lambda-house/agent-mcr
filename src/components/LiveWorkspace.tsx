@@ -16,7 +16,7 @@ import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
 import { liveNav } from '../utils/liveNav';
 import { PLATFORM } from '../utils/platform';
 import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
-import { pickDirectory, isTauri } from '../utils/tauri';
+import { pickDirectory, isTauri, takeOpenSession } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
 import '../styles/harness.css';
@@ -303,8 +303,10 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   // A clicked banner's ask (MCR-180), app-level state read in the first render: while it is set
   // nothing is acknowledged and no terminal takes the keyboard or sends anything
   const banner = useBannerIntent(s => s.intent);
-  // The ask and the list request it waits beyond: only a read that began after it decides
-  const pendingReveal = useRef<{ at: number; after: number } | null>(null);
+  // The ask and the list request it waits beyond: only a read that began after it decides,
+  // with the rows that read gave, and only while no later click is being taken (`decide`)
+  const pendingReveal = useRef<{ at: number; after: number; rows?: Hosted[] } | null>(null);
+  const taking = useBannerIntent(s => s.taking);
   const revealer = useRef<(asked: BannerIntent, rows: Hosted[]) => void>(() => {});
   const hostedNow = useRef<Hosted[]>([]);
   const listStamp = useRef('');
@@ -358,10 +360,10 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       // the list held while Live was hidden may be older than the session or its end
       const asked = pendingReveal.current;
       if (asked && request > asked.after) {
-        pendingReveal.current = null;
-        // Taken back meanwhile (a click about no session, the operator's own choice): nothing opens
-        const now = useBannerIntent.getState().intent;
-        if (now?.at === asked.at) revealer.current(now, answer.sessions ?? hostedNow.current);
+        asked.rows = answer.sessions ?? hostedNow.current;
+        // The app holds a click the page has not taken: it is newer than this ask, so it is taken first
+        if (answer.bannerPending) void takeOpenSession();
+        decider.current();
       }
     } catch (e) {
       if (!mounted.current || request <= listShown.current) return;
@@ -462,12 +464,16 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const select = (id: string) => {
     // The operator's own choice: a banner's ask still on its way gives way to it
     cancelBanner();
-    setPassive('');
+    markPassive('');
     openItem({ kind: 'session', id });
   };
-  // The session a banner showed, until the operator chooses it or another one, or gives its terminal the keyboard (MCR-180)
+  // The selected session the operator has not looked at by their own choice since a banner (MCR-180):
+  // the one a banner showed, or the one selected when a banner's ask came, whatever became of the ask.
+  // It ends when the operator chooses it or another one, or clicks or types in its terminal
   const [passive, setPassive] = useState('');
-  useEffect(() => { if (passive && selected !== passive) setPassive(''); }, [selected, passive]);
+  const passiveNow = useRef('');
+  const markPassive = (id: string) => { passiveNow.current = id; setPassive(id); };
+  useEffect(() => { if (passive && selected !== passive) markPassive(''); }, [selected, passive]);
   hostedNow.current = hosted;
   revealer.current = ({ id, at }, rows) => {
     // Decided in the same render as what it shows: there is no moment with neither the ask nor a passive view
@@ -475,10 +481,24 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     // A session that ended or that the harness forgot is not opened over what the pane shows
     if (!rows.some(h => h.id === id && !h.exit)) { setError('The session that notification is about is no longer running.'); return; }
     openItem({ kind: 'session', id });
-    setPassive(id);
+    markPassive(id);
   };
+  // An ask is decided by the read that began after it, once no click is being taken: a click the
+  // page heard of, or one that read says the app holds, may take the ask back or replace it
+  const decider = useRef(() => {});
+  decider.current = () => {
+    const asked = pendingReveal.current;
+    if (!asked?.rows || useBannerIntent.getState().taking) return;
+    pendingReveal.current = null;
+    // Taken back meanwhile (a click about no session, the operator's own choice): nothing opens
+    const now = useBannerIntent.getState().intent;
+    if (now?.at === asked.at) revealer.current(now, asked.rows);
+  };
+  useEffect(() => { decider.current(); }, [taking]);
   useEffect(() => {
     if (!banner) return;
+    // What is selected now was not chosen for this ask: it stays unacknowledged if the ask opens nothing
+    if (selected) markPassive(selected);
     pendingReveal.current = { at: banner.at, after: listRequest.current };
     // Read now, also while Live was hidden; before the harness answered, its first read does it
     if (status) void refresh();
@@ -525,25 +545,34 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   useEffect(() => { if (listRead.current) keep.retain(new Set(listedIds.split(' ').filter(Boolean))); }, [listedIds]);
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
+  /**
+   * The one place an acknowledgement for the operator's look leaves (MCR-180): none while a
+   * banner's ask is pending, for any session, or for a session not looked at by their own choice
+   * since a banner. Read at the call, not from a render, so no path or stale closure gets past it
+   */
+  const autoAck = (id: string, since: number) => {
+    if (useBannerIntent.getState().intent || passiveNow.current === id) return;
+    if (acknowledging.current.get(id) === since) return;
+    acknowledging.current.set(id, since);
+    void harnessApi.ack(id, since).then(refresh).catch(e => setError(err(e))).finally(() => acknowledging.current.delete(id));
+  };
+  const autoAcker = useRef(autoAck);
+  autoAcker.current = autoAck;
   useEffect(() => {
     const acknowledge = () => {
       if (!active || document.hidden || !document.hasFocus()) return;
-      // A banner's ask pending, for any session, or the view a banner showed: not the operator's own look (MCR-180)
-      if (useBannerIntent.getState().intent || selected === passive) return;
       const attention = hosted.find(h => h.id === selected && !h.exit)?.harness?.attention;
-      if (attention?.kind !== 'notification' || acknowledging.current.get(selected) === attention.since) return;
-      acknowledging.current.set(selected, attention.since);
-      void harnessApi.ack(selected, attention.since).then(refresh).catch(e => setError(err(e))).finally(() => acknowledging.current.delete(selected));
+      if (attention?.kind === 'notification') autoAcker.current(selected, attention.since);
     };
     acknowledge();
     window.addEventListener('focus', acknowledge);
     document.addEventListener('visibilitychange', acknowledge);
     return () => { window.removeEventListener('focus', acknowledge); document.removeEventListener('visibilitychange', acknowledge); };
-  }, [active, hosted, selected, refresh, passive, banner]);
+  }, [active, hosted, selected, passive, banner]);
   const focusPane = (leafId: string, item: PaneItem | null) => {
     // A click in a pane is the operator's own choice
     cancelBanner();
-    setPassive('');
+    markPassive('');
     setFocusedPane(leafId);
     if (item?.kind === 'session' && item.id) {
       setSelected(item.id);
@@ -1265,7 +1294,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
               const el = slotEls.get(id);
               if (!el) return null;
               const selectedPane = selected === id && focusedItem?.kind === 'session' && focusedItem.id === id;
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane && !banner && passive !== id} passive={!!banner || passive === id} onActive={() => { cancelBanner(); setPassive(p => p === id ? '' : p); }} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane && passive !== id} passive={passive === id} onActive={() => { if (passiveNow.current === id) markPassive(''); }} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );

@@ -462,7 +462,8 @@ export const harnessApi = {
   /** Ends every session and both processes after a native dialog; resolves to whether it was done */
   stopBackground: (uninstall: boolean) => invoke<boolean>('harness_background_stop', { uninstall }),
   list: () => invoke<{ sessions: Hosted[] }>('harness_list').then(r => r.sessions),
-  listSince: (stamp: string) => invoke<{ stamp: string; sessions: Hosted[] | null }>('harness_list_since', { stamp: stamp || null }),
+  // `bannerPending`: the app holds a banner click the page has not taken yet (MCR-180)
+  listSince: (stamp: string) => invoke<{ stamp: string; sessions: Hosted[] | null; bannerPending?: boolean }>('harness_list_since', { stamp: stamp || null }),
   /** `supervisor`: the session the new one works for, as its executor */
   spawn: (profile: string, cwd: string, cols: number, rows: number, resume?: string, supervisor?: string) => invoke<Hosted>('harness_spawn', { profile, cwd, cols, rows, resume, supervisor: supervisor ?? null }),
   /** Connect a session to a supervising one (asked in a native dialog; null when the person said no), or detach it */
