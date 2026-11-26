@@ -2487,7 +2487,10 @@ fn open_files(pid: i32) -> Option<Vec<PathBuf>> {
 }
 
 /// Not read on other systems: no proof from the rollouts there.
+/// Test builds read the open files from `Harness.open` instead, so nothing
+/// calls this stub there (Windows CI, MCR-179).
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg_attr(test, allow(dead_code))]
 fn open_files(_pid: i32) -> Option<Vec<PathBuf>> {
     None
 }
