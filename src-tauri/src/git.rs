@@ -34,6 +34,15 @@ impl std::error::Error for Error {}
 
 /// Callers supply a fixed Git subcommand followed by its arguments. Place user
 /// data in operands. Check the exit status before using the output.
+///
+/// The guards cover the subcommands used so far: plumbing (`rev-parse`,
+/// `ls-files`, `show-ref`, `merge-base`, `config`, `read-tree`,
+/// `checkout-index`, `symbolic-ref`, `check-ref-format`), `worktree`,
+/// `status`, and `diff`, `show` and `log`, which also get `--no-ext-diff` and
+/// `--no-textconv`. Formats must not use the `%G` signature placeholders, which
+/// run the configured gpg program. `blame`, `grep --textconv` and
+/// `cat-file --textconv` are not guarded: they would still run a configured
+/// textconv program. Add a guard here before calling them.
 pub fn run(
     cwd: &Path,
     args: &[impl AsRef<OsStr>],
@@ -153,6 +162,9 @@ fn local_command(cwd: &Path) -> Command {
             "status.submoduleSummary=false",
             "-c",
             "submodule.recurse=false",
+            // A signed commit in log or show would run the configured gpg program.
+            "-c",
+            "log.showSignature=false",
         ])
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -357,6 +369,24 @@ mod tests {
         let hooks = cwd.join(".git/test-hooks");
         fs::create_dir(&hooks).unwrap();
         fs::copy(&probe, hooks.join("post-checkout")).unwrap();
+        // A commit with a signature header (no key needed) makes log run gpg.
+        let head = raw(&["cat-file", "commit", "HEAD"]).stdout;
+        let head = String::from_utf8(head).unwrap();
+        let (headers, message) = head.split_once("\n\n").unwrap();
+        let signed = format!("{headers}\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\n{message}");
+        let mut hash = Command::new("git")
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut hash.stdin.take().unwrap(), signed.as_bytes()).unwrap();
+        let hash = hash.wait_with_output().unwrap();
+        assert!(hash.status.success(), "{hash:?}");
+        setup(&["update-ref", "HEAD", String::from_utf8(hash.stdout).unwrap().trim()]);
 
         for (key, value, args) in [
             (
@@ -390,8 +420,13 @@ mod tests {
                 probe_cmd,
                 &["checkout-index", "--all", "--index"][..],
             ),
+            ("gpg.program", probe_cmd, &["log", "-1"][..]),
+            ("gpg.program", probe_cmd, &["show", "-s", "HEAD"][..]),
         ] {
             setup(&["config", "--local", key, value]);
+            if key == "gpg.program" {
+                setup(&["config", "--local", "log.showSignature", "true"]);
+            }
             if key.starts_with("filter.") && !key.ends_with(".smudge") {
                 setup(&["config", "--local", "filter.a=b.required", "true"]);
             }
@@ -413,6 +448,9 @@ mod tests {
             assert!(output.status.success(), "{key}: {output:?}");
             assert!(!marker.exists(), "{key} ran");
             setup(&["config", "--local", "--unset", key]);
+            if key == "gpg.program" {
+                setup(&["config", "--local", "--unset", "log.showSignature"]);
+            }
             if key.starts_with("filter.") && !key.ends_with(".smudge") {
                 setup(&["config", "--local", "--unset", "filter.a=b.required"]);
             }
