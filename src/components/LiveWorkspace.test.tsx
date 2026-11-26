@@ -16,6 +16,10 @@ vi.mock('./SessionRow', async importOriginal => {
   return { ...original, hostedDetail: vi.fn(original.hostedDetail) };
 });
 vi.mock('../utils/tauri', () => ({ isTauri: () => true, pickDirectory: vi.fn() }));
+// The panes beside a terminal: which session each was shown for (MCR-176)
+const sidePanes = vi.hoisted(() => [] as string[]);
+vi.mock('./ChangesPane', () => ({ default: ({ session, active }: { session: { id: string }; active: boolean }) => { sidePanes.push(`changes:${session.id}:${active}`); return <aside data-changes={session.id}/>; } }));
+vi.mock('./SessionStats', () => ({ default: ({ session }: { session: { id: string } }) => { sidePanes.push(`usage:${session.id}`); return <aside data-usage={session.id}/>; } }));
 // Terminals need a real canvas; the pane itself is exercised in the app
 // The link button stands for a click on `mcr:<linkTo>` in that terminal's text
 // and the stand-in takes the keyboard as the pane does: once per request, then says so. `mounts` counts its mounts.
@@ -1018,5 +1022,38 @@ describe('Live workspace', () => {
     expect(host.querySelector('.hs-gate')).toBeNull();
     expect(host.textContent).not.toContain('Runner pid');
     expect(host.querySelector('.hs-dir')).not.toBeNull();
+  });
+});
+
+describe('the pane beside the terminal (MCR-176)', () => {
+  beforeEach(() => { localStorage.removeItem('hs-side'); localStorage.removeItem('hs-stats'); sidePanes.length = 0; });
+  const toggle = (label: string) => [...host.querySelectorAll('.hs-pane-title .hs-stats-toggle')].find(b => b.textContent?.includes(label)) as HTMLButtonElement;
+
+  it('opens Changes for the session the pane shows, one side pane at a time, and keeps the choice', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
+    await act(async () => rows().find(r => r.textContent?.includes('Fixing tests'))!.querySelector('button')!.click());
+    expect(host.querySelector('[data-changes]')).toBeNull();
+    await act(async () => toggle('Changes').click());
+    expect(host.querySelector('[data-changes]')?.getAttribute('data-changes')).toBe('r1');
+    expect(sidePanes.every(p => p === 'changes:r1:true')).toBe(true);
+    expect(toggle('Changes').getAttribute('aria-pressed')).toBe('true');
+    expect(localStorage.getItem('hs-side')).toBe('changes');
+    // Usage takes its place: never both
+    await act(async () => toggle('Usage').click());
+    expect(host.querySelector('[data-changes]')).toBeNull();
+    expect(host.querySelector('[data-usage]')?.getAttribute('data-usage')).toBe('r1');
+    await act(async () => toggle('Usage').click());
+    expect(host.querySelector('[data-usage], [data-changes]')).toBeNull();
+    expect(localStorage.getItem('hs-side')).toBe('');
+  });
+
+  it('reads the older usage key', async () => {
+    localStorage.setItem('hs-stats', '1');
+    vi.mocked(harnessApi.list).mockResolvedValue([running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>));
+    await act(async () => rows().find(r => r.textContent?.includes('Fixing tests'))!.querySelector('button')!.click());
+    expect(toggle('Usage').getAttribute('aria-pressed')).toBe('true');
+    expect(toggle('Changes').getAttribute('aria-pressed')).toBe('false');
   });
 });

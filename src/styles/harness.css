@@ -313,6 +313,42 @@
 .hs-stats li.hs-stats-more { display: block; color: var(--sc-muted); }
 .hs-stats-note { margin: 8px 0 0; color: var(--sc-muted); font-size: 11px; line-height: 1.4; }
 
+/* Changes of the selected session's work tree, beside its terminal (MCR-176). Read only */
+.hs-stats.hs-changes { flex-basis: clamp(300px, 42%, 760px); display: flex; flex-direction: column; padding-top: 6px; }
+.hs-changes-head { display: flex; align-items: center; gap: 6px; padding: 2px 0 6px; border-bottom: 1px solid var(--sc-border); color: var(--sc-muted); }
+.hs-changes-head strong { color: var(--sc-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.hs-changes-sha { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; user-select: all; }
+.hs-changes-refresh { margin-left: auto; flex: 0 0 auto; display: inline-flex; padding: 3px; border: 1px solid var(--sc-border); border-radius: 4px; background: transparent; color: var(--sc-muted); cursor: pointer; }
+.hs-changes-refresh:hover:not(:disabled) { color: var(--sc-accent); border-color: var(--sc-accent); }
+.hs-changes-refresh:disabled { opacity: .5; cursor: default; }
+.hs-changes-tracks p { margin: 0 0 3px; }
+.hs-changes-label { display: inline-block; min-width: 62px; color: var(--sc-muted); }
+.hs-changes-hidden { display: flex; align-items: flex-start; gap: 5px; margin: 6px 0 0; padding: 4px 6px; border-radius: 4px; background: rgba(240, 138, 75, .14); color: #f08a4b; font-size: 11px; line-height: 1.4; }
+.hs-changes-hidden svg { flex: 0 0 auto; margin-top: 2px; }
+.hs-changes-error { color: #e07a7a; }
+.hs-stats .hs-changes-commits li { grid-template-columns: auto minmax(0, 1fr); }
+.hs-stats .hs-changes-commits li span { text-align: left; color: var(--sc-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-changes-commits code { font-size: 11px; color: var(--sc-muted); }
+.hs-stats .hs-changes-files li { display: block; padding: 0; }
+.hs-changes-files button { width: 100%; display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 6px; align-items: baseline; padding: 2px 4px; border: 0; border-radius: 3px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.hs-changes-files button:hover { background: var(--sc-card); }
+.hs-changes-files button[aria-pressed='true'] { background: var(--sc-card); box-shadow: inset 2px 0 0 var(--sc-accent); }
+.hs-changes-status { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; color: var(--sc-muted); }
+.hs-changes-status.s-A { color: #5fb98a; }
+.hs-changes-status.s-D { color: #e07a7a; }
+.hs-changes-counts { font-variant-numeric: tabular-nums; color: var(--sc-muted); font-size: 11px; }
+.hs-changes-untracked { overflow-wrap: anywhere; }
+.hs-changes-diff { border-bottom: 0; min-height: 0; }
+.hs-changes-diff h4 { text-transform: none; letter-spacing: 0; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-diff { margin: 0; padding: 4px 0; overflow: auto; display: grid; grid-template-columns: minmax(100%, max-content); font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; line-height: 1.45; background: var(--sc-bg); border: 1px solid var(--sc-border); border-radius: 4px; }
+.hs-diff span { display: block; padding: 0 8px; white-space: pre; }
+.hs-diff-meta { color: var(--sc-muted); }
+.hs-diff-hunk { color: #6aa8d8; background: rgba(106, 168, 216, .08); }
+.hs-diff-add { background: rgba(95, 185, 138, .16); }
+.hs-diff-del { background: rgba(224, 122, 122, .16); }
+.hs-diff-hidden { color: #f08a4b; font-style: italic; }
+.hs-diff-note { color: var(--sc-muted); font-style: italic; }
+
 /* Shell commands an agent has running: rows under it, like subagents */
 .hs-list ul.hs-shells li { align-items: center; color: var(--sc-accent); }
 .hs-list ul.hs-shells li > svg { flex: 0 0 auto; }
