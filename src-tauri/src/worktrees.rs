@@ -736,7 +736,7 @@ pub mod tests {
         let bytes = managed.cleanup(deadline()).unwrap();
         assert!(bytes >= 32 * 1024);
         assert!(!managed.path.exists());
-        assert_eq!(removed_from(), [repo.clone()]);
+        assert_eq!(removed_from(), std::slice::from_ref(&repo));
         assert!(repo.join("tracked").exists());
         assert!(!git(&repo, &["rev-parse", "--verify", "refs/heads/feature/one"]).is_empty());
     }
@@ -867,7 +867,7 @@ pub mod tests {
             !path.exists(),
             "a launch that never spawned rolls back its scratch checkout"
         );
-        assert_eq!(removed_from(), [repo.clone()], "the rollback runs from the main checkout");
+        assert_eq!(removed_from(), std::slice::from_ref(&repo), "the rollback runs from the main checkout");
         let managed = make(&repo, request).keep();
         fs::write(managed.path.join("tracked"), "change").unwrap();
         git(&managed.path, &["commit", "-qam", "detached work"]);
