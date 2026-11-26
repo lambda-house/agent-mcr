@@ -13,7 +13,7 @@
 //! kernel, as for `mcr`) and written to the local log; it is not sent on.
 
 use crate::runner::{lock, now_ms};
-use crate::vault::Vault;
+use crate::vault::{Unavailable, Vault};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -74,6 +74,9 @@ pub enum Fail {
     /// result (see `lacks_model_key`); the HTTP status 402 means the same
     NoModelKey,
     Unreachable(String),
+    /// The secret store did not say whether the sign-in is there (locked,
+    /// refused, no answer): the sign-in is kept, and the call is told
+    Vault(Unavailable),
     Refused(String),
     /// The remote's own JSON-RPC error, passed on as it is
     Rpc(Value),
@@ -86,6 +89,7 @@ impl Fail {
             Fail::SignedOut => "Memory's sign-in is no longer valid. The operator signs in again in Agent MCR (Settings, Memory).".into(),
             Fail::NoModelKey => "The memory service has no model key for this tenant, so it cannot answer this call. Calls that need no model, such as lists and reads, still work. Tell the operator.".into(),
             Fail::Unreachable(e) => format!("The memory service could not be reached: {e}"),
+            Fail::Vault(why) => format!("Memory's sign-in could not be read from the secret store: {}. The sign-in is kept, and calls work again once the store can be read. Tell the operator if this lasts.", why.0),
             Fail::Refused(e) => format!("The memory service refused the call: {e}"),
             Fail::Rpc(e) => e["message"].as_str().unwrap_or("The memory service answered with an error").to_string(),
         }
@@ -96,6 +100,7 @@ impl Fail {
             Fail::SignedOut => "signed_out",
             Fail::NoModelKey => "no_model_key",
             Fail::Unreachable(_) => "unreachable",
+            Fail::Vault(_) => "vault_unavailable",
             Fail::Refused(_) | Fail::Rpc(_) => "refused",
         }
     }
@@ -393,22 +398,29 @@ impl Link {
         self.change(|s| s.problem = Some(problem));
     }
 
-    fn forget_tokens(&self) {
+    /// Take every token out of the vault. All are tried; the first reason one
+    /// could not be removed is returned.
+    fn forget_tokens(&self) -> Result<(), Unavailable> {
+        let mut removed = Ok(());
         for account in ["access", "refresh", "client", "meta"] {
-            self.vault.delete(account);
+            if let Err(why) = self.vault.delete(account) {
+                eprintln!("memory: `{account}` could not be removed from the secret store: {}", why.0);
+                removed = removed.and(Err(why));
+            }
         }
         *lock(&self.meta) = None;
+        removed
     }
 
     /// Where the tokens of this sign-in go: read from the vault, where the
     /// sign-in put it, and held to the rule of the sign-in once more. Never
-    /// from the state file.
-    fn meta(&self) -> Option<Meta> {
+    /// from the state file. `Ok(None)`: the vault holds none that holds.
+    fn meta(&self) -> Result<Option<Meta>, Unavailable> {
         let mut held = lock(&self.meta);
         if held.is_none() {
-            *held = self.vault.get("meta").and_then(|text| serde_json::from_str::<Meta>(&text).ok()).filter(Meta::sound);
+            *held = self.vault.get("meta")?.and_then(|text| serde_json::from_str::<Meta>(&text).ok()).filter(Meta::sound);
         }
-        held.clone()
+        Ok(held.clone())
     }
 
     /// Keep the authorization server's description with the secrets.
@@ -431,7 +443,8 @@ impl Link {
             return Fail::NotConnected;
         }
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        self.forget_tokens();
+        // What could not be removed is no longer used, and the next sign-in replaces it
+        let _ = self.forget_tokens();
         let problem = Problem { kind: "signed_out".into(), text: Fail::SignedOut.text(), at: now_ms() };
         self.change(|s| {
             s.state = "signed_out".into();
@@ -453,19 +466,22 @@ impl Link {
             _ => return Err(Fail::NotConnected),
         }
         let due = state.access_expires != 0 && now_ms() + RENEW_BEFORE_MS >= state.access_expires;
-        if let Some(access) = self.vault.get("access") {
+        // A vault that cannot be read says nothing about the sign-in: it is kept (`Fail::Vault`)
+        if let Some(access) = self.vault.get("access").map_err(Fail::Vault)? {
             let refused = spent == Some(access.as_str());
             if !refused && (spent.is_some() || !due) {
                 return Ok(access);
             }
         }
         // Without a description that holds, there is nowhere a token may be sent
-        let Some(meta) = self.meta() else { return Err(self.signed_out(epoch)) };
+        let Some(meta) = self.meta().map_err(Fail::Vault)? else { return Err(self.signed_out(epoch)) };
         self.refresh(&meta, epoch)
     }
 
     fn refresh(&self, meta: &Meta, epoch: u64) -> Result<String, Fail> {
-        let (Some(refresh), Some(client)) = (self.vault.get("refresh"), self.vault.get("client")) else { return Err(self.signed_out(epoch)) };
+        let (refresh, client) = (self.vault.get("refresh").map_err(Fail::Vault)?, self.vault.get("client").map_err(Fail::Vault)?);
+        // Only a vault that says the grant is not there ends the sign-in
+        let (Some(refresh), Some(client)) = (refresh, client) else { return Err(self.signed_out(epoch)) };
         let form = [("grant_type", "refresh_token"), ("refresh_token", refresh.as_str()), ("client_id", client.as_str()), ("resource", self.endpoint.as_str())];
         let sent = self.agent.post(&meta.token_endpoint).timeout(QUICK).set("Accept", "application/json").send_form(&form);
         let answer = match sent {
@@ -797,7 +813,7 @@ impl Memory {
         json!({
             "state": if state.state.is_empty() { "disconnected" } else { state.state.as_str() },
             "endpoint": self.link.endpoint,
-            "issuer": if state.state == "connected" { self.link.meta().map(|m| m.issuer) } else { None },
+            "issuer": if state.state == "connected" { self.link.meta().ok().flatten().map(|m| m.issuer) } else { None },
             "since": state.since,
             "defaultMemory": DEFAULT_MEMORY,
             "problem": state.problem,
@@ -912,7 +928,7 @@ impl Memory {
                     if called_off() {
                         return;
                     }
-                    link.forget_tokens();
+                    let _ = link.forget_tokens();
                     link.change(|s| {
                         s.state = String::new();
                         s.access_expires = 0;
@@ -986,39 +1002,57 @@ impl Memory {
     }
 
     /// End the connection: the grant is revoked at the authorization server
-    /// and the tokens leave the Keychain, whatever the server answers.
+    /// and the tokens leave the vault, whatever the server answers. What could
+    /// not be done is said: a vault that cannot be read gives nothing to revoke.
     pub fn disconnect(&self) -> Value {
         let link = &self.link;
         // In one step with a sign-in or a renewal that is about to keep its tokens
         // (`keeping`): either it kept them and they are taken here, or it sees that
         // it was called off. Nothing here waits for a call that is under way: the
         // app waits ten seconds at most, and a renewal may take longer
-        let held = {
+        let (held, removed) = {
             let _kept = lock(&link.keeping);
             self.flow.fetch_add(1, Ordering::SeqCst);
             link.epoch.fetch_add(1, Ordering::SeqCst);
             let held = (link.meta(), link.vault.get("client"), link.vault.get("refresh"));
-            link.forget_tokens();
+            let removed = link.forget_tokens();
             link.change(|s| {
                 s.state = String::new();
                 s.since = 0;
                 s.access_expires = 0;
                 s.problem = None;
             });
-            held
+            (held, removed)
         };
         self.backend.reset();
         *lock(&self.tools) = None;
         // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
-        if let (Some(meta), Some(client), Some(token)) = held {
-            if !link.revoke(&meta, &client, &token) {
-                let unrevoked = Problem { kind: "not_revoked".into(), text: "The tokens are removed from this Mac, but the memory service did not confirm that the sign-in is revoked there. It may still be valid on that side: revoke it in the memory console.".into(), at: now_ms() };
-                link.change(|s| {
-                    if s.state.is_empty() {
-                        s.problem = Some(unrevoked);
-                    }
-                });
-            }
+        let revoked = match held {
+            (Ok(Some(meta)), Ok(Some(client)), Ok(Some(token))) => Ok(link.revoke(&meta, &client, &token)),
+            (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => Err(why),
+            // Nothing was signed in: there is no grant to end
+            _ => Ok(true),
+        };
+        let told = match (revoked, removed) {
+            (Ok(true), Ok(())) => None,
+            (Ok(false), Ok(())) => Some(("not_revoked", "The tokens are removed from this computer, but the memory service did not confirm that the sign-in is revoked there. It may still be valid on that side: revoke it in the memory console.".to_string())),
+            (Err(why), Ok(())) => Some(("not_revoked", format!("The tokens are removed from this computer, but the secret store could not be read before ({}), so the memory service was not asked to revoke the sign-in. It may still be valid on that side: revoke it in the memory console.", why.0))),
+            (revoked, Err(why)) => Some((
+                "not_removed",
+                format!(
+                    "Memory is disconnected, but the secret store could not remove its tokens ({}). Nothing uses them any more, and the next Connect replaces them.{}",
+                    why.0,
+                    if revoked == Ok(true) { "" } else { " The memory service did not confirm that the sign-in is revoked: revoke it in the memory console." }
+                ),
+            )),
+        };
+        if let Some((kind, text)) = told {
+            let problem = Problem { kind: kind.into(), text, at: now_ms() };
+            link.change(|s| {
+                if s.state.is_empty() {
+                    s.problem = Some(problem);
+                }
+            });
         }
         self.status()
     }
@@ -1040,9 +1074,9 @@ impl Memory {
     /// The backend's answer, with what it says about the connection kept for the operator.
     fn noted<T>(&self, result: Result<T, Fail>) -> Result<T, Fail> {
         match &result {
-            Err(fail @ (Fail::NoModelKey | Fail::Unreachable(_) | Fail::Refused(_))) => self.link.problem(fail),
-            // A call that got through says the earlier trouble with the service is over
-            Ok(_) if self.link.snapshot().problem.as_ref().is_some_and(|p| p.kind == "unreachable" || p.kind == "refused") => self.link.change(|s| s.problem = None),
+            Err(fail @ (Fail::NoModelKey | Fail::Unreachable(_) | Fail::Vault(_) | Fail::Refused(_))) => self.link.problem(fail),
+            // A call that got through says the earlier trouble with the service or the vault is over
+            Ok(_) if self.link.snapshot().problem.as_ref().is_some_and(|p| ["unreachable", "vault_unavailable", "refused"].contains(&p.kind.as_str())) => self.link.change(|s| s.problem = None),
             _ => {}
         }
         result
@@ -1168,18 +1202,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::vault::Held;
     use std::collections::BTreeMap;
-
-    impl Vault for Arc<Held> {
-        fn get(&self, account: &str) -> Option<String> {
-            (**self).get(account)
-        }
-        fn set(&self, account: &str, secret: &str) -> Result<(), String> {
-            (**self).set(account, secret)
-        }
-        fn delete(&self, account: &str) {
-            (**self).delete(account)
-        }
-    }
 
     struct Req {
         method: String,
@@ -1503,9 +1525,9 @@ pub(crate) mod tests {
         let registered = lock(&rig.world).registered[0].clone();
         assert_eq!(registered["token_endpoint_auth_method"], "none");
         assert!(registered["redirect_uris"][0].as_str().unwrap().starts_with("http://127.0.0.1:"));
-        assert_eq!(rig.vault.get("access").as_deref(), Some("access-secret-1"));
-        assert_eq!(rig.vault.get("refresh").as_deref(), Some("refresh-secret-1"));
-        assert_eq!(rig.vault.get("client").as_deref(), Some("client-1"));
+        assert_eq!(rig.vault.get("access").unwrap().as_deref(), Some("access-secret-1"));
+        assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-1"));
+        assert_eq!(rig.vault.get("client").unwrap().as_deref(), Some("client-1"));
         let visible = rig.visible();
         assert!(!visible.contains("secret") && visible.contains(&base), "{visible}");
         // The state is the person's alone
@@ -1648,8 +1670,8 @@ pub(crate) mod tests {
         assert_eq!(rig.call("clock", json!({}))["result"]["isError"], false);
         assert_eq!(lock(&rig.world).count("POST /oauth/token"), 2);
         // The rotated pair is kept, the spent one is gone
-        assert_eq!(rig.vault.get("refresh").as_deref(), Some("refresh-secret-2"));
-        assert_eq!(rig.vault.get("access").as_deref(), Some("access-secret-2"));
+        assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-2"));
+        assert_eq!(rig.vault.get("access").unwrap().as_deref(), Some("access-secret-2"));
         assert_eq!(lock(&rig.world).spent, ["refresh-secret-1"]);
         // Somebody who was refused with the old token finds the new one and does not renew again
         assert_eq!(rig.memory.link.bearer(Some("access-secret-1")).unwrap(), "access-secret-2");
@@ -1715,7 +1737,7 @@ pub(crate) mod tests {
             assert!(text.contains(refusal.1) && text.contains("The sign-in is kept"), "{text}");
             // Nothing is thrown away over an answer that does not say the grant ended
             assert_eq!(rig.state(), "connected");
-            assert_eq!(rig.vault.get("refresh").as_deref(), Some("refresh-secret-1"));
+            assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-1"));
             assert_eq!(rig.memory.status()["problem"]["kind"], "refused");
         }
         // When it does say so, the sign-in is over
@@ -1746,11 +1768,45 @@ pub(crate) mod tests {
         assert!(told["result"]["content"][0]["text"].as_str().unwrap().starts_with("The memory service could not be reached"), "{told}");
         assert_eq!(rig.state(), "connected");
         assert_eq!(rig.memory.status()["problem"]["kind"], "unreachable");
-        assert_eq!(rig.vault.get("refresh").as_deref(), Some("refresh-secret-1"));
+        assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-1"));
         // It comes back: the kept token still renews, and the trouble is no longer shown
         lock(&rig.world).token_fails = false;
         assert_eq!(rig.call("clock", json!({}))["result"]["isError"], false);
         assert!(rig.memory.status()["problem"].is_null());
+    }
+
+    #[test]
+    fn a_vault_that_cannot_be_read_does_not_cost_the_sign_in() {
+        let rig = Rig::signed_in();
+        // The token is due for renewal, and the vault is locked
+        rig.memory.link.change(|s| s.access_expires = now_ms() + 1000);
+        let locked = Unavailable("the vault is locked");
+        rig.vault.refuse(Some(locked));
+        let told = rig.call("clock", json!({}));
+        assert_eq!(told["result"]["isError"], true, "{told}");
+        assert_eq!(told["result"]["content"][0]["text"], Fail::Vault(locked).text());
+        // Neither signed out nor renewed: nothing was taken for a grant that is gone
+        assert_eq!(rig.state(), "connected");
+        assert_eq!(rig.memory.status()["problem"]["kind"], "vault_unavailable");
+        assert_eq!(lock(&rig.world).count("POST /oauth/token"), 1);
+        // The vault opens again: the kept token renews, and the trouble is no longer shown
+        rig.vault.refuse(None);
+        assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-1"));
+        assert_eq!(rig.call("clock", json!({}))["result"]["isError"], false);
+        assert_eq!(lock(&rig.world).count("POST /oauth/token"), 2);
+        assert!(rig.memory.status()["problem"].is_null());
+    }
+
+    #[test]
+    fn a_grant_the_vault_says_it_does_not_hold_is_over() {
+        let rig = Rig::signed_in();
+        rig.memory.link.change(|s| s.access_expires = now_ms() + 1000);
+        rig.vault.delete("refresh").unwrap();
+        assert_eq!(rig.call("clock", json!({}))["result"]["content"][0]["text"], Fail::SignedOut.text());
+        assert_eq!(rig.state(), "signed_out");
+        assert!(rig.vault.0.lock().unwrap().is_empty());
+        // Nothing was sent to renew with
+        assert_eq!(lock(&rig.world).count("POST /oauth/token"), 1);
     }
 
     #[test]
@@ -1763,12 +1819,34 @@ pub(crate) mod tests {
         assert!(rig.memory.status()["problem"].is_null());
         assert_eq!(rig.ask("tools/list", json!({}))["result"]["tools"], json!([]));
 
-        // When the other side cannot be told, the tokens still leave this Mac, and the person is told
+        // When the other side cannot be told, the tokens still leave this computer, and the person is told
         let rig = Rig::signed_in();
         lock(&rig.world).revoke_fails = true;
         let status = rig.memory.disconnect();
         assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_revoked")));
         assert!(rig.vault.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_disconnect_that_cannot_reach_the_vault_says_what_is_left() {
+        let rig = Rig::signed_in();
+        rig.vault.refuse(Some(Unavailable("the vault is locked")));
+        let status = rig.memory.disconnect();
+        assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_removed")));
+        let text = status["problem"]["text"].as_str().unwrap();
+        assert!(text.contains("(the vault is locked)") && text.contains("revoke it in the memory console"), "{text}");
+        // The refresh token could not be read, so nothing was revoked
+        assert!(lock(&rig.world).revoked.is_empty());
+        // What stayed in the vault is not used, and the next sign-in replaces it
+        rig.vault.refuse(None);
+        assert!(!rig.vault.0.lock().unwrap().is_empty());
+        assert_eq!(rig.memory.link.bearer(None), Err(Fail::NotConnected));
+        assert_eq!(rig.ask("tools/list", json!({}))["result"]["tools"], json!([]));
+        let url = rig.memory.connect().unwrap()["url"].as_str().unwrap().to_string();
+        assert!(rig.browse(&url, |_| {}).contains("Memory is connected"));
+        rig.settle();
+        assert_eq!(rig.state(), "connected");
+        assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-2"));
     }
 
     #[test]
@@ -1952,10 +2030,10 @@ pub(crate) mod tests {
         // The renewal was not given up half way: a refresh token that was sent is spent,
         // so its answer is waited for and kept
         let until = Instant::now() + Duration::from_secs(5);
-        while rig.vault.get("refresh").as_deref() != Some("refresh-secret-2") && Instant::now() < until {
+        while rig.vault.get("refresh").unwrap().as_deref() != Some("refresh-secret-2") && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(rig.vault.get("refresh").as_deref(), Some("refresh-secret-2"));
+        assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-2"));
         assert_eq!(rig.state(), "connected");
         lock(&rig.world).token_slow = Duration::ZERO;
         std::thread::sleep(AWAY_FOR.min(Duration::from_millis(50)));

@@ -8,7 +8,7 @@
 //! status, tool result, log line or audit row carries them.
 
 use crate::runner::{lock, now_ms, random_id};
-use crate::vault::{Keychain, Vault};
+use crate::vault::{Keychain, Unavailable, Vault};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -378,6 +378,12 @@ fn clean(text: &str, max: usize) -> String {
     text.trim().chars().filter(|c| !c.is_control() || *c == '\n').take(max).collect()
 }
 
+/// Why nothing goes to Slack while the vault cannot say whether the tokens
+/// are there. The connection is kept: the tokens are not taken for gone.
+fn unreadable(why: Unavailable) -> String {
+    format!("The Slack tokens cannot be read from the secret store now ({})", why.0)
+}
+
 /// Agent text as Slack shows it without parsing anything: plain-text blocks of at most 2900 characters.
 fn text_blocks(text: &str) -> Vec<Value> {
     let chars: Vec<char> = text.chars().collect();
@@ -427,7 +433,11 @@ impl Slack {
     }
 
     fn bot(&self) -> Result<String, String> {
-        self.vault.get("bot").ok_or_else(|| "Slack is not connected".to_string())
+        match self.vault.get("bot") {
+            Ok(Some(bot)) => Ok(bot),
+            Ok(None) => Err("Slack is not connected".into()),
+            Err(why) => Err(unreadable(why)),
+        }
     }
 
     fn api(&self, method: &str, params: &[(&str, String)]) -> Result<Value, Fail> {
@@ -545,7 +555,8 @@ impl Slack {
         let found = self.probe(bot, app, operator)?;
         self.vault.set("bot", bot)?;
         if let Err(e) = self.vault.set("app", app) {
-            self.vault.delete("bot");
+            // A bot token left behind is not used: nothing is connected, and the next connect replaces it
+            let _ = self.vault.delete("bot");
             return Err(e);
         }
         let text = |key: &str| found[key].as_str().unwrap_or("").to_string();
@@ -569,12 +580,15 @@ impl Slack {
 
     pub fn disconnect(&self, host: &dyn Host) {
         self.cancel_open(host, "Slack was disconnected");
-        self.vault.delete("bot");
-        self.vault.delete("app");
+        // Both are tried; what could not be removed is said in the audit
+        let removed = self.vault.delete("bot").and(self.vault.delete("app"));
         self.update(|s| {
             s.connection = None;
             s.enabled = false;
-            s.log("disconnected", String::new());
+            s.log("disconnected", match removed {
+                Ok(()) => String::new(),
+                Err(why) => format!("the tokens could not be removed from the secret store ({}); nothing uses them, and the next connect replaces them", why.0),
+            });
         });
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
@@ -1261,7 +1275,8 @@ impl Slack {
     /// One round of the work that talks to Slack: approval messages, sending,
     /// settling unknown outcomes, catching up. Returns whether anything was done.
     pub fn work(&self, host: &dyn Host) -> bool {
-        if !self.active() || self.vault.get("bot").is_none() {
+        // Nothing goes out while the tokens cannot be read either; the listener says why
+        if !self.active() || !matches!(self.vault.get("bot"), Ok(Some(_))) {
             return false;
         }
         if !self.saved() {
@@ -1530,11 +1545,15 @@ impl Slack {
             let mut pause = 1;
             loop {
                 let epoch = slack.epoch.load(Ordering::SeqCst);
-                let app = slack.vault.get("app").filter(|_| slack.active());
-                let Some(app) = app else {
-                    slack.set_link("off", "");
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
+                let app = if slack.active() { slack.vault.get("app") } else { Ok(None) };
+                let app = match app {
+                    Ok(Some(app)) => app,
+                    // Off, or the tokens cannot be read now: looked at again shortly
+                    other => {
+                        slack.set_link("off", &other.err().map(unreadable).unwrap_or_default());
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
                 };
                 slack.set_link(if lock(&slack.link).last_event == 0 { "connecting" } else { "reconnecting" }, "");
                 match slack.listen(&*host, &app, epoch) {
@@ -1693,6 +1712,7 @@ pub fn agent_tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::Held;
 
     type Params = Vec<(String, String)>;
 
@@ -1733,22 +1753,6 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Memory(Mutex<BTreeMap<String, String>>);
-
-    impl Vault for Memory {
-        fn get(&self, account: &str) -> Option<String> {
-            lock(&self.0).get(account).cloned()
-        }
-        fn set(&self, account: &str, secret: &str) -> Result<(), String> {
-            lock(&self.0).insert(account.into(), secret.into());
-            Ok(())
-        }
-        fn delete(&self, account: &str) {
-            lock(&self.0).remove(account);
-        }
-    }
-
-    #[derive(Default)]
     struct FakeHost {
         inbox: Mutex<Vec<(String, String, String, Value)>>,
         notices: Mutex<Vec<String>>,
@@ -1769,9 +1773,13 @@ mod tests {
     }
 
     fn connected(posting: &str) -> (tempdir::Dir, Slack, Arc<FakeWeb>, FakeHost) {
+        connected_to(posting, Box::new(Held::default()))
+    }
+
+    fn connected_to(posting: &str, vault: Box<dyn Vault>) -> (tempdir::Dir, Slack, Arc<FakeWeb>, FakeHost) {
         let dir = tempdir::Dir::new();
         let web = Arc::new(FakeWeb::default());
-        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let slack = Slack::with(dir.path(), Box::new(web.clone()), vault, 0);
         slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
         // Off from connect; the tests of approval in Slack are about a connection where the operator switched it on
         slack.set_slack_approval(true);
@@ -1961,7 +1969,7 @@ mod tests {
         // The stored state holds no token, and a new service reads the same policies
         let stored = std::fs::read_to_string(dir.path().join("slack-state.json")).unwrap();
         assert!(!stored.contains("xoxb-") && !stored.contains("xapp-") && !slack.status().to_string().contains("xoxb-"));
-        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Held::default()), 0);
         assert_eq!(lock(&again.state).channels["C1"].posting, "approve");
         assert_eq!(post_of(&again, &p.id).state, "cancelled");
     }
@@ -2117,6 +2125,36 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_sent_while_the_tokens_cannot_be_read_and_nothing_is_lost() {
+        let vault = Arc::new(Held::default());
+        let (_dir, slack, web, host) = connected_to("auto", Box::new(vault.clone()));
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "later"}));
+        assert_eq!(p.state, "approved");
+        // Locked: nothing goes out, the post stays allowed, and the connection stays
+        let locked = Unavailable("the vault is locked");
+        vault.refuse(Some(locked));
+        assert!(!slack.work(&host));
+        assert_eq!(web.count("chat.postMessage"), 0);
+        assert_eq!(post_of(&slack, &p.id).state, "approved");
+        assert_eq!(slack.bot(), Err(unreadable(locked)));
+        assert!(slack.status()["connection"].is_object());
+        // Open again: the post goes, once
+        vault.refuse(None);
+        while slack.work(&host) {}
+        assert_eq!(post_of(&slack, &p.id).state, "sent");
+        assert_eq!(web.count("chat.postMessage"), 1);
+        // A disconnect while it is locked says that the tokens stayed behind, where nothing uses them
+        vault.refuse(Some(locked));
+        slack.disconnect(&host);
+        let said = lock(&slack.state).audit.last().unwrap().text.clone();
+        assert!(said.contains("could not be removed") && said.contains("the vault is locked"), "{said}");
+        vault.refuse(None);
+        assert_eq!(vault.get("bot"), Ok(Some("xoxb-1".to_string())));
+        assert!(slack.status()["connection"].is_null());
+        assert!(!slack.work(&host));
+    }
+
+    #[test]
     fn a_session_is_told_only_the_channels_it_posts_to_or_hears_from() {
         let (_dir, slack, _web, host) = connected("never");
         let seen = |me: &str| slack.tool(&host, me, "slack_channels", &json!({})).unwrap()["channels"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap().to_string(), c["youMayPost"] == true, !c["listenedFor"].is_null())).collect::<Vec<_>>();
@@ -2146,7 +2184,7 @@ mod tests {
         let dir = tempdir::Dir::new();
         let web = Arc::new(FakeWeb::default());
         let host = FakeHost::default();
-        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Held::default()), 0);
         slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
         slack.set_policy("C1", &json!({"listen": "all", "route": "session", "session": "s1", "posting": "approve"})).unwrap();
         assert_eq!(slack.status()["connection"]["approveInSlack"], false);
@@ -2166,7 +2204,7 @@ mod tests {
         assert_eq!((post_of(&slack, &p.id).state.as_str(), web.count("conversations.open"), web.count("chat.postMessage")), ("sent", 0, 1));
         // Switched on by the operator, it is kept as stored: on after a restart, and a later post is asked about in Slack
         slack.set_slack_approval(true);
-        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Held::default()), 0);
         assert_eq!(again.status()["connection"]["approveInSlack"], true);
         ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "asked in Slack too"}));
         slack.work(&host);
