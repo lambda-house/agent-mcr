@@ -415,3 +415,32 @@ describe('a pane on a real terminal (review 17086)', () => {
     expect(keep.ids).toEqual(['a']);
   });
 });
+
+describe('a view a clicked banner shows (MCR-180)', () => {
+  // The browser xterm answers DECSET 1004 at once with the focus it has (CoreBrowserTerminal's
+  // _reportFocus): ESC [ O for a view without the keyboard. The headless one parses the mode
+  // and leaves the report to the browser, so the report goes in through the same onData here
+  const reportFocus = (focused: boolean) => { const t = last(); if (t.modes.sendFocusMode) t.input(focused ? '\x1b[I' : '\x1b[O', false); };
+
+  it('sends no focus report, nor any other answer, until the operator gives it the keyboard', async () => {
+    const onActive = vi.fn();
+    await act(async () => root.render(<TerminalPane id="shown" active passive onActive={onActive}/>)); await frame();
+    await answer('\x1b[?1004hthe agent turns on focus reports\r\n', 0);
+    expect(last().modes.sendFocusMode).toBe(true);
+    await act(async () => { reportFocus(false); });
+    await act(async () => { last().input('\x1b[1;1R', false); });
+    expect(harnessApi.input).not.toHaveBeenCalled();
+    expect(onActive).not.toHaveBeenCalled();
+    // The operator clicks into it: the view is theirs, and its focus report goes out
+    await act(async () => { host.querySelector('textarea')!.dispatchEvent(new FocusEvent('focus')); reportFocus(true); });
+    expect(onActive).toHaveBeenCalledOnce();
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\x1b[I']]);
+  });
+
+  it('a view the operator chose sends its focus report as before', async () => {
+    await act(async () => root.render(<TerminalPane id="chosen" active/>)); await frame();
+    await answer('\x1b[?1004h', 0);
+    await act(async () => { reportFocus(false); });
+    expect(vi.mocked(harnessApi.input).mock.calls).toEqual([[1, '\x1b[O']]);
+  });
+});

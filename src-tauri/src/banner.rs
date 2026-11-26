@@ -4,32 +4,34 @@
 //! instead of only bringing Agent MCR forward.
 //!
 //! macOS hands the click to a process of the bundle: the app or the service
-//! that posted it. Both listen, and in both the latest click wins: a click
+//! that posted it. Both listen and stamp the click with a clock the two
+//! share (`stamp`), so the latest click wins across both routes, and a click
 //! on a banner about no session takes back an earlier one. The service keeps
-//! it until `CLICK_KEEP` has passed, for the app to take with the control op
-//! `banner_clicked` (`take_clicked`). The app keeps what it has to open until
-//! its page takes it (`take_open`): a click that launched the app arrives
-//! before the page listens.
+//! its click until `CLICK_KEEP` has passed, for the app to take with the
+//! control op `banner_clicked` (`take_clicked`). The app asks only when
+//! there is reason to: when its main window gains the focus (macOS brings
+//! the app forward at the click), a few times and then no more
+//! (`FOCUS_ASKS`); once when a click reaches the app itself, to settle the
+//! order with one the service may hold; and with the Live list read it
+//! already makes (`sessions` with `bannerClick`). There is no poll of its
+//! own. The app keeps what it has to open until its page takes it
+//! (`take_open`): a click that launched the app arrives before the page
+//! listens.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Request identifiers of banners about a session: `session/<id>/<random>`.
 const SESSION_PREFIX: &str = "session/";
-/// How long the service keeps a click for the app. The app asks while its
-/// window has the focus, and macOS brings it forward at the click, so a
-/// click the app has not taken by then is not taken at a later, unrelated
-/// focus
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// How long the service keeps a click for the app. macOS brings the app
+/// forward at the click, so a click the app has not taken by then is not
+/// taken at a later, unrelated focus
 const CLICK_KEEP: Duration = Duration::from_secs(10);
-/// After the app's window gains the focus it asks the service this often,
-/// for `FOCUS_BURST`; then every `FOCUSED_EVERY` while it keeps the focus
+/// When the app asks the service after its main window gained the focus,
+/// counted from the focus: the click that brought it forward may reach the
+/// service a moment after the focus. Then it stops until the next focus
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const FOCUS_STEP: Duration = Duration::from_millis(250);
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const FOCUS_BURST: Duration = Duration::from_secs(3);
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const FOCUSED_EVERY: Duration = Duration::from_secs(2);
+pub const FOCUS_ASKS: [Duration; 5] = [Duration::from_millis(0), Duration::from_millis(200), Duration::from_millis(500), Duration::from_millis(1000), Duration::from_millis(2000)];
 
 /// The request identifier of a banner, naming its session if it has one.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -52,77 +54,90 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// In the service: the latest click, its session (none for a banner about
-/// none) and until when it is kept. A monotonic clock: a wall clock set back
-/// would keep a stale click.
-static CLICKED: Mutex<Option<(Option<String>, Instant)>> = Mutex::new(None);
+/// When a click came, in nanoseconds of a monotonic clock that the app and
+/// the service read alike (macOS: `CLOCK_UPTIME_RAW`, since boot), so the
+/// two processes' clicks can be ordered. No wall clock: one set back would
+/// misorder them.
+pub fn stamp() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut t) } == 0 {
+            return t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64;
+        }
+    }
+    // Elsewhere no banner is posted; a process-local clock keeps the order within the process
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 1
+}
+
+/// A click: its session (none for a banner about none) and its `stamp`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Click {
+    pub session: Option<String>,
+    pub at: u64,
+}
+
+/// In the service: the latest click and until when it is kept (a monotonic deadline).
+static CLICKED: Mutex<Option<(Click, Instant)>> = Mutex::new(None);
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn keep_clicked(session: Option<String>, now: Instant) {
-    *lock(&CLICKED) = Some((session, now + CLICK_KEEP));
+fn keep_clicked(click: Click, now: Instant) {
+    let mut slot = lock(&CLICKED);
+    if slot.as_ref().is_none_or(|(kept, _)| kept.at < click.at) {
+        *slot = Some((click, now + CLICK_KEEP));
+    }
 }
 
-fn take_clicked_at(now: Instant) -> Option<String> {
-    lock(&CLICKED).take().filter(|(_, until)| now < *until).and_then(|(s, _)| s)
+fn take_clicked_at(now: Instant) -> Option<Click> {
+    lock(&CLICKED).take().filter(|(_, until)| now < *until).map(|(click, _)| click)
 }
 
-/// In the service: the session of the latest banner clicked here, once, while it is kept.
-pub fn take_clicked() -> Option<String> {
+/// In the service: the latest click handed to it, once, while it is kept.
+pub fn take_clicked() -> Option<Click> {
     take_clicked_at(Instant::now())
 }
 
-/// In the app: what the latest click asks the page to open, until the page takes it.
-static OPEN: Mutex<Option<String>> = Mutex::new(None);
+/// The service's answer to `banner_clicked`, and the `bannerClick` of a list read.
+pub fn click_json(click: Option<Click>) -> serde_json::Value {
+    match click {
+        Some(c) => serde_json::json!({ "session": c.session, "at": c.at }),
+        None => serde_json::json!({ "session": null }),
+    }
+}
 
-/// In the app: a click to open; a click on a banner about no session takes back an earlier one.
-pub fn set_open(session: Option<String>) {
-    *lock(&OPEN) = session;
+/// The app's reading of that answer: a click, or none.
+pub fn click_from(answer: &serde_json::Value) -> Option<Click> {
+    let at = answer["at"].as_u64()?;
+    Some(Click { session: answer["session"].as_str().map(str::to_owned), at })
+}
+
+/// In the app: the session the page is to open, and the stamp of the latest
+/// click seen by either route, kept after the page took it, so an older
+/// click that comes later opens nothing.
+#[derive(Default)]
+struct Open {
+    session: Option<String>,
+    latest: u64,
+}
+
+static OPEN: Mutex<Open> = Mutex::new(Open { session: None, latest: 0 });
+
+/// In the app: a click from either route. Whether it is the latest and
+/// about a session, so that the page is to be told.
+pub fn offer(click: Click) -> bool {
+    let mut open = lock(&OPEN);
+    if click.at <= open.latest {
+        return false;
+    }
+    open.latest = click.at;
+    open.session = click.session;
+    open.session.is_some()
 }
 
 /// In the app: the session the page is to open, once.
 pub fn take_open() -> Option<String> {
-    lock(&OPEN).take()
-}
-
-/// When the app's window gained the focus, while it has it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-static FOCUSED_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// In the app: the main window gained or lost the focus.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn window_focused(focused: bool) {
-    *lock(&FOCUSED_SINCE) = focused.then(Instant::now);
-}
-
-/// Whether the app asks the service now: only while its window has the
-/// focus, often just after it gained it (the click that brought it forward
-/// may reach the service a moment later), then now and then (a click while
-/// the window already had the focus brings no new focus).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn ask_now(focused_since: Option<Instant>, last_asked: Option<Instant>, now: Instant) -> bool {
-    let Some(since) = focused_since else { return false };
-    let Some(last) = last_asked.filter(|last| *last >= since) else { return true };
-    let gap = now.saturating_duration_since(last);
-    if now.saturating_duration_since(since) < FOCUS_BURST { gap >= FOCUS_STEP } else { gap >= FOCUSED_EVERY }
-}
-
-/// In the app: ask the service for clicks it was handed, on its own thread
-/// for as long as the app runs. `ask` is one request; it must not start the
-/// service.
-#[cfg(target_os = "macos")]
-pub fn watch_service(ask: impl Fn() -> Option<String> + Send + 'static, opened: impl Fn(String) + Send + 'static) {
-    std::thread::spawn(move || {
-        let mut last: Option<Instant> = None;
-        loop {
-            std::thread::sleep(FOCUS_STEP / 2);
-            let now = Instant::now();
-            if !ask_now(*lock(&FOCUSED_SINCE), last, now) { continue; }
-            last = Some(now);
-            if let Some(session) = ask() {
-                opened(session);
-            }
-        }
-    });
+    lock(&OPEN).session.take()
 }
 
 #[cfg(target_os = "macos")]
@@ -143,7 +158,7 @@ mod mac {
     }
 
     pub struct Ivars {
-        clicked: Box<dyn Fn(Option<String>) + Send + Sync>,
+        clicked: Box<dyn Fn(super::Click) + Send + Sync>,
     }
 
     define_class!(
@@ -161,8 +176,9 @@ mod mac {
                 // A click on the banner itself; a dismissal or another action opens nothing
                 let default = unsafe { UNNotificationDefaultActionIdentifier };
                 if response.actionIdentifier().isEqualToString(default) {
+                    let at = super::stamp();
                     let id = response.notification().request().identifier().to_string();
-                    (self.ivars().clicked)(super::session_of(&id).map(str::to_owned));
+                    (self.ivars().clicked)(super::Click { session: super::session_of(&id).map(str::to_owned), at });
                 }
                 done.call(());
             }
@@ -178,7 +194,7 @@ mod mac {
 
     /// Hear clicks on this bundle's banners that macOS hands to this process.
     /// Call it early: a click that launches the app is handed over at launch.
-    pub fn listen(clicked: Box<dyn Fn(Option<String>) + Send + Sync>) {
+    pub fn listen(clicked: Box<dyn Fn(super::Click) + Send + Sync>) {
         if !bundled() { return; }
         let this = Delegate::alloc().set_ivars(Ivars { clicked });
         let delegate: Retained<Delegate> = unsafe { msg_send![super(this), init] };
@@ -221,8 +237,8 @@ pub fn post(title: &str, text: &str, session: Option<&str>) {
     let _ = (title, text, session);
 }
 
-/// In the app: hand every click on a banner to `clicked` (none: a banner about no session).
-pub fn listen_in_app(clicked: impl Fn(Option<String>) + Send + Sync + 'static) {
+/// In the app: hand every click on a banner to `clicked`.
+pub fn listen_in_app(clicked: impl Fn(Click) + Send + Sync + 'static) {
     #[cfg(target_os = "macos")]
     mac::listen(Box::new(clicked));
     #[cfg(not(target_os = "macos"))]
@@ -232,7 +248,7 @@ pub fn listen_in_app(clicked: impl Fn(Option<String>) + Send + Sync + 'static) {
 /// In the service: keep the clicked banner's session for the app.
 pub fn listen_in_service() {
     #[cfg(target_os = "macos")]
-    mac::listen(Box::new(|session| keep_clicked(session, Instant::now())));
+    mac::listen(Box::new(|click| keep_clicked(click, Instant::now())));
 }
 
 #[cfg(test)]
@@ -253,51 +269,74 @@ mod tests {
         assert_eq!(session_of("session/x"), None);
     }
 
+    fn click(session: Option<&str>, at: u64) -> Click {
+        Click { session: session.map(str::to_owned), at }
+    }
+
     // CLICKED is one slot per process: the service's tests of it run in one test
     #[test]
     fn the_service_keeps_the_latest_click_once_and_only_until_its_deadline() {
         let t = Instant::now();
-        keep_clicked(Some("s1".into()), t);
-        assert_eq!(take_clicked_at(t + Duration::from_secs(1)).as_deref(), Some("s1"));
+        keep_clicked(click(Some("s1"), 1), t);
+        assert_eq!(take_clicked_at(t + Duration::from_secs(1)), Some(click(Some("s1"), 1)));
         assert_eq!(take_clicked_at(t + Duration::from_secs(1)), None);
         // Past its deadline: not taken at a later, unrelated focus
-        keep_clicked(Some("s2".into()), t);
+        keep_clicked(click(Some("s2"), 2), t);
         assert_eq!(take_clicked_at(t + CLICK_KEEP), None);
         assert_eq!(take_clicked_at(t), None, "taking it empties the slot");
-        // A later click on a banner about no session (the state file's) takes back the earlier one
-        keep_clicked(Some("s3".into()), t);
-        keep_clicked(None, t + Duration::from_millis(10));
-        assert_eq!(take_clicked_at(t + Duration::from_millis(20)), None);
-        // An earlier instant (no wall clock to set back): kept
-        keep_clicked(Some("s4".into()), t + Duration::from_secs(5));
-        assert_eq!(take_clicked_at(t).as_deref(), Some("s4"));
+        // A later click on a banner about no session (the state file's) takes back the earlier one,
+        // and is handed on as such, so the app can take back its own older one too
+        keep_clicked(click(Some("s3"), 3), t);
+        keep_clicked(click(None, 4), t);
+        assert_eq!(take_clicked_at(t), Some(click(None, 4)));
+        // An older stamp does not replace a newer click
+        keep_clicked(click(Some("s5"), 6), t);
+        keep_clicked(click(Some("s4"), 5), t);
+        assert_eq!(take_clicked_at(t).and_then(|c| c.session).as_deref(), Some("s5"));
     }
 
     #[test]
-    fn the_app_holds_a_click_until_its_page_takes_it_and_the_latest_wins() {
-        set_open(Some("s1".into()));
-        set_open(Some("s2".into()));
-        assert_eq!(take_open().as_deref(), Some("s2"));
+    fn the_answer_carries_the_click_and_its_stamp_or_nothing() {
+        assert_eq!(click_from(&click_json(Some(click(Some("s1"), 7)))), Some(click(Some("s1"), 7)));
+        assert_eq!(click_from(&click_json(Some(click(None, 8)))), Some(click(None, 8)));
+        assert_eq!(click_from(&click_json(None)), None);
+        // An older service's answer (no stamp) is no click
+        assert_eq!(click_from(&serde_json::json!({ "session": "s1" })), None);
+    }
+
+    // OPEN is one slot per process too
+    #[test]
+    fn the_app_opens_only_the_latest_click_of_either_route_once() {
+        // The app's own click B, then the service's older A: A opens nothing
+        assert!(offer(click(Some("b"), 20)));
+        assert!(!offer(click(Some("a"), 10)));
+        assert_eq!(take_open().as_deref(), Some("b"));
         assert_eq!(take_open(), None);
-        set_open(Some("s3".into()));
-        set_open(None);
+        // Taken already: an older click that comes later still opens nothing
+        assert!(!offer(click(Some("a"), 15)));
         assert_eq!(take_open(), None);
+        // A later click about no session takes back one the page has not taken
+        assert!(offer(click(Some("c"), 30)));
+        assert!(!offer(click(None, 31)));
+        assert_eq!(take_open(), None);
+        // A newer click from the service after the app's own: the service's opens
+        assert!(offer(click(Some("d"), 40)));
+        assert!(offer(click(Some("e"), 41)));
+        assert_eq!(take_open().as_deref(), Some("e"));
     }
 
     #[test]
-    fn the_app_asks_the_service_only_while_focused_often_at_first_then_now_and_then() {
-        let t = Instant::now();
-        let ms = Duration::from_millis;
-        // Not focused: never
-        assert!(!ask_now(None, None, t));
-        // Focus gained: at once, then every step during the burst
-        assert!(ask_now(Some(t), None, t));
-        assert!(ask_now(Some(t), Some(t - ms(5)), t), "an ask from before this focus does not count");
-        assert!(!ask_now(Some(t), Some(t), t + ms(100)));
-        assert!(ask_now(Some(t), Some(t), t + FOCUS_STEP));
-        // After the burst: every FOCUSED_EVERY, for a click while the window already had the focus
-        let late = t + FOCUS_BURST + ms(1);
-        assert!(!ask_now(Some(t), Some(late - ms(500)), late));
-        assert!(ask_now(Some(t), Some(late - FOCUSED_EVERY), late));
+    fn the_stamp_moves_on() {
+        let a = stamp();
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(stamp() > a);
+    }
+
+    #[test]
+    fn the_app_asks_a_few_times_after_a_focus_and_then_stops() {
+        assert_eq!(FOCUS_ASKS[0], Duration::ZERO);
+        assert!(FOCUS_ASKS.windows(2).all(|w| w[0] < w[1]));
+        // All within the time the service keeps a click
+        assert!(*FOCUS_ASKS.last().unwrap() < CLICK_KEEP);
     }
 }

@@ -1154,23 +1154,47 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// A banner was clicked (MCR-180). One about a session: the main window
-/// comes forward, and the page is told to take the session
-/// (`harness_open_session_take`); the page also takes it when it starts
-/// listening, because a click that launched the app comes before that. One
-/// about no session takes back an earlier click the page has not taken.
-fn open_banner_session(app: &tauri::AppHandle, session: Option<String>) {
-    let some = session.is_some();
-    banner::set_open(session);
-    if !some { return; }
+/// A banner was clicked (MCR-180), by either route. Only the latest click
+/// counts (`banner::offer`); one about no session takes back an earlier one
+/// the page has not taken. One about a session: the page is told to take it
+/// (`harness_open_session_take`; it also takes it when it starts listening,
+/// because a click that launched the app comes before that), then the main
+/// window comes forward.
+fn banner_click(app: &tauri::AppHandle, click: banner::Click) {
+    if !banner::offer(click) { return; }
     let main = app.clone();
     let _ = app.run_on_main_thread(move || {
+        // The word first: the page holds back an acknowledgement while a click is on its way
+        let _ = main.emit_to("main", "harness-open-session", ());
         if let Some(window) = main.get_webview_window("main") {
             let _ = window.unminimize();
             let _ = window.show();
             let _ = window.set_focus();
         }
-        let _ = main.emit_to("main", "harness-open-session", ());
+    });
+}
+
+/// The main window gained the focus: macOS brings the app forward at a
+/// click on a banner, and that click may have gone to the service, so the
+/// service is asked at `banner::FOCUS_ASKS` and no more (MCR-180). A loss
+/// of the focus or a later focus ends the round.
+#[cfg(target_os = "macos")]
+fn ask_after_focus(app: &tauri::AppHandle, focused: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ROUND: AtomicU64 = AtomicU64::new(0);
+    let mine = ROUND.fetch_add(1, Ordering::SeqCst) + 1;
+    if !focused { return; }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        for at in banner::FOCUS_ASKS {
+            std::thread::sleep(at.saturating_sub(start.elapsed()));
+            if ROUND.load(Ordering::SeqCst) != mine { return; }
+            if let Some(click) = harness_commands::ask_service_for_click() {
+                banner_click(&app, click);
+                return;
+            }
+        }
     });
 }
 
@@ -1298,12 +1322,15 @@ fn main() {
         .setup(|app| {
             // Before launching ends: a click on a banner that started the app is handed over then
             let handle = app.handle().clone();
-            banner::listen_in_app(move |session| open_banner_session(&handle, session));
-            #[cfg(target_os = "macos")]
-            {
-                let handle = app.handle().clone();
-                banner::watch_service(harness_commands::ask_service_for_click, move |session| open_banner_session(&handle, Some(session)));
-            }
+            banner::listen_in_app(move |click| {
+                banner_click(&handle, click);
+                // One the service holds may be older or newer: the order across both is settled now
+                #[cfg(target_os = "macos")]
+                {
+                    let handle = handle.clone();
+                    std::thread::spawn(move || if let Some(click) = harness_commands::ask_service_for_click() { banner_click(&handle, click); });
+                }
+            });
             install_app_menu(app)?;
             harness_commands::window_opened();
             session_analysis_commands::start_scanner(app.handle().clone());
@@ -1314,7 +1341,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             if let tauri::WindowEvent::Focused(focused) = event {
                 if window.label() == "main" {
-                    banner::window_focused(*focused);
+                    ask_after_focus(window.app_handle(), *focused);
                 }
             }
             #[cfg(not(target_os = "macos"))]

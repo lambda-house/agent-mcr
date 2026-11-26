@@ -5489,9 +5489,11 @@ impl Harness {
                 "version": env!("CARGO_PKG_VERSION"),
                 "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
             })),
+            // The app's list read also takes a banner click handed to the service (MCR-180)
+            "sessions" if req["bannerClick"] == true => Ok(json!({ "sessions": self.sessions()?, "bannerClick": crate::banner::click_json(crate::banner::take_clicked()) })),
             "sessions" => Ok(json!({ "sessions": self.sessions()? })),
             // A banner clicked that macOS handed to the service: the app opens its session (MCR-180)
-            "banner_clicked" => Ok(json!({ "session": crate::banner::take_clicked() })),
+            "banner_clicked" => Ok(crate::banner::click_json(crate::banner::take_clicked())),
             "create" => self.create(req),
             // The operator connects a session to a supervising one, or detaches it
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
@@ -6097,6 +6099,11 @@ impl Harness {
             let op = req["op"].as_str().unwrap_or("");
             let reply = if op == "hello" {
                 self.control(&req)
+            } else if op == "banner_clicked" && who.is_none() && Stream::connect(runner_socket(&self.dir)).is_err() {
+                // Telling who asks reads the runner's list, which starts an absent runner (`runner`).
+                // The app asks this after every focus: it must start nothing, so without a runner
+                // there is no answer, and the click stays kept (MCR-180)
+                Ok(crate::banner::click_json(None))
             } else {
                 match (op, &*who.get_or_insert_with(|| self.who(&peer))) {
                     // A hook speaks for the session its process runs in, whatever it says
@@ -9660,6 +9667,31 @@ mod tests {
         assert_eq!(ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))["result"]["tools"], json!([]));
         let told = ask(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_list", "arguments": {}}}));
         assert_eq!((told["result"]["isError"].clone(), told["result"]["content"][0]["text"].clone()), (json!(true), json!(why)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_question_for_a_banner_click_starts_no_runner() {
+        // The app asks after every focus (MCR-180). Telling who asks reads the runner's list,
+        // and that would start an absent runner: without one there is no answer and nothing taken
+        let dir = std::env::temp_dir().join(format!("mcr-harness-{}", runner::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = Arc::new(Harness::open(&dir));
+        let (mut app, service) = Stream::pair().unwrap();
+        let serving = harness.clone();
+        std::thread::spawn(move || serving.handle(service, now_ms()));
+        let mut answers = BufReader::new(app.try_clone().unwrap());
+        writeln!(app, "{}", json!({"op": "banner_clicked"})).unwrap();
+        let mut line = String::new();
+        answers.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), json!({"session": null}));
+        assert!(!runner_socket(&dir).exists());
+        // Any other request still goes through who asks, as before
+        writeln!(app, "{}", json!({"op": "sessions"})).unwrap();
+        line.clear();
+        answers.read_line(&mut line).unwrap();
+        assert!(serde_json::from_str::<Value>(&line).unwrap()["error"].is_string(), "{line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -39,6 +39,12 @@ const rowUsesClock = (h: Hosted, session?: Session) => {
   return !!(hasAge || h.waits?.length || h.shells?.length || h.subagents?.some(a => !a.finished) || session?.context?.cacheAt);
 };
 
+/**
+ * How long an acknowledgement waits after the window came forward (MCR-180):
+ * a click on a banner brings it forward before the page hears of the click,
+ * and the session selected at that moment is not what the operator came for
+ */
+export const ACK_SETTLE_MS = 1000;
 const LIST_WIDTH_KEY = 'hs-list-width';
 /** The session list is never narrower than this, and leaves the terminal at least as much. */
 export const LIST_MIN_WIDTH = 200;
@@ -306,8 +312,11 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const closing = useRef(new Map<string, boolean>());
   // The service's list has been read since this view mounted: before that an empty list says nothing
   const listRead = useRef(false);
-  // The same for effects that must wait for the first read of the list
-  const [listLoaded, setListLoaded] = useState(false);
+  // A session a banner asks to show, until a list read that began after the ask has answered (MCR-180)
+  const pendingReveal = useRef<{ id: string; after: number } | null>(null);
+  const revealSeen = useRef<number | undefined>(undefined);
+  const revealer = useRef<(id: string, rows: Hosted[]) => void>(() => {});
+  const hostedNow = useRef<Hosted[]>([]);
   const listStamp = useRef('');
   const listRequest = useRef(0);
   const listShown = useRef(0);
@@ -318,7 +327,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const closed = useCallback(() => {
     listStamp.current = '';
     listShown.current = ++listRequest.current;
-    setStatus(null); setHosted([]); setOpened([]); setSelected(''); setError(''); setListLoaded(false);
+    setStatus(null); setHosted([]); setOpened([]); setSelected(''); setError('');
     harnessApi.background().then(b => { if (mounted.current) setGate(b.consent === 'stopped' ? 'stopped' : 'new'); }).catch(() => { if (mounted.current) setGate('new'); });
   }, []);
   const connect = useCallback(() => {
@@ -344,7 +353,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       // An overlapping read replaced the base for this unchanged reply.
       if (!answer.sessions && stamp !== listStamp.current) return refreshList();
       listRead.current = true;
-      setListLoaded(true);
       if (ENDED_ROW_GRACE_MS > 0) setListNow(Date.now());
       if (answer.sessions) {
         listStamp.current = answer.stamp;
@@ -356,6 +364,13 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
         });
       }
       setError('');
+      // Only a read that began after the banner's ask says whether its session runs now:
+      // the list held while Live was hidden may be older than the session or its end
+      const asked = pendingReveal.current;
+      if (asked && request > asked.after) {
+        pendingReveal.current = null;
+        revealer.current(asked.id, answer.sessions ?? hostedNow.current);
+      }
     } catch (e) {
       if (!mounted.current || request <= listShown.current) return;
       listShown.current = request;
@@ -453,22 +468,28 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   }, []);
 
   const select = (id: string) => {
+    // The operator's own choice: a banner's ask still on its way gives way to it
+    pendingReveal.current = null;
     setPassive('');
     openItem({ kind: 'session', id });
   };
-  // The session a banner showed, until the operator chooses it or another one (MCR-180)
+  // The session a banner showed, until the operator chooses it or another one, or gives its terminal the keyboard (MCR-180)
   const [passive, setPassive] = useState('');
   useEffect(() => { if (passive && selected !== passive) setPassive(''); }, [selected, passive]);
-  const [toReveal, setToReveal] = useState<{ id: string; at: number } | null>(null);
-  useEffect(() => { if (reveal) setToReveal({ id: reveal.id, at: reveal.at }); }, [reveal?.id, reveal?.at]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    if (!toReveal || !listLoaded) return;
-    setToReveal(null);
+  hostedNow.current = hosted;
+  revealer.current = (id, rows) => {
     // A session that ended or that the harness forgot is not opened over what the pane shows
-    if (!hosted.some(h => h.id === toReveal.id && !h.exit)) { setError('The session that notification is about is no longer running.'); return; }
-    openItem({ kind: 'session', id: toReveal.id });
-    setPassive(toReveal.id);
-  }, [toReveal, listLoaded, hosted, openItem]);
+    if (!rows.some(h => h.id === id && !h.exit)) { setError('The session that notification is about is no longer running.'); return; }
+    openItem({ kind: 'session', id });
+    setPassive(id);
+  };
+  useEffect(() => {
+    if (!reveal || revealSeen.current === reveal.at) return;
+    revealSeen.current = reveal.at;
+    pendingReveal.current = { id: reveal.id, after: listRequest.current };
+    // Read now, also while Live was hidden; before the harness answered, its first read does it
+    if (status) void refresh();
+  }, [reveal?.id, reveal?.at]); // eslint-disable-line react-hooks/exhaustive-deps
   // Back and Forward (MCR-108): every change of the shown session is a place in the history, whatever made it
   const [history, setHistory] = useState(EMPTY_HISTORY);
   // The session Back or Forward is going to: that change is a step, not a new place
@@ -511,21 +532,35 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   useEffect(() => { if (listRead.current) keep.retain(new Set(listedIds.split(' ').filter(Boolean))); }, [listedIds]);
   const follow = (id: string) => { if (!isSession(id)) return; select(id); setLinked({ id, at: Date.now() }); };
   const acknowledging = useRef(new Map<string, number>());
+  // Until when an acknowledgement waits after the window came forward (MCR-180)
+  const settleUntil = useRef(0);
   useEffect(() => {
     const acknowledge = () => {
       if (!active || document.hidden || !document.hasFocus()) return;
-      // Shown by a banner: not yet looked at by the operator's own choice (MCR-180)
-      if (selected === passive) return;
+      // A banner's ask on its way, or shown by a banner: not looked at by the operator's own choice (MCR-180).
+      // The ask is read from the prop too: this effect can run before the one that takes it
+      if (pendingReveal.current || (reveal && revealSeen.current !== reveal.at) || selected === passive) return;
+      // A click on a banner brings the window forward before the page hears of it: the session
+      // selected then is not what the operator came to look at, so wait to see whether a banner follows
+      if (Date.now() < settleUntil.current) return;
       const attention = hosted.find(h => h.id === selected && !h.exit)?.harness?.attention;
       if (attention?.kind !== 'notification' || acknowledging.current.get(selected) === attention.since) return;
       acknowledging.current.set(selected, attention.since);
       void harnessApi.ack(selected, attention.since).then(refresh).catch(e => setError(err(e))).finally(() => acknowledging.current.delete(selected));
     };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const later = () => {
+      clearTimeout(timer);
+      const wait = settleUntil.current - Date.now();
+      if (wait > 0) timer = setTimeout(acknowledge, wait + 1);
+    };
+    const cameForward = () => { settleUntil.current = Date.now() + ACK_SETTLE_MS; later(); };
     acknowledge();
-    window.addEventListener('focus', acknowledge);
-    document.addEventListener('visibilitychange', acknowledge);
-    return () => { window.removeEventListener('focus', acknowledge); document.removeEventListener('visibilitychange', acknowledge); };
-  }, [active, hosted, selected, refresh, passive]);
+    later();
+    window.addEventListener('focus', cameForward);
+    document.addEventListener('visibilitychange', cameForward);
+    return () => { clearTimeout(timer); window.removeEventListener('focus', cameForward); document.removeEventListener('visibilitychange', cameForward); };
+  }, [active, hosted, selected, refresh, passive, reveal]);
   const focusPane = (leafId: string, item: PaneItem | null) => {
     setPassive('');
     setFocusedPane(leafId);
@@ -1249,7 +1284,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
               const el = slotEls.get(id);
               if (!el) return null;
               const selectedPane = selected === id && focusedItem?.kind === 'session' && focusedItem.id === id;
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane && passive !== id} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
+              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane && passive !== id} passive={passive === id} onActive={() => setPassive(p => p === id ? '' : p)} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
             })}
           </>
         );

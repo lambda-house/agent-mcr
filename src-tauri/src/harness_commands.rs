@@ -261,10 +261,17 @@ pub fn window_opened() {
 /// it instead of the app (MCR-180). Connects only: it never starts the
 /// background units.
 #[cfg(target_os = "macos")]
-pub fn ask_service_for_click() -> Option<String> {
+pub fn ask_service_for_click() -> Option<crate::banner::Click> {
     let mut client = config_dir().and_then(|dir| Client::connect(&harness::socket(&dir))).ok()?;
     let answer = client.call(json!({"op": "banner_clicked"})).ok()?;
-    answer["session"].as_str().filter(|s| valid_id(s).is_ok()).map(str::to_owned)
+    clicked_in(&answer)
+}
+
+/// A click in the service's answer, with a session id only when it is a valid one.
+fn clicked_in(answer: &Value) -> Option<crate::banner::Click> {
+    let mut click = crate::banner::click_from(answer)?;
+    click.session = click.session.filter(|s| valid_id(s).is_ok());
+    Some(click)
 }
 
 /// The session a clicked banner asks the page to show, once (MCR-180). The
@@ -526,13 +533,19 @@ pub async fn harness_outside_supervisors(app: tauri::AppHandle, on: bool) -> Res
 }
 
 #[tauri::command]
-pub async fn harness_list(state: State<'_, HarnessState>) -> Result<Value, String> {
+pub async fn harness_list(app: tauri::AppHandle, state: State<'_, HarnessState>) -> Result<Value, String> {
     let drafts = state.drafts.clone();
-    blocking(move || read_list(&drafts)).await
+    blocking(move || read_list(&app, &drafts)).await
 }
 
-fn read_list(drafts: &Mutex<BTreeMap<String, Draft>>) -> Result<Value, String> {
-    let list = service(json!({"op": "sessions"}))?;
+/// The list read also takes a banner click the service holds (MCR-180): a
+/// click while the window already has the focus brings no new focus, and
+/// this read is made anyway, so no request is added for it.
+fn read_list(app: &tauri::AppHandle, drafts: &Mutex<BTreeMap<String, Draft>>) -> Result<Value, String> {
+    let mut list = service(json!({"op": "sessions", "bannerClick": true}))?;
+    if let Some(click) = list.as_object_mut().and_then(|l| l.remove("bannerClick")).as_ref().and_then(clicked_in) {
+        crate::banner_click(app, click);
+    }
     if let Ok(mut drafts) = drafts.lock() {
         prune(&mut drafts, &list);
     }
@@ -540,9 +553,9 @@ fn read_list(drafts: &Mutex<BTreeMap<String, Draft>>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn harness_list_since(stamp: Option<String>, state: State<'_, HarnessState>) -> Result<Value, String> {
+pub async fn harness_list_since(app: tauri::AppHandle, stamp: Option<String>, state: State<'_, HarnessState>) -> Result<Value, String> {
     let drafts = state.drafts.clone();
-    blocking(move || list_since(read_list(&drafts)?, stamp.as_deref())).await
+    blocking(move || list_since(read_list(&app, &drafts)?, stamp.as_deref())).await
 }
 
 fn list_since(mut list: Value, held: Option<&str>) -> Result<Value, String> {

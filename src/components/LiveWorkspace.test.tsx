@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import LiveWorkspace from './LiveWorkspace';
+import LiveWorkspace, { ACK_SETTLE_MS } from './LiveWorkspace';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type Hosted } from '../utils/harness';
 import { pickDirectory } from '../utils/tauri';
 import { useStore } from '../store';
@@ -31,12 +31,12 @@ const renders: string[] = [];
 const kept = vi.hoisted(() => ({ retained: [] as string[][], retain(ids: Set<string>) { this.retained.push([...ids].sort()); }, protect: vi.fn(), forget: vi.fn() }));
 vi.mock('./TerminalPane', async () => {
   const { useEffect } = await import('react');
-  return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused, focusOnMount }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void; focusOnMount?: boolean }) => {
+  return { keep: kept, default: ({ id, onQuit, isSession, onSession, focusAt, onFocused, focusOnMount, passive, onActive }: { id: string; onQuit?: () => void; isSession?: (id: string) => boolean; onSession?: (id: string) => void; focusAt?: number; onFocused?: () => void; focusOnMount?: boolean; passive?: boolean; onActive?: () => void }) => {
     renders.push(id);
     useEffect(() => { mounts.push(id); return () => { unmounts.push(id); }; }, [id]);
     useEffect(() => { givenIsSession.push(isSession); }, [isSession]);
     useEffect(() => { if (focusAt) { focused.push(id); onFocused?.(); } }, [focusAt]); // eslint-disable-line react-hooks/exhaustive-deps
-    return <div data-terminal={id} data-focus-at={focusAt ?? ''} data-focus-mount={String(!!focusOnMount)} data-links={['r1', 'e1', 's1', 'nobody'].filter(x => isSession?.(x)).join(' ')}><button aria-label={`quit ${id}`} onClick={onQuit}/><button aria-label={`link in ${id}`} onClick={() => onSession?.(linkTo)}/></div>;
+    return <div data-terminal={id} data-focus-at={focusAt ?? ''} data-focus-mount={String(!!focusOnMount)} data-passive={String(!!passive)} data-links={['r1', 'e1', 's1', 'nobody'].filter(x => isSession?.(x)).join(' ')}><button aria-label={`quit ${id}`} onClick={onQuit}/><button aria-label={`link in ${id}`} onClick={() => onSession?.(linkTo)}/><button aria-label={`keyboard to ${id}`} onClick={() => onActive?.()}/></div>;
   } };
 });
 
@@ -49,6 +49,8 @@ const withReport = (h: Hosted, report: 'done' | 'needs_human', text: string, sin
 
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
+/** Past the wait of an acknowledgement after the window came forward */
+const settle = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, ACK_SETTLE_MS + 30)); }); await flush(); };
 const button = (label: string) => host.querySelector(`button[aria-label="${label}"]`) as HTMLButtonElement;
 let slotHeight: number;
 let intersectionHeight: number;
@@ -904,8 +906,10 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     expect(harnessApi.ack).not.toHaveBeenCalled();
     vi.mocked(document.hasFocus).mockReturnValue(true);
-    vi.mocked(harnessApi.list).mockResolvedValue([session]);
     await act(async () => window.dispatchEvent(new Event('focus'))); await flush();
+    // A banner's click may be what brought the window forward: the acknowledgement waits a moment (MCR-180)
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+    await settle();
     expect(harnessApi.ack).toHaveBeenCalledWith('r1', 8);
   });
 
@@ -1023,15 +1027,28 @@ describe('Live workspace', () => {
 
 describe('a session a clicked banner asks for (MCR-180)', () => {
   const pane = (id: string) => host.querySelector(`.hs-pane:not([hidden]) [data-terminal="${id}"]`);
+  const shownIds = () => [...host.querySelectorAll('.hs-pane:not([hidden]) [data-terminal]')].map(e => e.getAttribute('data-terminal'));
+  const other: Hosted = { ...running, id: 'r2', title: 'Other work', started: 3 };
+  /** Every list read from now on waits for `release`, then answers with the list as it is then */
+  const holdNextRead = () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const listed = vi.mocked(harnessApi.listSince).getMockImplementation()!;
+    vi.mocked(harnessApi.listSince).mockImplementation(async stamp => { await held; return listed(stamp); });
+    return async () => { await act(async () => release()); await flush(); };
+  };
 
-  it('shows it passively: no acknowledgement and no keyboard until the operator clicks its pane', async () => {
+  it('shows it passively: no acknowledgement and a terminal that sends nothing until the operator gives it the keyboard', async () => {
     vi.mocked(harnessApi.list).mockResolvedValue([ended, withReport(running, 'done', 'Finished the tests')]);
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
     expect(pane('r1')?.getAttribute('data-focus-mount')).toBe('false');
+    expect(pane('r1')?.getAttribute('data-passive')).toBe('true');
     // The window comes forward with it: still not the operator's own look
-    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush();
+    await act(async () => { window.dispatchEvent(new Event('focus')); }); await settle();
     expect(harnessApi.ack).not.toHaveBeenCalled();
-    await act(async () => { host.querySelector('.hs-pane')!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); }); await flush();
+    await act(async () => button('keyboard to r1').click()); await flush();
+    expect(pane('r1')?.getAttribute('data-passive')).toBe('false');
+    await settle();
     expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
   });
 
@@ -1040,27 +1057,76 @@ describe('a session a clicked banner asks for (MCR-180)', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
     expect(harnessApi.ack).not.toHaveBeenCalled();
     await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
+    expect(pane('r1')?.getAttribute('data-passive')).toBe('false');
     expect(harnessApi.ack).toHaveBeenCalledWith('r1', 5);
   });
 
-  it('waits for the first read of the list before it opens anything', async () => {
-    let answer!: () => void;
-    const first = new Promise<void>(resolve => { answer = resolve; });
-    const listed = vi.mocked(harnessApi.listSince).getMockImplementation()!;
-    vi.mocked(harnessApi.listSince).mockImplementation(async held => { await first; return listed(held); });
-    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
-    expect(pane('r1')).toBeNull();
-    await act(async () => answer()); await flush();
+  it('does not acknowledge the mark of the session selected before, when the window comes forward for a banner', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([withReport(running, 'done', 'Finished the tests'), other]);
+    vi.mocked(document.hasFocus).mockReturnValue(false);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
     expect(pane('r1')).not.toBeNull();
+    // The click on the banner brings the window forward, then the page hears of it
+    vi.mocked(document.hasFocus).mockReturnValue(true);
+    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r2', at: 1 }}/>)); await flush();
+    expect(pane('r2')).not.toBeNull();
+    await settle();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+  });
+
+  it('does not acknowledge the session selected before when Live comes back for a banner', async () => {
+    vi.mocked(harnessApi.list).mockResolvedValue([withReport(running, 'done', 'Finished the tests'), other]);
+    vi.mocked(document.hasFocus).mockReturnValue(false);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => host.querySelector<HTMLButtonElement>('.needs-you .hs-item')!.click()); await flush();
+    await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
+    vi.mocked(document.hasFocus).mockReturnValue(true);
+    const release = holdNextRead();
+    // Documents or Journal → Live with the ask, in one render
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r2', at: 1 }}/>)); await flush();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+    await release();
+    expect(pane('r2')).not.toBeNull();
+    await settle();
+    expect(harnessApi.ack).not.toHaveBeenCalled();
+  });
+
+  it('opens a session that started while Live was hidden, once a fresh read lists it', async () => {
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, running, other]);
+    const release = holdNextRead();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r2', at: 1 }}/>)); await flush();
+    // The held list does not have it yet: no verdict on it
     expect(host.querySelector('.hs-error')).toBeNull();
+    expect(pane('r2')).toBeNull();
+    await release();
+    expect(pane('r2')).not.toBeNull();
+    expect(host.querySelector('.hs-error')).toBeNull();
+  });
+
+  it('does not open a session that ended while Live was hidden, though the held list says it runs', async () => {
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => host.querySelector<HTMLButtonElement>('.hs-item')!.click()); await flush();
+    const before = shownIds();
+    await act(async () => root.render(<LiveWorkspace active={false} recentDirectories={[]}/>)); await flush();
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...other, exit: { code: 0, signal: null, at: 9 } }]);
+    const release = holdNextRead();
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id: 'r1', at: 1 }}/>)); await flush();
+    vi.mocked(harnessApi.list).mockResolvedValue([ended, { ...running, exit: { code: 0, signal: null, at: 9 } }]);
+    await release();
+    expect(shownIds()).toEqual(before);
+    expect(host.querySelector('.hs-error')?.textContent).toContain('no longer running');
   });
 
   it.each([['an ended session', 'e1'], ['a session the harness forgot', 'gone']])('does not open %s over what the pane shows, and says so', async (_, id) => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     await act(async () => host.querySelector<HTMLButtonElement>('.hs-item')!.click()); await flush();
-    const shown = [...host.querySelectorAll('.hs-pane:not([hidden]) [data-terminal]')].map(e => e.getAttribute('data-terminal'));
+    const shown = shownIds();
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]} reveal={{ id, at: 2 }}/>)); await flush();
-    expect([...host.querySelectorAll('.hs-pane:not([hidden]) [data-terminal]')].map(e => e.getAttribute('data-terminal'))).toEqual(shown);
+    expect(shownIds()).toEqual(shown);
     expect(host.querySelector('.hs-error')?.textContent).toContain('no longer running');
   });
 });

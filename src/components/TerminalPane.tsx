@@ -102,7 +102,7 @@ class TerminalView {
  * with no text is saved and its path typed. Ctrl-V reaches the agent as ^V
  * (Claude Code reads the clipboard image itself).
  */
-export default function TerminalPane({ id, name, active, focusOnMount = false, onQuit, isSession, onSession, focusAt, onFocused }: {
+export default function TerminalPane({ id, name, active, focusOnMount = false, onQuit, isSession, onSession, focusAt, onFocused, passive = false, onActive }: {
   id: string; active: boolean;
   /** The selected pane may take the keyboard when it mounts. */
   focusOnMount?: boolean;
@@ -118,14 +118,44 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
   focusAt?: number;
   /** It took the keyboard for `focusAt`: the request is served and must not be handed to a later mount */
   onFocused?: () => void;
+  /**
+   * Shown by a clicked banner, not by the operator (MCR-180): nothing goes
+   * from this view to the session, not even the focus reports xterm sends by
+   * itself when the output turns them on, until the operator gives it the
+   * keyboard. Then `onActive`
+   */
+  passive?: boolean;
+  onActive?: () => void;
 }) {
   const quit = useRef(onQuit);
   quit.current = onQuit;
-  const sessions = useRef({ isSession, onSession, onFocused });
-  sessions.current = { isSession, onSession, onFocused };
+  const sessions = useRef({ isSession, onSession, onFocused, onActive });
+  sessions.current = { isSession, onSession, onFocused, onActive };
+  // Once the operator gave this view the keyboard it is theirs, whatever a render still says
+  const activated = useRef(false);
+  // A later banner that shows this view again makes it passive again
+  const wasPassive = useRef(passive);
+  if (passive && !wasPassive.current) activated.current = false;
+  wasPassive.current = passive;
+  const passiveNow = useRef(passive);
+  passiveNow.current = passive && !activated.current;
   // Looks at the pointers on screen again (MCR-106)
   const pointers = useRef<() => void>(() => {});
   const host = useRef<HTMLDivElement>(null);
+  // The operator gives a passive view the keyboard: capture, before xterm's own
+  // focus handler sends its focus report, so that report goes out
+  useEffect(() => {
+    const element = host.current;
+    if (!element) return;
+    const take = () => {
+      if (!passiveNow.current) return;
+      activated.current = true;
+      passiveNow.current = false;
+      sessions.current.onActive?.();
+    };
+    element.addEventListener('focus', take, true);
+    return () => element.removeEventListener('focus', take, true);
+  }, []);
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
   const resend = useRef<() => void>(() => {});
@@ -442,6 +472,8 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
 
     const typed = t.onData(data => {
       if (disposed) return;
+      // Passive: the terminal's own answers and reports are dropped, never typed into the agent
+      if (passiveNow.current) return;
       if (view.handle !== null && ((!discard && !reconnecting) || (shown.current && writingInput))) {
         sendInput(view.handle, data, true);
       } else if (shown.current) {
