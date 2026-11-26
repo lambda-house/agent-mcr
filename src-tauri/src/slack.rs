@@ -312,7 +312,8 @@ impl Post {
 
 #[derive(Clone, Default)]
 struct Link {
-    /// off | connecting | connected | reconnecting | refused
+    /// off | connecting | connected | reconnecting | refused | unreadable (the
+    /// vault cannot say whether the tokens are there)
     state: String,
     error: String,
     last_event: u64,
@@ -437,6 +438,19 @@ impl Slack {
             Ok(Some(bot)) => Ok(bot),
             Ok(None) => Err("Slack is not connected".into()),
             Err(why) => Err(unreadable(why)),
+        }
+    }
+
+    /// The app-level token to listen with, or the link state and its error to
+    /// show instead: `unreadable` while the vault cannot say whether it is there.
+    fn listening_token(&self) -> Result<String, (&'static str, String)> {
+        if !self.active() {
+            return Err(("off", String::new()));
+        }
+        match self.vault.get("app") {
+            Ok(Some(app)) => Ok(app),
+            Ok(None) => Err(("off", String::new())),
+            Err(why) => Err(("unreadable", unreadable(why))),
         }
     }
 
@@ -1545,12 +1559,11 @@ impl Slack {
             let mut pause = 1;
             loop {
                 let epoch = slack.epoch.load(Ordering::SeqCst);
-                let app = if slack.active() { slack.vault.get("app") } else { Ok(None) };
-                let app = match app {
-                    Ok(Some(app)) => app,
+                let app = match slack.listening_token() {
+                    Ok(app) => app,
                     // Off, or the tokens cannot be read now: looked at again shortly
-                    other => {
-                        slack.set_link("off", &other.err().map(unreadable).unwrap_or_default());
+                    Err((state, error)) => {
+                        slack.set_link(state, &error);
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
@@ -2138,8 +2151,11 @@ mod tests {
         assert_eq!(post_of(&slack, &p.id).state, "approved");
         assert_eq!(slack.bot(), Err(unreadable(locked)));
         assert!(slack.status()["connection"].is_object());
-        // Open again: the post goes, once
+        // The listener shows why, as a state of its own that the panel offers to unlock
+        assert_eq!(slack.listening_token(), Err(("unreadable", unreadable(locked))));
+        // Open again: the listener has its token, and the post goes, once
         vault.refuse(None);
+        assert_eq!(slack.listening_token(), Ok("xapp-1".to_string()));
         while slack.work(&host) {}
         assert_eq!(post_of(&slack, &p.id).state, "sent");
         assert_eq!(web.count("chat.postMessage"), 1);
@@ -2152,6 +2168,7 @@ mod tests {
         assert_eq!(vault.get("bot"), Ok(Some("xoxb-1".to_string())));
         assert!(slack.status()["connection"].is_null());
         assert!(!slack.work(&host));
+        assert_eq!(slack.listening_token(), Err(("off", String::new())));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { basename } from './paths';
 export { tildePath } from './paths';
 import { Channel, invoke } from '@tauri-apps/api/core';
+import type { Platform } from './platform';
 
 /** A launch profile held by the backend; the webview can only pick one by id. */
 export interface Profile { id: string; label: string; command: string; optional: boolean; canSupervise: boolean; taskTracking: boolean }
@@ -385,7 +386,8 @@ export interface SlackReceived {
   cut?: boolean;
 }
 export interface SlackStatus {
-  connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;
+  /** `unreadable`: the keyring cannot say whether the tokens are there (locked, or no keyring running) */
+  connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused' | 'unreadable'; linkError: string; lastEvent: number;
   /** When Slack last accepted the connection, and what arrived since the service started */
   connectedAt?: number; eventsSeen?: number; actionsSeen?: number;
   /** Frames of any kind from Slack, the kind of the last one, and the last event that was not kept (type and why, never its text) */
@@ -445,6 +447,19 @@ export const memoryApi = {
   connect: () => invoke<MemoryStatus>('memory_connect'),
   /** Asks in a native dialog unless a sign-in is only under way */
   disconnect: () => invoke<MemoryStatus>('memory_disconnect'),
+};
+
+/** Where the Slack and memory tokens are kept, in the words of the app's native dialogs (`vault::STORE_NAME`). */
+export function secretStoreName(platform: Platform): string {
+  return platform === 'macos' ? 'the macOS Keychain' : platform === 'windows' ? 'Windows Credential Manager' : 'your desktop keyring';
+}
+
+/** Only the Linux keyring is unlocked from the app, on the person's word; the harness service never unlocks it (MCR-177). */
+export const canUnlockStore = (platform: Platform): boolean => platform === 'linux';
+
+export const vaultApi = {
+  /** The keyring asks for its password in its own prompt; resolves once it is unlocked */
+  unlock: () => invoke<void>('vault_unlock'),
 };
 
 export const harnessApi = {

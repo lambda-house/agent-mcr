@@ -42,6 +42,50 @@ impl Keychain {
     }
 }
 
+/// The secret store as the person knows it, for the app's dialogs. The page
+/// has the same words (`secretStoreName` in `utils/harness.ts`).
+pub const STORE_NAME: &str = if cfg!(target_os = "macos") {
+    "the macOS Keychain"
+} else if cfg!(windows) {
+    "Windows Credential Manager"
+} else if cfg!(target_os = "linux") {
+    "your desktop keyring"
+} else {
+    "a secret store"
+};
+
+/// What the person should know before a secret is kept there: Credential
+/// Manager and the Secret Service keep no rule per program, and a locked
+/// keyring asks for its password first.
+pub const STORE_NOTE: Option<&str> = if cfg!(windows) {
+    Some("Other programs that run as you, agents included, can read it there while you are logged in.")
+} else if cfg!(target_os = "linux") {
+    Some("Other programs that run as you, agents included, can read it there while the keyring is unlocked. A locked keyring asks for its password first.")
+} else {
+    None
+};
+
+/// Unlock the desktop keyring because the person asked for it in the app: the
+/// keyring shows its own prompt, waited for at most two minutes. Only the app
+/// calls this, on the person's action, and it reads no secret; the harness
+/// service never unlocks (MCR-177). Nothing to do on other systems.
+pub fn unlock() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let (done, finished) = std::sync::mpsc::channel();
+        // A prompt nobody answers keeps this thread, not the caller
+        std::thread::spawn(move || {
+            let _ = done.send(keyring::unlock_default());
+        });
+        match finished.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(unlocked) => unlocked.map_err(|why| format!("The keyring could not be unlocked: {}", why.0)),
+            Err(_) => Err("The keyring was not unlocked within two minutes".into()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 impl Vault for Keychain {
     fn get(&self, account: &str) -> Result<Option<String>, Unavailable> {
@@ -284,6 +328,20 @@ mod keyring {
         })
     }
 
+    /// Unlock the default collection through the keyring's own prompt, on a
+    /// connection of its own: the vault's thread never waits for a prompt.
+    pub(super) fn unlock_default() -> Result<(), Unavailable> {
+        let service = connect()?;
+        let collection = service.get_default_collection().map_err(|e| why(&e))?;
+        if collection.is_locked().map_err(|e| why(&e))? {
+            collection.unlock().map_err(|e| match e {
+                Error::Prompt => Unavailable("the unlock was cancelled"),
+                e => why(&e),
+            })?;
+        }
+        Ok(())
+    }
+
     /// A session bus connection with a time limit on every call, and a session
     /// with the Secret Service: encrypted, or plain when the service refuses that.
     fn connect() -> Result<SecretService<'static>, Unavailable> {
@@ -426,6 +484,16 @@ mod tests {
         let timed_out = Error::Zbus(zbus::Error::InputOutput(std::sync::Arc::new(std::io::ErrorKind::TimedOut.into())));
         assert_eq!(keyring::why(&timed_out), Unavailable("the keyring did not answer in time"));
         assert_eq!(keyring::why(&Error::Crypto("bad padding")), Unavailable("the keyring could not be read"));
+    }
+
+    /// Run by hand on a Linux desktop: `cargo test live_unlock -- --ignored`.
+    /// A locked keyring shows its own prompt and waits for the person; an
+    /// unlocked one is left as it is. `live_keyring` can run after it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn live_unlock_shows_the_keyrings_own_prompt() {
+        unlock().unwrap();
     }
 
     /// Run by hand on a Linux desktop whose keyring is unlocked:

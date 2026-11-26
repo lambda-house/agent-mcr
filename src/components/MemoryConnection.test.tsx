@@ -3,12 +3,15 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import MemoryConnection from './MemoryConnection';
-import { memoryApi, memoryStateLine, type MemoryStatus } from '../utils/harness';
+import { memoryApi, memoryStateLine, vaultApi, type MemoryStatus } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({
   ...await importOriginal<object>(),
   memoryApi: { status: vi.fn(), connect: vi.fn(), disconnect: vi.fn() },
+  vaultApi: { unlock: vi.fn() },
 }));
+// The keyring the app can unlock is Linux's
+vi.mock('../utils/platform', async importOriginal => ({ ...await importOriginal<object>(), PLATFORM: 'linux' }));
 const base: MemoryStatus = { state: 'disconnected', endpoint: 'https://mcp.memory.teob.cc/mcp', since: 0, defaultMemory: 'mcr-agents', problem: null };
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
@@ -51,6 +54,28 @@ it('shows what went wrong and lets the person sign in again', async () => {
   await act(async () => button().click()); await flush();
   expect(host.querySelector('[role="alert"]')?.textContent).toBe('The browser could not be opened');
   expect(button().disabled).toBe(false);
+});
+
+it('offers to unlock the keyring that holds the sign-in back, and says why an unlock failed', async () => {
+  const locked = { kind: 'vault_unavailable', text: "Memory's sign-in could not be read from the secret store: the keyring is locked.", at: 7 };
+  vi.mocked(memoryApi.status).mockResolvedValue({ ...base, state: 'connected', since: 5, problem: locked });
+  vi.mocked(vaultApi.unlock).mockRejectedValueOnce('The keyring could not be unlocked: the unlock was cancelled').mockResolvedValueOnce(undefined);
+  await act(async () => root.render(<MemoryConnection/>)); await flush();
+  expect(host.textContent).toContain('the sign-in stays in your desktop keyring and Agent MCR gives it to no agent');
+  const unlock = () => [...host.querySelectorAll('button')].find(b => b.textContent === 'Unlock keyring…');
+  await act(async () => unlock()!.click()); await flush();
+  expect(host.querySelector('[role="alert"]')?.textContent).toBe('The keyring could not be unlocked: the unlock was cancelled');
+  await act(async () => unlock()!.click()); await flush();
+  expect(vaultApi.unlock).toHaveBeenCalledTimes(2);
+  expect(unlock()).toBeUndefined();
+  expect(host.querySelector('[role="status"]')?.textContent).toContain('The keyring is unlocked');
+});
+
+it('offers no unlock for a problem that is not the keyring', async () => {
+  vi.mocked(memoryApi.status).mockResolvedValue({ ...base, state: 'connected', since: 5, problem: { kind: 'unreachable', text: 'The memory service could not be reached: timed out', at: 3 } });
+  await act(async () => root.render(<MemoryConnection/>)); await flush();
+  expect(host.textContent).toContain('Last problem');
+  expect(host.textContent).not.toContain('Unlock keyring');
 });
 
 it('says in one line where the connection stands', () => {
