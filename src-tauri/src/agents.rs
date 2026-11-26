@@ -486,6 +486,13 @@ pub trait Adapter: Sync {
     fn sees_prompt(&self) -> bool {
         false
     }
+    /// Positive proof from the screen that the input box belongs to a new,
+    /// empty conversation in `folder` (as the agent shows it), for an agent
+    /// that does not name its conversation, before it has reported one
+    /// (MCR-179): the harness types into it only then. Default: no proof
+    fn fresh_conversation(&self, _screen: &str, _folder: &str) -> bool {
+        false
+    }
     /// Launched as Supervisor so that `terminal_write` is the one tool left to
     /// its own permission prompt: the operator approves each call (Claude:
     /// `claude_settings` pre-approves every other supervisor tool). Only such
@@ -572,6 +579,10 @@ pub const CODEX_HOOK: &str = "codex-hook";
 /// The Codex hooks the harness asks for (Unix launches only, like `own_hooks`).
 #[cfg_attr(windows, allow(dead_code))]
 pub const CODEX_HOOKS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse"];
+
+/// Said with Codex's folder question when its second answer is "Back to Agent
+/// Command Center" (codex-cli 0.172, MCR-179).
+pub const COMMAND_CENTER_NOTE: &str = "Codex asks to trust this folder: 1 starts this session's task. 2 opens Codex's Agent command center, where Enter opens another task here instead.";
 
 pub struct Claude;
 pub struct Codex;
@@ -886,6 +897,23 @@ impl Adapter for Codex {
     fn sees_prompt(&self) -> bool {
         true
     }
+    /// A new conversation, as codex-cli 0.172 draws it (recorded 2026-11-26):
+    /// its banner, nothing said yet, and the line under the input box naming
+    /// the model and the folder and no conversation title. A task opened from
+    /// the Agent command center shows its history (`›` lines of the person,
+    /// `•` items of the agent) and its own folder and title on that line
+    fn fresh_conversation(&self, screen: &str, folder: &str) -> bool {
+        let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+        if !self.at_prompt(screen) || !lines.iter().any(|l| l.trim_start().starts_with(">_ OpenAI Codex")) {
+            return false;
+        }
+        let marks: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.starts_with('\u{203a}')).map(|(i, _)| i).collect();
+        let said = lines.iter().any(|l| l.trim_start().starts_with('\u{2022}') || l.trim_start().starts_with('\u{2514}'));
+        let [box_line] = marks[..] else { return false };
+        let Some(status) = lines[box_line + 1..].iter().find(|l| !l.trim().is_empty()) else { return false };
+        let parts: Vec<&str> = status.trim().split(" \u{b7} ").collect();
+        !said && parts.len() == 2 && parts[1] == folder
+    }
     /// Codex sets "[ ! ] Action Required" as the title while it waits for an answer
     /// (after a glyph that blinks, before the folder). Nothing else: a
     /// conversation may be titled with these words and more
@@ -898,17 +926,14 @@ impl Adapter for Codex {
         body.starts_with("Approval requested")
     }
     fn question(&self, screen: &str) -> Option<String> {
-        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
-            // The folder question at start (0.170 wording), whose answers may not be numbered
-            if self.at_prompt(screen) {
-                return None;
-            }
-            // Codex's review of hooks it has not run before, ours among them (MCR-74)
-            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
-                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
-            }
-            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
-            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        let question = self.question_asked(screen)?;
+        // codex-cli 0.172's second answer at the folder question opens its
+        // Agent command center, where Enter opens any task on the machine in
+        // this terminal: the session's own task then never starts (MCR-179)
+        // The note comes first: a notification shows only the start of the text
+        Some(match question.starts_with("Trust this folder?") && screen.contains("Back to Agent Command Center") {
+            true => format!("{COMMAND_CENTER_NOTE} {question}"),
+            false => question,
         })
     }
     /// Codex takes one `developer_instructions` value: the operator's own, if set, stays
@@ -990,6 +1015,22 @@ pub const CODEX_NETWORK_OFF: [&str; 2] = ["-c", "sandbox_workspace_write.network
 const CODEX_BARE: [&str; 4] = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"];
 
 impl Codex {
+    /// The question on the screen, as Codex words it.
+    fn question_asked(&self, screen: &str) -> Option<String> {
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
+            // The folder question at start (0.170 wording), whose answers may not be numbered
+            if self.at_prompt(screen) {
+                return None;
+            }
+            // Codex's review of hooks it has not run before, ours among them (MCR-74)
+            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
+                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
+            }
+            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
+            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        })
+    }
+
     /// The sandbox and approval words of a launch: the profile's, or the bare
     /// line's. Under an auto-mode root on `CODEX_SOCKETS_OS` the socket
     /// profile takes the place of `--sandbox workspace-write` (MCR-162);
@@ -1382,6 +1423,30 @@ mod tests {
     }
 
     #[test]
+    fn a_new_codex_conversation_is_told_from_one_opened_from_the_command_center() {
+        // MCR-179 review 17342 (1): before Codex reports its conversation, the
+        // harness types into it only on positive proof that it is a new one
+        let codex = Codex;
+        let banner = "  >_ OpenAI Codex (v0.172.0)\n     ~/work/infra/wt/infra-253-skills\n\n";
+        let fresh = format!("{banner}\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~/work/infra/wt/infra-253-skills\n  \u{2190} for agents \u{b7} ? for shortcuts\n");
+        assert!(codex.fresh_conversation(&fresh, "~/work/infra/wt/infra-253-skills"));
+        // Another folder on the line under the box: not this session's conversation
+        assert!(!codex.fresh_conversation(&fresh, "~/work/infra/wt/infra-252-skills"));
+        // The task of 26 Nov as mcr:45bb49adeb2b showed it: its history, its folder and its title
+        let opened = "\u{203a} resume\n    1733\n\u{2022} Ran git status --porcelain\n  \u{2514} (no output)\n\n\u{25a0} Conversation interrupted\n\n\u{203a} Ask Codex to do anything\n\n  GPT-6.2-Sol high \u{b7} ~/work/teob-cc/teob-rust \u{b7} Validate CORE-850 round 2 at the exact commit 3a0e726 (loca\u{2026}\n  \u{2190} for agents \u{b7} ? for shortcuts\n";
+        assert!(!codex.fresh_conversation(opened, "~/work/teob-cc/teob-rust"));
+        // The same task with its history scrolled away still names itself on that line
+        let titled = format!("{banner}\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~/work/infra/wt/infra-253-skills \u{b7} Validate INFRA-253\n  ? for shortcuts\n");
+        assert!(!codex.fresh_conversation(&titled, "~/work/infra/wt/infra-253-skills"));
+        // Something said already, or a menu on screen, or no banner: no proof
+        let said = format!("{banner}\u{2022} Explored\n\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~/work/infra/wt/infra-253-skills\n  ? for shortcuts\n");
+        assert!(!codex.fresh_conversation(&said, "~/work/infra/wt/infra-253-skills"));
+        let menu = "\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n  ? for shortcuts\n";
+        assert!(!codex.fresh_conversation(menu, "~/work/infra/wt/infra-253-skills"));
+        assert!(!Claude.fresh_conversation(&fresh, "~/work/infra/wt/infra-253-skills"));
+    }
+
+    #[test]
     fn a_prompt_is_recognised_from_the_title_and_the_screen() {
         let codex = adapter("codex");
         assert_eq!(codex.title_asks("[ ! ] Action Required | teob-ai"), Some(true));
@@ -1412,7 +1477,17 @@ mod tests {
         assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n  Yes, continue\n  No, quit\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
         assert_eq!(codex.question("Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, quit").as_deref(), Some("Do you trust the contents of this directory?"));
         // As seen on 2026-11-18 (codex-cli 0.170): numbered answers
-        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
+        // Its second answer opens the Agent command center, where Enter opens another
+        // task in this terminal (MCR-179): the question says so
+        let note = format!("{COMMAND_CENTER_NOTE} Trust this folder? Codex can read, edit, and run files here.");
+        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some(note.as_str()));
+        // As mcr:45bb49adeb2b showed it on 2026-11-26 (codex-cli 0.172), in a worktree of an untrusted repository
+        let worktree = "  Folder access\n  /Users/x/work/infra/wt/infra-253-skills\n\n  Note: You\u{2019}re in a subdirectory of a Git project. Trusting will apply to the repository root:\n  /Users/x/work/infra/infra-skills\n\n  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code\n  automatically, even without a model request. Continue only if you trust these files. Your trust decision will be saved.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n\n  enter continue \u{b7} esc back\n";
+        let asked = codex.question(worktree).unwrap();
+        assert!(asked.starts_with(COMMAND_CENTER_NOTE) && asked.contains("Trust this folder? Codex can read, edit, and run files here, subject to"), "{asked}");
+        // A notification shows 200 characters of "Seen in its terminal: <question>" (`notify_user`): the whole note fits (review 17342, 6)
+        let shown: String = format!("Seen in its terminal: {asked}").chars().take(200).collect();
+        assert!(shown.contains(COMMAND_CENTER_NOTE), "{shown}");
         assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
         // Codex's own review of hooks, as recorded on 2026-11-18 (it does not set the title)
         let review = "  Hooks need review\n  4 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\u{203a} 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n";
