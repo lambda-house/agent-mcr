@@ -2042,7 +2042,7 @@ impl Store {
         // The mark of a conversation the session did not start stands while
         // the session is apart from it: whatever took it away (the
         // operator's Enter, a prompt that went) does not end that (MCR-179)
-        for t in self.sessions.values_mut().filter(|t| t.foreign.is_some() && t.attention.is_none() && t.state != ENDED) {
+        for t in self.sessions.values_mut().filter(|t| t.foreign.is_some() && t.attention.as_ref().is_none_or(plain_notification) && t.state != ENDED) {
             t.attention = Some(Attention { kind: "assessment".into(), text: FOREIGN_MARK.into(), since: now, ..Attention::default() });
         }
         // A session that is gone waits for nothing
@@ -2390,9 +2390,12 @@ const HELD_LINE: &str = "Refused: the operator has an unsent line in that sessio
 /// did not start (MCR-179); asked under the writer's lock, as `HELD_LINE`.
 const FOREIGN_LINE: &str = "Refused: that session's agent is in a conversation the session did not start, and input there would go to that conversation";
 
-/// The mark of a task that waits because nothing proves the conversation on screen is the session's (MCR-179).
-const UNPROVEN_TASK: &str = "A task is queued, but the harness cannot see in its terminal that this is a new conversation of the session's own \
-     (it may be asking something, or another task may be open there): it types nothing until it can";
+/// The mark of input that waits because nothing proves the conversation on screen is the session's (MCR-179).
+const UNPROVEN_TASK: &str = "A task or a message notice waits for it, but the harness cannot see in its terminal that this is a new conversation \
+     of the session's own (it may be asking something, or another task may be open there): it types nothing until it can";
+
+/// The screen no longer proved a new conversation at the moment of writing (review 17361, 3).
+const UNPROVEN_LINE: &str = "Refused: the terminal no longer shows a new conversation of that session's own";
 
 /// An agent that does not name its conversation (Codex), launched by this
 /// build, that has not said which conversation it is in yet: what is
@@ -2403,12 +2406,21 @@ fn conversation_unknown(t: &Tracked) -> bool {
     agent.is_agent() && !agent.names_conversation() && t.launched != 0 && t.agent_session.is_none()
 }
 
-/// A folder as agents show it: under the home folder with `~`.
+/// A folder as Codex 0.172 shows it (`status/helpers.rs`,
+/// `format_directory_display`): under the home folder as `~`, the system's
+/// separator, and the rest as the path displays itself, so `~\work\repo`
+/// on Windows (review 17361, 2).
 fn shown_folder(cwd: &str) -> String {
-    match dirs::home_dir().and_then(|home| Path::new(cwd).strip_prefix(&home).ok().map(Path::to_path_buf)) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => cwd.to_string(),
+    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+    folder_shown(cwd, &home, std::path::MAIN_SEPARATOR)
+}
+
+fn folder_shown(cwd: &str, home: &str, separator: char) -> String {
+    let home = home.trim_end_matches(['/', '\\']);
+    match cwd.strip_prefix(home).filter(|_| !home.is_empty()) {
+        Some("") => "~".into(),
+        Some(rest) if rest.starts_with(['/', '\\']) => format!("~{separator}{}", &rest[1..]),
+        _ => cwd.to_string(),
     }
 }
 
@@ -2853,37 +2865,63 @@ enum Found {
 /// folders. Read by the service (`Harness::hook`) only for an id that is
 /// not the session's own and does not date itself.
 fn conversation_found(home: &Path, id: &str, named: Option<&str>) -> Found {
-    if !is_uuid(id) {
-        return Found::Unknown;
-    }
-    let suffix = format!("{id}.jsonl");
-    let ours = |p: &Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix));
-    let named = named.map(PathBuf::from).filter(|p| ours(p) && p.is_file());
-    let found = named.or_else(|| {
-        adapters().find_map(|agent| {
-            let (folder, depth) = agent.transcripts()?;
-            let mut files = Vec::new();
-            jsonl_files(&home.join(folder), depth, &mut files);
-            files.into_iter().find(|p| ours(p))
-        })
-    });
-    let Some(path) = found else { return Found::Missing };
+    let Some(path) = transcript_of(home, id, named) else {
+        return if is_uuid(id) { Found::Missing } else { Found::Unknown };
+    };
     let Ok(mut file) = crate::transcript_stats::open_regular(&path) else { return Found::Unknown };
     let born = file.metadata().ok().map(|m| file_ms(m.created())).filter(|ms| *ms > 0);
+    // Read one byte past the cap, to know whether the head is the whole file
+    const HEAD: u64 = 64 * 1024;
     let mut head = Vec::new();
-    if (&mut file).take(64 * 1024).read_to_end(&mut head).is_err() {
-        return born.map_or(Found::Unknown, Found::Began);
+    if (&mut file).take(HEAD + 1).read_to_end(&mut head).is_err() {
+        return Found::Unknown;
     }
+    let whole = head.len() as u64 <= HEAD;
+    head.truncate(HEAD as usize);
     let recorded = String::from_utf8_lossy(&head)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter_map(|v| chrono::DateTime::parse_from_rfc3339(v["timestamp"].as_str()?).ok())
         .map(|at| at.timestamp_millis().max(0) as u64)
         .min();
-    match born.into_iter().chain(recorded).min() {
-        Some(at) => Found::Began(at),
-        None => Found::Unknown,
+    // A head that holds no time tells nothing of the records after it
+    // (review 17361, 6): the birth time alone counts only for a whole file
+    match (recorded, born) {
+        (Some(at), born) => Found::Began(born.map_or(at, |b| b.min(at))),
+        (None, Some(b)) if whole => Found::Began(b),
+        _ => Found::Unknown,
     }
+}
+
+/// What the service adds to a hook about a conversation that is not the
+/// session's own: for an id that does not date itself, `conversation-found`;
+/// for a Codex thread, `conversation-here`, whether its rollout names the
+/// session's folder (left out when no rollout is found yet).
+fn conversation_evidence(home: &Path, id: &str, cwd: &str, payload: &mut Value) {
+    if uuid7_ms(id).is_none() {
+        payload["conversation-found"] = found_value(&conversation_found(home, id, payload["transcript_path"].as_str()));
+    } else if let Some(folder) = transcript_of(home, id, None).and_then(|path| crate::agents::head_value(&path, "cwd", 8192)) {
+        let real = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+        payload["conversation-here"] = json!(real(&folder) == real(cwd));
+    }
+}
+
+/// A conversation's transcript: at the path the hook names when that file
+/// is the conversation's, else in the agents' own folders.
+fn transcript_of(home: &Path, id: &str, named: Option<&str>) -> Option<PathBuf> {
+    if !is_uuid(id) {
+        return None;
+    }
+    let suffix = format!("{id}.jsonl");
+    let ours = |p: &Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix));
+    named.map(PathBuf::from).filter(|p| ours(p) && p.is_file()).or_else(|| {
+        adapters().find_map(|agent| {
+            let (folder, depth) = agent.transcripts()?;
+            let mut files = Vec::new();
+            jsonl_files(&home.join(folder), depth, &mut files);
+            files.into_iter().find(|p| ours(p))
+        })
+    })
 }
 
 /// `Found` as the service puts it into a hook's payload, and back.
@@ -2905,12 +2943,15 @@ fn found_from(v: &Value) -> Found {
 
 /// Whether a conversation an agent reports may be the session's own
 /// (MCR-179). Its own (the one it has, or the one it was launched with) is.
-/// Another session's never is. Else only with positive proof that it began
-/// after the launch, and never one the agent says it resumed (a start with
-/// `source: resume`): a Codex thread id that dates itself at or after the
-/// launch; a transcript whose oldest time is at or after it; or, with no
-/// transcript at all, a start the agent calls new (`startup`, Claude's
-/// `clear`). A session recorded before launches were takes any, as before.
+/// Another session's never is, nor one it rejected already. Else only with
+/// positive proof that it began after the launch, and never one the agent
+/// says it resumed (a start with `source: resume`): a Codex thread id that
+/// dates itself at or after the launch and whose rollout names the
+/// session's folder (`conversation-here`, from `Harness::hook`; without a
+/// rollout yet, only a `startup` start); a transcript whose oldest time is
+/// at or after it; or, with no transcript at all, a start the agent calls
+/// new (`startup`, Claude's `clear`). A session recorded before launches
+/// were takes any, as before.
 fn takes_conversation(store: &Store, session: &str, event: &str, id: &str, payload: &Value) -> bool {
     let Some(t) = store.sessions.get(session) else { return false };
     if t.agent_session.as_deref() == Some(id) || t.launch_conversation.as_deref() == Some(id) {
@@ -2922,12 +2963,19 @@ fn takes_conversation(store: &Store, session: &str, event: &str, id: &str, paylo
     if t.launched == 0 {
         return true;
     }
+    // A rejection stands for that id; a launch time this build could not read takes nothing new
+    if t.foreign.as_deref() == Some(id) || t.launched == u64::MAX {
+        return false;
+    }
     let start = (event == "SessionStart" || payload["hook_event_name"] == "SessionStart").then(|| payload["source"].as_str().unwrap_or(""));
     if start == Some("resume") {
         return false;
     }
+    // Its date is not enough: a task opened from the command center may be
+    // younger than the launch (review 17361, 1). Its rollout says where it runs
     if let Some(at) = uuid7_ms(id) {
-        return at >= t.launched;
+        let here = payload["conversation-here"].as_bool().unwrap_or(start == Some("startup"));
+        return at >= t.launched && here;
     }
     match found_from(&payload["conversation-found"]) {
         Found::Began(at) => at >= t.launched,
@@ -2936,11 +2984,18 @@ fn takes_conversation(store: &Store, session: &str, event: &str, id: &str, paylo
     }
 }
 
+/// A terminal's notification, neither a prompt nor the agent's own report.
+fn plain_notification(a: &Attention) -> bool {
+    a.kind == "notification" && a.report.is_none()
+}
+
 /// Its agent is in a conversation that is not the session's: say so on the
 /// session, unless a prompt or a report is marked there already.
 fn mark_foreign(tracked: &mut Tracked, id: &str) {
     tracked.foreign = Some(id.to_string());
-    if tracked.attention.is_none() {
+    // A plain notification that came just before is likely about that
+    // conversation: the warning takes its place (review 17361, 5)
+    if tracked.attention.as_ref().is_none_or(plain_notification) {
         tracked.attention = Some(Attention { kind: "assessment".into(), text: FOREIGN_MARK.into(), since: now_ms(), ..Attention::default() });
     }
 }
@@ -3156,6 +3211,10 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
 /// track, its id, its stamp, and whether the reason was the operator's typing.
 type ToldOutdated = (String, bool, String, u64, bool);
 
+/// A change of the store a test makes between a hook's first look and its update.
+#[cfg(test)]
+type AfterLook = Box<dyn FnOnce(&mut Store) + Send>;
+
 pub struct Harness {
     /// Whether session folders are still there, and when that was asked (`Harness::folder_there`)
     folders: Mutex<BTreeMap<String, (Instant, bool)>>,
@@ -3169,6 +3228,10 @@ pub struct Harness {
     /// Writes for tests, in place of the runner's: recorded while it is `Some`
     #[cfg(test)]
     typed: Mutex<Option<Vec<(String, String)>>>,
+    /// Run by `hook` between its first look at the store and its update, for
+    /// a test of a binding that moves in that moment (review 17361, 4)
+    #[cfg(test)]
+    after_look: Mutex<Option<AfterLook>>,
     #[cfg(test)]
     launch_home: Option<PathBuf>,
     /// The Codex socket check for tests, in place of running Codex: None
@@ -3370,7 +3433,7 @@ impl Harness {
         }
         // No bridge is connected to a service that just started; they come back on their own
         store.sessions.values_mut().for_each(|t| t.tools = false);
-        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
+        let harness = Self { folders: Mutex::new(BTreeMap::new()), writers: Mutex::new(BTreeMap::new()), wrote: Mutex::new(BTreeMap::new()), #[cfg(test)] typed: Mutex::new(None), #[cfg(test)] after_look: Mutex::new(None), #[cfg(test)] launch_home: None, #[cfg(test)] sockets_check: Mutex::new(None), #[cfg(test)] launch_os: None, outdated_told: Mutex::new(BTreeSet::new()), dir: dir.to_path_buf(), frozen, store: Mutex::new(store), changed: Condvar::new(), connections: AtomicUsize::new(0), processes: Mutex::new((None, Arc::new(Vec::new()))), activity: Mutex::new(BTreeMap::new()), subagents: Subagents::new(), slack: Arc::new(Slack::open(dir)), memory: Memory::open(dir), screens: Mutex::new(BTreeMap::new()), titled: Mutex::new(BTreeSet::new()), #[cfg(test)] shown: Mutex::new(BTreeMap::new()), drafts_checked: Mutex::new(BTreeMap::new()), draft_window: Mutex::new(0), draft_words: Mutex::new(BTreeMap::new()), contexts: crate::transcript_stats::Contexts::new() };
         if noticed {
             // Once the file is kept, the store goes to disk with the notice
             // and without the parts left out: the next start finds a file it
@@ -4136,13 +4199,19 @@ impl Harness {
         if agent {
             plain_prompt(&clean)?;
         }
-        self.submit(session, &clean)
+        self.submit_as(session, &clean, true)
     }
 
     /// Type text into the session, then Enter as a write of its own 250 ms
     /// later (`submit_writes`). Shared by tasks, inbox notices and
     /// `terminal_write` with `submit`.
     fn submit(&self, session: &str, text: &str) -> Result<(), String> {
+        self.submit_as(session, text, false)
+    }
+
+    /// `submit`, for the harness's own input (`deliver`: a task or a notice)
+    /// when `own` is set.
+    fn submit_as(&self, session: &str, text: &str, own: bool) -> Result<(), String> {
         // From the text to its Enter nobody else writes there (MCR-97)
         let writer = self.writer(session);
         let _typing = lock(&writer);
@@ -4151,6 +4220,13 @@ impl Harness {
         // Enter, and a conversation the session did not start would get it
         if let Some(why) = write_refusal(lock(&self.store).sessions.get(session)) {
             return Err(why.into());
+        }
+        // Before its agent said which conversation it is in, the screen's proof
+        // is read again here, just before the text, and not only when the work
+        // was claimed (review 17361, 3)
+        let unknown = lock(&self.store).sessions.get(session).is_some_and(conversation_unknown);
+        if own && unknown && !self.new_conversation_on_screen(session) {
+            return Err(UNPROVEN_LINE.into());
         }
         // Agents always turn it on, and their old output may have left the scrollback
         let agent = lock(&self.store).sessions.get(session).is_some_and(|t| adapter(&t.profile).is_agent());
@@ -4391,7 +4467,7 @@ impl Harness {
                     Some(label(tracked))
                 });
                 if let Some(who) = raise {
-                    notify_user(&format!("Agent MCR: {who} is waiting for you"), "Its terminal is not at the prompt");
+                    notify_user(&format!("Agent MCR: {who} is waiting for you"), if unproven { UNPROVEN_TASK } else { "Its terminal is not at the prompt" });
                 }
             }
             return;
@@ -4414,7 +4490,7 @@ impl Harness {
             Ok(()) => {}
             // The operator got a line there in the moment between the look and
             // the typing: the task goes back to the queue, as if `held` had said so
-            Err(e) if e == HELD_LINE || e == FOREIGN_LINE => self.update(|s| s.requeue(session)),
+            Err(e) if e == HELD_LINE || e == FOREIGN_LINE || e == UNPROVEN_LINE => self.update(|s| s.requeue(session)),
             Err(e) => self.update(|s| s.finish(session, "failed", Some(e))),
         }
     }
@@ -4451,6 +4527,18 @@ impl Harness {
             false => reads_screen(untracked, unsure, sees) && self.at_prompt(session),
         };
         if unproven && !at_prompt {
+            // A message that waits so says on the session, as a task does (review 17361, 5)
+            let since = lock(&self.store).messages.values().filter(|m| m.to == session && m.read == 0 && !m.notified).map(|m| m.created).min().unwrap_or(u64::MAX);
+            if now_ms().saturating_sub(since) > 15_000 {
+                let raise = self.update(|s| {
+                    let tracked = s.sessions.get_mut(session).filter(|t| t.attention.is_none())?;
+                    tracked.attention = Some(Attention { kind: "permission".into(), text: UNPROVEN_TASK.into(), since: now_ms(), ..Attention::default() });
+                    Some(label(tracked))
+                });
+                if let Some(who) = raise {
+                    notify_user(&format!("Agent MCR: {who} is waiting for you"), UNPROVEN_TASK);
+                }
+            }
             return;
         }
         let from = self.update(|s| {
@@ -5515,35 +5603,49 @@ impl Harness {
         if let (Some(thread), Some(home)) = (thread, dirs::home_dir()) {
             payload["top-level"] = json!(top_level_thread(&home, thread));
         }
-        // A conversation that is not the session's own (MCR-179). Its
-        // transcript is looked at for an id that does not date itself, and
-        // only when the id is not the session's, which is rare. The mark it
-        // may bring is set under the session's writer lock: a task, notice
-        // or line that `submit`, `write_raw` or `place` began is typed whole
-        // first, and every later one sees the mark (review 17342, 3)
-        let mut maybe_foreign = false;
-        if let Some(id) = reported_conversation(event, &payload).map(str::to_owned) {
-            let known = lock(&self.store).sessions.get(session).map(|t| (t.agent_session.clone(), t.launch_conversation.clone())).unwrap_or_default();
-            maybe_foreign = known.0.as_deref() != Some(id.as_str()) && known.1.as_deref() != Some(id.as_str());
-            if let (true, None, Some(home)) = (maybe_foreign, uuid7_ms(&id), dirs::home_dir()) {
-                payload["conversation-found"] = found_value(&conversation_found(&home, &id, payload["transcript_path"].as_str()));
-            }
+        // A conversation that is not the session's own (MCR-179). What its
+        // transcript says (its age, or for a Codex thread its folder) is looked
+        // at only when the id is not the session's, which is rare. The mark it
+        // may bring is set under the session's writer lock: a task, notice or
+        // line that `submit`, `write_raw` or `place` began is typed whole
+        // first, and every later one sees the mark (review 17342, 3). Whether
+        // to mark is decided under the store: a hook that would mark without
+        // holding the writer goes round once more with it, so a binding that
+        // moved since the first look cannot skip it (review 17361, 4)
+        let id = reported_conversation(event, &payload).map(str::to_owned);
+        let known = lock(&self.store).sessions.get(session).map(|t| (t.agent_session.clone(), t.launch_conversation.clone(), t.cwd.clone())).unwrap_or_default();
+        let mut holding = id.as_deref().is_some_and(|id| known.0.as_deref() != Some(id) && known.1.as_deref() != Some(id));
+        #[cfg(test)]
+        if let Some(moved) = lock(&self.after_look).take() {
+            moved(&mut lock(&self.store));
         }
-        let writer = maybe_foreign.then(|| self.writer(session));
-        let typing = writer.as_ref().map(|w| lock(w));
-        let payload = &payload;
-        let (ready, waiting, foreign) = self.update(|s| {
-            let before = s.sessions.get(session).map(|t| (t.state.clone(), t.foreign.clone()));
-            if event == crate::agents::CODEX_HOOK && s.sessions.contains_key(session) {
-                s.codex_hooks_seen = this_program();
+        let (ready, waiting, foreign) = loop {
+            if let (true, Some(id), Some(home)) = (holding, id.as_deref(), dirs::home_dir()) {
+                conversation_evidence(&home, id, &known.2, &mut payload);
             }
-            let ready = apply_hook(s, session, event, payload);
-            let tracked = s.sessions.get(session);
-            let now_waiting = tracked.filter(|t| t.state == "waiting" && before.as_ref().map(|b| b.0.as_str()) != Some("waiting")).cloned();
-            let now_foreign = tracked.is_some_and(|t| t.foreign.is_some() && before.as_ref().map(|b| &b.1) != Some(&t.foreign));
-            (ready, now_waiting, now_foreign)
-        });
-        drop(typing);
+            let writer = holding.then(|| self.writer(session));
+            let typing = writer.as_ref().map(|w| lock(w));
+            let payload = &payload;
+            let outcome = self.update(|s| {
+                if !holding && reported_conversation(event, payload).is_some_and(|id| !takes_conversation(s, session, event, id, payload)) {
+                    return None;
+                }
+                let before = s.sessions.get(session).map(|t| (t.state.clone(), t.foreign.clone()));
+                if event == crate::agents::CODEX_HOOK && s.sessions.contains_key(session) {
+                    s.codex_hooks_seen = this_program();
+                }
+                let ready = apply_hook(s, session, event, payload);
+                let tracked = s.sessions.get(session);
+                let now_waiting = tracked.filter(|t| t.state == "waiting" && before.as_ref().map(|b| b.0.as_str()) != Some("waiting")).cloned();
+                let now_foreign = tracked.is_some_and(|t| t.foreign.is_some() && before.as_ref().map(|b| &b.1) != Some(&t.foreign));
+                Some((ready, now_waiting, now_foreign))
+            });
+            drop(typing);
+            match outcome {
+                Some(outcome) => break outcome,
+                None => holding = true,
+            }
+        };
         if waiting.is_some() {
             self.tell_waiting(session);
         }
@@ -12569,9 +12671,9 @@ mod tests {
             s
         };
         let takes = |session: &str, event: &str, id: &str, payload: Value| takes_conversation(&fresh(), session, event, id, &payload);
-        // A Codex thread dated at the launch is its own; one millisecond earlier is not: no slack
-        assert!(takes("ex", "codex-notify", &v7(launched), json!({})));
-        assert!(!takes("ex", "codex-notify", &v7(launched - 1), json!({})));
+        // A Codex thread dated at the launch, whose rollout runs in its folder, is its own; one millisecond earlier is not: no slack
+        assert!(takes("ex", "codex-notify", &v7(launched), json!({"conversation-here": true})));
+        assert!(!takes("ex", "codex-notify", &v7(launched - 1), json!({"conversation-here": true})));
         // A start the agent calls a resume is never new, however its id is dated
         assert!(!takes("ex", "codex-hook", &v7(launched + 5_000), json!({"hook_event_name": "SessionStart", "source": "resume"})));
         assert!(takes("ex", "codex-hook", &v7(launched + 5_000), json!({"hook_event_name": "SessionStart", "source": "startup"})));
@@ -12765,5 +12867,191 @@ mod tests {
         // An unreadable launch time takes no new conversation; an unreadable mark types nothing
         assert!(!takes_conversation(&store, "ex", "codex-notify", "01a2182c-f44c-7ef3-be26-22469e20be39", &json!({})));
         assert_eq!(write_refusal(Some(ex)), Some(FOREIGN_LINE));
+    }
+
+    /// Review 17361 (1): a turn end alone never binds a conversation. A
+    /// Codex thread younger than the launch but run elsewhere (a task opened
+    /// from the command center), or one rejected already, stays apart.
+    #[test]
+    fn a_young_thread_from_elsewhere_is_not_taken_at_a_turn_end() {
+        let launched = 1_795_701_652_000u64;
+        let v7 = |ms: u64| format!("{:08x}-{:04x}-7abc-8def-0123456789ab", ms >> 16, ms & 0xffff);
+        let elsewhere = v7(launched + 60_000);
+        let mut s = Store::default();
+        s.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), launched, cwd: "/work/infra-253".into(), ..Tracked::default() });
+        task(&mut s, "t1", "ex", "working", launched);
+        let notify = |s: &mut Store, thread: &str, more: Value| {
+            let mut p = json!({"type": "agent-turn-complete", "thread-id": thread, "top-level": true});
+            p.as_object_mut().unwrap().extend(more.as_object().unwrap().clone());
+            apply_hook(s, "ex", "codex-notify", &p)
+        };
+        // Its rollout runs in another folder: not taken, the task stays open
+        assert!(!notify(&mut s, &elsewhere, json!({"conversation-here": false})));
+        let t = s.sessions["ex"].clone();
+        assert_eq!((t.agent_session.as_deref(), t.foreign.as_deref(), t.state.as_str(), s.tasks["t1"].state.as_str()), (None, Some(elsewhere.as_str()), "working", "working"));
+        // Rejected once, rejected again, also if a later word says it runs here
+        assert!(!notify(&mut s, &elsewhere, json!({"conversation-here": true})));
+        assert_eq!(s.sessions["ex"].agent_session, None);
+        // No rollout found: a turn end proves nothing
+        let unfound = v7(launched + 70_000);
+        let mut quiet = Store::default();
+        quiet.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), launched, ..Tracked::default() });
+        assert!(!apply_hook(&mut quiet, "ex", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": unfound, "top-level": true})));
+        assert_eq!(quiet.sessions["ex"].foreign.as_deref(), Some(unfound.as_str()));
+        // Its own: young and here
+        let own = v7(launched + 3_000);
+        let mut fine = Store::default();
+        fine.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), launched, ..Tracked::default() });
+        assert!(apply_hook(&mut fine, "ex", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": own, "top-level": true, "conversation-here": true})));
+        assert_eq!(fine.sessions["ex"].agent_session.as_deref(), Some(own.as_str()));
+        // A launch time this build could not read takes nothing new, a start without a transcript included
+        let mut unread = Store::default();
+        unread.sessions.insert("cl".into(), Tracked { profile: "claude".into(), state: "working".into(), launched: u64::MAX, ..Tracked::default() });
+        assert!(!takes_conversation(&unread, "cl", "SessionStart", "66666666-7777-4888-8999-000000000000", &json!({"source": "clear", "conversation-found": {"missing": true}})));
+    }
+
+    /// The service's evidence for a Codex thread: whether its rollout runs in
+    /// the session's folder (review 17361, 1).
+    #[test]
+    fn a_codex_rollout_says_where_its_thread_runs() {
+        let home = std::env::temp_dir().join(format!("agent-mcr-here-{}", runner::random_id()));
+        let day = home.join(".codex/sessions/2026/11/26");
+        std::fs::create_dir_all(&day).unwrap();
+        let here = home.join("work/infra-253");
+        std::fs::create_dir_all(&here).unwrap();
+        let id = "01a2182c-f44c-7ef3-be26-22469e20be39";
+        std::fs::write(day.join(format!("rollout-2026-11-26T15-05-29-{id}.jsonl")), format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/Users/x/work/teob-ai\"}}}}\n")).unwrap();
+        let mut payload = json!({});
+        conversation_evidence(&home, id, &here.display().to_string(), &mut payload);
+        assert_eq!(payload["conversation-here"], false);
+        let mine = "01a2182c-f44c-7ef3-be26-22469e20be40";
+        std::fs::write(day.join(format!("rollout-2026-11-26T15-05-30-{mine}.jsonl")), format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{mine}\",\"cwd\":\"{}\"}}}}\n", here.display())).unwrap();
+        let mut payload = json!({});
+        conversation_evidence(&home, mine, &here.display().to_string(), &mut payload);
+        assert_eq!(payload["conversation-here"], true);
+        // No rollout yet: nothing is said
+        let mut payload = json!({});
+        conversation_evidence(&home, "01a2182c-f44c-7ef3-be26-22469e20be41", &here.display().to_string(), &mut payload);
+        assert!(payload["conversation-here"].is_null());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// Review 17361 (2): Codex writes a folder under home with the system's
+    /// separator after `~`: `~\work\repo` on Windows.
+    #[test]
+    fn a_folder_is_shown_as_codex_shows_it_on_each_system() {
+        assert_eq!(folder_shown(r"C:\Users\x\work\repo", r"C:\Users\x", '\\'), r"~\work\repo");
+        assert_eq!(folder_shown(r"C:\Users\x", r"C:\Users\x\", '\\'), "~");
+        assert_eq!(folder_shown(r"C:\Users\xy\work", r"C:\Users\x", '\\'), r"C:\Users\xy\work");
+        assert_eq!(folder_shown(r"D:\work\repo", r"C:\Users\x", '\\'), r"D:\work\repo");
+        assert_eq!(folder_shown("/Users/x/work/repo", "/Users/x", '/'), "~/work/repo");
+        assert_eq!(folder_shown("/work/repo", "/Users/x", '/'), "/work/repo");
+        // A default Windows screen of a new conversation is proof for that folder
+        let screen = "  >_ OpenAI Codex (v0.172.0)\n     ~\\work\\repo\n\n\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~\\work\\repo\n  ? for shortcuts\n";
+        assert!(adapter("codex").fresh_conversation(screen, &folder_shown(r"C:\Users\x\work\repo", r"C:\Users\x", '\\')));
+        assert!(!adapter("codex").fresh_conversation(screen, "~/work\\repo"), "the form of round 2");
+    }
+
+    /// Review 17361 (3): the screen's proof is read again at the write, under
+    /// the writer's lock; a screen that changed since the work was claimed
+    /// gets nothing, and the task goes back to the queue.
+    #[test]
+    fn the_screen_proof_is_read_again_when_the_harness_writes() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-proof-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        *lock(&harness.typed) = Some(Vec::new());
+        harness.update(|h| {
+            h.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "unknown".into(), cwd: "/work/infra-253".into(), launched: now_ms(), ..Tracked::default() });
+        });
+        let new = "  >_ OpenAI Codex (v0.172.0)\n\n\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} /work/infra-253\n  ? for shortcuts\n";
+        let opened = "\u{203a} resume\n\u{2022} Ran ls\n\n\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~/work/teob-cc/teob-rust \u{b7} Validate CORE-850\n  ? for shortcuts\n";
+        lock(&harness.shown).insert("ex".into(), opened.into());
+        assert_eq!(harness.deliver("ex", "Validate INFRA-253").unwrap_err(), UNPROVEN_LINE);
+        assert!(lock(&harness.typed).as_ref().unwrap().is_empty());
+        // The operator's own input (terminal_write) is not the harness's: not asked
+        assert!(harness.submit("ex", "x").is_ok());
+        lock(&harness.typed).as_mut().unwrap().clear();
+        lock(&harness.shown).insert("ex".into(), new.into());
+        assert!(harness.deliver("ex", "Validate INFRA-253").is_ok());
+        assert!(!lock(&harness.typed).as_ref().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review 17361 (4): a hook that would mark without the writer goes round
+    /// again with it, even when the store moved since its first look.
+    #[test]
+    fn a_mark_decided_late_still_waits_for_the_writer() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-late-mark-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        let (c1, c2) = ("11111111-2222-4333-8444-555555555555", "66666666-7777-4888-8999-000000000000");
+        harness.update(|h| {
+            h.sessions.insert("cl".into(), Tracked { profile: "claude".into(), state: "working".into(), launched: now_ms(), agent_session: Some(c1.into()), ..Tracked::default() });
+        });
+        // Hook A's first look sees C1 as the session's own and takes no writer;
+        // hook B moves the binding to C2 before A's update. A must not mark
+        // without the writer: it goes round again and waits for it
+        *lock(&harness.after_look) = Some(Box::new(move |s: &mut Store| s.sessions.get_mut("cl").unwrap().agent_session = Some(c2.into())));
+        let writer = harness.writer("cl");
+        let writing = lock(&writer);
+        std::thread::scope(|scope| {
+            let late = scope.spawn(|| {
+                // As A: the decision is made under the store; with the binding moved it would mark
+                harness.hook("cl", "PostToolUse", &json!({"session_id": c1}))
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(lock(&harness.store).sessions["cl"].foreign.is_none(), "no mark while a write is under way");
+            drop(writing);
+            late.join().unwrap();
+        });
+        assert_eq!(lock(&harness.store).sessions["cl"].foreign.as_deref(), Some(c1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review 17361 (5): an inbox-only wait says why on the session, and the
+    /// warning takes the place of a notification that came just before it.
+    #[test]
+    fn a_wait_and_a_switch_are_said_on_the_session() {
+        let dir = std::env::temp_dir().join(format!("agent-mcr-said-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        *lock(&harness.typed) = Some(Vec::new());
+        harness.update(|h| {
+            h.sessions.insert("mail".into(), Tracked { profile: "codex".into(), state: "unknown".into(), cwd: "/work/x".into(), launched: now_ms(), ..Tracked::default() });
+            h.post(Message { to: "mail".into(), text: "hello".into(), ..Message::default() });
+            for m in h.messages.values_mut() {
+                m.created = now_ms() - 20_000;
+            }
+        });
+        lock(&harness.shown).insert("mail".into(), "\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n".into());
+        harness.nudge("mail");
+        let a = lock(&harness.store).sessions["mail"].attention.clone().unwrap();
+        assert_eq!(a.text, UNPROVEN_TASK);
+        assert!(lock(&harness.typed).as_ref().unwrap().is_empty());
+        // A terminal notification first, then the hook that shows the switch
+        let mut t = Tracked { profile: "codex".into(), state: "working".into(), launched: 1, ..Tracked::default() };
+        t.attention = Some(Attention { kind: "notification".into(), text: "Kafka suite passed".into(), since: 1, ..Attention::default() });
+        mark_foreign(&mut t, "01a2138f-db30-7f33-932d-71a5cae26b9a");
+        assert_eq!(t.attention.as_ref().map(|a| a.text.as_str()), Some(FOREIGN_MARK));
+        // Not over a prompt or the agent's own report
+        let mut asked = Tracked { attention: Some(Attention { kind: "permission".into(), text: "Allow?".into(), since: 1, ..Attention::default() }), ..Tracked::default() };
+        mark_foreign(&mut asked, "x");
+        assert_eq!(asked.attention.unwrap().text, "Allow?");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review 17361 (6): a head that ends inside its first record says
+    /// nothing of the file's age, whatever its birth time.
+    #[test]
+    fn a_long_first_record_makes_the_age_unknown() {
+        let home = std::env::temp_dir().join(format!("agent-mcr-long-{}", runner::random_id()));
+        std::fs::create_dir_all(home.join(".claude/projects/-work")).unwrap();
+        let id = "12345678-1234-4123-8123-123456789abc";
+        let path = home.join(format!(".claude/projects/-work/{id}.jsonl"));
+        let big = format!("{{\"type\":\"user\",\"timestamp\":\"2026-11-20T08:00:00Z\",\"text\":\"{}\"}}\n", "x".repeat(70 * 1024));
+        std::fs::write(&path, big).unwrap();
+        assert_eq!(conversation_found(&home, id, None), Found::Unknown);
+        // A short file wholly read with no time keeps its birth time where the system has one
+        std::fs::write(&path, "{\"type\":\"summary\"}\n").unwrap();
+        assert!(matches!(conversation_found(&home, id, None), Found::Began(_) | Found::Unknown));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }
