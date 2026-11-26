@@ -1998,11 +1998,17 @@ impl Store {
     /// Whether `me` may end the session `id` (MCR-46): only an executor it
     /// started itself with `executor_create`, that still works for it, has no
     /// executors of its own and is idle with nothing that needs action.
-    fn may_end(&self, me: &str, id: &str) -> Result<(), String> {
+    /// An executor `me` started itself with `executor_create` and that still works for it.
+    fn started_by(&self, me: &str, id: &str) -> Result<&Tracked, String> {
         let t = self.sessions.get(id).ok_or_else(|| format!("No session {id}"))?;
         if t.created_by.as_deref() != Some(me) || t.supervisor.as_deref() != Some(me) {
             return Err("Refused: you can end only an executor you started yourself with executor_create and that still works for you. The operator ends other sessions.".into());
         }
+        Ok(t)
+    }
+
+    fn may_end(&self, me: &str, id: &str) -> Result<(), String> {
+        let t = self.started_by(me, id)?;
         let mut blockers = Vec::new();
         let attention = t.attention.as_ref();
         if let Some(mark) = attention {
@@ -3612,6 +3618,16 @@ impl Harness {
         }
     }
 
+    /// A session with a managed worktree whose process the runner says has
+    /// already exited (a natural exit, Close session in Live, an exit after
+    /// `finish_worktree` stopped waiting): its end only checks the worktree
+    /// (review 17407 finding 5). False when the runner cannot be asked.
+    fn exited_managed(&self, id: &str) -> bool {
+        lock(&self.store).sessions.get(id).is_some_and(|t| t.worktree.is_some())
+            && self.runner_list_for_worktree(Duration::from_secs(1))
+                .is_ok_and(|sessions| sessions.iter().any(|s| s["id"] == id && !s["exit"].is_null()))
+    }
+
     /// Call after the runner accepts HUP. A refused cleanup is part of the end
     /// result, while the runner still owns the ordinary session exit.
     fn finish_worktree(&self, id: &str) -> Option<(Value, String)> {
@@ -3842,13 +3858,15 @@ impl Harness {
         let prefs = crate::harness_preferences::HarnessPreferences::load(&self.dir)?;
         let profile = prefs.supervisor_profile.ok_or("Choose a supervisor in Settings → Harnesses")?;
         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true, None)
+        self.create_as(&json!({"profile": profile, "cwd": folder.display().to_string(), "name": "Supervisor", "cols": req["cols"], "rows": req["rows"]}), true, None, Origin::Operator)
     }
 
-    fn create(&self, req: &Value) -> Result<Value, String> {
+    /// `origin`: the app's `create` op is the operator's launch, the
+    /// Supervisor's `session_create` an agent's. Never a field of `req`.
+    fn create(&self, req: &Value, origin: Origin) -> Result<Value, String> {
         // Who assigns and who created is known from the caller's process, never from
         // what the app or a supervisor sends: only `executor_create` sets it
-        self.create_as(&without_assigner(req), false, None)
+        self.create_as(&without_assigner(req), false, None, origin)
     }
 
     /// End a session's agent and continue its conversation in a new process,
@@ -3906,7 +3924,7 @@ impl Harness {
         if !self.update(|s| s.restarting.insert(id.to_string())) {
             return Err("That session is already being restarted".into());
         }
-        let started = self.launch_as(&req, old["meta"]["role"] == "supervisor", launch, Some(id));
+        let started = self.launch_as(&req, old["meta"]["role"] == "supervisor", launch, Some(id), Origin::Agent);
         let new = match started {
             Ok(new) => new,
             Err(e) => {
@@ -4047,12 +4065,12 @@ impl Harness {
     /// restart's pin, an executor's lowered profile). Otherwise `profile` in
     /// `req` is an adapter id (a bare launch) or an agent profile id, taken
     /// as it is now (MCR-126 P2). Never profile text from a request.
-    fn create_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>) -> Result<Value, String> {
+    fn create_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>, origin: Origin) -> Result<Value, String> {
         let _lifecycle = lock(&self.worktree_lifecycle);
-        self.launch_as(req, supervisor, pinned, None)
+        self.launch_as(req, supervisor, pinned, None, origin)
     }
 
-    fn launch_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>, replacing: Option<&str>) -> Result<Value, String> {
+    fn launch_as(&self, req: &Value, supervisor: bool, pinned: Option<crate::profiles::Launchable>, replacing: Option<&str>, origin: Origin) -> Result<Value, String> {
         let home = self.launch_home()?;
         let resume = req["resume"].as_str().filter(|s| !s.is_empty());
         let found = match resume {
@@ -4085,7 +4103,11 @@ impl Harness {
         match &worktree {
             Some(_) if !agent.is_agent() || resume.is_some() => return Err("Worktrees are for new agent sessions".into()),
             Some(Request::Scratch(_)) if !scratch => return Err("A detached worktree requires a profile with permissions.worktree = scratch".into()),
-            Some(Request::Branch(_)) | None if scratch && replacing.is_none() => return Err("This profile requires worktree {repo, commit} for a detached scratch checkout".into()),
+            Some(Request::Branch(_)) if scratch && replacing.is_none() => return Err("This profile requires worktree {repo, commit} for a detached scratch checkout".into()),
+            // The operator's launch from the app starts in the folder they chose, and a
+            // resumed or restarted conversation keeps its own: only an agent's new launch
+            // of a scratch profile must name the commit (review 17407 finding 1)
+            None if scratch && replacing.is_none() && resume.is_none() && origin == Origin::Agent => return Err("This profile requires worktree {repo, commit} for a detached scratch checkout".into()),
             _ => {}
         }
         let existing_dir = || {
@@ -5551,8 +5573,12 @@ impl Harness {
                 let wanted = text("session")?.trim();
                 let id = wanted.strip_prefix("mcr:").unwrap_or(wanted).to_string();
                 let _lifecycle = lock(&self.worktree_lifecycle);
-                lock(&self.store).may_end(me, &id)?;
-                {
+                let exited = self.exited_managed(&id);
+                if exited {
+                    // Nothing left to end: only the creator checks its worktree
+                    lock(&self.store).started_by(me, &id)?;
+                } else {
+                    lock(&self.store).may_end(me, &id)?;
                     // Check again under the writer's lock: `place` may have set a draft since the first check.
                     let writer = self.writer(&id);
                     let _typing = lock(&writer);
@@ -5573,7 +5599,8 @@ impl Harness {
                         }
                         (label(t), t.cwd.clone())
                     }).unwrap_or_default();
-                    s.reports.push(Report { id: format!("r{}", &runner::random_id()[..10]), session: id.clone(), name: name.clone(), cwd, kind: "done".into(), text: format!("Ended by its supervisor {by:?} (mcr:{me}), which had started it as its executor. Its conversation is kept.{summary}"), created: now_ms(), supervisor: Some(me.to_string()), ..Report::default() });
+                    let what = if exited { "Its worktree was checked by its supervisor" } else { "Ended by its supervisor" };
+                    s.reports.push(Report { id: format!("r{}", &runner::random_id()[..10]), session: id.clone(), name: name.clone(), cwd, kind: "done".into(), text: format!("{what} {by:?} (mcr:{me}), which had started it as its executor. Its conversation is kept.{summary}"), created: now_ms(), supervisor: Some(me.to_string()), ..Report::default() });
                     name
                 });
                 let outcome = if summary.is_empty() {
@@ -5581,8 +5608,9 @@ impl Harness {
                 } else {
                     format!("Its conversation is kept.{summary}")
                 };
-                self.notice(me, format!("Your executor {name:?} (mcr:{id}) was ended at your request. {outcome}"));
-                let mut out = json!({ "ended": id, "note": format!("Ended. {outcome}") });
+                let (done, ended) = if exited { ("had already ended; its worktree was checked", "It had already ended.") } else { ("was ended", "Ended.") };
+                self.notice(me, format!("Your executor {name:?} (mcr:{id}) {done} at your request. {outcome}"));
+                let mut out = json!({ "ended": id, "note": format!("{ended} {outcome}") });
                 if let Some((worktree, _)) = cleanup {
                     out["worktree"] = worktree;
                 }
@@ -5649,7 +5677,7 @@ impl Harness {
                 let created = self.create_as(&json!({
                     "profile": profile, "cwd": cwd, "worktree": args["worktree"], "name": args["name"], "role": args["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("executor"),
                     "task": args["task"], "supervisor": me, "by": me,
-                }), false, launch)?;
+                }), false, launch, Origin::Agent)?;
                 let mut out = Self::brief(&created);
                 out["task"] = created["task"].clone();
                 if !lowered.is_empty() {
@@ -6226,7 +6254,7 @@ impl Harness {
                 "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
             })),
             "sessions" => Ok(json!({ "sessions": self.sessions()? })),
-            "create" => self.create(req),
+            "create" => self.create(req, Origin::Operator),
             // The operator connects a session to a supervising one, or detaches it
             "bind" => self.bind(id()?, req["supervisor"].as_str().filter(|s| !s.is_empty())),
             "supervisor" => self.supervisor(req),
@@ -6609,7 +6637,7 @@ impl Harness {
                 Err("Refused: the harness can't tell when this agent finishes a turn, so it takes no task. Start it without one and work in its terminal.".into())
             }
             "session_create" if args["task"].as_str().is_some_and(|t| plain_prompt(t).is_err()) => plain_prompt(args["task"].as_str().unwrap_or("")).map(|_| json!({})),
-            "session_create" => self.create(args).map(|s| {
+            "session_create" => self.create(args, Origin::Agent).map(|s| {
                 let mut out = Self::brief(&s);
                 // The first prompt is a task like any other: follow it with task_wait
                 out["task"] = s["task"].clone();
@@ -6686,13 +6714,18 @@ impl Harness {
             "session_end" => {
                 let id = text("session")?;
                 let _lifecycle = lock(&self.worktree_lifecycle);
-                // Hangup, as when a terminal window closes: interactive shells ignore SIGTERM
-                self.runner(json!({"op": "signal", "id": id, "signal": "HUP"}))?;
+                // An exited managed session has nothing to hang up: its worktree is still checked
+                let exited = self.exited_managed(id);
+                if !exited {
+                    // Hangup, as when a terminal window closes: interactive shells ignore SIGTERM
+                    self.runner(json!({"op": "signal", "id": id, "signal": "HUP"}))?;
+                }
                 let mut out = json!({ "ended": true });
                 if let Some((worktree, summary)) = self.finish_worktree(id) {
+                    let what = if exited { "Its worktree was checked by the Supervisor after it had ended" } else { "Ended by the Supervisor" };
                     self.update(|s| {
                         let (name, cwd) = s.sessions.get(id).map(|t| (label(t), t.cwd.clone())).unwrap_or_default();
-                        s.reports.push(Report { id: format!("r{}", &runner::random_id()[..10]), session: id.to_string(), name, cwd, kind: "done".into(), text: format!("Ended by the Supervisor. Its conversation is kept. {summary}"), created: now_ms(), ..Report::default() });
+                        s.reports.push(Report { id: format!("r{}", &runner::random_id()[..10]), session: id.to_string(), name, cwd, kind: "done".into(), text: format!("{what}. Its conversation is kept. {summary}"), created: now_ms(), ..Report::default() });
                     });
                     out["worktree"] = worktree;
                 }
@@ -6864,6 +6897,13 @@ impl Harness {
 
 /// A request to create a session as the app or a supervisor sent it, without
 /// the field that names an assigning session.
+/// Who asked for a launch: the operator in the app, or an agent over MCP.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Origin {
+    Operator,
+    Agent,
+}
+
 fn without_assigner(req: &Value) -> Value {
     let mut req = req.clone();
     if let Some(fields) = req.as_object_mut() {
@@ -8250,12 +8290,12 @@ mod tests {
         let dir = Path::new("/tmp").join(format!("mcr-disabled-{}", runner::random_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let harness = Harness::open(&dir);
-        assert!(harness.create(&json!({"profile": "pi", "cwd": "/tmp"})).unwrap_err().contains("disabled"));
+        assert!(harness.create(&json!({"profile": "pi", "cwd": "/tmp"}), Origin::Operator).unwrap_err().contains("disabled"));
         assert!(!harness.tool("profiles_list", &json!({})).unwrap()["profiles"].as_array().unwrap().iter().any(|p| p["id"] == "pi"));
         let saved = harness.control(&json!({"op": "harness_preferences", "preferences": {"enabledProfiles": ["pi"], "supervisorProfile": "pi"}})).unwrap();
         assert_eq!(saved["supervisorProfile"], "pi");
         assert_eq!(harness.tool("profiles_list", &json!({})).unwrap()["profiles"][0]["id"], "pi");
-        assert!(harness.create(&json!({"profile": "claude", "cwd": "/tmp"})).unwrap_err().contains("disabled"));
+        assert!(harness.create(&json!({"profile": "claude", "cwd": "/tmp"}), Origin::Operator).unwrap_err().contains("disabled"));
         assert!(tool_cli(&dir, "terminal_write", None, true).unwrap_err().contains("approval"));
         assert!(tool_cli(&dir, "session_list", Some("[]".into()), true).unwrap_err().contains("JSON object"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -8849,8 +8889,14 @@ mod tests {
                     }
                     "signal" => {
                         lock(&events).push(format!("signal {}", req["id"].as_str().unwrap()));
-                        sessions.get_mut(req["id"].as_str().unwrap()).unwrap()["exit"] = json!(0);
-                        json!({})
+                        let session = sessions.get_mut(req["id"].as_str().unwrap()).unwrap();
+                        if session["exit"].is_null() {
+                            session["exit"] = json!(0);
+                            json!({})
+                        } else {
+                            // As the runner: an ended session takes no signal
+                            json!({"error": "The session has ended"})
+                        }
                     }
                     "forget" => {
                         sessions.remove(req["id"].as_str().unwrap());
@@ -9885,6 +9931,69 @@ mod tests {
         stop_test_runner(&dir, server);
     }
 
+    /// Review 17407 finding 5: a managed session whose process already exited (a
+    /// natural exit, Close session in Live) still gets its worktree checked by
+    /// executor_end and session_end, instead of "The session has ended".
+    #[test]
+    #[cfg(unix)]
+    fn an_exited_managed_session_still_gets_its_worktree_checked() {
+        let base = crate::ipc::test_socket_dir("mcr174");
+        std::fs::create_dir_all(&base).unwrap();
+        let fixture = tempfile::tempdir_in(base).unwrap();
+        let dir = dunce::canonicalize(fixture.path()).unwrap();
+        let track = dir.join("track");
+        let checkout = track.join("repo");
+        crate::worktrees::tests::init(&checkout);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (_, server) = codex_root_runner(&dir, events.clone());
+        let mut h = Harness::open(&dir);
+        h.launch_home = Some(dir.join("home"));
+        let lead = h.tool("session_create", &json!({"profile": "claude", "cwd": track})).unwrap();
+        let lead = lead["id"].as_str().unwrap();
+        let other = h.tool("session_create", &json!({"profile": "claude", "cwd": track})).unwrap();
+        let other = other["id"].as_str().unwrap();
+        let exit = |id: &str| {
+            // The process exits by itself: the runner records it, the service hears of it
+            Client::connect(&runner_socket(&dir)).unwrap().call(json!({"op": "signal", "id": id, "signal": "TERM"})).unwrap();
+            h.runner_event(&json!({"event": "exited", "id": id}));
+            assert_eq!(lock(&h.store).sessions[id].state, ENDED);
+        };
+        let lane = |branch: &str| {
+            let ex = h.agent_tool(lead, "executor_create", &json!({
+                "profile": "implementer@claude-opus", "worktree": {"repo": checkout, "branch": branch, "base": "main"}
+            })).unwrap();
+            assert_eq!(ex["cwd"], json!(track.join("wt").join(branch)));
+            ex["id"].as_str().unwrap().to_string()
+        };
+        let first = lane("first");
+        exit(&first);
+        // Only its creator checks it, as only its creator ends it
+        assert!(h.agent_tool(other, "executor_end", &json!({"session": first})).unwrap_err().contains("you started yourself"));
+        assert!(track.join("wt/first").is_dir());
+        let signals = lock(&events).iter().filter(|e| e.starts_with("signal")).count();
+        let result = h.agent_tool(lead, "executor_end", &json!({"session": first})).unwrap();
+        assert_eq!(result["worktree"]["status"], "removed", "{result}");
+        assert!(!track.join("wt/first").exists());
+        assert!(result["note"].as_str().unwrap().contains("already ended"));
+        assert_eq!(lock(&events).iter().filter(|e| e.starts_with("signal")).count(), signals, "nothing to hang up");
+        assert!(lock(&h.store).board_reports().iter().any(|r| r.session == first && r.text.contains("bytes freed")));
+        // Its checks still hold: a checkout with work in it is kept
+        let second = lane("second");
+        std::fs::write(track.join("wt/second/untracked"), "my work").unwrap();
+        exit(&second);
+        let finished = h.tool("session_end", &json!({"session": second})).unwrap();
+        assert_eq!(finished["worktree"]["status"], "kept", "{finished}");
+        assert!(finished["worktree"]["reason"].as_str().unwrap().contains("untracked"));
+        std::fs::remove_file(track.join("wt/second/untracked")).unwrap();
+        let finished = h.tool("session_end", &json!({"session": second})).unwrap();
+        assert_eq!(finished["worktree"]["status"], "removed", "{finished}");
+        assert!(!track.join("wt/second").exists());
+        // An ended session without a managed worktree is refused as before
+        exit(other);
+        assert_eq!(h.tool("session_end", &json!({"session": other})).unwrap_err(), "The session has ended");
+        stop_test_runner(&dir, server);
+    }
+
     #[test]
     #[cfg(unix)]
     fn scratch_profile_requires_a_commit_and_supervisor_end_removes_its_checkout() {
@@ -9901,6 +10010,20 @@ mod tests {
         let make = |args| h.tool("session_create", &args);
         assert!(make(json!({"profile": "validator@codex", "cwd": track})).unwrap_err().contains("requires worktree"));
         assert!(make(json!({"profile": "codex", "worktree": {"repo": checkout, "commit": commit}})).unwrap_err().contains("requires a profile"));
+        // The operator's launch from the app (the Live "+" menu) starts in the folder
+        // the operator chose, without a worktree, as before MCR-174 (review 17407 finding 1)
+        let operator = h.control(&json!({"op": "create", "profile": "validator@codex", "cwd": track})).unwrap();
+        assert_eq!(operator["cwd"], json!(track));
+        assert!(lock(&h.store).sessions[operator["id"].as_str().unwrap()].worktree.is_none());
+        // A resumed scratch conversation continues in its own folder
+        let conversation = "019abc00-0000-7000-8000-000000000174";
+        let rollouts = dir.join("home/.codex/sessions/2026/11/26");
+        std::fs::create_dir_all(&rollouts).unwrap();
+        std::fs::write(rollouts.join(format!("rollout-2026-11-26T10-00-00-{conversation}.jsonl")), format!("{}\n", json!({"type": "session_meta", "payload": {"id": conversation, "cwd": track, "thread_source": "user"}}))).unwrap();
+        let resumed = make(json!({"profile": "validator@codex", "resume": conversation})).unwrap();
+        assert_eq!(resumed["cwd"], json!(track));
+        assert!(lock(&h.store).sessions[resumed["id"].as_str().unwrap()].worktree.is_none());
+        assert!(make(json!({"profile": "validator@codex", "resume": conversation, "worktree": {"repo": checkout, "commit": commit}})).unwrap_err().contains("new agent sessions"));
         let first = make(json!({"profile": "validator@codex", "worktree": {"repo": checkout, "commit": commit}})).unwrap();
         let first_id = first["id"].as_str().unwrap();
         let path = Path::new(first["cwd"].as_str().unwrap());
