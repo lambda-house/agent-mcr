@@ -68,11 +68,25 @@ pub fn run(
                     .split_terminator('\0')
                     .filter_map(|key| key.rsplit_once('.').map(|(name, _)| name))
                     .collect();
+                // Keep keys and values separate. Git's -c syntax splits on
+                // the first '=' even when it belongs to a filter driver name.
+                let mut index = 0;
                 for filter in filters {
-                    for setting in ["clean=", "smudge=", "process=", "required=false"] {
-                        command.arg("-c").arg(format!("{filter}.{setting}"));
+                    for (setting, value) in [
+                        ("clean", ""),
+                        ("smudge", ""),
+                        ("process", ""),
+                        ("required", "false"),
+                    ] {
+                        command.env(
+                            format!("GIT_CONFIG_KEY_{index}"),
+                            format!("{filter}.{setting}"),
+                        );
+                        command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+                        index += 1;
                     }
                 }
+                command.env("GIT_CONFIG_COUNT", index.to_string());
             }
             Some(1) if found.stderr.is_empty() => {}
             _ => return Err(io::Error::other("cannot inspect Git filter configuration").into()),
@@ -298,6 +312,8 @@ mod tests {
         let raw = |args: &[&str]| {
             Command::new("git")
                 .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args(args)
                 .output()
                 .unwrap()
@@ -307,7 +323,7 @@ mod tests {
             assert!(output.status.success(), "{output:?}");
         };
         setup(&["init", "-q"]);
-        fs::write(cwd.join(".gitattributes"), "file filter=probe diff=probe\n").unwrap();
+        fs::write(cwd.join(".gitattributes"), "file filter=a=b diff=probe\n").unwrap();
         fs::write(cwd.join("file"), "original\n").unwrap();
         setup(&["add", "--", ".gitattributes", "file"]);
         setup(&[
@@ -338,14 +354,14 @@ mod tests {
 
         for (key, value, args) in [
             (
-                "filter.probe.clean",
+                "filter.a=b.clean",
                 probe_cmd,
-                &["status", "--porcelain"][..],
+                &["diff", "--numstat", "HEAD", "--", "file"][..],
             ),
             (
-                "filter.probe.process",
+                "filter.a=b.process",
                 probe_cmd,
-                &["status", "--porcelain"][..],
+                &["diff", "--numstat", "HEAD", "--", "file"][..],
             ),
             (
                 "diff.probe.textconv",
@@ -364,14 +380,14 @@ mod tests {
                 &["checkout", "--", "file"][..],
             ),
             (
-                "filter.probe.smudge",
+                "filter.a=b.smudge",
                 probe_cmd,
                 &["checkout", "--", "file"][..],
             ),
         ] {
             setup(&["config", "--local", key, value]);
             if key.starts_with("filter.") {
-                setup(&["config", "--local", "filter.probe.required", "true"]);
+                setup(&["config", "--local", "filter.a=b.required", "true"]);
             }
             let baseline = raw(args);
             assert!(
@@ -385,7 +401,7 @@ mod tests {
             assert!(!marker.exists(), "{key} ran");
             setup(&["config", "--local", "--unset", key]);
             if key.starts_with("filter.") {
-                setup(&["config", "--local", "--unset", "filter.probe.required"]);
+                setup(&["config", "--local", "--unset", "filter.a=b.required"]);
             }
         }
     }
