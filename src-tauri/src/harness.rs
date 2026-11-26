@@ -1084,8 +1084,21 @@ pub struct Tracked {
     pub precise: bool,
     /// At least one hook arrived from this session
     pub hooked: bool,
+    /// The conversation it runs: the one it was launched with (Claude's
+    /// `--session-id`, a resume id) or one its agent created after the
+    /// launch, never another (`takes_conversation`, MCR-179)
     pub agent_session: Option<String>,
     pub transcript: Option<String>,
+    /// When the harness launched its process (ms; 0 for a record made before
+    /// MCR-179, or for a process the service did not start)
+    pub launched: u64,
+    /// A conversation its agent opened that is not the session's own: older
+    /// than the launch, or another session's (MCR-179: Codex's Agent command
+    /// center opens any task in the same terminal). Nothing is typed into it
+    /// while this is set, and the session's id, transcript, state and tasks
+    /// do not follow that conversation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreign: Option<String>,
     pub attention: Option<Attention>,
     pub last_message: Option<String>,
     pub last_message_at: u64,
@@ -2721,10 +2734,102 @@ fn apply_look(store: &mut Store, session: &str, seen: Seen, now: u64) -> bool {
     }
 }
 
+/// The mark of a session whose agent opened a conversation it did not start (MCR-179).
+pub const FOREIGN_MARK: &str = "Its agent opened a conversation this session did not start (for example a task from Codex's Agent command center, \
+     or Claude Code's /resume). The harness keeps the session apart from it and types no task or message notice into it. \
+     Its own task did not run there: close the session and start a fresh one, or go back to its own conversation";
+
+/// How much earlier than the launch a conversation may begin and still be the
+/// launch's own: the harness reads its clock just before the runner starts the process.
+const LAUNCH_SLACK_MS: u64 = 2_000;
+
+/// The conversation a hook event is about: Codex's `session_id` or `thread-id`, Claude's `session_id`.
+fn reported_conversation<'a>(event: &str, payload: &'a Value) -> Option<&'a str> {
+    match event {
+        "codex-notify" => payload["thread-id"].as_str(),
+        _ => payload["session_id"].as_str(),
+    }
+    .filter(|id| !id.is_empty())
+}
+
+/// When a conversation began, from its id alone: a UUIDv7 (Codex's thread
+/// ids) carries its creation time in its first 48 bits.
+fn uuid7_ms(id: &str) -> Option<u64> {
+    if !crate::agents::is_uuid(id) || id.as_bytes()[14] != b'7' {
+        return None;
+    }
+    let high = u64::from_str_radix(&id[..8], 16).ok()?;
+    let low = u64::from_str_radix(&id[9..13], 16).ok()?;
+    Some(high << 16 | low)
+}
+
+/// When a conversation whose id does not carry its time began (Claude's
+/// ids): the birth time of its transcript, else the earliest `timestamp` in
+/// its head. A conversation that has no transcript yet is new: `now`. Read
+/// by the service (`Harness::hook`) only when the id is not the session's own.
+fn conversation_started(home: &Path, id: &str, now: u64) -> Option<u64> {
+    if !is_uuid(id) {
+        return None;
+    }
+    let suffix = format!("{id}.jsonl");
+    let found = adapters().find_map(|agent| {
+        let (folder, depth) = agent.transcripts()?;
+        let mut files = Vec::new();
+        jsonl_files(&home.join(folder), depth, &mut files);
+        files.into_iter().find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix)))
+    });
+    let Some(path) = found else { return Some(now) };
+    let mut file = crate::transcript_stats::open_regular(&path).ok()?;
+    if let Some(born) = file.metadata().ok().map(|m| file_ms(m.created())).filter(|ms| *ms > 0) {
+        return Some(born);
+    }
+    let mut head = Vec::new();
+    (&mut file).take(64 * 1024).read_to_end(&mut head).ok()?;
+    String::from_utf8_lossy(&head)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|v| chrono::DateTime::parse_from_rfc3339(v["timestamp"].as_str()?).ok())
+        .map(|at| at.timestamp_millis().max(0) as u64)
+        .min()
+}
+
+/// Whether a conversation an agent reports may be the session's own
+/// (MCR-179): the one it has, else one no other session holds that began
+/// after the launch (`started` from the service for an id that carries no
+/// time). A session recorded before launches were takes any, as before.
+fn takes_conversation(store: &Store, session: &str, id: &str, started: Option<u64>) -> bool {
+    let Some(t) = store.sessions.get(session) else { return false };
+    if t.agent_session.as_deref() == Some(id) {
+        return true;
+    }
+    if store.sessions.iter().any(|(other, o)| other != session && o.agent_session.as_deref() == Some(id)) {
+        return false;
+    }
+    t.launched == 0 || uuid7_ms(id).or(started).is_some_and(|at| at + LAUNCH_SLACK_MS >= t.launched)
+}
+
+/// Its agent is in a conversation that is not the session's: say so on the
+/// session, unless a prompt or a report is marked there already.
+fn mark_foreign(tracked: &mut Tracked, id: &str) {
+    tracked.foreign = Some(id.to_string());
+    if tracked.attention.is_none() {
+        tracked.attention = Some(Attention { kind: "assessment".into(), text: FOREIGN_MARK.into(), since: now_ms(), ..Attention::default() });
+    }
+}
+
+/// Its agent is back in the session's own conversation (or a new one it created).
+fn back_on_course(tracked: &mut Tracked) {
+    if tracked.foreign.take().is_some() && tracked.attention.as_ref().is_some_and(|a| a.text == FOREIGN_MARK) {
+        tracked.attention = None;
+    }
+}
+
 /// What a hook event does to a session. Returns true when the session became
 /// ready for its next queued task.
 fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) -> bool {
     let open = store.open_report(session).map(|r| r.id.clone());
+    // A conversation that is not the session's own never becomes it (MCR-179)
+    let foreign = reported_conversation(event, payload).filter(|id| !takes_conversation(store, session, id, payload["conversation-started"].as_u64())).map(str::to_owned);
     // A hook that arrives after the end changes nothing: no mark, no state, no task typed
     let Some(tracked) = store.sessions.get_mut(session).filter(|t| t.state != ENDED) else { return false };
     let text = |v: &Value| v.as_str().map(|s| s.chars().take(MAX_TEXT).collect::<String>());
@@ -2742,9 +2847,18 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
         // differs from the known one is another thread's
         let id = payload["session_id"].as_str().filter(|id| !id.is_empty());
         let top = payload["top-level"].as_bool();
-        let own = tracked.agent_session.as_deref();
+        let own = tracked.agent_session.clone();
+        let own = own.as_deref();
         let subagent = payload["agent_id"].as_str().is_some_and(|a| !a.is_empty());
-        let other = subagent || top == Some(false) || (top.is_none() && id.zip(own).is_some_and(|(id, own)| id != own));
+        // The agent's own thread went into a conversation that is not the session's (MCR-179)
+        let foreign = foreign.as_ref().filter(|_| !subagent && top != Some(false));
+        if let Some(conversation) = foreign {
+            mark_foreign(tracked, conversation);
+        }
+        let other = subagent || top == Some(false) || foreign.is_some() || (top.is_none() && id.zip(own).is_some_and(|(id, own)| id != own));
+        if !other && id.is_some() && id == own {
+            back_on_course(tracked);
+        }
         match payload["hook_event_name"].as_str().unwrap_or("") {
             // The conversation's id from its first moment. Nothing more: when in
             // its start Codex runs this is not known, so it neither makes the
@@ -2754,8 +2868,9 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
             // real turn ends would be ignored and a restart would resume the
             // wrong conversation
             "SessionStart" => {
-                if let Some(id) = id.filter(|_| !subagent && (top == Some(true) || (own.is_none() && top.is_none()))) {
+                if let Some(id) = id.filter(|_| !subagent && foreign.is_none() && (top == Some(true) || (own.is_none() && top.is_none()))) {
                     tracked.agent_session = Some(id.to_string());
+                    back_on_course(tracked);
                     if let Some(path) = payload["transcript_path"].as_str() {
                         tracked.transcript = Some(path.to_string());
                     }
@@ -2810,17 +2925,39 @@ fn apply_hook(store: &mut Store, session: &str, event: &str, payload: &Value) ->
         if title_writer || thread.is_empty() {
             return false;
         }
+        // A turn in a conversation that is not the session's ends none of its tasks (MCR-179)
+        if let Some(conversation) = foreign.as_deref().filter(|_| payload["top-level"].as_bool() != Some(false)) {
+            mark_foreign(tracked, conversation);
+            return false;
+        }
         match (tracked.agent_session.as_deref(), payload["top-level"].as_bool()) {
             (_, Some(false)) => return false,
             // Also corrects a thread taken by mistake, and follows a new conversation in the same terminal
-            (_, Some(true)) | (None, None) => tracked.agent_session = Some(thread.to_string()),
+            (_, Some(true)) | (None, None) => {
+                tracked.agent_session = Some(thread.to_string());
+                back_on_course(tracked);
+            }
             (Some(own), None) if own != thread => return false,
-            _ => {}
+            // Its own thread
+            _ => back_on_course(tracked),
         }
     } else if let Some(id) = payload["session_id"].as_str().filter(|_| !tracked.own_hooks || adapter(&tracked.profile).reports_from_start()) {
-        tracked.agent_session = Some(id.to_string());
+        match &foreign {
+            // Claude Code's /resume of an older conversation, or another
+            // session's: only a prompt it asks there is still the operator's
+            Some(conversation) => {
+                mark_foreign(tracked, conversation);
+                if event != "Notification" {
+                    return false;
+                }
+            }
+            None => {
+                tracked.agent_session = Some(id.to_string());
+                back_on_course(tracked);
+            }
+        }
     }
-    if let Some(path) = payload["transcript_path"].as_str() {
+    if let Some(path) = payload["transcript_path"].as_str().filter(|_| foreign.is_none()) {
         tracked.transcript = Some(path.to_string());
     }
     tracked.hooked = true;
@@ -3796,6 +3933,8 @@ impl Harness {
         if let Some(id) = replacing.filter(|id| live.clone().any(|s| s["id"] == *id)) {
             self.stop_for_restart(id)?;
         }
+        // Before the process exists: any conversation it creates is younger (MCR-179)
+        let launched = now_ms();
         self.runner(json!({
             "op": "spawn",
             "id": id,
@@ -3824,6 +3963,7 @@ impl Harness {
                     since: now,
                     precise: agent.reports_from_start(),
                     agent_session: agent_session.or(resume.map(str::to_owned)),
+                    launched,
                     role: req["role"].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(80).collect(),
                     cwd: dir.display().to_string(),
                     supervisor: above.clone(),
@@ -4006,6 +4146,9 @@ impl Harness {
         if t.attention.as_ref().is_some_and(|a| a.kind == "permission") {
             return Some("that session asks you something in its terminal: a line typed there would answer it. Answer it first");
         }
+        if t.foreign.is_some() {
+            return Some("its agent is in a conversation that session did not start (MCR-179): a line placed there would go to that conversation");
+        }
         if t.state != "idle" || !t.hooked {
             return Some("that session is not idle by its own word: it works, or has not reported yet");
         }
@@ -4093,8 +4236,9 @@ impl Harness {
             (queued, store.sessions.get(session).is_some_and(|t| adapter(&t.profile).detects_prompt() && t.state == "unknown"))
         };
         let Some(queued) = queued else { return };
-        // The operator is writing there: the task stays queued, the timer comes back
-        if lock(&self.store).sessions.get(session).is_some_and(|t| held(t, now_ms())) {
+        // The operator is writing there, or its agent is in a conversation that
+        // is not the session's (MCR-179): the task stays queued, the timer comes back
+        if lock(&self.store).sessions.get(session).is_some_and(|t| held(t, now_ms()) || t.foreign.is_some()) {
             return;
         }
         let at_prompt = unsure && self.at_prompt(session);
@@ -4148,8 +4292,9 @@ impl Harness {
             }
             let Some(t) = store.sessions.get(session) else { return };
             // Into a line the operator is writing the notice would be sent with
-            // it (MCR-85): the message stays not notified, the timer comes back
-            if held(t, now_ms()) {
+            // it (MCR-85): the message stays not notified, the timer comes back.
+            // Nor into a conversation that is not the session's (MCR-179)
+            if held(t, now_ms()) || t.foreign.is_some() {
                 return;
             }
             // An agent without state tracking (no turn-end hooks) is only seen
@@ -4162,7 +4307,7 @@ impl Harness {
         let at_prompt = reads_screen(untracked, unsure, sees) && self.at_prompt(session);
         let from = self.update(|s| {
             let t = s.sessions.get(session)?;
-            if !notice_ready(untracked, unsure, at_prompt, &t.state) || held(t, now_ms()) {
+            if !notice_ready(untracked, unsure, at_prompt, &t.state) || held(t, now_ms()) || t.foreign.is_some() {
                 return None;
             }
             let mut from: Vec<String> = Vec::new();
@@ -5222,19 +5367,31 @@ impl Harness {
         if let (Some(thread), Some(home)) = (thread, dirs::home_dir()) {
             payload["top-level"] = json!(top_level_thread(&home, thread));
         }
+        // When a conversation that is not the session's began, for an id that
+        // does not say it (MCR-179): read only when the id changes, which is rare
+        if let Some(id) = reported_conversation(event, &payload).filter(|id| uuid7_ms(id).is_none()).map(str::to_owned) {
+            let known = lock(&self.store).sessions.get(session).and_then(|t| t.agent_session.clone());
+            if let (true, Some(home)) = (known.as_deref() != Some(id.as_str()), dirs::home_dir()) {
+                payload["conversation-started"] = json!(conversation_started(&home, &id, now_ms()));
+            }
+        }
         let payload = &payload;
-        let (ready, waiting) = self.update(|s| {
-            let before = s.sessions.get(session).map(|t| t.state.clone());
+        let (ready, waiting, foreign) = self.update(|s| {
+            let before = s.sessions.get(session).map(|t| (t.state.clone(), t.foreign.clone()));
             if event == crate::agents::CODEX_HOOK && s.sessions.contains_key(session) {
                 s.codex_hooks_seen = this_program();
             }
             let ready = apply_hook(s, session, event, payload);
             let tracked = s.sessions.get(session);
-            let now_waiting = tracked.filter(|t| t.state == "waiting" && before.as_deref() != Some("waiting")).cloned();
-            (ready, now_waiting)
+            let now_waiting = tracked.filter(|t| t.state == "waiting" && before.as_ref().map(|b| b.0.as_str()) != Some("waiting")).cloned();
+            let now_foreign = tracked.is_some_and(|t| t.foreign.is_some() && before.as_ref().map(|b| &b.1) != Some(&t.foreign));
+            (ready, now_waiting, now_foreign)
         });
         if waiting.is_some() {
             self.tell_waiting(session);
+        }
+        if foreign {
+            self.tell_foreign(session);
         }
         if ready {
             self.pump(session);
@@ -5461,6 +5618,24 @@ impl Harness {
     /// notification, and the session it works for a notice in its inbox. The
     /// prompt's text goes there as data; nothing is typed into a terminal
     /// but the fixed inbox notice.
+    /// Its agent went into a conversation that is not the session's (MCR-179):
+    /// the operator's notification, and a notice in its supervisor's inbox.
+    fn tell_foreign(&self, id: &str) {
+        let Some(t) = lock(&self.store).sessions.get(id).cloned() else { return };
+        let who = label(&t);
+        notify_user(&format!("Agent MCR: {who} left its own conversation"), FOREIGN_MARK);
+        if let Some(supervisor) = &t.supervisor {
+            self.notice(
+                supervisor,
+                format!(
+                    "Your executor {who:?} (mcr:{id}) opened a conversation it did not start, in its own terminal. The harness keeps the session apart \
+                     from it: no task or message notice is typed into it, and the session's tasks, state and context figures do not follow it. \
+                     The task you gave did not run there. End the session and start a fresh one, or ask the operator to take it back to its own conversation."
+                ),
+            );
+        }
+    }
+
     fn tell_waiting(&self, id: &str) {
         let Some(t) = lock(&self.store).sessions.get(id).cloned() else { return };
         let who = label(&t);
@@ -5856,7 +6031,7 @@ impl Harness {
             "id": session["id"], "name": h["name"], "profile": h["profile"], "cwd": session["cwd"],
             "state": h["state"], "stateSince": h["since"], "stateFromHooks": h["precise"] == true && h["hooked"] == true, "stateNote": Self::state_note(session),
             "held": held_info(h, now_ms()),
-            "attention": h["attention"], "openTasks": session["openTasks"], "agentSession": h["agentSession"],
+            "attention": h["attention"], "openTasks": session["openTasks"], "agentSession": h["agentSession"], "foreignConversation": h["foreign"],
             "pid": session["pid"], "exit": session["exit"], "title": session["title"], "lastOutput": session["lastOutput"],
             "status": h["status"], "role": h["role"], "unread": session["unread"], "subagents": session["subagents"],
         });
@@ -12118,5 +12293,111 @@ mod tests {
         std::fs::rename(&dir, home.join("old-subagents")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
         assert!(subagents(&home, &transcript.display().to_string(), 0).is_empty());
+    }
+    /// MCR-179: on 26 Nov a fresh validator@codex executor stopped at Codex's
+    /// folder question, its second answer opened Codex's Agent command
+    /// center, and a task of a session killed by the restart was opened in
+    /// its terminal. Codex's SessionStart hook reported that old thread and
+    /// the session took it as its own. A session takes only the conversation
+    /// it was launched with or one created after its launch.
+    #[test]
+    fn a_session_never_takes_a_conversation_it_did_not_start() {
+        let launched = 1_795_701_652_000u64;
+        // The killed CORE-850 validator's thread: a UUIDv7 of 25 Nov, 17:35
+        let old = "01a2138f-db30-7f33-932d-71a5cae26b9a";
+        assert_eq!(uuid7_ms(old), Some(1_795_624_524_592));
+        let v7 = |ms: u64| format!("{:08x}-{:04x}-7abc-8def-0123456789ab", ms >> 16, ms & 0xffff);
+        let new = v7(launched + 4_000);
+        assert_eq!(uuid7_ms(&new), Some(launched + 4_000));
+        assert_eq!(uuid7_ms("c0ffee00-0000-4000-8000-000000000000"), None);
+
+        let mut s = Store::default();
+        s.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), launched, supervisor: Some("lead".into()), ..Tracked::default() });
+        task(&mut s, "t1", "ex", "working", launched);
+        let hook = |s: &mut Store, payload: Value| apply_hook(s, "ex", "codex-hook", &payload);
+        // The command center opened the old task: its start is not the session's
+        assert!(!hook(&mut s, json!({"hook_event_name": "SessionStart", "session_id": old, "transcript_path": "/old.jsonl", "source": "resume", "top-level": true})));
+        let t = s.sessions["ex"].clone();
+        assert_eq!((t.agent_session.as_deref(), t.transcript.as_deref(), t.foreign.as_deref()), (None, None, Some(old)));
+        assert_eq!(t.attention.as_ref().map(|a| (a.kind.as_str(), a.text.as_str())), Some(("assessment", FOREIGN_MARK)));
+        // Its prompts, tools and turn ends there move nothing: the brief's task stays open
+        for name in ["UserPromptSubmit", "PostToolUse"] {
+            assert!(!hook(&mut s, json!({"hook_event_name": name, "session_id": old, "top-level": true})));
+        }
+        assert!(!apply_hook(&mut s, "ex", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": old, "top-level": true, "last-assistant-message": "Kafka suite passed"})));
+        let t = s.sessions["ex"].clone();
+        assert_eq!((t.state.as_str(), t.agent_session.as_deref(), t.last_message.as_deref(), s.tasks["t1"].state.as_str()), ("working", None, None, "working"));
+        assert_eq!(t.attention.as_ref().map(|a| a.text.as_str()), Some(FOREIGN_MARK));
+        // What it asks to run there is still the operator's to answer (D6)
+        assert!(!hook(&mut s, json!({"hook_event_name": "PermissionRequest", "session_id": old, "top-level": true, "tool_name": "Bash", "command": "cargo test"})));
+        assert_eq!((s.sessions["ex"].state.as_str(), s.sessions["ex"].attention.as_ref().unwrap().kind.as_str()), ("waiting", "permission"));
+        // Nothing is typed into it: no queued task, no notice, no placed line
+        let dir = std::env::temp_dir().join(format!("agent-mcr-foreign-{}", runner::random_id()));
+        let harness = Harness::open(&dir);
+        *lock(&harness.typed) = Some(Vec::new());
+        harness.update(|h| {
+            h.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "idle".into(), hooked: true, precise: true, launched, foreign: Some(old.into()), ..Tracked::default() });
+            h.tasks.insert("t2".into(), Task { id: "t2".into(), session: "ex".into(), text: "Validate INFRA-253".into(), state: "queued".into(), created: 1, started: 0, finished: 0, result: None, by: String::new(), told: false });
+            h.post(Message { to: "ex".into(), text: "hello".into(), ..Message::default() });
+        });
+        harness.pump("ex");
+        harness.nudge("ex");
+        assert!(lock(&harness.typed).as_ref().unwrap().is_empty());
+        assert!(Harness::place_obstacle(&lock(&harness.store), "ex", now_ms()).is_some_and(|why| why.contains("did not start")));
+        assert_eq!(lock(&harness.store).tasks["t2"].state, "queued");
+        // Back in a conversation of its own: one created after the launch is taken, and the mark goes
+        s.sessions.get_mut("ex").unwrap().attention = Some(Attention { kind: "assessment".into(), text: FOREIGN_MARK.into(), since: 1, ..Attention::default() });
+        assert!(!hook(&mut s, json!({"hook_event_name": "SessionStart", "session_id": new, "transcript_path": "/new.jsonl", "source": "startup", "top-level": true})));
+        let t = s.sessions["ex"].clone();
+        assert_eq!((t.agent_session.as_deref(), t.transcript.as_deref(), t.foreign.as_deref(), t.attention.is_none()), (Some(new.as_str()), Some("/new.jsonl"), None, true));
+        // A conversation another session holds is never taken, however new
+        let theirs = v7(launched + 9_000);
+        s.sessions.insert("peer".into(), Tracked { profile: "codex".into(), state: "idle".into(), agent_session: Some(theirs.clone()), ..Tracked::default() });
+        assert!(!apply_hook(&mut s, "ex", "codex-notify", &json!({"type": "agent-turn-complete", "thread-id": theirs, "top-level": true})));
+        assert_eq!((s.sessions["ex"].agent_session.as_deref(), s.sessions["ex"].foreign.as_deref()), (Some(new.as_str()), Some(theirs.as_str())));
+
+        // Claude Code: /resume of a conversation begun before the launch is not
+        // taken; /clear starts a new one, which is
+        let own = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut c = Store::default();
+        c.sessions.insert("cl".into(), Tracked { profile: "claude".into(), state: "working".into(), launched, agent_session: Some(own.into()), transcript: Some("/own.jsonl".into()), ..Tracked::default() });
+        task(&mut c, "t3", "cl", "working", launched);
+        let older = "11111111-2222-4333-8444-555555555555";
+        assert!(!apply_hook(&mut c, "cl", "Stop", &json!({"session_id": older, "transcript_path": "/older.jsonl", "conversation-started": launched - 86_400_000})));
+        let t = c.sessions["cl"].clone();
+        assert_eq!((t.agent_session.as_deref(), t.transcript.as_deref(), t.foreign.as_deref(), t.state.as_str(), c.tasks["t3"].state.as_str()), (Some(own), Some("/own.jsonl"), Some(older), "working", "working"));
+        // An id the service could not date is not taken either
+        assert!(!apply_hook(&mut c, "cl", "PostToolUse", &json!({"session_id": older})));
+        assert_eq!(c.sessions["cl"].agent_session.as_deref(), Some(own));
+        let cleared = "66666666-7777-4888-8999-000000000000";
+        assert!(!apply_hook(&mut c, "cl", "SessionStart", &json!({"session_id": cleared, "transcript_path": "/cleared.jsonl", "conversation-started": launched + 60_000})));
+        let t = c.sessions["cl"].clone();
+        assert_eq!((t.agent_session.as_deref(), t.transcript.as_deref(), t.foreign.as_deref()), (Some(cleared), Some("/cleared.jsonl"), None));
+        // Its own conversation's hooks go on as always
+        assert!(apply_hook(&mut c, "cl", "Stop", &json!({"session_id": cleared})));
+        assert_eq!(c.tasks["t3"].state, "completed");
+
+        // A record from before launches were kept (launched 0) takes a reported conversation as before
+        let mut before = Store::default();
+        before.sessions.insert("ex".into(), Tracked { profile: "codex".into(), state: "working".into(), ..Tracked::default() });
+        assert!(!apply_hook(&mut before, "ex", "codex-hook", &json!({"hook_event_name": "SessionStart", "session_id": old})));
+        assert_eq!(before.sessions["ex"].agent_session.as_deref(), Some(old));
+    }
+
+    /// A transcript that has none of the times `conversation_started` looks
+    /// for yet: a conversation not written yet is a new one.
+    #[test]
+    fn a_conversation_without_a_transcript_is_new() {
+        let home = std::env::temp_dir().join(format!("agent-mcr-started-{}", runner::random_id()));
+        std::fs::create_dir_all(home.join(".claude/projects/-work")).unwrap();
+        let id = "12345678-1234-4123-8123-123456789abc";
+        assert_eq!(conversation_started(&home, id, 42), Some(42));
+        assert_eq!(conversation_started(&home, "not-a-uuid", 42), None);
+        let path = home.join(format!(".claude/projects/-work/{id}.jsonl"));
+        std::fs::write(&path, "{\"type\":\"summary\"}\n{\"type\":\"user\",\"timestamp\":\"2026-11-25T16:35:24.652Z\"}\n").unwrap();
+        let started = conversation_started(&home, id, u64::MAX).unwrap();
+        // The file's birth time where the system keeps one, else its first timestamp; both are before now
+        assert!(started <= now_ms() && started >= 1_795_624_524_652 - 1_000, "{started}");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

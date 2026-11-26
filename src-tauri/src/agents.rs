@@ -573,6 +573,10 @@ pub const CODEX_HOOK: &str = "codex-hook";
 #[cfg_attr(windows, allow(dead_code))]
 pub const CODEX_HOOKS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse"];
 
+/// Said with Codex's folder question when its second answer is "Back to Agent
+/// Command Center" (codex-cli 0.172, MCR-179).
+pub const COMMAND_CENTER_NOTE: &str = "Answer 1 to start this session's task here. Answer 2 opens Codex's Agent command center, where Enter opens another task in this terminal, and this session's task never starts.";
+
 pub struct Claude;
 pub struct Codex;
 pub struct Shell;
@@ -898,17 +902,13 @@ impl Adapter for Codex {
         body.starts_with("Approval requested")
     }
     fn question(&self, screen: &str) -> Option<String> {
-        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
-            // The folder question at start (0.170 wording), whose answers may not be numbered
-            if self.at_prompt(screen) {
-                return None;
-            }
-            // Codex's review of hooks it has not run before, ours among them (MCR-74)
-            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
-                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
-            }
-            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
-            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        let question = self.question_asked(screen)?;
+        // codex-cli 0.172's second answer at the folder question opens its
+        // Agent command center, where Enter opens any task on the machine in
+        // this terminal: the session's own task then never starts (MCR-179)
+        Some(match question.starts_with("Trust this folder?") && screen.contains("Back to Agent Command Center") {
+            true => format!("{question} {COMMAND_CENTER_NOTE}"),
+            false => question,
         })
     }
     /// Codex takes one `developer_instructions` value: the operator's own, if set, stays
@@ -990,6 +990,22 @@ pub const CODEX_NETWORK_OFF: [&str; 2] = ["-c", "sandbox_workspace_write.network
 const CODEX_BARE: [&str; 4] = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"];
 
 impl Codex {
+    /// The question on the screen, as Codex words it.
+    fn question_asked(&self, screen: &str) -> Option<String> {
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
+            // The folder question at start (0.170 wording), whose answers may not be numbered
+            if self.at_prompt(screen) {
+                return None;
+            }
+            // Codex's review of hooks it has not run before, ours among them (MCR-74)
+            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
+                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
+            }
+            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
+            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        })
+    }
+
     /// The sandbox and approval words of a launch: the profile's, or the bare
     /// line's. Under an auto-mode root on `CODEX_SOCKETS_OS` the socket
     /// profile takes the place of `--sandbox workspace-write` (MCR-162);
@@ -1412,7 +1428,14 @@ mod tests {
         assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n  Yes, continue\n  No, quit\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
         assert_eq!(codex.question("Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, quit").as_deref(), Some("Do you trust the contents of this directory?"));
         // As seen on 2026-11-18 (codex-cli 0.170): numbered answers
-        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
+        // Its second answer opens the Agent command center, where Enter opens another
+        // task in this terminal (MCR-179): the question says so
+        let note = format!("Trust this folder? Codex can read, edit, and run files here. {COMMAND_CENTER_NOTE}");
+        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some(note.as_str()));
+        // As mcr:45bb49adeb2b showed it on 2026-11-26 (codex-cli 0.172), in a worktree of an untrusted repository
+        let worktree = "  Folder access\n  /Users/x/work/infra/wt/infra-253-skills\n\n  Note: You\u{2019}re in a subdirectory of a Git project. Trusting will apply to the repository root:\n  /Users/x/work/infra/infra-skills\n\n  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code\n  automatically, even without a model request. Continue only if you trust these files. Your trust decision will be saved.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n\n  enter continue \u{b7} esc back\n";
+        let asked = codex.question(worktree).unwrap();
+        assert!(asked.starts_with("Trust this folder? Codex can read, edit, and run files here, subject to") && asked.ends_with(COMMAND_CENTER_NOTE), "{asked}");
         assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
         // Codex's own review of hooks, as recorded on 2026-11-18 (it does not set the title)
         let review = "  Hooks need review\n  4 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\u{203a} 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n";
