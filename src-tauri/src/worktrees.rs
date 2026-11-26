@@ -383,25 +383,73 @@ impl Managed {
             ],
             deadline,
         )?;
-        if ignored
-            .stdout
-            .split(|b| *b == 0)
-            .filter(|path| !path.is_empty())
-            .any(|path| {
-                let directory = path
+        let outside = |path: &[u8]| {
+            let directory = path
+                .iter()
+                .rposition(|b| *b == b'/')
+                .map_or(&b""[..], |last| &path[..last]);
+            let entry = path.strip_suffix(b"/").unwrap_or(path);
+            let disposable = self.disposable.iter().any(|d| {
+                entry.strip_prefix(d.as_bytes()).is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+            });
+            !disposable
+                && !directory
+                    .split(|b| *b == b'/')
+                    .any(|part| matches!(part, b"target" | b"node_modules" | b"dist"))
+        };
+        let mut stray = false;
+        let mut parents = Vec::new();
+        for path in ignored.stdout.split(|b| *b == 0).filter(|path| !path.is_empty()) {
+            if !outside(path) {
+                continue;
+            }
+            // Git names a directory alone when everything in it is ignored, also
+            // when only a deeper path in it is disposable: look inside such a one.
+            let entry = path.strip_suffix(b"/").unwrap_or(path);
+            let parent = path.ends_with(b"/").then(|| {
+                self.disposable.iter().find(|d| {
+                    d.as_bytes()
+                        .strip_prefix(entry)
+                        .is_some_and(|rest| rest.starts_with(b"/"))
+                })
+            });
+            match parent.flatten() {
+                Some(d) => parents.push(d[..entry.len()].to_string()),
+                None => {
+                    stray = true;
+                    break;
+                }
+            }
+        }
+        for parent in &parents {
+            if stray {
+                break;
+            }
+            let mut args = vec![
+                "ls-files".to_string(),
+                "-o".into(),
+                "-i".into(),
+                "--exclude-standard".into(),
+                "-z".into(),
+                "--".into(),
+                format!(":(literal){parent}/"),
+            ];
+            // Excluding the disposable paths only keeps the listing short: every
+            // file listed still goes through `outside`.
+            args.extend(
+                self.disposable
                     .iter()
-                    .rposition(|b| *b == b'/')
-                    .map_or(&b""[..], |last| &path[..last]);
-                let entry = path.strip_suffix(b"/").unwrap_or(path);
-                let disposable = self.disposable.iter().any(|d| {
-                    entry.strip_prefix(d.as_bytes()).is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
-                });
-                !disposable
-                    && !directory
-                        .split(|b| *b == b'/')
-                        .any(|part| matches!(part, b"target" | b"node_modules" | b"dist"))
-            })
-        {
+                    .filter(|d| d.starts_with(&format!("{parent}/")))
+                    .map(|d| format!(":(exclude,literal){d}")),
+            );
+            let inside = checked(&self.path, &args, deadline)?;
+            stray = inside
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|path| !path.is_empty())
+                .any(outside);
+        }
+        if stray {
             return Err(if self.disposable.is_empty() {
                 "the worktree has ignored files outside target, node_modules, or dist (name generated paths in worktree.disposable)".into()
             } else {
@@ -773,6 +821,38 @@ pub mod tests {
         // The record keeps the list across a store round trip
         let stored: Managed = serde_json::from_value(serde_json::to_value(&kept).unwrap()).unwrap();
         assert!(stored.disposable.is_empty());
+    }
+
+    #[test]
+    fn a_parent_git_names_for_a_deeper_disposable_path_is_looked_into() {
+        let (_root, repo) = fixture();
+        // Only src-tauri/gen/schemas is disposable, but Git names src-tauri/gen/
+        // when everything in it is ignored
+        fs::create_dir(repo.join("src-tauri")).unwrap();
+        fs::write(repo.join("src-tauri/build.rs"), "fn main() {}").unwrap();
+        let mut ignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
+        ignore.push_str("src-tauri/gen/other.json\n");
+        fs::write(repo.join(".gitignore"), ignore).unwrap();
+        git(&repo, &["add", "--", ".gitignore", "src-tauri/build.rs"]);
+        git(&repo, &["commit", "-qm", "src-tauri"]);
+        let request = |branch: &str| {
+            json!({"repo": repo, "branch": branch, "base": "main", "disposable": ["src-tauri/gen/schemas"]})
+        };
+        let generated = |path: &Path| {
+            fs::create_dir_all(path.join("src-tauri/gen/schemas")).unwrap();
+            fs::write(path.join("src-tauri/gen/schemas/acl.json"), "{}").unwrap();
+        };
+        let removed = make(&repo, request("removed")).keep();
+        generated(&removed.path);
+        removed.cleanup(deadline()).unwrap();
+        assert!(!removed.path.exists());
+        // An ignored sibling of the disposable path keeps the checkout
+        let kept = make(&repo, request("kept")).keep();
+        generated(&kept.path);
+        fs::write(kept.path.join("src-tauri/gen/other.json"), "{}").unwrap();
+        assert!(kept.cleanup(deadline()).unwrap_err().contains("disposable paths"));
+        assert!(kept.path.join("src-tauri/gen/other.json").is_file());
+        assert!(kept.path.join("src-tauri/gen/schemas/acl.json").is_file());
     }
 
     #[test]
