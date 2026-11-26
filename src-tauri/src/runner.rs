@@ -1140,9 +1140,13 @@ pub struct Client {
 
 impl Client {
     pub fn connect(socket: &Path) -> Result<Self, String> {
+        Self::connect_with_timeout(socket, Duration::from_secs(10))
+    }
+
+    pub fn connect_with_timeout(socket: &Path, timeout: Duration) -> Result<Self, String> {
         let stream = Stream::connect(socket).map_err(|e| format!("Runner unavailable: {e}"))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
-        stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+        stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+        stream.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
         Ok(Self { reader: BufReader::new(stream.try_clone().map_err(|e| e.to_string())?), writer: stream })
     }
 
