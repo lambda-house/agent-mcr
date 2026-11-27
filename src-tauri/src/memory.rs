@@ -2717,7 +2717,12 @@ pub(crate) mod tests {
             let hello = start.join().unwrap();
             assert!(hello["result"]["instructions"].as_str().unwrap().contains("It did not answer when this session started"), "{hello}");
         }
-        assert!(started.elapsed() < AT_START * 2, "{:?}", started.elapsed());
+        // One wait, counted at the fake service rather than by the clock: a busy CI runner
+        // starts the eight threads late and made a bound of AT_START * 2 fail (MCR-208)
+        let tried = lock(&rig.world).arrived.iter().filter(|p| *p == "/mcp").count();
+        assert_eq!(tried, 1, "{:?}", lock(&rig.world).arrived);
+        // Eight waits one after another would take AT_START * 8
+        assert!(started.elapsed() < AT_START * 4, "{:?}", started.elapsed());
     }
 
     #[test]
