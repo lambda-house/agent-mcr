@@ -3,7 +3,8 @@ import { ArrowRight, ExternalLink, Inbox, MessageSquareShare, PlugZap, RefreshCw
 import { create } from 'zustand';
 import { Pane, usePane, useSurfaceShown, type PaneType } from '@lambda-house/workbench';
 import { Button, keepSame } from '@lambda-house/ui';
-import { harnessApi, hostedLabel, isSupervisor, slackApi, SLACK_POSTING, type Hosted, type SlackChannel, type SlackPolicy, type SlackPost, type SlackPosting, type SlackStatus } from '../utils/harness';
+import { canUnlockStore, harnessApi, hostedLabel, isSupervisor, secretStoreName, slackApi, SLACK_POSTING, vaultApi, type Hosted, type SlackChannel, type SlackPolicy, type SlackPost, type SlackPosting, type SlackStatus } from '../utils/harness';
+import { PLATFORM } from '../utils/platform';
 import { isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { sharedPoll } from '../utils/sharedPoll';
@@ -19,7 +20,7 @@ import '../styles/harness.css';
 // made one at a time, and its answer is the new state.
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
-const LINK: Record<SlackStatus['link'], string> = { off: 'Off', connecting: 'Connecting…', connected: 'Connected', reconnecting: 'Reconnecting…', refused: 'Refused by Slack' };
+const LINK: Record<SlackStatus['link'], string> = { off: 'Off', connecting: 'Connecting…', connected: 'Connected', reconnecting: 'Reconnecting…', refused: 'Refused by Slack', unreadable: 'Not listening' };
 const STATE: Record<SlackPost['state'], string> = {
   waiting: 'waiting for you', approved: 'allowed, being sent', sending: 'being sent', sent: 'sent', denied: 'denied', cancelled: 'cancelled', failed: 'not sent', unknown: 'outcome unknown, being looked up',
 };
@@ -237,16 +238,20 @@ export function SlackConnectionPanel() {
       const counts = status.counts;
       const alarm = counts.sentWithoutApproval + counts.refusedApprovals + counts.deliveredFromStrangers;
       return !c ? <form className="hs-slack-connect" aria-label="Connect Slack" onSubmit={e => { e.preventDefault(); run(async () => { const s = await slackApi.connect(bot.trim(), appToken.trim(), operator.trim()); if (s) { setBot(''); setAppToken(''); } return s; }); }}>
-        <p className="hs-board-help">Create a Slack app in your workspace from the manifest <b>docs/slack-app-manifest.yaml</b>, install it, and paste its two tokens. They are kept in the macOS Keychain on this Mac and shown to no agent.</p>
+        <p className="hs-board-help">Create a Slack app in your workspace from the manifest <b>docs/slack-app-manifest.yaml</b>, install it, and paste its two tokens. They are kept in {secretStoreName(PLATFORM)} on this computer and given to no agent.</p>
         <label>Bot token<input type="password" autoComplete="off" spellCheck={false} placeholder="xoxb-…" value={bot} onChange={e => setBot(e.target.value)}/></label>
         <label>App-level token<input type="password" autoComplete="off" spellCheck={false} placeholder="xapp-… (scope connections:write)" value={appToken} onChange={e => setAppToken(e.target.value)}/></label>
         <label>Your member ID<input autoComplete="off" spellCheck={false} placeholder="U… (your Slack profile: ⋮ > Copy member ID)" value={operator} onChange={e => setOperator(e.target.value)}/></label>
         <div><Button type="submit" variant="primary" size="xs" disabled={busy || !bot.trim() || !appToken.trim() || !operator.trim()}>{busy ? 'Checking…' : 'Connect…'}</Button></div>
       </form> : <>
         <div className="hs-slack-state">
-          <span className={`hs-dot ${status.link === 'connected' ? 'idle' : status.link === 'off' ? 'past' : status.link === 'refused' ? 'failed' : 'working'}`} aria-hidden/>
+          <span className={`hs-dot ${status.link === 'connected' ? 'idle' : status.link === 'off' ? 'past' : status.link === 'refused' || status.link === 'unreadable' ? 'failed' : 'working'}`} aria-hidden/>
           <span>{LINK[status.link]}{status.lastEvent ? ` · last event ${formatAge(status.lastEvent)}` : ''}{status.link === 'connected' ? ` · ${status.eventsSeen ?? 0} event${status.eventsSeen === 1 ? '' : 's'} received` : ''}{status.linkError ? ` · ${status.linkError}` : ''}</span>
         </div>
+        {/* The keyring asks for its password itself; the service listens again within seconds */}
+        {status.link === 'unreadable' && canUnlockStore(PLATFORM) && <div className="hs-slack-actions">
+          <Button variant="ghost" size="xs" disabled={busy} onClick={() => run(async () => { await vaultApi.unlock(); return slackApi.status(); })}>Unlock keyring…</Button>
+        </div>}
         {status.link !== 'off' && <p className="hs-slack-counts" title="What arrived from Slack since the harness service started">From Slack: {status.envelopesSeen ?? 0} frame{status.envelopesSeen === 1 ? '' : 's'}{status.lastEnvelope ? `, the last a ${status.lastEnvelope}` : ''} · {status.eventsSeen ?? 0} events · {status.actionsSeen ?? 0} button presses{status.lastDropped ? ` · last event not kept: ${status.lastDropped}` : ''}</p>}
         {(c.missingScopes?.length ?? 0) > 0 && <p className="hs-slack-warning" role="alert">
           The Slack app lacks {c.missingScopes!.length === 1 ? 'a permission' : 'permissions'} this needs: <b>{c.missingScopes!.join(', ')}</b>. Add {c.missingScopes!.length === 1 ? 'it' : 'them'} in the Slack app under OAuth &amp; Permissions &gt; Bot Token Scopes, reinstall the app to the workspace, then press Channels. Or recreate the app from docs/slack-app-manifest.yaml.

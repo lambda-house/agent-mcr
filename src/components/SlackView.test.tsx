@@ -3,13 +3,16 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SlackConnectionPanel, SlackPostsPanel, SlackReceivedPanel, SlackWaitingPanel, useSlack } from './SlackView';
-import { harnessApi, slackApi, type Hosted, type SlackStatus } from '../utils/harness';
+import { harnessApi, slackApi, vaultApi, type Hosted, type SlackStatus } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({
   ...await importOriginal<object>(),
   harnessApi: { list: vi.fn() },
   slackApi: { status: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), enable: vi.fn(), approval: vi.fn(), refresh: vi.fn(), policy: vi.fn(), decide: vi.fn() },
+  vaultApi: { unlock: vi.fn() },
 }));
+// The keyring the app can unlock is Linux's
+vi.mock('../utils/platform', async importOriginal => ({ ...await importOriginal<object>(), PLATFORM: 'linux' }));
 vi.mock('../utils/tauri', () => ({ isTauri: () => true }));
 vi.mock('../utils/agent', () => ({ formatAge: () => 'just now' }));
 
@@ -134,5 +137,22 @@ describe('Slack view', () => {
     expect(host.querySelector('form[aria-label="Connect Slack"]')).not.toBeNull();
     expect(host.querySelectorAll('.hs-slack-channel').length).toBe(0);
     expect(host.querySelectorAll('input[type="password"]').length).toBe(2);
+    expect(host.textContent).toContain('They are kept in your desktop keyring on this computer and given to no agent');
+  });
+
+  it('offers to unlock the keyring while the tokens cannot be read, then asks for the state again', async () => {
+    await act(async () => renderSlack()); await flush();
+    expect(host.textContent).not.toContain('Unlock keyring');
+    await act(async () => root.unmount()); root = createRoot(host);
+    vi.mocked(slackApi.status).mockResolvedValue({ ...status, link: 'unreadable', linkError: 'The Slack tokens cannot be read from the secret store now (the keyring is locked)' });
+    vi.mocked(vaultApi.unlock).mockResolvedValue(undefined);
+    await act(async () => renderSlack()); await flush();
+    const state = host.querySelector('.hs-slack-state')!.textContent!;
+    expect(state).toContain('Not listening');
+    expect(state).toContain('The Slack tokens cannot be read from the secret store now (the keyring is locked)');
+    const asked = vi.mocked(slackApi.status).mock.calls.length;
+    await act(async () => button('Unlock keyring…').click()); await flush();
+    expect(vaultApi.unlock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(slackApi.status).mock.calls.length).toBe(asked + 1);
   });
 });

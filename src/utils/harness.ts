@@ -1,6 +1,7 @@
 import { basename } from './paths';
 export { tildePath } from './paths';
 import { Channel, invoke } from '@tauri-apps/api/core';
+import type { Platform } from './platform';
 
 /** A launch profile held by the backend; the webview can only pick one by id. */
 export interface Profile { id: string; label: string; command: string; optional: boolean; canSupervise: boolean; taskTracking: boolean }
@@ -385,7 +386,8 @@ export interface SlackReceived {
   cut?: boolean;
 }
 export interface SlackStatus {
-  connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused'; linkError: string; lastEvent: number;
+  /** `unreadable`: the keyring cannot say whether the tokens are there (locked, or no keyring running) */
+  connection: SlackConnection | null; enabled: boolean; link: 'off' | 'connecting' | 'connected' | 'reconnecting' | 'refused' | 'unreadable'; linkError: string; lastEvent: number;
   /** When Slack last accepted the connection, and what arrived since the service started */
   connectedAt?: number; eventsSeen?: number; actionsSeen?: number;
   /** Frames of any kind from Slack, the kind of the last one, and the last event that was not kept (type and why, never its text) */
@@ -429,8 +431,32 @@ export interface MemoryStatus {
   problem?: { kind: string; text: string; at: number } | null;
 }
 
-/** One line on where the memory connection stands, for Settings. */
-export function memoryStateLine(status: MemoryStatus): string {
+/** Problems that leave memory unusable while connected: the bridge's tool list fails (`noted` in memory.rs clears them at the next call that gets through).
+ *  `no_model_key` is not one: the tools are listed and calls that need no model still work. Neither is `vault_unsaved`
+ *  (the store reads but did not save a renewed token): calls go through, and an unlock would not help. */
+const MEMORY_DOWN: Record<string, string> = {
+  vault_unavailable: 'the sign-in cannot be read from the secret store',
+  unreachable: 'the memory service cannot be reached',
+  refused: 'the memory service refuses its calls',
+};
+/** What a session started without the memory tools does to get them: the bridge says `listChanged: false`, so a later fix is not told to it. */
+const MEMORY_RESTART = 'restarted or reconnected (in Claude Code, /mcp and then reconnect mcr-memory)';
+
+/** One line on where the memory connection stands, for Settings. `unlocked`: the person unlocked the keyring for the current problem. */
+export function memoryStateLine(status: MemoryStatus, unlocked = false): string {
+  if (status.state === 'connected' && status.problem?.kind === 'vault_unsaved') {
+    return `Connected to ${status.endpoint}. Memory works and new and restarted sessions have the memory tools, but the secret store could not save a renewed token: the last problem says what that means until a save succeeds.`;
+  }
+  if (status.state === 'connected' && status.problem?.kind === 'sign_in_unusable') {
+    return `Signed in to ${status.endpoint}, but the description kept with the sign-in in the secret store cannot be read or used, so the sign-in cannot be renewed. Nothing was removed. Disconnect and connect again.`;
+  }
+  const down = status.state === 'connected' && status.problem ? MEMORY_DOWN[status.problem.kind] : undefined;
+  if (down && unlocked && status.problem?.kind === 'vault_unavailable') {
+    return `Signed in to ${status.endpoint}. The keyring is unlocked: memory is used again at its next call. Sessions started while it was locked have no memory tools until they are ${MEMORY_RESTART}.`;
+  }
+  if (down) {
+    return `Signed in to ${status.endpoint}; no new sign-in is needed. Memory cannot be used now: ${down}. Sessions started meanwhile have no memory tools until they are ${MEMORY_RESTART}.`;
+  }
   switch (status.state) {
     case 'connected': return `Connected to ${status.endpoint}. New and restarted sessions have the memory tools; a call that names no memory goes to ${status.defaultMemory}.`;
     case 'connecting': return 'Waiting for the sign-in in your browser. It is given up after five minutes.';
@@ -445,6 +471,19 @@ export const memoryApi = {
   connect: () => invoke<MemoryStatus>('memory_connect'),
   /** Asks in a native dialog unless a sign-in is only under way */
   disconnect: () => invoke<MemoryStatus>('memory_disconnect'),
+};
+
+/** Where the Slack and memory tokens are kept, in the words of the app's native dialogs (`vault::STORE_NAME`). */
+export function secretStoreName(platform: Platform): string {
+  return platform === 'macos' ? 'the macOS Keychain' : platform === 'windows' ? 'Windows Credential Manager' : 'your desktop keyring';
+}
+
+/** Only the Linux keyring is unlocked from the app, on the person's word; the harness service never unlocks it (MCR-177). */
+export const canUnlockStore = (platform: Platform): boolean => platform === 'linux';
+
+export const vaultApi = {
+  /** The keyring asks for its password in its own prompt; resolves once it is unlocked */
+  unlock: () => invoke<void>('vault_unlock'),
 };
 
 export const harnessApi = {

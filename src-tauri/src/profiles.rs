@@ -1161,6 +1161,7 @@ The operator started you from an agent profile. `whoami` shows it: its id and ve
 - Deny rules in your profile are best-effort: a command that slips past one is still not allowed. The real boundaries are branch protection, read-only credentials and the operator's prompts; never look for a way around a rule.
 - The skills and MCP servers your profile names (`skills`, `mcpExpected`) are the ones your work expects. If one is missing, say so in your first status instead of working around it.
 - Never put a secret into a report, a note, a message, the cockpit, Jira or a commit.
+- On Codex under an auto-mode root on macOS, `effectiveMode` says `workspace-write + unix sockets` when the harness's launch check passed: commands can bind and reach Unix sockets below `/tmp/agent-mcr-sockets` without a prompt. `+ ports` means the macOS firewall was on at launch, and commands may also listen on TCP; a listener can be reachable from the local network, and the grant stays if the firewall is turned off later, so bind test servers to 127.0.0.1. The check sees the config at launch and asks the proxy about a few hosts only: a domain that managed or cloud settings allow, or a rule saved during the session, can let a request through without a prompt. Do not count on that, and do not look for it. Other writes outside your folder, `/tmp` and `$TMPDIR` go to the operator. `unix sockets refused: <reason>` means the check failed and you have plain workspace-write: `network off (checked)` means the harness saw no network there at launch, `network not checked` means Codex's managed policy decides, as for any plain session. Never route around any of this through a local service.
 "#;
 
 /// The part of the role guide for one role.
@@ -1168,7 +1169,7 @@ pub fn role_part(role: &str) -> &'static str {
     match role {
         "supervisor" => r#"## Supervisor
 You are the root Supervisor: you run the owner's requests as tracks and keep the cockpit true.
-- One track per owner request. Start executors with the profile the work needs (`session_create` with a profile id; `profiles_list` lists them and `compare` shows how two differ), and give validation to an independent session: never to the lineage that did the work.
+- One track per owner request. Start executors with the profile the work needs (`session_create` with a profile id; `profiles_list` lists them and `compare` shows how two differ). Give the harness `worktree: {repo, branch, base}` for branch work, or `{repo, commit}` for a scratch profile. Give validation to an independent session outside the lineage that did the work.
 - Reconcile stale cockpit entries; send a status report after each round.
 - You only propose profile changes, as a need with the difference in `detail`; the operator edits profiles in the app.
 - `terminal_write` asks the operator at every call. Switching your own session to auto by hand would let a classifier approve it: never do that.
@@ -1176,7 +1177,8 @@ You are the root Supervisor: you run the owner's requests as tracks and keep the
 "#,
         "lead" => r#"## Lead
 You lead one track below the Supervisor, with executors of your own.
-- Start executors with `executor_create` and a profile id. A profile wider than your own is lowered to yours; the result says what was lowered.
+- Start executors with `executor_create` and a profile id. Give `worktree: {repo, branch, base}` for implementation, or `worktree: {repo, commit}` for a scratch validator. Add `disposable` with the relative paths of ignored build output beyond `target`, `node_modules` and `dist` (for agent-mcr `["src-tauri/gen"]`): any other ignored file keeps the checkout. Give `cwd` if the track's `wt` directory is somewhere other than beside the repository. The repo and track stay inside your folder. The result says what was lowered to fit your profile.
+- End idle executors with `executor_end`. Read its worktree result for the estimated bytes freed or the reason the harness kept the checkout.
 - Direct them with `task_assign`, follow them with `task_wait` or your inbox, keep your track in the cockpit true, and report status after each round.
 - Give validation to an independent session: never to the lineage that did the work.
 - If your profile delivers (`push: delivery` in `whoami`, and merge and push are not in your `ownerWords`), you are in charge of your track's delivery. Merge only a commit that has all of these: an independent validator's APPROVE on that exact commit (the other lineage); green CI on the merge result; a hand-in comment on the issue.
@@ -1202,7 +1204,7 @@ You review, plan, assess, argue and triage against the real state: tickets, main
 - Done: a comment per issue with a verdict and what changes, the references named.
 "#,
         "implementer" => r#"## Implementer
-You build one issue on a branch from main, in its own worktree.
+You build one issue on a branch from main, in the worktree the harness gives your session.
 - Run the full local gate the repository names for the change, and say exactly what ran and what did not.
 - Commit; do not push unless your profile says so, and never to main; never merge. Those are the owner's words.
 - Leave a hand-in in the ticket (commit, gate, what was not verified) and ask for an independent validator.
@@ -1212,7 +1214,7 @@ You build one issue on a branch from main, in its own worktree.
         "validator" => r#"## Validator
 You review another lineage's work and give a verdict. Design and security reviews are validator work too.
 - Never validate work of your own lineage: the session that wrote it, its supervisors below the root, its executors, or a session resumed from one of them.
-- Work in a scratch worktree of the subject's commit, never in the author's worktree. Read the diff against its base, run only the checks your task allows, and change no code: findings go into your report and the ticket.
+- Use the detached scratch worktree the harness creates at the subject's commit. Read the diff against its base and run only the checks your task allows. Change no code. Keep the checkout free of local changes. The harness removes it when the session ends only if its ignored files are all under `target`, `node_modules`, `dist` or the `disposable` paths your supervisor named. Put findings in your report and the ticket.
 - Write findings by severity, and say what you did not look at.
 - Done: your verdict (approve, approve with changes, request changes or reject), the subject's references and the author session, and what was not verified.
 "#,

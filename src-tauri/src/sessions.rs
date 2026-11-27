@@ -763,7 +763,7 @@ impl Indexed {
         {
             return Err("Transcript replaced by a symlink".into());
         }
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let mut file = open_transcript(path)?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         let modified = meta
             .modified()
@@ -1363,6 +1363,23 @@ impl Index {
         }
     }
 }
+/// Opens a transcript only as a regular file: on unix without following a
+/// symlink and without waiting (`O_NONBLOCK`), checked again once open, so a
+/// named pipe put in an agent's folder never holds the index (MCR-149).
+fn open_transcript(path: &Path) -> Result<File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Transcript is not a regular file".into());
+    }
+    Ok(file)
+}
 pub fn events_before(path: &Path, provider: &str, before: u64) -> Result<Vec<Event>, String> {
     if fs::symlink_metadata(path)
         .map_err(|e| e.to_string())?
@@ -1372,7 +1389,7 @@ pub fn events_before(path: &Path, provider: &str, before: u64) -> Result<Vec<Eve
         return Err("Transcript was replaced by a symlink".into());
     }
     let mut page = Indexed::new(path, provider);
-    let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+    let mut reader = BufReader::new(open_transcript(path)?);
     let mut line = Vec::new();
     while page.session.event_count < before {
         line.clear();
@@ -1756,5 +1773,24 @@ mod tests {
         i.read(&path, None).unwrap();
         assert_eq!(i.session.event_count, 0);
         fs::remove_file(path).unwrap();
+    }
+
+    /// MCR-149: a named pipe named like a transcript does not hold the
+    /// index; it is refused as no regular file.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_not_read_as_a_transcript() {
+        let dir = std::env::temp_dir().join(format!("mcr-index-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pipe = dir.join("0b8c9630-d8ae-4b6f-a765-44266a0929e0.jsonl");
+        let c = std::ffi::CString::new(pipe.display().to_string()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut index = Indexed::new(&pipe, "claude");
+            let _ = tx.send((index.read(&pipe, None).is_err(), events_before(&pipe, "claude", 1).is_err()));
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the index waited on a pipe"), (true, true));
     }
 }

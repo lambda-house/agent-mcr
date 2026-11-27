@@ -45,7 +45,13 @@ pub fn modified_ms(path: &Path) -> u64 {
 /// can be megabytes long, so this never parses whole lines.
 pub fn head_value(path: &Path, key: &str, limit: u64) -> Option<String> {
     let mut head = Vec::new();
-    std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
+    // A regular file only: a named pipe in an agent's folder would wait for good
+    crate::transcript_stats::open_regular(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
+    value_in(&head, key)
+}
+
+/// The first JSON string value of `key` in these bytes of a transcript's head.
+pub fn value_in(head: &[u8], key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let at = head.windows(needle.len()).position(|w| w == needle.as_bytes())? + needle.len() - 1;
     serde_json::Deserializer::from_slice(&head[at..]).into_iter::<String>().next()?.ok()
@@ -103,7 +109,7 @@ fn transcript_summary(path: &Path, is_claude: bool) -> TranscriptSummary {
         }
     }
 
-    let Ok(file) = std::fs::File::open(path) else { return TranscriptSummary::default() };
+    let Ok(file) = crate::transcript_stats::open_regular(path) else { return TranscriptSummary::default() };
     let mut reader = std::io::BufReader::new(file.take(192 * 1024));
     let mut line = String::new();
     let mut custom = None;
@@ -268,12 +274,46 @@ pub struct Launch<'a> {
     /// the command line only through the adapter's fixed mapping
     /// (`profile_words`). None: today's line (a bare launch)
     pub agent: Option<&'a crate::profiles::AgentProfile>,
-    /// Set only by the harness after matching an operator-configured root.
-    pub claude_auto_root: Option<&'a str>,
+    /// Set only by the harness after matching an operator-configured root
+    /// (MCR-152 for Claude, MCR-162 for Codex).
+    pub auto_root: Option<&'a str>,
+    /// Why the Codex socket profile is not passed although a root matched:
+    /// the harness's launch check (`codex_sockets::check`) could not
+    /// establish its policy, so the session gets plain workspace-write with
+    /// its network explicitly off (MCR-162 reviews 17269 P1, 17282 P1). A
+    /// fixed message, never text from the check
+    pub sockets_refused: Option<&'a str>,
+    /// With the socket profile: commands may also listen on TCP, because
+    /// the macOS firewall was on at the check (owner's decision 17284)
+    pub codex_ports: bool,
+    /// With the socket profile and no ports: the fixed reason why not
+    pub ports_refused: Option<&'a str>,
+    /// With a refusal: the plain line it falls back to was run under Codex
+    /// and showed no network (review 17287 P1). Otherwise Codex's managed
+    /// policy decides, as for any plain line, and `effectiveMode` says so
+    pub network_off_checked: bool,
 }
 
 // The root override promotes acceptEdits and manual. Plan keeps its mode (MCR-160).
 const CLAUDE_AUTO_FROM_MODES: &[&str] = &["acceptEdits", "manual"];
+
+/// The only system where the Codex socket profile is passed (MCR-162):
+/// verified there against Seatbelt with codex-cli 0.172. Elsewhere a Codex
+/// session under a root keeps plain workspace-write.
+pub const CODEX_SOCKETS_OS: &str = "macos";
+
+/// The permission profile a Codex session under a root runs in, defined on
+/// its command line. A name of our own, so it does not take the operator's;
+/// a config file that defines it makes the launch check refuse it.
+pub const CODEX_SOCKET_PROFILE: &str = "agent-mcr-sockets";
+
+/// The one folder where a Codex session under a root may bind and connect
+/// Unix sockets (MCR-162). The canonical path: Codex refuses `/tmp` for a
+/// folder that does not exist yet. The tests put their sockets below it
+/// (`ipc::test_socket_dir`), so `cargo test` needs no prompt there. The other
+/// sockets in `/tmp` and `$TMPDIR` (a browser's, an agent daemon's, a JVM's)
+/// stay closed.
+pub const CODEX_SOCKETS: &str = "/private/tmp/agent-mcr-sockets";
 
 impl Launch<'_> {
     fn claude_mode(&self) -> &str {
@@ -281,8 +321,32 @@ impl Launch<'_> {
     }
 
     pub fn claude_uses_auto(&self) -> bool {
-        self.claude_auto_root.is_some()
+        self.profile == "claude"
+            && self.auto_root.is_some()
             && CLAUDE_AUTO_FROM_MODES.contains(&self.profile_mode().unwrap_or("acceptEdits"))
+    }
+
+    /// A Codex session in workspace-write that a root would give Unix
+    /// sockets on `os` (MCR-162), before the root is known: the harness reads
+    /// auto-mode.json for Codex only then (review 17269 P3). Read-only, the
+    /// root Supervisor and other systems keep their line.
+    pub fn codex_could_take_sockets(&self, os: &str) -> bool {
+        self.profile == "codex" && !self.supervisor && os == CODEX_SOCKETS_OS && self.codex_mode() == "workspace-write"
+    }
+
+    /// A Codex session under a root in workspace-write gets Unix sockets
+    /// (MCR-162) unless the launch check refused them; read-only keeps its mode
+    pub fn codex_sockets(&self) -> bool {
+        self.profile == "codex" && self.auto_root.is_some() && self.sockets_refused.is_none() && self.codex_mode() == "workspace-write"
+    }
+
+    fn codex_mode(&self) -> &str {
+        self.profile_mode().unwrap_or("workspace-write")
+    }
+
+    /// Whether the socket profile reaches the command line on `os`
+    fn codex_sockets_on(&self, os: &str) -> bool {
+        self.codex_sockets() && os == CODEX_SOCKETS_OS
     }
 
     fn profile_mode(&self) -> Option<&str> {
@@ -290,14 +354,27 @@ impl Launch<'_> {
     }
 
     pub fn effective_mode(&self, notes: &[String]) -> Option<String> {
+        self.effective_mode_on(notes, std::env::consts::OS)
+    }
+
+    fn effective_mode_on(&self, notes: &[String], os: &str) -> Option<String> {
         let mode = match self.profile {
             "claude" => self.claude_mode(),
+            "codex" if self.codex_sockets_on(os) && self.codex_ports => "workspace-write + unix sockets + ports",
+            "codex" if self.codex_sockets_on(os) => "workspace-write + unix sockets",
             "codex" => self.profile_mode().unwrap_or("workspace-write"),
             "antigravity" => "accept-edits",
             _ => return None,
         };
-        let mut reason = match self.claude_auto_root {
+        let mut reason = match self.auto_root {
+            Some(root) if self.codex_sockets_on(os) && self.codex_ports => format!("root {root}, macOS firewall on at launch"),
+            Some(root) if self.codex_sockets_on(os) => format!("root {root}, no ports: {}", self.ports_refused.unwrap_or("not checked")),
             Some(root) if self.claude_uses_auto() => format!("root {root}"),
+            Some(root) if self.codex_sockets() => format!("root {root}, unix sockets are passed on {CODEX_SOCKETS_OS} only"),
+            Some(root) if self.profile == "codex" && self.codex_mode() == "workspace-write" && self.sockets_refused.is_some() => {
+                let network = if self.network_off_checked { CODEX_OFF_CHECKED } else { CODEX_OFF_UNCHECKED };
+                format!("root {root}, {network}, unix sockets refused: {}", self.sockets_refused.unwrap_or(""))
+            }
             Some(root) => format!("profile mode kept under root {root}"),
             None if self.profile_mode().is_some() => "profile".into(),
             None => "adapter default".into(),
@@ -409,6 +486,13 @@ pub trait Adapter: Sync {
     fn sees_prompt(&self) -> bool {
         false
     }
+    /// Positive proof from the screen that the input box belongs to a new,
+    /// empty conversation in `folder` (as the agent shows it), for an agent
+    /// that does not name its conversation, before it has reported one
+    /// (MCR-179): the harness types into it only then. Default: no proof
+    fn fresh_conversation(&self, _screen: &str, _folder: &str) -> bool {
+        false
+    }
     /// Launched as Supervisor so that `terminal_write` is the one tool left to
     /// its own permission prompt: the operator approves each call (Claude:
     /// `claude_settings` pre-approves every other supervisor tool). Only such
@@ -496,6 +580,10 @@ pub const CODEX_HOOK: &str = "codex-hook";
 #[cfg_attr(windows, allow(dead_code))]
 pub const CODEX_HOOKS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse"];
 
+/// Said with Codex's folder question when its second answer is "Back to Agent
+/// Command Center" (codex-cli 0.172, MCR-179).
+pub const COMMAND_CENTER_NOTE: &str = "Codex asks to trust this folder: 1 starts this session's task. 2 opens Codex's Agent command center, where Enter opens another task here instead.";
+
 pub struct Claude;
 pub struct Codex;
 pub struct Shell;
@@ -557,7 +645,7 @@ impl Adapter for Claude {
     }
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
-        let mut cmd = if l.agent.is_some() || l.claude_auto_root.is_some() {
+        let mut cmd = if l.agent.is_some() || l.auto_root.is_some() {
             format!("exec {} {}", base.split(' ').next().unwrap_or(base), self.launch_words(l).iter().map(|w| sh(w)).collect::<Vec<_>>().join(" "))
         } else {
             format!("exec {base}")
@@ -748,13 +836,12 @@ impl Adapter for Codex {
     #[cfg(any(unix, test))]
     fn command_line(&self, base: &str, l: &Launch) -> Result<String, String> {
         let (head, flags) = base.split_once(' ').unwrap_or((base, ""));
-        let profiled;
-        let flags = match l.agent {
-            Some(p) => {
-                profiled = self.profile_words(p)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ");
-                profiled.as_str()
-            }
-            None => flags,
+        let worded;
+        let flags = if l.agent.is_some() || l.codex_sockets_on(std::env::consts::OS) || l.sockets_refused.is_some() {
+            worded = self.sandbox_words(l, std::env::consts::OS)?.iter().map(|w| sh(w)).collect::<Vec<_>>().join(" ");
+            worded.as_str()
+        } else {
+            flags
         };
         let notify = format!("notify={}", json!([l.exe, "--harness-hook", "codex-notify"]));
         // The harness tools and the memory server, for this launch only (values are TOML; a JSON string is one)
@@ -810,6 +897,23 @@ impl Adapter for Codex {
     fn sees_prompt(&self) -> bool {
         true
     }
+    /// A new conversation, as codex-cli 0.172 draws it (recorded 2026-11-26):
+    /// its banner, nothing said yet, and the line under the input box naming
+    /// the model and the folder and no conversation title. A task opened from
+    /// the Agent command center shows its history (`›` lines of the person,
+    /// `•` items of the agent) and its own folder and title on that line
+    fn fresh_conversation(&self, screen: &str, folder: &str) -> bool {
+        let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+        if !self.at_prompt(screen) || !lines.iter().any(|l| l.trim_start().starts_with(">_ OpenAI Codex")) {
+            return false;
+        }
+        let marks: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.starts_with('\u{203a}')).map(|(i, _)| i).collect();
+        let said = lines.iter().any(|l| l.trim_start().starts_with('\u{2022}') || l.trim_start().starts_with('\u{2514}'));
+        let [box_line] = marks[..] else { return false };
+        let Some(status) = lines[box_line + 1..].iter().find(|l| !l.trim().is_empty()) else { return false };
+        let parts: Vec<&str> = status.trim().split(" \u{b7} ").collect();
+        !said && parts.len() == 2 && parts[1] == folder
+    }
     /// Codex sets "[ ! ] Action Required" as the title while it waits for an answer
     /// (after a glyph that blinks, before the folder). Nothing else: a
     /// conversation may be titled with these words and more
@@ -822,17 +926,14 @@ impl Adapter for Codex {
         body.starts_with("Approval requested")
     }
     fn question(&self, screen: &str) -> Option<String> {
-        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
-            // The folder question at start (0.170 wording), whose answers may not be numbered
-            if self.at_prompt(screen) {
-                return None;
-            }
-            // Codex's review of hooks it has not run before, ours among them (MCR-74)
-            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
-                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
-            }
-            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
-            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        let question = self.question_asked(screen)?;
+        // codex-cli 0.172's second answer at the folder question opens its
+        // Agent command center, where Enter opens any task on the machine in
+        // this terminal: the session's own task then never starts (MCR-179)
+        // The note comes first: a notification shows only the start of the text
+        Some(match question.starts_with("Trust this folder?") && screen.contains("Back to Agent Command Center") {
+            true => format!("{COMMAND_CENTER_NOTE} {question}"),
+            false => question,
         })
     }
     /// Codex takes one `developer_instructions` value: the operator's own, if set, stays
@@ -899,6 +1000,120 @@ impl Adapter for Codex {
     fn takes_mcp(&self) -> bool {
         true
     }
+}
+
+/// What `effectiveMode` says of the fallback's network: checked under Codex
+/// in the same deadline, or left to Codex's managed policy, as for any
+/// plain line (review 17287 P1)
+pub const CODEX_OFF_CHECKED: &str = "network off (checked)";
+pub const CODEX_OFF_UNCHECKED: &str = "network not checked: Codex's managed policy applies";
+
+/// What a refused check adds after `--sandbox workspace-write` (MCR-162)
+pub const CODEX_NETWORK_OFF: [&str; 2] = ["-c", "sandbox_workspace_write.network_access=false"];
+
+/// The bare Codex line's sandbox and approvals (its `Profile.command` after the program)
+const CODEX_BARE: [&str; 4] = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"];
+
+impl Codex {
+    /// The question on the screen, as Codex words it.
+    fn question_asked(&self, screen: &str) -> Option<String> {
+        asked(screen, |l| l.starts_with("Would you like to") || l.ends_with("needs your approval.") || l.starts_with("Do you trust") || l.starts_with("Trust this folder?") || l.starts_with("Hooks need review")).or_else(|| {
+            // The folder question at start (0.170 wording), whose answers may not be numbered
+            if self.at_prompt(screen) {
+                return None;
+            }
+            // Codex's review of hooks it has not run before, ours among them (MCR-74)
+            if screen.contains("Hooks need review") && screen.contains("Trust all and continue") {
+                return Some("Hooks need review: Codex asks whether to trust the hooks it was started with".into());
+            }
+            let trust = screen.lines().map(str::trim).find(|l| l.starts_with("Trust this folder?"))?;
+            Some(trust.chars().filter(|c| !c.is_control()).take(300).collect())
+        })
+    }
+
+    /// The sandbox and approval words of a launch: the profile's, or the bare
+    /// line's. Under an auto-mode root on `CODEX_SOCKETS_OS` the socket
+    /// profile takes the place of `--sandbox workspace-write` (MCR-162);
+    /// `--ask-for-approval on-request` and everything else stay
+    fn sandbox_words(&self, l: &Launch, os: &str) -> Result<Vec<String>, String> {
+        let mut words = match l.agent {
+            Some(p) => self.profile_words(p)?,
+            None => CODEX_BARE.map(str::to_owned).to_vec(),
+        };
+        let at = words.windows(2).position(|w| w[0] == "--sandbox" && w[1] == "workspace-write");
+        if l.codex_sockets_on(os) {
+            let at = at.ok_or("The Codex line has no workspace-write sandbox to give Unix sockets")?;
+            words.splice(at..at + 2, codex_socket_words(l.codex_ports));
+        } else if let (Some(at), Some(_), Some(_)) = (at, l.auto_root, l.sockets_refused) {
+            // The check refused: workspace-write with its network off, whatever
+            // `[sandbox_workspace_write].network_access` a config layer says
+            // (review 17282 P1)
+            words.splice(at + 2..at + 2, CODEX_NETWORK_OFF.map(str::to_owned));
+        }
+        one_sandbox(&words)?;
+        Ok(words)
+    }
+}
+
+/// Codex ignores `default_permissions` without a word when a `--sandbox` is
+/// given too, and the session would run without the profile the harness
+/// reports: the two never go together on a line the harness builds
+fn one_sandbox(words: &[String]) -> Result<(), String> {
+    if words.iter().any(|w| w == "--sandbox" || w.starts_with("--sandbox=")) && words.iter().any(|w| w.starts_with("default_permissions=")) {
+        return Err("The Codex line has both --sandbox and a permission profile".into());
+    }
+    Ok(())
+}
+
+/// Codex's workspace-write with Unix sockets in one folder (MCR-162;
+/// codex-cli 0.172).
+///
+/// A command-line `--sandbox` wins over `default_permissions`, which is then
+/// ignored without a word, so it is left out: `default_permissions` names a
+/// permission profile defined here. Its filesystem is workspace-write's as
+/// Codex renders it (read everywhere; write the folder, `/tmp` and `$TMPDIR`;
+/// the folder's `.git`, `.codex`, `.agents` and `.aws` read-only): the
+/// built-in `:workspace` leaves `.git` and `.codex` writable.
+///
+/// Seatbelt passes a profile's Unix sockets only with its network on and
+/// Codex's managed proxy running (the `network_proxy` feature, still
+/// experimental in 0.172; `--enable` fails at start on a name Codex does not
+/// know). The proxy has no allowed domain, so anything outside goes to the
+/// operator as before. Without the proxy, `network.enabled` would be the
+/// whole network and every Unix socket, which is why the harness runs
+/// `codex_sockets::check` before every such launch and falls back to plain
+/// workspace-write when it fails.
+///
+/// TCP listening (`ports`) only while the macOS firewall is on: Seatbelt's
+/// `network-bind (local ip "*:*")` is the only grant there is, and a
+/// listener on `0.0.0.0` answered a connection to the Mac's en0 address
+/// (review 17269 P2, measured 25 Nov); the owner accepts that with the
+/// firewall as the mitigation (17284). Without it, `allow_local_binding` is
+/// false. Both ways it is set here, with the two `dangerously_*` switches
+/// false, so a lower config layer cannot set them for this profile.
+pub fn codex_socket_words(ports: bool) -> Vec<String> {
+    let p = CODEX_SOCKET_PROFILE;
+    [
+        "--enable".to_owned(),
+        "network_proxy".to_owned(),
+        "-c".to_owned(),
+        format!("default_permissions=\"{p}\""),
+        "-c".to_owned(),
+        format!(
+            "permissions.{p}.filesystem={{\":root\"=\"read\", \":project_roots\"={{\".\"=\"write\", \".git\"=\"read\", \".codex\"=\"read\", \".agents\"=\"read\", \".aws\"=\"read\"}}, \":slash_tmp\"=\"write\", \":tmpdir\"=\"write\"}}"
+        ),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.enabled=true"),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.allow_local_binding={ports}"),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.dangerously_allow_all_unix_sockets=false"),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.dangerously_allow_non_loopback_proxy=false"),
+        "-c".to_owned(),
+        format!("permissions.{p}.network.unix_sockets={{\"{CODEX_SOCKETS}\"=\"allow\"}}"),
+    ]
+    .to_vec()
 }
 
 impl Adapter for Shell {
@@ -1059,10 +1274,9 @@ pub fn windows_args(l: &Launch) -> Result<Vec<String>, String> {
             if l.resume.is_some() {
                 args.push("resume".into());
             }
-            args.extend(match l.agent {
-                Some(p) => agent.profile_words(p)?,
-                None => ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"].map(str::to_owned).to_vec(),
-            });
+            // The Windows sandbox is not Seatbelt and its managed network is
+            // not verified: under a root it keeps plain workspace-write (MCR-162)
+            args.extend(Codex.sandbox_words(l, "windows")?);
             let exe_lit = toml_literal(l.exe)?;
             args.extend(["-c".into(), format!("notify=[{exe_lit},'--harness-hook','codex-notify']")]);
             args.extend(["-c".into(), "tui.notifications=true".into()]);
@@ -1209,6 +1423,30 @@ mod tests {
     }
 
     #[test]
+    fn a_new_codex_conversation_is_told_from_one_opened_from_the_command_center() {
+        // MCR-179 review 17342 (1): before Codex reports its conversation, the
+        // harness types into it only on positive proof that it is a new one
+        let codex = Codex;
+        let banner = "  >_ OpenAI Codex (v0.172.0)\n     ~/work/infra/wt/infra-253-skills\n\n";
+        let fresh = format!("{banner}\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~/work/infra/wt/infra-253-skills\n  \u{2190} for agents \u{b7} ? for shortcuts\n");
+        assert!(codex.fresh_conversation(&fresh, "~/work/infra/wt/infra-253-skills"));
+        // Another folder on the line under the box: not this session's conversation
+        assert!(!codex.fresh_conversation(&fresh, "~/work/infra/wt/infra-252-skills"));
+        // The task of 26 Nov as mcr:45bb49adeb2b showed it: its history, its folder and its title
+        let opened = "\u{203a} resume\n    1733\n\u{2022} Ran git status --porcelain\n  \u{2514} (no output)\n\n\u{25a0} Conversation interrupted\n\n\u{203a} Ask Codex to do anything\n\n  GPT-6.2-Sol high \u{b7} ~/work/teob-cc/teob-rust \u{b7} Validate CORE-850 round 2 at the exact commit 3a0e726 (loca\u{2026}\n  \u{2190} for agents \u{b7} ? for shortcuts\n";
+        assert!(!codex.fresh_conversation(opened, "~/work/teob-cc/teob-rust"));
+        // The same task with its history scrolled away still names itself on that line
+        let titled = format!("{banner}\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~/work/infra/wt/infra-253-skills \u{b7} Validate INFRA-253\n  ? for shortcuts\n");
+        assert!(!codex.fresh_conversation(&titled, "~/work/infra/wt/infra-253-skills"));
+        // Something said already, or a menu on screen, or no banner: no proof
+        let said = format!("{banner}\u{2022} Explored\n\u{203a} Ask Codex to do anything\n  GPT-6.2-Sol high \u{b7} ~/work/infra/wt/infra-253-skills\n  ? for shortcuts\n");
+        assert!(!codex.fresh_conversation(&said, "~/work/infra/wt/infra-253-skills"));
+        let menu = "\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n  ? for shortcuts\n";
+        assert!(!codex.fresh_conversation(menu, "~/work/infra/wt/infra-253-skills"));
+        assert!(!Claude.fresh_conversation(&fresh, "~/work/infra/wt/infra-253-skills"));
+    }
+
+    #[test]
     fn a_prompt_is_recognised_from_the_title_and_the_screen() {
         let codex = adapter("codex");
         assert_eq!(codex.title_asks("[ ! ] Action Required | teob-ai"), Some(true));
@@ -1239,7 +1477,17 @@ mod tests {
         assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n  Yes, continue\n  No, quit\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
         assert_eq!(codex.question("Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue\n  2. No, quit").as_deref(), Some("Do you trust the contents of this directory?"));
         // As seen on 2026-11-18 (codex-cli 0.170): numbered answers
-        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some("Trust this folder? Codex can read, edit, and run files here."));
+        // Its second answer opens the Agent command center, where Enter opens another
+        // task in this terminal (MCR-179): the question says so
+        let note = format!("{COMMAND_CENTER_NOTE} Trust this folder? Codex can read, edit, and run files here.");
+        assert_eq!(codex.question("  Trust this folder? Codex can read, edit, and run files here.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n").as_deref(), Some(note.as_str()));
+        // As mcr:45bb49adeb2b showed it on 2026-11-26 (codex-cli 0.172), in a worktree of an untrusted repository
+        let worktree = "  Folder access\n  /Users/x/work/infra/wt/infra-253-skills\n\n  Note: You\u{2019}re in a subdirectory of a Git project. Trusting will apply to the repository root:\n  /Users/x/work/infra/infra-skills\n\n  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code\n  automatically, even without a model request. Continue only if you trust these files. Your trust decision will be saved.\n\n\u{203a} 1. Trust and continue\n  2. Back to Agent Command Center\n\n  enter continue \u{b7} esc back\n";
+        let asked = codex.question(worktree).unwrap();
+        assert!(asked.starts_with(COMMAND_CENTER_NOTE) && asked.contains("Trust this folder? Codex can read, edit, and run files here, subject to"), "{asked}");
+        // A notification shows 200 characters of "Seen in its terminal: <question>" (`notify_user`): the whole note fits (review 17342, 6)
+        let shown: String = format!("Seen in its terminal: {asked}").chars().take(200).collect();
+        assert!(shown.contains(COMMAND_CENTER_NOTE), "{shown}");
         assert_eq!(codex.question("\u{2022} Trust this folder? was asked before\n\u{203a} Explain this codebase\n\n  ? for shortcuts"), None);
         // Codex's own review of hooks, as recorded on 2026-11-18 (it does not set the title)
         let review = "  Hooks need review\n  4 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\u{203a} 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n";
@@ -1570,5 +1818,133 @@ mod tests {
         // The supervisor profile is for the root only, and the root takes no other
         check(&loaded.get("supervisor@claude-opus").unwrap().profile, "claude", false);
         check(&loaded.get("implementer@claude-opus").unwrap().profile, "claude", true);
+    }
+
+    /// MCR-162: under an auto-mode root, a Codex session in workspace-write
+    /// gets the socket profile in place of `--sandbox workspace-write` on
+    /// macOS, profile or bare, new or resumed, with ports only when the
+    /// check found the firewall on; `on-request` stays. A refused check gives
+    /// workspace-write with its network explicitly off (review 17282 P1).
+    /// Read-only, outside a root and the Windows path keep today's words.
+    #[test]
+    fn codex_under_a_root_gets_unix_sockets_on_macos_only() {
+        let loaded = crate::profiles::load(Path::new("/nonexistent-config-dir"));
+        let implementer = loaded.get("implementer@codex").unwrap().profile.clone();
+        let lead = loaded.get("lead@codex").unwrap().profile.clone();
+        let validator = loaded.get("validator@codex").unwrap().profile.clone();
+        let mut read_only = implementer.clone();
+        read_only.permissions.mode = Some("read-only".into());
+        let resume = "019a3c48-7d0e-7d61-b1f5-6a1f0c6d2b3e";
+        for ports in [false, true] {
+            let sockets = codex_socket_words(ports);
+            assert_eq!(sockets[..4], ["--enable", "network_proxy", "-c", "default_permissions=\"agent-mcr-sockets\""]);
+            let filesystem = &sockets[5];
+            for rule in [r#"":root"="read""#, r#""."="write""#, r#"".git"="read""#, r#"".codex"="read""#, r#"".agents"="read""#, r#"":slash_tmp"="write""#, r#"":tmpdir"="write""#] {
+                assert!(filesystem.contains(rule), "{filesystem}");
+            }
+            for word in ["network.enabled=true".to_owned(), format!("network.allow_local_binding={ports}"), "network.dangerously_allow_all_unix_sockets=false".into(), "network.dangerously_allow_non_loopback_proxy=false".into()] {
+                assert!(sockets.contains(&format!("permissions.agent-mcr-sockets.{word}")), "{word}");
+            }
+            assert_eq!(sockets.last().unwrap(), &format!("permissions.agent-mcr-sockets.network.unix_sockets={{\"{CODEX_SOCKETS}\"=\"allow\"}}"));
+            assert!(sockets.iter().all(|w| !w.contains("network_access") && !w.contains("domains") && !w.contains('\'') && !w.contains("--sandbox")));
+            assert_eq!(sockets.iter().filter(|w| w.ends_with("=true")).count(), 1 + usize::from(ports));
+            // The two never stand together on a line
+            assert!(one_sandbox(&sockets).is_ok());
+            let mut both = sockets.clone();
+            both.extend(["--sandbox".to_owned(), "workspace-write".to_owned()]);
+            assert!(one_sandbox(&both).unwrap_err().contains("both"));
+            both.truncate(sockets.len());
+            both.push("--sandbox=workspace-write".into());
+            assert!(one_sandbox(&both).is_err());
+        }
+        #[cfg(unix)]
+        assert_eq!(CODEX_SOCKETS, format!("/private{}", crate::ipc::TEST_SOCKETS));
+
+        let refusal = "Codex's managed network proxy is not running";
+        let firewall_off = "the macOS firewall is off";
+        for agent in [None, Some(&implementer), Some(&lead), Some(&validator), Some(&read_only)] {
+            let mode = agent.and_then(|p| p.permissions.mode.as_deref()).unwrap_or("workspace-write");
+            for root in [None, Some("~/work")] {
+                for (refused, ports, checked) in [(None, false, false), (None, true, false), (Some(refusal), false, true), (Some(refusal), false, false)] {
+                    for resumed in [None, Some(resume)] {
+                        let ports_refused = (refused.is_none() && !ports).then_some(firewall_off);
+                        let l = Launch { profile: "codex", exe: "/x", agent, auto_root: root, sockets_refused: refused, codex_ports: ports, ports_refused, network_off_checked: checked, resume: resumed, ..Default::default() };
+                        let eligible = root.is_some() && mode == "workspace-write";
+                        let widened = eligible && refused.is_none();
+                        let fallback = eligible && refused.is_some();
+                        assert_eq!(l.codex_sockets(), widened);
+                        // Whether the harness reads the roots and runs the check at all
+                        assert_eq!(l.codex_could_take_sockets("macos"), mode == "workspace-write");
+                        assert!(!l.codex_could_take_sockets("windows") && !l.codex_could_take_sockets("linux"));
+                        // The words on each system
+                        let mac = Codex.sandbox_words(&l, "macos").unwrap();
+                        let linux = Codex.sandbox_words(&l, "linux").unwrap();
+                        let windows = Codex.sandbox_words(&l, "windows").unwrap();
+                        let plain = match agent {
+                            Some(p) => Codex.profile_words(p).unwrap(),
+                            None => CODEX_BARE.map(str::to_owned).to_vec(),
+                        };
+                        let mut off = plain.clone();
+                        if fallback {
+                            off.splice(2..2, CODEX_NETWORK_OFF.map(str::to_owned));
+                        }
+                        // A refusal is only ever set on macOS; the words would hold elsewhere too
+                        assert_eq!(linux, off);
+                        assert_eq!(windows, off);
+                        if widened {
+                            let mut expected = codex_socket_words(ports);
+                            expected.extend(plain[2..].iter().cloned());
+                            assert_eq!(mac, expected);
+                            assert!(!mac.contains(&"--sandbox".to_owned()));
+                        } else {
+                            assert_eq!(mac, off);
+                            assert!(!mac.iter().any(|w| w.contains("network_proxy") || w.contains("default_permissions")));
+                        }
+                        assert_eq!(mac.contains(&"sandbox_workspace_write.network_access=false".to_owned()), fallback);
+                        assert_eq!(mac.windows(2).filter(|w| w[0] == "--ask-for-approval" && w[1] == "on-request").count(), 1);
+                        // What each says of itself
+                        let reason = match (root, agent) {
+                            (Some(_), _) if widened && ports => "root ~/work, macOS firewall on at launch".to_owned(),
+                            (Some(_), _) if widened => format!("root ~/work, no ports: {firewall_off}"),
+                            (Some(_), _) if eligible && checked => format!("root ~/work, network off (checked), unix sockets refused: {refusal}"),
+                            (Some(_), _) if eligible => format!("root ~/work, network not checked: Codex's managed policy applies, unix sockets refused: {refusal}"),
+                            (Some(_), _) => "profile mode kept under root ~/work".to_owned(),
+                            (None, Some(_)) => "profile".to_owned(),
+                            (None, None) => "adapter default".to_owned(),
+                        };
+                        let on_mac = match (widened, ports) {
+                            (true, true) => "workspace-write + unix sockets + ports".to_owned(),
+                            (true, false) => "workspace-write + unix sockets".to_owned(),
+                            _ => mode.to_owned(),
+                        };
+                        assert_eq!(l.effective_mode_on(&[], "macos").unwrap(), format!("{on_mac} ({reason})"));
+                        let elsewhere = if widened { "root ~/work, unix sockets are passed on macos only".to_owned() } else { reason };
+                        assert_eq!(l.effective_mode_on(&[], "windows").unwrap(), format!("{mode} ({elsewhere})"));
+                        // The launch paths: Unix as this system does it
+                        let line = command_line(&l).unwrap();
+                        let here = std::env::consts::OS == CODEX_SOCKETS_OS && widened;
+                        assert_eq!(line.contains("'default_permissions=\"agent-mcr-sockets\"'"), here, "{line}");
+                        assert_eq!(line.contains("network_proxy"), here, "{line}");
+                        assert_eq!(line.contains("allow_local_binding=true"), here && ports, "{line}");
+                        assert_eq!(line.contains("workspace-write"), mode == "workspace-write" && !here, "{line}");
+                        assert_eq!(line.contains("network_access=false"), fallback, "{line}");
+                        assert_eq!(line.starts_with("exec codex resume "), resumed.is_some(), "{line}");
+                        assert_eq!(line.ends_with(&format!(" {resume}")), resumed.is_some(), "{line}");
+                        let args = windows_args(&l).unwrap();
+                        let at = if resumed.is_some() { 2 } else { 1 };
+                        assert_eq!(args[at..at + off.len()], off[..]);
+                        assert!(!args.iter().any(|a| a.contains("network_proxy") || a.contains("default_permissions")), "{args:?}");
+                    }
+                }
+            }
+        }
+        // The root Supervisor never takes them
+        let supervisor = Launch { profile: "codex", supervisor: true, ..Default::default() };
+        assert!(!supervisor.codex_could_take_sockets("macos"));
+        // A Claude launch under a root is not a Codex one
+        let claude = Launch { profile: "claude", auto_root: Some("~/work"), settings: "/s", ..Default::default() };
+        assert!(!claude.codex_sockets() && claude.claude_uses_auto());
+        let codex = Launch { profile: "codex", auto_root: Some("~/work"), ..Default::default() };
+        assert!(!codex.claude_uses_auto());
     }
 }

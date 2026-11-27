@@ -27,7 +27,11 @@ mod cockpit;
 mod secret_shape;
 mod task_copy;
 mod harness;
+mod git;
+mod worktrees;
 mod auto_mode;
+#[cfg(target_os = "macos")]
+mod codex_sockets;
 mod harness_preferences;
 mod profiles;
 mod harness_commands;
@@ -41,6 +45,7 @@ mod session_commands;
 mod session_db;
 mod session_memory;
 mod sessions;
+mod transcript_stats;
 
 // ============================================================
 // Types
@@ -1230,6 +1235,13 @@ fn main() {
             }
             return;
         }
+        // The harness's launch check for the Codex socket profile, run inside
+        // `codex sandbox` (MCR-162, macOS only): prints one line, exits
+        #[cfg(target_os = "macos")]
+        Some(codex_sockets::PROBE_FLAG) => {
+            let arg = |n| std::env::args().nth(n).unwrap_or_default();
+            std::process::exit(codex_sockets::probe_main(&arg(2), &arg(3), &arg(4)));
+        }
         Some("--harness-hook") => {
             harness::hook_bridge(&std::env::args().nth(2).unwrap_or_default(), std::env::args().nth(3));
             return;
@@ -1304,6 +1316,7 @@ fn main() {
             harness_commands::memory_status,
             harness_commands::memory_connect,
             harness_commands::memory_disconnect,
+            harness_commands::vault_unlock,
             harness_commands::slack_status,
             harness_commands::slack_waiting,
             harness_commands::slack_connect,

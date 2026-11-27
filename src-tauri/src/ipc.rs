@@ -7,6 +7,30 @@ pub use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
 #[cfg(windows)]
 pub use uds_windows::{UnixListener as Listener, UnixStream as Stream};
 
+/// Where the tests put Unix sockets on Unix (MCR-162): short, because a
+/// socket path holds about 100 bytes, and the one folder where a Codex session
+/// under an auto-mode root may bind them (`agents::CODEX_SOCKETS`, the same
+/// folder by its canonical macOS path). Elsewhere the system's temp folder.
+#[cfg(all(test, unix))]
+pub const TEST_SOCKETS: &str = "/tmp/agent-mcr-sockets";
+
+/// The folder for a test's Unix sockets, created.
+#[cfg(test)]
+pub fn test_socket_base() -> std::path::PathBuf {
+    #[cfg(unix)]
+    let base = std::path::PathBuf::from(TEST_SOCKETS);
+    #[cfg(not(unix))]
+    let base = std::env::temp_dir();
+    std::fs::create_dir_all(&base).expect("test socket folder");
+    base
+}
+
+/// A folder named `name` below `test_socket_base`, not created.
+#[cfg(test)]
+pub fn test_socket_dir(name: &str) -> std::path::PathBuf {
+    test_socket_base().join(name)
+}
+
 /// Create `path` if needed and restrict it to the current user.
 #[cfg(unix)]
 pub fn private_dir(path: &Path) -> Result<(), String> {
