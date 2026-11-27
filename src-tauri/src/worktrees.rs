@@ -242,7 +242,18 @@ pub fn create(
     }
     let operand = path.as_os_str();
     let add_args: Vec<&OsStr> = match &add {
-        Add::Existing(branch) | Add::Branch(branch) => vec![
+        Add::Branch(branch) => vec![
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--no-checkout".as_ref(),
+            "--no-track".as_ref(),
+            "-b".as_ref(),
+            branch.as_ref(),
+            "--".as_ref(),
+            operand,
+            start.as_ref(),
+        ],
+        Add::Existing(branch) => vec![
             "worktree".as_ref(),
             "add".as_ref(),
             "--no-checkout".as_ref(),
@@ -262,16 +273,6 @@ pub fn create(
         ],
     };
     let result = (|| -> Result<Pending, String> {
-        if let Add::Branch(branch) = &add {
-            // `worktree add -b` would run `git branch` as a child, which the
-            // runner's Git may not start. As with -b, the branch stays when
-            // the worktree cannot be added.
-            checked(
-                &repo,
-                &["branch", "--no-track", "--", branch.as_str(), start.as_str()],
-                deadline,
-            )?;
-        }
         checked(&repo, &add_args, deadline)?;
         let admin = git_path(&path, "--absolute-git-dir", deadline)?;
         if git_path(&path, "--git-common-dir", deadline)? != common
@@ -359,7 +360,14 @@ impl Managed {
                 return Err(format!("branch {branch} has an unpushed or unmerged HEAD (checked local {remote} and base {base})"));
             }
         }
-        self.check_clean(deadline)?;
+        let status = checked(
+            &self.path,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            deadline,
+        )?;
+        if !status.stdout.is_empty() {
+            return Err("the worktree has uncommitted or untracked changes".into());
+        }
         // Ignore rules often cover local configuration as well as build output.
         // Only the generated directories named here, and the paths the request
         // named as disposable, may go away with the checkout.
@@ -459,11 +467,7 @@ impl Managed {
         }
         let bytes = disk_bytes(&self.path, deadline)?;
         self.verify_owner(deadline)?;
-        // Without --force, `worktree remove` checks the contents with `git
-        // status` as a child, which the runner's Git may not start. So the same
-        // check runs here, last before the removal, under the runner's guards.
-        // One --force still refuses a locked worktree; never pass it twice.
-        self.check_clean(deadline)?;
+        // Git rechecks the worktree's contents and rejects locked trees. Never force removal.
         // Run it from the main checkout: Windows does not delete a process's
         // current directory. The worktree's own scoped filter settings are disabled too.
         let removed = git::run_from(
@@ -472,7 +476,6 @@ impl Managed {
             &[
                 "worktree".as_ref(),
                 "remove".as_ref(),
-                "--force".as_ref(),
                 "--".as_ref(),
                 self.path.as_os_str(),
             ],
@@ -484,18 +487,6 @@ impl Managed {
             return Err(failure(&removed));
         }
         Ok(bytes)
-    }
-
-    fn check_clean(&self, deadline: Instant) -> Result<(), String> {
-        let status = checked(
-            &self.path,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            deadline,
-        )?;
-        if !status.stdout.is_empty() {
-            return Err("the worktree has uncommitted or untracked changes".into());
-        }
-        Ok(())
     }
 
     fn check_checkout(&self, deadline: Instant) -> Result<String, String> {
@@ -1048,10 +1039,8 @@ pub mod tests {
         )
         .keep();
         let path = managed.path.to_str().unwrap();
-        // The runner's Git starts no child: no `git status` inside a plain
-        // remove, no `git reset` inside a checkout.
-        git(&repo, &["worktree", "remove", "--force", "--", path]);
-        git(&repo, &["worktree", "add", "--no-checkout", "--", path, "feature"]);
+        git(&repo, &["worktree", "remove", "--", path]);
+        git(&repo, &["worktree", "add", "--", path, "feature"]);
         assert!(managed
             .cleanup(deadline())
             .unwrap_err()
