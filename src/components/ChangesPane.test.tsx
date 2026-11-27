@@ -146,12 +146,15 @@ describe('Changes pane', () => {
     expect(refresh().disabled).toBe(false);
   });
 
-  it('says when a staged change was undone in the work tree', async () => {
+  it('says a staged change may be undone in the work tree, and never that the two agree (review 17503)', async () => {
     const c = changes();
     const undone = { ...c.repo!.uncommitted.files[1], path: 'a.txt', status: 'M', staged: true, unstaged: true, undone: true, hidden: 0, diff: 'diff --git a/a.txt b/a.txt\n@@ -1 +1,2 @@\n one\n+staged\ndiff --git a/a.txt b/a.txt\n@@ -1,2 +1 @@\n one\n-staged\n' };
     vi.mocked(changesApi.read).mockResolvedValue({ ...c, repo: { ...c.repo!, hidden: 0, uncommitted: { files: [undone], more: false, note: null } } });
     await act(async () => root.render(<ChangesPane session={hosted()} active/>)); await flush();
-    expect(host.querySelector('.hs-changes-diff h4')?.textContent).toBe('a.txt · +2 −0 · staged, undone in the work tree');
-    expect(host.querySelector('.hs-changes-diff')?.textContent).toContain('a commit would still take the staged change');
+    expect(host.querySelector('.hs-changes-diff h4')?.textContent).toBe('a.txt · +2 −0 · staged, changed since');
+    const shown = host.querySelector('.hs-changes-diff')?.textContent ?? '';
+    expect(shown).toContain('the work tree may put the staged change back');
+    expect(shown).toContain('A commit would still take the staged change');
+    expect(shown).not.toMatch(/agree|undone in the work tree/);
   });
 });

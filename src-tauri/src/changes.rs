@@ -36,8 +36,9 @@
 //! resolved to shas once, and every later call names those shas, so an
 //! agent that commits during the read cannot mix two heads in one answer.
 //! The uncommitted files are the net diff from that head plus what `git
-//! status` reports beside it (a change staged and then undone in the work
-//! tree, which a commit would still take). Logs are read with
+//! status` reports beside it (a staged change the work tree may put back,
+//! which a commit would still take). A file git status lists is never
+//! dropped: a diff git refuses says so. Logs are read with
 //! `--encoding=UTF-8`, and a count git refuses is an error, never "even".
 
 use serde::Serialize;
@@ -187,15 +188,19 @@ pub struct File {
     /// Why there is no diff: binary, too large, not loaded
     pub diff_note: Option<String>,
     pub hidden: usize,
-    /// Uncommitted only: staged, then put back in the work tree, so the
-    /// head and the work tree agree while a commit would still take the
-    /// staged change. Its diff is the staged one, then the work tree's.
+    /// Uncommitted only: listed by `git status` but not by the net diff
+    /// from the head, with a staged diff and a work tree diff (the work tree
+    /// may put the staged change back: a commit would still take it). Its
+    /// diff is the staged one, then the work tree's. Nothing here says the
+    /// head and the work tree agree: the file can change during the read.
     pub undone: bool,
 }
 
 const TOO_LARGE: &str = "too large to show here: run git diff in a terminal";
 const NOT_LOADED: &str = "not loaded: the diff of all files passed the limit";
 const UNMATCHED: &str = "not shown: its part of the diff could not be told apart";
+const NOT_AVAILABLE: &str = "diff not available: git refused it; staged or not as git status said";
+const CHANGED_DURING: &str = "no diff now: git status listed it, then it changed while the pane read; Refresh";
 
 /// Everything the pane shows for the folder `cwd`.
 pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
@@ -237,7 +242,8 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
         if let Some(full) = r.line(&["rev-parse", "--symbolic-full-name", "@{upstream}"])?.filter(|u| u.starts_with("refs/")) {
             if let Some(sha) = r.line(&["rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")])?.filter(|u| !u.is_empty()) {
                 let (behind, ahead) = r.counts("the upstream", &sha, &head)?;
-                let name = full.strip_prefix("refs/remotes/").or_else(|| full.strip_prefix("refs/heads/")).unwrap_or(&full).to_string();
+                // Git's own short name of that ref: unambiguous in this repository
+                let name = r.line(&["rev-parse", "--abbrev-ref", &full])?.filter(|n| !n.is_empty()).unwrap_or(full);
                 repo.upstream = Some(Track { name, ahead, behind, merge_base: None });
             }
         }
@@ -259,17 +265,16 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
                 file.status = (if x == b' ' { y } else { x } as char).to_string();
             }
         }
-        // A change git status sees that the net diff from the head does not:
-        // staged, then undone in the work tree. A plain commit takes it.
+        // A change git status sees that the net diff from the head does not
+        // (staged, and the work tree may put it back: a commit takes it).
+        // Every such path is listed, whatever its diffs say.
         let missing: Vec<&(String, String)> = status.iter().filter(|(path, _)| !repo.uncommitted.files.iter().any(|f| f.path == *path)).collect();
         for (n, (path, xy)) in missing.into_iter().enumerate() {
             if n >= ONE_BY_ONE || repo.uncommitted.files.len() >= MAX_FILES {
                 repo.uncommitted.more = true;
                 break;
             }
-            if let Some(file) = r.undone(&head, path, xy)? {
-                repo.uncommitted.files.push(file);
-            }
+            repo.uncommitted.files.push(r.undone(&head, path, xy)?);
         }
     } else {
         repo.uncommitted.files = status.into_iter().map(|(path, xy)| File { status: xy.trim().chars().next().unwrap_or('A').to_string(), staged: xy.as_bytes()[0] != b' ', unstaged: xy.as_bytes()[1] != b' ', path, diff_note: Some("no commit to compare with yet".into()), ..File::default() }).collect();
@@ -404,11 +409,12 @@ impl Reader<'_> {
     }
 
     /// A tracked file the net diff from `head` leaves out: its staged diff,
-    /// then its work tree's, each read alone. What it says comes from those
-    /// two diffs, not from the status read before them: a file an editor
-    /// put back in the meantime has neither and is no row (None), and only
-    /// a staged diff that the work tree takes back is `undone`.
-    fn undone(&self, head: &str, path: &str, xy: &str) -> Result<Option<File>, String> {
+    /// then its work tree's, each read alone. A file `git status` lists is
+    /// never dropped. When git refuses either diff, the row says the diff
+    /// is not available and its staged and unstaged marks are git status's
+    /// own. When both diffs are read, the marks come from them, and a file
+    /// with neither (put back while the pane read) says so.
+    fn undone(&self, head: &str, path: &str, xy: &str) -> Result<File, String> {
         let (x, y) = (xy.as_bytes()[0], xy.as_bytes()[1]);
         let mut file = File { path: path.to_string(), status: (if x == b' ' { y } else { x } as char).to_string(), ..File::default() };
         let spec = format!(":(literal){path}");
@@ -416,15 +422,19 @@ impl Reader<'_> {
         let mut cut = [false, false];
         for (i, from) in [&["--cached", head][..], &[][..]].into_iter().enumerate() {
             let args: Vec<String> = ["diff", "--patch"].iter().chain(DIFF.iter()).chain(from.iter()).map(|a| a.to_string()).chain(["--".to_string(), spec.clone()]).collect();
-            if let Some(out) = self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), FILE_DIFF)? {
-                cut[i] = out.truncated;
-                parts[i] = String::from_utf8_lossy(&out.stdout).into_owned();
-            }
+            let Some(out) = self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), FILE_DIFF)? else {
+                (file.staged, file.unstaged) = (x != b' ', y != b' ');
+                file.diff_note = Some(NOT_AVAILABLE.into());
+                return Ok(file);
+            };
+            cut[i] = out.truncated;
+            parts[i] = String::from_utf8_lossy(&out.stdout).into_owned();
         }
         file.staged = cut[0] || !parts[0].is_empty();
         file.unstaged = cut[1] || !parts[1].is_empty();
         if !file.staged && !file.unstaged {
-            return Ok(None);
+            file.diff_note = Some(CHANGED_DURING.into());
+            return Ok(file);
         }
         file.undone = file.staged && file.unstaged;
         let text = parts.concat();
@@ -440,7 +450,7 @@ impl Reader<'_> {
             file.diff = Some(shown);
             file.hidden = hidden;
         }
-        Ok(Some(file))
+        Ok(file)
     }
 
     /// The files between `range` (one commit: to the work tree) with counts and diffs
@@ -1312,7 +1322,51 @@ mod tests {
             },
         };
         let r = read(&reverting, &work).unwrap().repo.unwrap();
-        assert!(r.uncommitted.files.is_empty(), "{:?}", r.uncommitted.files.iter().map(|f| (&f.path, f.staged, f.undone)).collect::<Vec<_>>());
+        // Kept, as git status listed it, with no claim that anything is staged
+        let files: Vec<_> = r.uncommitted.files.iter().map(|f| (f.path.as_str(), f.staged, f.unstaged, f.undone, f.diff.is_some(), f.diff_note.as_deref())).collect();
+        assert_eq!(files, vec![("a.txt", false, false, false, false, Some(CHANGED_DURING))]);
+    }
+
+    #[test]
+    fn a_status_listed_file_whose_diffs_git_refuses_is_kept_and_says_so() {
+        let (_tmp, work) = clone();
+        write(&work, "a.txt", "one\ntwo\nthree\nstaged\n");
+        git(&work, &["add", "a.txt"]);
+        write(&work, "a.txt", "one\ntwo\nthree\n");
+        // Git refuses both diffs of that one path (a broken diff driver does this)
+        let refusing = Hooked { instead: |args: &[String]| args.iter().any(|a| a == ":(literal)a.txt").then_some(Ok(None)), after: |_: &[String]| {} };
+        let r = read(&refusing, &work).unwrap().repo.unwrap();
+        let files: Vec<_> = r.uncommitted.files.iter().map(|f| (f.path.as_str(), f.status.as_str(), f.staged, f.unstaged, f.undone, f.diff.is_some(), f.diff_note.as_deref())).collect();
+        // Staged and changed as git status said; no diff, and why
+        assert_eq!(files, vec![("a.txt", "M", true, true, false, false, Some(NOT_AVAILABLE))]);
+        // One refused is enough: nothing is guessed from the other
+        let calls = std::cell::Cell::new(0);
+        let second = Hooked {
+            instead: |args: &[String]| {
+                if !args.iter().any(|a| a == ":(literal)a.txt") {
+                    return None;
+                }
+                calls.set(calls.get() + 1);
+                (calls.get() == 2).then_some(Ok(None))
+            },
+            after: |_: &[String]| {},
+        };
+        let r = read(&second, &work).unwrap().repo.unwrap();
+        assert_eq!(r.uncommitted.files.iter().map(|f| (f.staged, f.unstaged, f.diff_note.as_deref())).collect::<Vec<_>>(), vec![(true, true, Some(NOT_AVAILABLE))]);
+    }
+
+    #[test]
+    fn an_upstream_whose_short_name_a_branch_shares_is_named_unambiguously() {
+        let (_tmp, work) = clone();
+        git(&work, &["checkout", "-qb", "feature"]);
+        write(&work, "f.txt", "f\n");
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "feature"]);
+        git(&work, &["branch", "--set-upstream-to=origin/main"]);
+        // A local branch called origin/main, at another commit
+        git(&work, &["branch", "origin/main", "HEAD"]);
+        let up = repo(&work).upstream.unwrap();
+        assert_eq!((up.name.as_str(), up.ahead, up.behind), ("remotes/origin/main", 1, 0));
     }
 
     #[test]

@@ -137,7 +137,7 @@ const FileDiff = memo(function FileDiff({ file, which }: { file: ChangedFile; wh
   const lines = useMemo(() => file.diff ? diffLines(file.diff) : [], [file.diff]);
   return <section className="hs-changes-diff" aria-label={`Diff of ${file.path}`}>
     <h4 title={file.path}>{file.path} · {counts(file)}{which === 'uncommitted' ? ` · ${stagedLabel(file)}` : ''}</h4>
-    {file.undone && <p className="hs-stats-note">Staged, then undone in the work tree: the head and the work tree agree, but a commit would still take the staged change.</p>}
+    {file.undone && <p className="hs-stats-note">Not in the diff from the head to the work tree when it was read: the work tree may put the staged change back. A commit would still take the staged change.</p>}
     {file.hidden > 0 && <p className="hs-changes-hidden"><ShieldAlert size={12} aria-hidden/> {file.hidden === 1 ? 'One line' : `${file.hidden} lines`} hidden here.</p>}
     {file.diff
       ? <pre className="hs-diff">{lines.map((l, i) => <span key={i} className={`hs-diff-${l.kind}`}>{l.text}{'\n'}</span>)}</pre>
