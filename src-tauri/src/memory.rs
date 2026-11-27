@@ -1134,8 +1134,11 @@ impl Memory {
             let unkept = link.unkept(was);
             let known = lock(&link.meta).take();
             *lock(&link.unkept) = None;
-            // One read and removal of all of them, in the vault's share of the time
-            let (mut values, removed) = link.vault.take(&ACCOUNTS, VAULT_SHARE);
+            // One read and removal of all of them, in the vault's share of what is left
+            // of the time: the wait for `keeping` counts, as a renewal or a sign-out may
+            // have held it over a slow vault. Nothing is begun once no time is left
+            let share = until.saturating_duration_since(Instant::now()).min(VAULT_SHARE);
+            let (mut values, removed) = if share.is_zero() { (vec![Err(vault::TOO_LATE); ACCOUNTS.len()], Err(vault::TOO_LATE)) } else { link.vault.take(&ACCOUNTS, share) };
             if let Err(why) = &removed {
                 eprintln!("memory: the tokens could not all be removed from the secret store: {}", why.0);
             }
@@ -1163,7 +1166,7 @@ impl Memory {
         *lock(&self.tools) = None;
         // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
         let revoked = match held {
-            (Ok(Some(meta)), Ok(Some(client)), Ok(Some(token))) => Ok(link.revoke(&meta, &client, &token, left(until))),
+            (Ok(Some(meta)), Ok(Some(client)), Ok(Some(token))) => Ok(Instant::now() < until && link.revoke(&meta, &client, &token, left(until))),
             (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => Err(why),
             // Nothing was signed in: there is no grant to end
             _ => Ok(true),
@@ -2431,6 +2434,53 @@ pub(crate) mod tests {
         assert!(asked.elapsed() < DISCONNECT + Duration::from_millis(200), "{:?}", asked.elapsed());
         assert_eq!(status["problem"]["kind"], "not_revoked");
         assert!(rig.vault.0.lock().unwrap().is_empty());
+    }
+
+    /// A renewal or a sign-out may hold `keeping` over a slow vault write. The
+    /// disconnect's time counts from the request, its wait for the lock
+    /// included: the vault and the revocation get only what is left of it
+    #[test]
+    fn a_disconnect_behind_a_slow_vault_write_still_answers_within_its_time() {
+        // The write holds the lock past the whole budget: nothing more is begun
+        let rig = Rig::signed_in();
+        let link = rig.memory.link.clone();
+        *lock(&link.unkept) = Some((link.epoch(), "refresh-synthetic-held".into()));
+        rig.vault.slow(Some(DISCONNECT + Duration::from_millis(100)));
+        let asked = std::thread::scope(|scope| {
+            let writer = link.clone();
+            scope.spawn(move || writer.keep_unkept(writer.epoch()));
+            std::thread::sleep(Duration::from_millis(50));
+            rig.vault.slow(None);
+            let asked = Instant::now();
+            let status = rig.memory.disconnect();
+            let elapsed = asked.elapsed();
+            assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_removed")));
+            let text = status["problem"]["text"].as_str().unwrap();
+            assert!(text.contains("(the secret store did not answer in time)") && text.contains("revoke it in the memory console"), "{text}");
+            elapsed
+        });
+        assert!(asked < DISCONNECT + Duration::from_millis(150), "{asked:?}");
+        assert!(lock(&rig.world).revoked.is_empty());
+        assert!(rig.vault.0.lock().unwrap().contains_key("access"));
+
+        // The write ends with some time left: the vault's share is cut to it
+        let rig = Rig::signed_in();
+        let link = rig.memory.link.clone();
+        *lock(&link.unkept) = Some((link.epoch(), "refresh-synthetic-held".into()));
+        rig.vault.slow(Some(Duration::from_millis(700)));
+        let asked = std::thread::scope(|scope| {
+            let writer = link.clone();
+            scope.spawn(move || writer.keep_unkept(writer.epoch()));
+            std::thread::sleep(Duration::from_millis(50));
+            rig.vault.slow(Some(Duration::from_millis(150)));
+            let asked = Instant::now();
+            let status = rig.memory.disconnect();
+            assert_eq!(status["problem"]["kind"], "not_removed");
+            asked.elapsed()
+        });
+        assert!(asked < DISCONNECT + Duration::from_millis(150), "{asked:?}");
+        let given = rig.vault.4.lock().unwrap().clone();
+        assert!(given.len() == 1 && !given[0].is_zero() && given[0] < VAULT_SHARE, "{given:?}");
     }
 
     #[test]

@@ -25,17 +25,23 @@ pub trait Vault: Send + Sync {
     /// says it, and the first reason one could not be removed. What was not
     /// begun in time is `TOO_LATE`.
     fn take(&self, accounts: &[&str], within: std::time::Duration) -> Taken {
-        let until = std::time::Instant::now() + within;
-        let late = || std::time::Instant::now() >= until;
-        let values = accounts.iter().map(|account| if late() { Err(TOO_LATE) } else { self.get(account) }).collect();
-        let mut removed = Ok(());
-        for account in accounts {
-            if let Err(why) = if late() { Err(TOO_LATE) } else { self.delete(account) } {
-                removed = removed.and(Err(why));
-            }
-        }
-        (values, removed)
+        take_each(self, accounts, within)
     }
+}
+
+/// `Vault::take` as a loop of `get`, then `delete`, that begins nothing
+/// once its time is up
+pub fn take_each(vault: &(impl Vault + ?Sized), accounts: &[&str], within: std::time::Duration) -> Taken {
+    let until = std::time::Instant::now() + within;
+    let late = || std::time::Instant::now() >= until;
+    let values = accounts.iter().map(|account| if late() { Err(TOO_LATE) } else { vault.get(account) }).collect();
+    let mut removed = Ok(());
+    for account in accounts {
+        if let Err(why) = if late() { Err(TOO_LATE) } else { vault.delete(account) } {
+            removed = removed.and(Err(why));
+        }
+    }
+    (values, removed)
 }
 
 /// What `take` found under each account, and whether all were removed
@@ -819,6 +825,8 @@ pub struct Held(
     std::sync::Mutex<Option<Unavailable>>,
     std::sync::Mutex<std::collections::BTreeMap<String, Unavailable>>,
     std::sync::Mutex<Option<std::time::Duration>>,
+    /// The time each `take` was given, in order
+    pub std::sync::Mutex<Vec<std::time::Duration>>,
 );
 
 #[cfg(test)]
@@ -873,6 +881,10 @@ impl Vault for Held {
         self.refused()?;
         self.0.lock().unwrap().remove(account);
         Ok(())
+    }
+    fn take(&self, accounts: &[&str], within: std::time::Duration) -> Taken {
+        self.4.lock().unwrap().push(within);
+        take_each(self, accounts, within)
     }
 }
 
