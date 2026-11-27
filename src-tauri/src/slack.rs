@@ -567,11 +567,12 @@ impl Slack {
     /// Keep the tokens in the Keychain and start listening. The app has asked the person first.
     pub fn connect(&self, bot: &str, app: &str, operator: &str) -> Result<Value, String> {
         let found = self.probe(bot, app, operator)?;
-        self.vault.set("bot", bot)?;
-        if let Err(e) = self.vault.set("app", app) {
+        let unkept = |why: Unavailable| format!("The Slack tokens could not be kept in {}: {}", crate::vault::STORE_NAME, why.0);
+        self.vault.set("bot", bot).map_err(unkept)?;
+        if let Err(why) = self.vault.set("app", app) {
             // A bot token left behind is not used: nothing is connected, and the next connect replaces it
             let _ = self.vault.delete("bot");
-            return Err(e);
+            return Err(unkept(why));
         }
         let text = |key: &str| found[key].as_str().unwrap_or("").to_string();
         self.update(|s| {

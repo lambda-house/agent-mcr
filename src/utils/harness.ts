@@ -443,6 +443,9 @@ const MEMORY_RESTART = 'restarted or reconnected (in Claude Code, /mcp and then 
 
 /** One line on where the memory connection stands, for Settings. `unlocked`: the person unlocked the keyring for the current problem. */
 export function memoryStateLine(status: MemoryStatus, unlocked = false): string {
+  if (status.state === 'connected' && status.problem?.kind === 'sign_in_unusable') {
+    return `Signed in to ${status.endpoint}, but the description kept with the sign-in in the secret store cannot be read, so the sign-in cannot be renewed. Nothing was removed. Disconnect and connect again.`;
+  }
   const down = status.state === 'connected' && status.problem ? MEMORY_DOWN[status.problem.kind] : undefined;
   if (down && unlocked && status.problem?.kind === 'vault_unavailable') {
     return `Signed in to ${status.endpoint}. The keyring is unlocked: memory is used again at its next call. Sessions started while it was locked have no memory tools until they are ${MEMORY_RESTART}.`;

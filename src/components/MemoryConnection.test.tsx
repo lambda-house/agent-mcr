@@ -113,6 +113,10 @@ it('does not claim the memory tools while a problem leaves memory unusable', () 
   expect(memoryStateLine({ ...connected, problem: { kind: 'vault_unavailable', text: '', at: 3 } }, true)).toBe('Signed in to https://mcp.memory.teob.cc/mcp. The keyring is unlocked: memory is used again at its next call. Sessions started while it was locked have no memory tools until they are restarted or reconnected (in Claude Code, /mcp and then reconnect mcr-memory).');
   // No model key: the tools are listed and calls without a model work, so the headline stays; the Last problem row says the rest
   expect(memoryStateLine({ ...connected, problem: { kind: 'no_model_key', text: '', at: 3 } })).toContain('New and restarted sessions have the memory tools');
+  // A sign-in the vault holds but cannot be used asks for a new Connect, not for patience
+  const unusable = memoryStateLine({ ...connected, problem: { kind: 'sign_in_unusable', text: '', at: 3 } });
+  expect(unusable).toContain('Disconnect and connect again');
+  expect(unusable).not.toContain('no new sign-in is needed');
   // A problem left over from before a sign-out or disconnect does not change those lines
   expect(memoryStateLine({ ...base, state: 'signed_out', problem: { kind: 'unreachable', text: '', at: 3 } })).toContain('Sign in again');
 });

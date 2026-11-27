@@ -14,7 +14,9 @@ pub struct Unavailable(pub &'static str);
 pub trait Vault: Send + Sync {
     /// The secret; `Ok(None)` only when the store says it has none.
     fn get(&self, account: &str) -> Result<Option<String>, Unavailable>;
-    fn set(&self, account: &str, secret: &str) -> Result<(), String>;
+    /// Keep `secret` in place of what is there. The reason it was not kept is
+    /// in fixed words, as for `get`: the store's own error is not passed on.
+    fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable>;
     /// A secret that is not there counts as removed.
     fn delete(&self, account: &str) -> Result<(), Unavailable>;
 }
@@ -100,14 +102,23 @@ impl Vault for Keychain {
             Err(e) => from_keychain_status(e.code()),
         }
     }
-    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(self.service, account, secret.as_bytes()).map_err(|e| format!("The Keychain refused the token: {e}"))
+    fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable> {
+        security_framework::passwords::set_generic_password(self.service, account, secret.as_bytes()).map_err(|e| unwritten_keychain(e.code()))
     }
     fn delete(&self, account: &str) -> Result<(), Unavailable> {
         match security_framework::passwords::delete_generic_password(self.service, account) {
             Ok(()) => Ok(()),
             Err(e) => from_keychain_status(e.code()).map(drop),
         }
+    }
+}
+
+/// Why the Keychain did not keep a secret, in fixed words
+#[cfg(any(target_os = "macos", test))]
+fn unwritten_keychain(status: i32) -> Unavailable {
+    match from_keychain_status(status) {
+        Err(why) => why,
+        Ok(_) => Unavailable("the Keychain did not keep the secret"),
     }
 }
 
@@ -156,7 +167,7 @@ impl Vault for Keychain {
             text_of(blob).map(Some)
         }
     }
-    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+    fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable> {
         use windows_sys::Win32::Security::Credentials::{CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC};
         let mut target = wide(&format!("{}/{account}", self.service));
         let mut blob = secret.as_bytes().to_vec();
@@ -171,7 +182,7 @@ impl Vault for Keychain {
             CredWriteW(&credential, 0)
         };
         if written == 0 {
-            return Err(format!("Windows Credential Manager refused the token: {}", std::io::Error::last_os_error()));
+            return Err(Unavailable("Windows Credential Manager did not keep the secret"));
         }
         Ok(())
     }
@@ -223,11 +234,9 @@ impl Vault for Keychain {
         })?;
         found.map(text_of).transpose()
     }
-    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+    fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable> {
         let (service, label, account, secret) = (self.service, format!("Agent MCR: {} ({account})", self.what), account.to_string(), secret.to_string());
-        self.keyring
-            .run(move |collection| collection.create(&label, &keyring::attributes(service, &account), secret.as_bytes()))
-            .map_err(|why| format!("{} could not be kept in the keyring: {}", self.what, why.0))
+        self.keyring.run(move |collection| collection.create(&label, &keyring::attributes(service, &account), secret.as_bytes()))
     }
     fn delete(&self, account: &str) -> Result<(), Unavailable> {
         let (service, account) = (self.service, account.to_string());
@@ -730,8 +739,8 @@ impl Vault for Keychain {
     fn get(&self, _: &str) -> Result<Option<String>, Unavailable> {
         Ok(None)
     }
-    fn set(&self, _: &str, _: &str) -> Result<(), String> {
-        Err(format!("{} are kept in the macOS Keychain, Windows Credential Manager or a Linux desktop's Secret Service ({}); this system has none of them", self.what, self.service))
+    fn set(&self, _: &str, _: &str) -> Result<(), Unavailable> {
+        Err(Unavailable("secrets are kept in the macOS Keychain, Windows Credential Manager or a Linux desktop's Secret Service, and this system has none of them"))
     }
     fn delete(&self, _: &str) -> Result<(), Unavailable> {
         Ok(())
@@ -743,13 +752,23 @@ impl Vault for Keychain {
 /// removed, and nothing is said about what it holds.
 #[cfg(test)]
 #[derive(Default)]
-pub struct Held(pub std::sync::Mutex<std::collections::BTreeMap<String, String>>, std::sync::Mutex<Option<Unavailable>>);
+pub struct Held(pub std::sync::Mutex<std::collections::BTreeMap<String, String>>, std::sync::Mutex<Option<Unavailable>>, std::sync::Mutex<std::collections::BTreeMap<String, Unavailable>>);
 
 #[cfg(test)]
 impl Held {
     /// Answer as a store that cannot be read (`Some`), or normally again (`None`).
     pub fn refuse(&self, why: Option<Unavailable>) {
         *self.1.lock().unwrap() = why;
+    }
+
+    /// Refuse to keep a secret under `account` only (`Some`), or keep it again
+    /// (`None`); everything else is answered normally.
+    pub fn refuse_set(&self, account: &str, why: Option<Unavailable>) {
+        let mut refused = self.2.lock().unwrap();
+        match why {
+            Some(why) => refused.insert(account.into(), why),
+            None => refused.remove(account),
+        };
     }
 
     fn refused(&self) -> Result<(), Unavailable> {
@@ -766,8 +785,11 @@ impl Vault for Held {
         self.refused()?;
         Ok(self.0.lock().unwrap().get(account).cloned())
     }
-    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
-        self.refused().map_err(|why| why.0.to_string())?;
+    fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable> {
+        self.refused()?;
+        if let Some(why) = self.2.lock().unwrap().get(account) {
+            return Err(*why);
+        }
         self.0.lock().unwrap().insert(account.into(), secret.into());
         Ok(())
     }
@@ -784,7 +806,7 @@ impl Vault for std::sync::Arc<Held> {
     fn get(&self, account: &str) -> Result<Option<String>, Unavailable> {
         (**self).get(account)
     }
-    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+    fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable> {
         (**self).set(account, secret)
     }
     fn delete(&self, account: &str) -> Result<(), Unavailable> {
@@ -805,6 +827,9 @@ mod tests {
         for status in [-25293, -25291, -25294, -1] {
             assert!(from_keychain_status(status).is_err(), "{status}");
         }
+        // A secret that was not kept says why in the same words, and never that it is missing
+        assert_eq!(unwritten_keychain(-25308), Unavailable("the Keychain is locked"));
+        assert_eq!(unwritten_keychain(-25300), Unavailable("the Keychain did not keep the secret"));
         assert_eq!(from_credential_error(Some(1168)), Ok(None));
         // ERROR_NO_SUCH_LOGON_SESSION, ERROR_ACCESS_DENIED, and no error code at all
         for code in [Some(1312), Some(5), None] {
@@ -1010,8 +1035,7 @@ mod tests {
         let keychain = fake::keychain(&fake, std::time::Duration::from_secs(5));
         keychain.set("a", "synthetic-one").unwrap();
         fake.0.lock().unwrap().prompt = true;
-        let refused = keychain.set("a", "synthetic-two").unwrap_err();
-        assert!(refused.contains("the keyring asked for a confirmation that was not given"), "{refused}");
+        assert_eq!(keychain.set("a", "synthetic-two"), Err(Unavailable("the keyring asked for a confirmation that was not given")));
         assert_eq!(keychain.delete("a"), Err(Unavailable("the keyring asked for a confirmation that was not given")));
         let calls = fake.calls();
         assert_eq!(calls.iter().filter(|c| **c == "Dismiss").count(), 2, "{calls:?}");
@@ -1051,7 +1075,7 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(30));
         // Queued behind the slow search, and given up on before the worker is free
-        assert_eq!(keychain.set("a", "synthetic-late"), Err("Test secrets could not be kept in the keyring: the keyring did not answer in time".into()));
+        assert_eq!(keychain.set("a", "synthetic-late"), Err(Unavailable("the keyring did not answer in time")));
         assert_eq!(first.join().unwrap(), Err(Unavailable("the keyring did not answer in time")));
         std::thread::sleep(Duration::from_millis(600));
         // The first job made its calls up to the slow search and stopped there; the second made none
