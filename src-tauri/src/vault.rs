@@ -1179,6 +1179,26 @@ mod tests {
         assert_eq!(keychain.get("a"), Ok(None));
     }
 
+    /// Inside one job: once the time is up, the next D-Bus call of the job is
+    /// not begun (`Calls::ask`), though the job itself had started in time
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_call_of_a_job_begins_after_its_time_is_up() {
+        use std::time::Duration;
+        let fake = fake::Fake::default();
+        let keychain = fake::keychain(&fake, Duration::from_millis(150));
+        keychain.set("a", "synthetic-a").unwrap();
+        // The search finds the item, but only after the time is up
+        fake.0.lock().unwrap().slow = vec![Duration::from_millis(400)];
+        assert_eq!(keychain.get("a"), Err(Unavailable("the keyring did not answer in time")));
+        std::thread::sleep(Duration::from_millis(400));
+        let calls = fake.calls();
+        assert_eq!(calls.last(), Some(&"SearchItems"), "{calls:?}");
+        assert!(!calls.contains(&"GetSecret"), "{calls:?}");
+        // The next job reads it
+        assert_eq!(keychain.get("a"), Ok(Some("synthetic-a".into())));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_call_the_caller_gave_up_on_is_never_started() {
