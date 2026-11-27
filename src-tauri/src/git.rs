@@ -128,13 +128,13 @@ pub fn run_from(
     may_run_alone()?;
     let start = Instant::now();
     let left = || timeout.saturating_sub(start.elapsed());
-    let mut command = local_command(cwd, left())?;
+    let mut command = local_command(cwd, left(), limit)?;
     if let Some((operation, operands)) = args.split_first() {
         // Worktree checkout and even status/diff can invoke configured filters.
         // Inspect only their names, and disable them before running the operation.
         let mut filters = BTreeSet::new();
         for dir in config_from {
-            let mut config = local_command(dir, left())?;
+            let mut config = local_command(dir, left(), Limit::Alone)?;
             config.args([
                 "config",
                 "--name-only",
@@ -261,13 +261,21 @@ fn privileged(status: &str) -> Option<bool> {
     Some(ids.contains(&0) || capabilities != 0)
 }
 
-fn local_command(cwd: &Path, timeout: Duration) -> io::Result<Command> {
+fn local_command(cwd: &Path, timeout: Duration, limit: Limit) -> io::Result<Command> {
     let no_hooks = if cfg!(windows) {
         "core.hooksPath=NUL"
     } else {
         "core.hooksPath=/dev/null"
     };
-    let mut command = Command::new(executable(timeout)?);
+    // An unconfined operation keeps Git for Windows' launcher, as on main: it
+    // supplies the installation's settings (`etc/git-bash.config`, such as
+    // native symlinks for checkout), which the inner `git.exe` alone misses.
+    let program = if cfg!(windows) && limit == Limit::None {
+        PathBuf::from("git.exe")
+    } else {
+        executable(timeout)?
+    };
+    let mut command = Command::new(program);
     // Inherited Git variables can redirect an operation away from its working directory,
     // add configuration, or send traces to a file.
     strip_git_env(&mut command);
