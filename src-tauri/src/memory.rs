@@ -18,7 +18,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(not(test))]
 use std::net::{TcpListener, TcpStream};
+#[cfg(not(test))]
+use ureq::Agent;
+// The tests' fakes neither listen nor connect over TCP (MCR-171): under a
+// Codex sandbox that allows Unix sockets only, a TCP listener needs the
+// operator. The same names stand for an in-memory loopback there, so the code
+// above the tests is the code that ships
+#[cfg(test)]
+use tests::net::{agent, Agent, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,6 +61,7 @@ const AT_START: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 40
 /// is: with a longer one a start-up or a call for the app waits for a host
 /// that does not answer past its own time. (Windows also takes two seconds to
 /// find that nothing listens on a local port, which is how this was found.)
+#[cfg_attr(test, allow(dead_code))]
 const TO_CONNECT: Duration = AT_START;
 /// A memory service that could not be reached is not asked again for this
 /// long by other sessions that start: they would each wait in turn.
@@ -228,7 +238,8 @@ impl Http {
     }
 }
 
-fn agent() -> ureq::Agent {
+#[cfg(not(test))]
+fn agent() -> Agent {
     // No redirects: a token or a bearer header is never sent on to another place
     ureq::AgentBuilder::new().timeout_connect(TO_CONNECT).timeout(CALL).redirects(0).build()
 }
@@ -249,7 +260,7 @@ fn json_of(response: ureq::Response) -> Result<Value, Http> {
     serde_json::from_slice(&body(response)?).map_err(|_| Http::Transport("the answer is not JSON".into()))
 }
 
-fn get_json(agent: &ureq::Agent, url: &str, wait: Duration) -> Result<Value, Http> {
+fn get_json(agent: &Agent, url: &str, wait: Duration) -> Result<Value, Http> {
     json_of(agent.get(url).timeout(wait).set("Accept", "application/json").call()?)
 }
 
@@ -258,7 +269,7 @@ fn left(until: Instant) -> Duration {
     until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))
 }
 
-fn post_form(agent: &ureq::Agent, url: &str, form: &[(&str, &str)]) -> Result<Value, Http> {
+fn post_form(agent: &Agent, url: &str, form: &[(&str, &str)]) -> Result<Value, Http> {
     json_of(agent.post(url).timeout(QUICK).set("Accept", "application/json").send_form(form)?)
 }
 
@@ -276,7 +287,7 @@ pub struct Meta {
 }
 
 /// RFC 9728 (the resource names its authorization server), then RFC 8414.
-fn discover(agent: &ureq::Agent, endpoint: &str, until: Instant) -> Result<Meta, Fail> {
+fn discover(agent: &Agent, endpoint: &str, until: Instant) -> Result<Meta, Fail> {
     let refused = |text: &str| Fail::Refused(text.to_string());
     let (origin, path) = split(endpoint).filter(|_| allowed(endpoint)).ok_or_else(|| refused("the memory address is not an https address"))?;
     let resource = get_json(agent, &format!("{origin}/.well-known/oauth-protected-resource{path}"), left(until))
@@ -345,7 +356,7 @@ struct Problem {
 pub struct Link {
     dir: PathBuf,
     endpoint: String,
-    agent: ureq::Agent,
+    agent: Agent,
     vault: Box<dyn Vault>,
     state: Mutex<State>,
     /// The authorization server that was signed in to, as the vault holds it
@@ -1376,54 +1387,310 @@ pub(crate) mod tests {
         }
     }
 
+    /// The fake memory service at an address of the in-memory loopback.
     fn serve() -> Arc<Mutex<World>> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let world = Arc::new(Mutex::new(World { base: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), meta: json!({}), ..World::default() }));
-        let shared = world.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let world = shared.clone();
-                std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                        return;
-                    }
-                    let mut parts = line.split_whitespace();
-                    let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
-                    let mut headers = BTreeMap::new();
-                    loop {
-                        let mut header = String::new();
-                        if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
-                            break;
-                        }
-                        if let Some((key, value)) = header.split_once(':') {
-                            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
-                        }
-                    }
-                    let mut body = vec![0u8; headers.get("content-length").and_then(|l| l.parse().ok()).unwrap_or(0)];
-                    reader.read_exact(&mut body).unwrap();
-                    let req = Req { method, path: target.split('?').next().unwrap_or("").to_string(), headers, body };
-                    let (slow, hangs) = {
-                        let mut w = lock(&world);
-                        w.arrived.push(req.path.clone());
-                        (w.token_slow, w.hangs)
-                    };
-                    if req.path == "/oauth/token" {
-                        std::thread::sleep(slow);
-                    }
-                    if req.path == "/mcp" && hangs {
-                        std::thread::sleep(Duration::from_secs(4));
-                        return;
-                    }
-                    let out = route(&world, &req);
-                    let mut stream = stream;
-                    let session = out.session.map(|s| format!("Mcp-Session-Id: {s}\r\n")).unwrap_or_default();
-                    let _ = write!(stream, "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\n{session}Connection: close\r\n\r\n{}", out.status, out.kind, out.body.len(), out.body);
-                });
-            }
-        });
+        let port = net::port();
+        let world = Arc::new(Mutex::new(World { base: format!("http://127.0.0.1:{port}"), meta: json!({}), ..World::default() }));
+        net::host(port, net::Host::Http(world.clone()));
         world
+    }
+
+    /// What the fake memory service does with one request, as its connection
+    /// did over TCP: `None` is a connection that closes without an answer.
+    fn exchange(world: &Mutex<World>, req: &Req) -> Option<Res> {
+        let (slow, hangs) = {
+            let mut w = lock(world);
+            w.arrived.push(req.path.clone());
+            (w.token_slow, w.hangs)
+        };
+        if req.path == "/oauth/token" {
+            std::thread::sleep(slow);
+        }
+        if req.path == "/mcp" && hangs {
+            std::thread::sleep(Duration::from_secs(4));
+            return None;
+        }
+        Some(route(world, req))
+    }
+
+    /// A loopback network in memory (MCR-171). The memory module's HTTP
+    /// client and the sign-in's callback listener are these types in tests,
+    /// so no test listens on or connects to TCP: a Codex session under an
+    /// auto-mode root (MCR-162) may use Unix sockets only, and a TCP listener
+    /// there asks the operator. Addresses keep their `http://127.0.0.1:<port>`
+    /// shape; a port is a key in `NET`, never a socket. What the code sends
+    /// is what it sends over ureq (method, URL, headers in order, body); what
+    /// comes back is a real `ureq::Response`, parsed from the HTTP text the
+    /// fake server used to write, with ureq's rules: a status of 400 or more
+    /// is `Error::Status`, nothing at the port is a refused connection, and a
+    /// request's `timeout` bounds the wait for the answer.
+    pub(crate) mod net {
+        use super::{enc, exchange, lock, Duration, Instant, Mutex, Req, World, CALL, TO_CONNECT};
+        use std::collections::{BTreeMap, HashMap, VecDeque};
+        use std::io::{self, Read, Write};
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicU16, Ordering};
+        use std::sync::mpsc::{self, Receiver, Sender};
+        use std::sync::{Arc, Condvar, LazyLock};
+
+        pub(super) enum Host {
+            Http(Arc<Mutex<World>>),
+            /// A sign-in's callback listener: a connection is handed to it
+            Door(Sender<TcpStream>),
+        }
+
+        static NET: LazyLock<Mutex<HashMap<u16, Host>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+        static NEXT: AtomicU16 = AtomicU16::new(20000);
+
+        /// A port nobody had: ports are never given out twice in a test run.
+        pub(crate) fn port() -> u16 {
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        }
+
+        pub(super) fn host(port: u16, host: Host) {
+            lock(&NET).insert(port, host);
+        }
+
+        fn port_of(address: &str) -> Option<u16> {
+            address.strip_prefix("127.0.0.1:")?.parse().ok()
+        }
+
+        fn refused() -> io::Error {
+            io::Error::new(io::ErrorKind::ConnectionRefused, "nothing listens at this address")
+        }
+
+        // ---- HTTP: the client side of `ureq::Agent` that memory.rs uses ----
+
+        #[derive(Clone)]
+        pub(crate) struct Agent {
+            /// The agent's own timeout, for a request that sets none (ureq's `timeout`)
+            timeout: Duration,
+        }
+
+        /// The agent the memory module builds, with its timeouts. Connecting
+        /// takes no time here: a port with nothing behind it refuses at once,
+        /// as loopback does.
+        pub(crate) fn agent() -> Agent {
+            let _ = TO_CONNECT;
+            Agent { timeout: CALL }
+        }
+
+        impl Agent {
+            pub(crate) fn get(&self, url: &str) -> Request {
+                Request { method: "GET", url: url.to_string(), timeout: self.timeout, headers: Vec::new() }
+            }
+            pub(crate) fn post(&self, url: &str) -> Request {
+                Request { method: "POST", url: url.to_string(), timeout: self.timeout, headers: Vec::new() }
+            }
+        }
+
+        pub(crate) struct Request {
+            method: &'static str,
+            url: String,
+            timeout: Duration,
+            headers: Vec<(String, String)>,
+        }
+
+        // The signatures are ureq's own, so the code that calls them is the same
+        #[allow(clippy::result_large_err)]
+        impl Request {
+            pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
+                self.timeout = timeout;
+                self
+            }
+            pub(crate) fn set(mut self, header: &str, value: &str) -> Self {
+                self.headers.retain(|(name, _)| !name.eq_ignore_ascii_case(header));
+                self.headers.push((header.to_string(), value.to_string()));
+                self
+            }
+            pub(crate) fn call(self) -> Result<ureq::Response, ureq::Error> {
+                self.send(None, Vec::new())
+            }
+            pub(crate) fn send_form(self, form: &[(&str, &str)]) -> Result<ureq::Response, ureq::Error> {
+                let body: Vec<String> = form.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect();
+                self.send(Some("application/x-www-form-urlencoded"), body.join("&").into_bytes())
+            }
+            pub(crate) fn send_json(self, data: impl serde::Serialize) -> Result<ureq::Response, ureq::Error> {
+                let body = serde_json::to_vec(&data).map_err(io::Error::other)?;
+                self.send(Some("application/json"), body)
+            }
+            pub(crate) fn send_string(self, data: &str) -> Result<ureq::Response, ureq::Error> {
+                self.send(None, data.as_bytes().to_vec())
+            }
+
+            fn send(self, kind: Option<&str>, body: Vec<u8>) -> Result<ureq::Response, ureq::Error> {
+                let rest = self.url.strip_prefix("http://").ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "the fake network speaks plain http to 127.0.0.1 only"))?;
+                let (address, target) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+                let world = match port_of(address).and_then(|port| match lock(&NET).get(&port) {
+                    Some(Host::Http(world)) => Some(world.clone()),
+                    _ => None,
+                }) {
+                    Some(world) => world,
+                    None => return Err(refused().into()),
+                };
+                let mut headers: BTreeMap<String, String> = self.headers.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
+                if let Some(kind) = kind {
+                    headers.entry("content-type".into()).or_insert_with(|| kind.to_string());
+                }
+                let path = target.split('?').next().unwrap_or("");
+                let req = Req { method: self.method.to_string(), path: if path.is_empty() { "/".into() } else { path.to_string() }, headers, body };
+                // The server works on whether or not anybody still waits, as over a socket
+                let (answered, answer) = mpsc::channel();
+                std::thread::spawn(move || {
+                    if let Some(out) = exchange(&world, &req) {
+                        let _ = answered.send(out);
+                    }
+                });
+                let out = match answer.recv_timeout(self.timeout) {
+                    Ok(out) => out,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out reading the answer").into()),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the connection closed without an answer").into()),
+                };
+                let session = out.session.map(|s| format!("Mcp-Session-Id: {s}\r\n")).unwrap_or_default();
+                let text = format!("HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\n{session}Connection: close\r\n\r\n{}", out.status, out.kind, out.body.len(), out.body);
+                let response: ureq::Response = text.parse()?;
+                // ureq's rule: an answer of 400 or more is an error that carries the answer
+                if response.status() >= 400 {
+                    return Err(ureq::Error::Status(response.status(), response));
+                }
+                Ok(response)
+            }
+        }
+
+        // ---- the sign-in's callback listener and the browser's connection ----
+
+        /// One direction of a connection.
+        #[derive(Default)]
+        struct Half {
+            bytes: Mutex<(VecDeque<u8>, bool)>,
+            moved: Condvar,
+        }
+
+        impl Half {
+            fn close(&self) {
+                lock(&self.bytes).1 = true;
+                self.moved.notify_all();
+            }
+        }
+
+        /// Both ends of a connection; dropping one closes it both ways.
+        pub(crate) struct TcpStream {
+            inbound: Arc<Half>,
+            outbound: Arc<Half>,
+            read_timeout: Mutex<Option<Duration>>,
+        }
+
+        impl TcpStream {
+            fn pair() -> (TcpStream, TcpStream) {
+                let (a, b) = (Arc::new(Half::default()), Arc::new(Half::default()));
+                let end = |inbound: &Arc<Half>, outbound: &Arc<Half>| TcpStream { inbound: inbound.clone(), outbound: outbound.clone(), read_timeout: Mutex::new(None) };
+                (end(&a, &b), end(&b, &a))
+            }
+            /// The browser: connect to a listener's address, or be refused.
+            pub(crate) fn connect(address: &str) -> io::Result<TcpStream> {
+                let net = lock(&NET);
+                let Some(Host::Door(door)) = port_of(address).and_then(|port| net.get(&port)) else { return Err(refused()) };
+                let (client, server) = TcpStream::pair();
+                door.send(server).map_err(|_| refused())?;
+                Ok(client)
+            }
+            /// A read never fails for want of bytes here: it waits for them, up to the read timeout.
+            pub(crate) fn set_nonblocking(&self, _: bool) -> io::Result<()> {
+                Ok(())
+            }
+            pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+                *lock(&self.read_timeout) = timeout;
+                Ok(())
+            }
+        }
+
+        impl Drop for TcpStream {
+            fn drop(&mut self) {
+                self.outbound.close();
+                self.inbound.close();
+            }
+        }
+
+        impl Read for &TcpStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let until = lock(&self.read_timeout).map(|t| Instant::now() + t);
+                let mut held = lock(&self.inbound.bytes);
+                loop {
+                    let (bytes, closed) = &mut *held;
+                    if !bytes.is_empty() || buf.is_empty() {
+                        let n = buf.len().min(bytes.len());
+                        for (to, from) in buf.iter_mut().zip(bytes.drain(..n)) {
+                            *to = from;
+                        }
+                        return Ok(n);
+                    }
+                    if *closed {
+                        return Ok(0);
+                    }
+                    let wait = match until {
+                        Some(until) if Instant::now() >= until => return Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out")),
+                        Some(until) => until - Instant::now(),
+                        None => Duration::from_secs(3600),
+                    };
+                    held = self.inbound.moved.wait_timeout(held, wait).unwrap_or_else(|e| e.into_inner()).0;
+                }
+            }
+        }
+
+        impl Read for TcpStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                (&*self).read(buf)
+            }
+        }
+
+        impl Write for TcpStream {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let mut held = lock(&self.outbound.bytes);
+                if held.1 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "the other end is closed"));
+                }
+                held.0.extend(buf);
+                self.outbound.moved.notify_all();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A listener at a port of its own until it is dropped, as a socket is.
+        pub(crate) struct TcpListener {
+            port: u16,
+            waiting: Mutex<Receiver<TcpStream>>,
+        }
+
+        impl TcpListener {
+            /// Loopback only, port 0 only: the sign-in asks for nothing else.
+            pub(crate) fn bind(address: (&str, u16)) -> io::Result<TcpListener> {
+                assert_eq!(address, ("127.0.0.1", 0), "the sign-in listens on loopback, on a port of the system's choice");
+                let (door, waiting) = mpsc::channel();
+                let port = port();
+                host(port, Host::Door(door));
+                Ok(TcpListener { port, waiting: Mutex::new(waiting) })
+            }
+            pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+                Ok(SocketAddr::from(([127, 0, 0, 1], self.port)))
+            }
+            /// Accepting never blocks here, which is what the sign-in sets.
+            pub(crate) fn set_nonblocking(&self, _: bool) -> io::Result<()> {
+                Ok(())
+            }
+            pub(crate) fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+                let stream = lock(&self.waiting).try_recv().map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "no connection waits"))?;
+                Ok((stream, SocketAddr::from(([127, 0, 0, 1], 0))))
+            }
+        }
+
+        impl Drop for TcpListener {
+            fn drop(&mut self) {
+                lock(&NET).remove(&self.port);
+            }
+        }
     }
 
     /// A memory signed in to a fake memory service; harness tests use it too.
@@ -1486,6 +1753,92 @@ pub(crate) mod tests {
         fn visible(&self) -> String {
             format!("{}{}", std::fs::read_to_string(self.dir.join("memory-state.json")).unwrap_or_default(), self.memory.status())
         }
+    }
+
+    /// MCR-171: no test module names std's TCP or UDP types, so `cargo test`
+    /// runs in the Codex sandbox that allows Unix sockets only (MCR-162).
+    /// A fake that must listen uses `net` here, or a Unix socket below
+    /// `ipc::test_socket_dir`. A look at the source, not at what the tests
+    /// call: production code that a test drives may still open TCP.
+    #[test]
+    fn no_test_listens_or_connects_over_tcp() {
+        fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut all = Vec::new();
+        files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut all);
+        assert!(all.len() > 20, "{all:?}");
+        // Spelt in two, so this test's own lines are not found
+        let net = concat!("std::", "net::");
+        let names = |line: &str| line.find(net).is_some_and(|at| ["Tcp", "Udp"].iter().any(|kind| line[at..].contains(kind)));
+        let mut found = Vec::new();
+        for path in all {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            // The test modules: from the first `mod …tests {` under `#[cfg(test)]` to the end
+            let Some(start) = (1..lines.len()).find(|&i| lines[i - 1].trim() == "#[cfg(test)]" && lines[i].contains("mod ") && lines[i].contains("tests {")) else { continue };
+            for (n, line) in lines.iter().enumerate().skip(start) {
+                if names(line) {
+                    found.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(found.is_empty(), "tests that use TCP or UDP:\n{}", found.join("\n"));
+    }
+
+    /// The in-memory loopback behaves as loopback does where the sign-in and
+    /// the fakes rely on it: a closed or never opened port refuses, a request
+    /// gets ureq's own response and errors, and a timeout is kept.
+    #[test]
+    fn the_in_memory_loopback_refuses_answers_and_times_out_as_tcp_does() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        assert!(listener.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock));
+        let mut browser = TcpStream::connect(&address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        write!(browser, "GET /callback HTTP/1.1\r\n\r\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(&server).read_line(&mut line).unwrap();
+        assert_eq!(line, "GET /callback HTTP/1.1\r\n");
+        answer(server, "200 OK", "done");
+        let mut text = String::new();
+        browser.read_to_string(&mut text).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with("<p>done</p></body>"), "{text}");
+        // A read waits for bytes only as long as the stream allows
+        let browser = TcpStream::connect(&address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let started = Instant::now();
+        assert!((&server).read(&mut [0u8; 8]).is_err() && started.elapsed() >= Duration::from_millis(50));
+        drop(browser);
+        assert_eq!((&server).read(&mut [0u8; 8]).unwrap(), 0);
+        drop(listener);
+        assert!(TcpStream::connect(&address).is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused));
+
+        let world = serve();
+        let base = lock(&world).base.clone();
+        let agent = agent();
+        let found = agent.get(&format!("{base}/.well-known/oauth-protected-resource/mcp?x=1")).set("Accept", "application/json").call().unwrap();
+        assert_eq!((found.status(), found.content_type()), (200, "application/json"));
+        assert_eq!(found.into_json::<Value>().unwrap()["resource"], format!("{base}/mcp"));
+        assert!(matches!(agent.get(&format!("{base}/nowhere")).call(), Err(ureq::Error::Status(404, _))));
+        assert_eq!(lock(&world).seen, ["GET /.well-known/oauth-protected-resource/mcp", "GET /nowhere"]);
+        let form = agent.post(&format!("{base}/oauth/revoke")).send_form(&[("token", "a b&c")]).unwrap();
+        assert_eq!(form.status(), 200);
+        assert_eq!(lock(&world).revoked, ["a b&c"]);
+        lock(&world).hangs = true;
+        let started = Instant::now();
+        let hung = agent.post(&format!("{base}/mcp")).timeout(Duration::from_millis(100)).send_string("{}");
+        assert!(matches!(hung, Err(ureq::Error::Transport(_))) && started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let gone = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        assert!(matches!(agent.get(&format!("http://127.0.0.1:{gone}/mcp")).call(), Err(ureq::Error::Transport(_))));
     }
 
     #[test]

@@ -1,0 +1,593 @@
+//! Run local Git operations with a deadline and a cap on each output stream.
+
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fmt;
+use std::io::{self, Read};
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+pub enum Error {
+    OutputLimit { limit: usize },
+    Other(io::Error),
+}
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutputLimit { limit } => write!(f, "Git output exceeds {limit} bytes"),
+            Self::Other(error) => write!(f, "Git: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Callers supply a fixed Git subcommand followed by its arguments. Place user
+/// data in operands. Check the exit status before using the output.
+///
+/// The guards cover the subcommands used so far: plumbing (`rev-parse`,
+/// `ls-files`, `show-ref`, `merge-base`, `config`, `read-tree`,
+/// `checkout-index`, `symbolic-ref`, `check-ref-format`), `worktree`,
+/// `status`, and `diff`, `show` and `log`, which also get `--no-ext-diff` and
+/// `--no-textconv`. Formats must not use the `%G` signature placeholders, which
+/// run the configured gpg program. `blame`, `grep --textconv` and
+/// `cat-file --textconv` are not guarded: they would still run a configured
+/// textconv program. Add a guard here before calling them.
+pub fn run(
+    cwd: &Path,
+    args: &[impl AsRef<OsStr>],
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Output, Error> {
+    run_from(cwd, &[cwd], args, timeout, max_output)
+}
+
+/// As `run`, with the filters configured in each folder of `config_from`
+/// disabled. For an operation that reaches into another checkout from `cwd`,
+/// such as `worktree remove`, which Windows cannot run from inside the folder
+/// it deletes.
+pub fn run_from(
+    cwd: &Path,
+    config_from: &[&Path],
+    args: &[impl AsRef<OsStr>],
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Output, Error> {
+    #[cfg(test)]
+    tests::RAN.with(|ran| {
+        ran.borrow_mut().push((
+            cwd.to_path_buf(),
+            args.iter().map(|a| a.as_ref().to_os_string()).collect(),
+        ))
+    });
+    if !cwd.is_absolute() || config_from.iter().any(|dir| !dir.is_absolute()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "requires an absolute working directory",
+        )
+        .into());
+    }
+    let start = Instant::now();
+    let mut command = local_command(cwd);
+    if let Some((operation, operands)) = args.split_first() {
+        // Worktree checkout and even status/diff can invoke configured filters.
+        // Inspect only their names, and disable them before running the operation.
+        let mut filters = BTreeSet::new();
+        for dir in config_from {
+            let mut config = local_command(dir);
+            config.args([
+                "config",
+                "--name-only",
+                "--null",
+                "--get-regexp",
+                "^filter\\.",
+            ]);
+            let found = capture(config, timeout.saturating_sub(start.elapsed()), 64 * 1024)?;
+            match found.status.code() {
+                Some(0) => {
+                    let names = String::from_utf8(found.stdout).map_err(io::Error::other)?;
+                    filters.extend(
+                        names
+                            .split_terminator('\0')
+                            .filter_map(|key| key.rsplit_once('.').map(|(name, _)| name.to_owned())),
+                    );
+                }
+                Some(1) if found.stderr.is_empty() => {}
+                _ => return Err(io::Error::other("cannot inspect Git filter configuration").into()),
+            }
+        }
+        if !filters.is_empty() {
+            // Keep keys and values separate. Git's -c syntax splits on
+            // the first '=' even when it belongs to a filter driver name.
+            let mut index = 0;
+            for filter in filters {
+                for (setting, value) in [
+                    ("clean", ""),
+                    ("smudge", ""),
+                    ("process", ""),
+                    ("required", "false"),
+                ] {
+                    command.env(
+                        format!("GIT_CONFIG_KEY_{index}"),
+                        format!("{filter}.{setting}"),
+                    );
+                    command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+                    index += 1;
+                }
+            }
+            command.env("GIT_CONFIG_COUNT", index.to_string());
+        }
+        command.arg(operation);
+        let operation = operation.as_ref();
+        let shows_diff = ["diff", "show", "log"]
+            .iter()
+            .any(|name| operation == OsStr::new(name));
+        if shows_diff {
+            command.args(["--no-ext-diff", "--no-textconv"]);
+        }
+        if shows_diff || operation == OsStr::new("status") {
+            // Gitlinks still show a commit difference. Their worktree contents
+            // would require a separate config inspection in each submodule.
+            command.arg("--ignore-submodules=dirty");
+        }
+        command.args(operands);
+    }
+    let remaining = timeout.saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        return Err(timed_out().into());
+    }
+    capture(command, remaining, max_output)
+}
+
+fn local_command(cwd: &Path) -> Command {
+    let executable = if cfg!(unix) && Path::new("/usr/bin/git").is_file() {
+        "/usr/bin/git"
+    } else if cfg!(windows) {
+        "git.exe"
+    } else {
+        "git"
+    };
+    let no_hooks = if cfg!(windows) {
+        "core.hooksPath=NUL"
+    } else {
+        "core.hooksPath=/dev/null"
+    };
+    let mut command = Command::new(executable);
+    // Inherited Git variables can redirect an operation away from its working directory,
+    // add configuration, or send traces to a file.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .args([
+            "--no-pager",
+            "-c",
+            no_hooks,
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "diff.external=",
+            "-c",
+            "status.submoduleSummary=false",
+            "-c",
+            "submodule.recurse=false",
+            // A signed commit in log or show would run the configured gpg program.
+            "-c",
+            "log.showSignature=false",
+        ])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .current_dir(cwd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+fn capture(mut command: Command, timeout: Duration, max_output: usize) -> Result<Output, Error> {
+    let start = Instant::now();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drain both pipes concurrently. Each reader keeps at most max_output + 1 bytes.
+    let stdout = read_pipe(child.stdout.take().unwrap(), max_output);
+    let stderr = read_pipe(child.stderr.take().unwrap(), max_output);
+    let result = (|| {
+        let (mut stdout, mut stderr) = (Some(stdout), Some(stderr));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        while stdout.is_some() || stderr.is_some() {
+            if stdout.as_ref().is_some_and(thread::JoinHandle::is_finished) {
+                out = stdout
+                    .take()
+                    .unwrap()
+                    .join()
+                    .map_err(|_| io::Error::other("stdout reader failed"))??;
+            }
+            if stderr.as_ref().is_some_and(thread::JoinHandle::is_finished) {
+                err = stderr
+                    .take()
+                    .unwrap()
+                    .join()
+                    .map_err(|_| io::Error::other("stderr reader failed"))??;
+            }
+            if stdout.is_some() || stderr.is_some() {
+                pause(start, timeout)?;
+            }
+        }
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            pause(start, timeout)?;
+        }
+    })();
+    if result.is_err() {
+        stop(&mut child);
+    }
+    result
+}
+
+fn read_pipe(
+    pipe: impl Read + Send + 'static,
+    limit: usize,
+) -> thread::JoinHandle<Result<Vec<u8>, Error>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(Error::OutputLimit { limit });
+        }
+        Ok(bytes)
+    })
+}
+
+fn pause(start: Instant, timeout: Duration) -> io::Result<()> {
+    let remaining = timeout.saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        return Err(timed_out());
+    }
+    thread::sleep(remaining.min(Duration::from_millis(5)));
+    Ok(())
+}
+
+fn timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "command timed out")
+}
+
+fn stop(child: &mut Child) {
+    #[cfg(unix)]
+    // Git can run child processes that inherit the output pipes.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    thread_local! {
+        /// The folder and arguments of each run on this thread.
+        pub static RAN: std::cell::RefCell<Vec<(std::path::PathBuf, Vec<std::ffi::OsString>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn runs_git_in_the_given_folder_with_literal_operands() {
+        let repo = tempfile::tempdir().unwrap();
+        let output = run(repo.path(), &["init", "-q"], TIMEOUT, 4096).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let nested = repo.path().join("a folder & more");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("a file & more"), b"data").unwrap();
+        let output = run(&nested, &["add", "--", "a file & more"], TIMEOUT, 4096).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let output = run(&nested, &["ls-files", "-z"], TIMEOUT, 4096).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"a file & more\0");
+        let output = run(&nested, &["rev-parse", "--verify", "HEAD"], TIMEOUT, 4096).unwrap();
+        assert!(!output.status.success());
+        assert!(!output.stderr.is_empty());
+    }
+
+    #[test]
+    fn refuses_relative_folders() {
+        assert!(run(Path::new("."), &["--version"], TIMEOUT, 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("absolute"));
+    }
+
+    #[test]
+    fn rejects_oversized_output() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(matches!(
+            run(&cwd, &["--version"], TIMEOUT, 1),
+            Err(Error::OutputLimit { limit: 1 })
+        ));
+        assert!(matches!(
+            run(&cwd, &["--mcr-unknown-option"], TIMEOUT, 1),
+            Err(Error::OutputLimit { limit: 1 })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_programs_are_disabled() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path();
+        let raw = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let setup = |args: &[&str]| {
+            let output = raw(args);
+            assert!(output.status.success(), "{output:?}");
+        };
+        setup(&["init", "-q"]);
+        fs::write(cwd.join(".gitattributes"), "file filter=a=b diff=probe\n").unwrap();
+        fs::write(cwd.join("file"), "original\n").unwrap();
+        setup(&["add", "--", ".gitattributes", "file"]);
+        setup(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        fs::write(cwd.join("file"), "changed content\n").unwrap();
+
+        let marker = cwd.join(".git/probe-ran");
+        let probe = cwd.join(".git/probe");
+        fs::write(
+            &probe,
+            format!("#!/bin/sh\ntouch '{}'; exit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+        let probe_cmd = probe.to_str().unwrap();
+        let hooks = cwd.join(".git/test-hooks");
+        fs::create_dir(&hooks).unwrap();
+        fs::copy(&probe, hooks.join("post-checkout")).unwrap();
+        // A commit with a signature header (no key needed) makes log run gpg.
+        let head = raw(&["cat-file", "commit", "HEAD"]).stdout;
+        let head = String::from_utf8(head).unwrap();
+        let (headers, message) = head.split_once("\n\n").unwrap();
+        let signed = format!("{headers}\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\n{message}");
+        let mut hash = Command::new("git")
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut hash.stdin.take().unwrap(), signed.as_bytes()).unwrap();
+        let hash = hash.wait_with_output().unwrap();
+        assert!(hash.status.success(), "{hash:?}");
+        setup(&["update-ref", "HEAD", String::from_utf8(hash.stdout).unwrap().trim()]);
+
+        for (key, value, args) in [
+            (
+                "filter.a=b.clean",
+                probe_cmd,
+                &["diff", "--numstat", "HEAD", "--", "file"][..],
+            ),
+            (
+                "filter.a=b.process",
+                probe_cmd,
+                &["diff", "--numstat", "HEAD", "--", "file"][..],
+            ),
+            (
+                "diff.probe.textconv",
+                probe_cmd,
+                &["diff", "HEAD", "--", "file"][..],
+            ),
+            (
+                "diff.external",
+                probe_cmd,
+                &["diff", "HEAD", "--", "file"][..],
+            ),
+            ("core.fsmonitor", probe_cmd, &["status", "--porcelain"][..]),
+            (
+                "core.hooksPath",
+                ".git/test-hooks",
+                &["checkout", "--", "file"][..],
+            ),
+            (
+                "filter.a=b.smudge",
+                probe_cmd,
+                &["checkout-index", "--all", "--index"][..],
+            ),
+            ("gpg.program", probe_cmd, &["log", "-1"][..]),
+            ("gpg.program", probe_cmd, &["show", "-s", "HEAD"][..]),
+        ] {
+            setup(&["config", "--local", key, value]);
+            if key == "gpg.program" {
+                setup(&["config", "--local", "log.showSignature", "true"]);
+            }
+            if key.starts_with("filter.") && !key.ends_with(".smudge") {
+                setup(&["config", "--local", "filter.a=b.required", "true"]);
+            }
+            if key.ends_with(".smudge") {
+                fs::remove_file(cwd.join("file")).unwrap();
+            }
+            let baseline = raw(args);
+            assert!(
+                marker.is_file(),
+                "{key} should run without guards: {baseline:?}"
+            );
+            fs::remove_file(&marker).unwrap();
+            if key.ends_with(".smudge") {
+                fs::remove_file(cwd.join("file")).unwrap();
+            } else {
+                fs::write(cwd.join("file"), "changed content\n").unwrap();
+            }
+            let output = run(cwd, args, TIMEOUT, 4096).unwrap();
+            assert!(output.status.success(), "{key}: {output:?}");
+            assert!(!marker.exists(), "{key} ran");
+            setup(&["config", "--local", "--unset", key]);
+            if key == "gpg.program" {
+                setup(&["config", "--local", "--unset", "log.showSignature"]);
+            }
+            if key.starts_with("filter.") && !key.ends_with(".smudge") {
+                setup(&["config", "--local", "--unset", "filter.a=b.required"]);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_does_not_run_submodule_summary() {
+        use std::fs;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        let module = repo.join("module");
+        fs::create_dir_all(&module).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = run(cwd, args, TIMEOUT, 4096).unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        for cwd in [&repo, &module] {
+            git(cwd, &["init", "-q"]);
+            git(cwd, &["config", "--local", "user.name", "Test"]);
+            git(
+                cwd,
+                &["config", "--local", "user.email", "test@example.invalid"],
+            );
+            git(cwd, &["config", "--local", "commit.gpgSign", "false"]);
+        }
+        git(&module, &["commit", "--allow-empty", "-qm", "first"]);
+        let commit = git(&module, &["rev-parse", "HEAD"]);
+        fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"module\"]\n  path = module\n  url = ./module\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "--", ".gitmodules"]);
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{commit},module"),
+            ],
+        );
+        git(&repo, &["commit", "-qm", "add gitlink"]);
+        git(
+            &module,
+            &["commit", "--allow-empty", "-qm", "module changed"],
+        );
+        git(
+            &repo,
+            &["config", "--local", "status.submoduleSummary", "true"],
+        );
+        let raw = Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["status", "--ignore-submodules=dirty"])
+            .output()
+            .unwrap();
+        assert!(raw.status.success());
+        assert!(String::from_utf8_lossy(&raw.stdout).contains("* module "));
+        let safe = run(&repo, &["status"], TIMEOUT, 4096).unwrap();
+        assert!(safe.status.success());
+        let status = String::from_utf8_lossy(&safe.stdout);
+        assert!(status.contains("module"));
+        assert!(!status.contains("* module "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_configuration_is_disabled() {
+        let fixture = tempfile::tempdir().unwrap();
+        let system = fixture.path().join("system.gitconfig");
+        std::fs::write(&system, "[mcr]\n  probe = system\n").unwrap();
+        let args = ["config", "--get", "mcr.probe"];
+        let raw = Command::new("git")
+            .current_dir(fixture.path())
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(raw.status.success());
+        assert_eq!(raw.stdout, b"system\n");
+        let safe = local_command(fixture.path())
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(safe.status.code(), Some(1));
+        assert!(safe.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kills_a_command_on_timeout() {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("/bin/sleep");
+        command.arg("10").process_group(0);
+        let start = Instant::now();
+        let error = capture(command, Duration::from_millis(30), 4096).unwrap_err();
+        assert!(matches!(error, Error::Other(error) if error.kind() == io::ErrorKind::TimedOut));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+}
