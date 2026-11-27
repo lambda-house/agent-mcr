@@ -70,6 +70,29 @@ impl std::fmt::Display for Fail {
 /// with a body (refused by Slack from 2027-02-17).
 pub trait Web: Send + Sync {
     fn call(&self, token: &str, method: &str, params: &[(&str, String)]) -> Result<Value, Fail>;
+    /// The Socket Mode WebSocket at `url` (from `apps.connections.open`)
+    fn socket(&self, url: &str) -> Result<Box<dyn Frames>, String> {
+        Ok(Box::new(dial(url)?))
+    }
+}
+
+/// What the listener does with its WebSocket, so a test can stand in for it
+pub trait Frames: Send {
+    fn read(&mut self) -> Result<tungstenite::Message, tungstenite::Error>;
+    fn send(&mut self, message: tungstenite::Message) -> Result<(), tungstenite::Error>;
+    fn close(&mut self);
+}
+
+impl Frames for Socket {
+    fn read(&mut self) -> Result<tungstenite::Message, tungstenite::Error> {
+        tungstenite::WebSocket::read(self)
+    }
+    fn send(&mut self, message: tungstenite::Message) -> Result<(), tungstenite::Error> {
+        tungstenite::WebSocket::send(self, message)
+    }
+    fn close(&mut self) {
+        let _ = tungstenite::WebSocket::close(self, None);
+    }
 }
 
 pub struct Https(ureq::Agent);
@@ -1625,10 +1648,11 @@ impl Slack {
     }
 
     /// Whether the app-level token can still be read, looked at every
-    /// `SILENCE / 3` while listening: a keyring that locked ends the
-    /// connection, which would otherwise stay up while nothing can go out.
+    /// `LOOK_EVERY` while listening, at every pass of the loop, a busy one
+    /// too: a keyring that locked ends the connection, which would otherwise
+    /// stay up while nothing can go out.
     fn still_readable(&self, looked: &mut Instant) -> Result<(), Stop> {
-        if looked.elapsed() < SILENCE / 3 {
+        if looked.elapsed() < LOOK_EVERY {
             return Ok(());
         }
         *looked = Instant::now();
@@ -1642,13 +1666,17 @@ impl Slack {
     fn listen(&self, host: &dyn Host, app: &str, epoch: u64) -> Result<(), Stop> {
         use tungstenite::Message;
         let url = self.web.call(app, "apps.connections.open", &[]).map_err(|e| e.to_string())?["url"].as_str().unwrap_or("").to_string();
-        let mut socket = dial(&url)?;
+        let mut socket = self.web.socket(&url)?;
         // Reads return every few seconds, so the off switch and a dead connection are noticed
         let (mut heard, mut pinged, mut looked) = (Instant::now(), Instant::now(), Instant::now());
         loop {
             if self.epoch.load(Ordering::SeqCst) != epoch {
-                let _ = socket.close(None);
+                socket.close();
                 return Ok(());
+            }
+            if let Err(stop) = self.still_readable(&mut looked) {
+                socket.close();
+                return Err(stop);
             }
             let text = match socket.read() {
                 Ok(Message::Text(text)) => {
@@ -1661,10 +1689,6 @@ impl Slack {
                     continue;
                 }
                 Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                    if let Err(stop) = self.still_readable(&mut looked) {
-                        let _ = socket.close(None);
-                        return Err(stop);
-                    }
                     // After sleep or a network change a connection can be dead without closing
                     if heard.elapsed() > SILENCE {
                         return Err(format!("Slack was not reached: nothing arrived for {} s", SILENCE.as_secs()).into());
@@ -1727,6 +1751,8 @@ impl Slack {
 
 /// With no frame for this long, not even an answer to our ping, the connection is taken for dead
 const SILENCE: Duration = Duration::from_secs(90);
+/// How often the listener looks whether the app-level token can still be read
+const LOOK_EVERY: Duration = if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(30) };
 
 /// Why a Socket Mode connection ended
 #[derive(Debug, PartialEq)]
@@ -1796,6 +1822,9 @@ mod tests {
         calls: Mutex<Vec<(String, Params)>>,
         /// Answers per method, used once each, before the default
         scripted: Mutex<BTreeMap<String, Vec<Result<Value, Fail>>>>,
+        /// Frames the fake Socket Mode connection gave, and whether it was closed
+        frames: std::sync::atomic::AtomicUsize,
+        closed: AtomicBool,
     }
 
     impl FakeWeb {
@@ -1810,7 +1839,27 @@ mod tests {
         }
     }
 
+    /// A Socket Mode connection that never goes quiet: a frame every 2 ms
+    struct Busy(Arc<FakeWeb>);
+
+    impl Frames for Busy {
+        fn read(&mut self) -> Result<tungstenite::Message, tungstenite::Error> {
+            std::thread::sleep(Duration::from_millis(2));
+            self.0.frames.fetch_add(1, Ordering::SeqCst);
+            Ok(tungstenite::Message::text(json!({"type": "events_api", "payload": {"event": {"type": "reaction_added"}}}).to_string()))
+        }
+        fn send(&mut self, _: tungstenite::Message) -> Result<(), tungstenite::Error> {
+            Ok(())
+        }
+        fn close(&mut self) {
+            self.0.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
     impl Web for Arc<FakeWeb> {
+        fn socket(&self, _url: &str) -> Result<Box<dyn Frames>, String> {
+            Ok(Box::new(Busy(self.clone())))
+        }
         fn call(&self, _token: &str, method: &str, params: &[(&str, String)]) -> Result<Value, Fail> {
             lock(&self.calls).push((method.into(), params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()));
             if let Some(answer) = lock(&self.scripted).get_mut(method).filter(|a| !a.is_empty()).map(|a| a.remove(0)) {
@@ -2313,6 +2362,31 @@ mod tests {
         assert_eq!(slack.status()["link"], "unreadable");
         vault.refuse(None);
         assert_eq!(slack.still_readable(&mut Instant::now().checked_sub(SILENCE).unwrap()), Ok(()));
+    }
+
+    /// A steady stream of frames never times a read out: the listener still
+    /// looks at the token by the clock, and ends as unreadable
+    #[test]
+    fn a_busy_listener_ends_as_unreadable_when_the_store_locks() {
+        let vault = Arc::new(Held::default());
+        let (_dir, slack, web, host) = connected_to("approve", Box::new(vault.clone()));
+        let locked = Unavailable("the vault is locked");
+        let epoch = slack.epoch.load(Ordering::SeqCst);
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let (slack, host) = (&slack, &host);
+            scope.spawn(move || {
+                let _ = done.send(slack.listen(host, "xapp-1", epoch));
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            vault.refuse(Some(locked));
+            let ended = ended.recv_timeout(Duration::from_secs(2));
+            // A listener that did not see it is stopped here, so the test ends either way
+            slack.epoch.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(ended, Ok(Err(Stop::Unreadable(unreadable(locked)))));
+        });
+        assert!(web.frames.load(Ordering::SeqCst) > 20, "the stream was not busy");
+        assert!(web.closed.load(Ordering::SeqCst));
     }
 
     #[test]
