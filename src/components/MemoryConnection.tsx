@@ -44,6 +44,7 @@ export default function MemoryConnection() {
 
   const off = !status || status.state === 'disconnected' || status.state === 'signed_out';
   const locked = canUnlockStore(PLATFORM) && status?.problem?.kind === 'vault_unavailable' ? status.problem : null;
+  const unlocked = !!locked && locked.at === unlockedFor;
   return <div className="settings-section">
     <div className="settings-section-head">
       <h3>Memory for agents <small className="hs-preview">Preview</small></h3>
@@ -51,15 +52,14 @@ export default function MemoryConnection() {
     </div>
     {error && <p role="alert">{error}</p>}
     {status && <div className="settings-card">
-      <SettingRow label="Connection" description={memoryStateLine(status)} control={
+      <SettingRow label="Connection" description={unlocked ? <span role="status">{memoryStateLine(status, true)}</span> : memoryStateLine(status)} control={
         off
           ? <button type="button" disabled={busy} onClick={() => void run(memoryApi.connect)}>{status.state === 'signed_out' ? 'Sign in again…' : 'Connect…'}</button>
           : <button type="button" disabled={busy} onClick={() => void run(memoryApi.disconnect)}>{connecting ? 'Cancel sign-in' : 'Disconnect…'}</button>
       }/>
       {status.problem && <SettingRow label="Last problem" description={`${status.problem.text} (${new Date(status.problem.at).toLocaleString()})`} control={
-        locked && locked.at !== unlockedFor ? <button type="button" disabled={busy} onClick={() => void unlock(locked.at)}>Unlock keyring…</button> : null
+        locked && !unlocked ? <button type="button" disabled={busy} onClick={() => void unlock(locked.at)}>Unlock keyring…</button> : null
       }/>}
-      {locked && locked.at === unlockedFor && <p role="status">The keyring is unlocked. The next call to memory reads the sign-in again.</p>}
     </div>}
   </div>;
 }

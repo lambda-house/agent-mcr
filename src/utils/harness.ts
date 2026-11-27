@@ -431,8 +431,25 @@ export interface MemoryStatus {
   problem?: { kind: string; text: string; at: number } | null;
 }
 
-/** One line on where the memory connection stands, for Settings. */
-export function memoryStateLine(status: MemoryStatus): string {
+/** Problems that leave memory unusable while connected: the bridge's tool list fails (`noted` in memory.rs clears them at the next call that gets through).
+ *  `no_model_key` is not one: the tools are listed and calls that need no model still work. */
+const MEMORY_DOWN: Record<string, string> = {
+  vault_unavailable: 'the sign-in cannot be read from the secret store',
+  unreachable: 'the memory service cannot be reached',
+  refused: 'the memory service refuses its calls',
+};
+/** What a session started without the memory tools does to get them: the bridge says `listChanged: false`, so a later fix is not told to it. */
+const MEMORY_RESTART = 'restarted or reconnected (in Claude Code, /mcp and then reconnect mcr-memory)';
+
+/** One line on where the memory connection stands, for Settings. `unlocked`: the person unlocked the keyring for the current problem. */
+export function memoryStateLine(status: MemoryStatus, unlocked = false): string {
+  const down = status.state === 'connected' && status.problem ? MEMORY_DOWN[status.problem.kind] : undefined;
+  if (down && unlocked && status.problem?.kind === 'vault_unavailable') {
+    return `Signed in to ${status.endpoint}. The keyring is unlocked: memory is used again at its next call. Sessions started while it was locked have no memory tools until they are ${MEMORY_RESTART}.`;
+  }
+  if (down) {
+    return `Signed in to ${status.endpoint}; no new sign-in is needed. Memory cannot be used now: ${down}. Sessions started meanwhile have no memory tools until they are ${MEMORY_RESTART}.`;
+  }
   switch (status.state) {
     case 'connected': return `Connected to ${status.endpoint}. New and restarted sessions have the memory tools; a call that names no memory goes to ${status.defaultMemory}.`;
     case 'connecting': return 'Waiting for the sign-in in your browser. It is given up after five minutes.';

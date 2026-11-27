@@ -68,7 +68,24 @@ it('offers to unlock the keyring that holds the sign-in back, and says why an un
   await act(async () => unlock()!.click()); await flush();
   expect(vaultApi.unlock).toHaveBeenCalledTimes(2);
   expect(unlock()).toBeUndefined();
-  expect(host.querySelector('[role="status"]')?.textContent).toContain('The keyring is unlocked');
+  // The headline says it, once: no longer locked, and what sessions started meanwhile need
+  const line = host.querySelector('[role="status"]')?.textContent ?? '';
+  expect(line).toContain('The keyring is unlocked: memory is used again at its next call.');
+  expect(line).toContain('Sessions started while it was locked have no memory tools until they are restarted or reconnected');
+  expect(host.textContent).not.toContain('Memory cannot be used now');
+  expect(host.textContent!.split('The keyring is unlocked').length).toBe(2);
+  // The Last problem row stays as it was
+  expect(host.textContent).toContain("Last problem");
+  expect(host.textContent).toContain("could not be read from the secret store: the keyring is locked.");
+});
+
+it('says in the headline that a locked keyring leaves memory unusable while still signed in', async () => {
+  const locked = { kind: 'vault_unavailable', text: "Memory's sign-in could not be read from the secret store: the keyring is locked.", at: 7 };
+  vi.mocked(memoryApi.status).mockResolvedValue({ ...base, state: 'connected', since: 5, problem: locked });
+  await act(async () => root.render(<MemoryConnection/>)); await flush();
+  expect(host.textContent).toContain('Signed in to https://mcp.memory.teob.cc/mcp; no new sign-in is needed. Memory cannot be used now: the sign-in cannot be read from the secret store.');
+  expect(host.textContent).not.toContain('New and restarted sessions have the memory tools');
+  expect(host.querySelector('[role="status"]')).toBeNull();
 });
 
 it('offers no unlock for a problem that is not the keyring', async () => {
@@ -79,6 +96,23 @@ it('offers no unlock for a problem that is not the keyring', async () => {
 });
 
 it('says in one line where the connection stands', () => {
-  expect(memoryStateLine({ ...base, state: 'connected' })).toContain('Connected to https://mcp.memory.teob.cc/mcp');
+  expect(memoryStateLine({ ...base, state: 'connected' })).toBe('Connected to https://mcp.memory.teob.cc/mcp. New and restarted sessions have the memory tools; a call that names no memory goes to mcr-agents.');
   expect(memoryStateLine(base)).toContain('tells them so');
+});
+
+it('does not claim the memory tools while a problem leaves memory unusable', () => {
+  const connected = { ...base, state: 'connected' as const, since: 5 };
+  const why = { vault_unavailable: 'the sign-in cannot be read from the secret store', unreachable: 'the memory service cannot be reached', refused: 'the memory service refuses its calls' };
+  for (const [kind, reason] of Object.entries(why)) {
+    const line = memoryStateLine({ ...connected, problem: { kind, text: 'in the service words', at: 3 } });
+    expect(line).toBe(`Signed in to https://mcp.memory.teob.cc/mcp; no new sign-in is needed. Memory cannot be used now: ${reason}. Sessions started meanwhile have no memory tools until they are restarted or reconnected (in Claude Code, /mcp and then reconnect mcr-memory).`);
+    expect(line).not.toContain('have the memory tools;');
+  }
+  // An unlock is about the keyring only
+  expect(memoryStateLine({ ...connected, problem: { kind: 'unreachable', text: '', at: 3 } }, true)).toContain('Memory cannot be used now: the memory service cannot be reached.');
+  expect(memoryStateLine({ ...connected, problem: { kind: 'vault_unavailable', text: '', at: 3 } }, true)).toBe('Signed in to https://mcp.memory.teob.cc/mcp. The keyring is unlocked: memory is used again at its next call. Sessions started while it was locked have no memory tools until they are restarted or reconnected (in Claude Code, /mcp and then reconnect mcr-memory).');
+  // No model key: the tools are listed and calls without a model work, so the headline stays; the Last problem row says the rest
+  expect(memoryStateLine({ ...connected, problem: { kind: 'no_model_key', text: '', at: 3 } })).toContain('New and restarted sessions have the memory tools');
+  // A problem left over from before a sign-out or disconnect does not change those lines
+  expect(memoryStateLine({ ...base, state: 'signed_out', problem: { kind: 'unreachable', text: '', at: 3 } })).toContain('Sign in again');
 });
