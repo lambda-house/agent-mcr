@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Hourglass } from 'lucide-react';
 import AgentMark from './AgentMark';
 import { SessionFigures } from './SessionMetrics';
 import { formatAge } from '../utils/agent';
-import { formatUntil, harnessApi, heldNote, hostedState, programHint, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
-import type { Session } from '../utils/sessions';
-import { keepSame } from '../utils/keepSame';
+import { formatUntil, harnessApi, heldNote, hostedState, liveSessionLabel, programHint, sessionSummary, STATE_LABEL, type Hosted } from '../utils/harness';
+import { sessionKey, sessionTooltip, type Session } from '../utils/sessions';
+import type { SessionRowProps } from '@lambda-house/journal';
+import { keepSame } from '@lambda-house/ui';
 
 /**
  * The two rows of the Live list. The list itself, the Journal's results and
@@ -124,4 +125,21 @@ export function useHostedByConversation(active: boolean, every = 0): Map<string,
     return () => { live = false; if (timer) clearInterval(timer); };
   }, [active, every]);
   return useMemo(() => new Map(hosted.filter(h => !h.exit && h.harness?.agentSession).map(h => [conversation(h), h])), [hosted]);
+}
+
+/** The hosted sessions by conversation key, for the journal's rows (SessionWorkspace provides it). */
+export const HostedByConversation = createContext<Map<string, Hosted>>(new Map());
+
+/**
+ * A session in the journal's lists, drawn as the Live list draws it: the live
+ * row for a conversation that runs now, the earlier one otherwise. Tokens,
+ * origin and the guessed state are in the tooltip, as the list keeps its detail.
+ */
+export function JournalRow({ session: s, node, title: own, selected, onOpen, onMenu }: SessionRowProps) {
+  const hosted = useContext(HostedByConversation).get(sessionKey(s));
+  const title = hosted ? liveSessionLabel(hosted, { [s.id]: own }) : own;
+  const tooltip = sessionTooltip(node, title);
+  return <button className={`sc-session hs-item ${hosted ? (rowIdle(hosted) ? 'idle' : '') : 'hs-resume'} ${selected ? 'selected' : ''}`} title={tooltip} onClick={onOpen} onContextMenu={onMenu}>
+    {hosted ? <HostedRow hosted={hosted} label={title} tooltip={tooltip} session={s}/> : <EarlierRow agent={s.provider} title={title} modified={s.modified}/>}
+  </button>;
 }

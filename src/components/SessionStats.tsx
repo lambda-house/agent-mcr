@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { cacheState, compact, contextWindow, sessionApi, type Session } from '../utils/sessions';
 import { runningFor, type Hosted } from '../utils/harness';
-import { keepSame } from '../utils/keepSame';
+import { keepSame } from '@lambda-house/ui';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const size = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} B`;

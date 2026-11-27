@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { GitBranch, RotateCw, ShieldAlert } from 'lucide-react';
 import { aheadBehind, changesApi, counts, diffLines, fileKey, findFile, pickFile, sideTotals, stagedLabel, type ChangedFile, type Changes, type ChangeSide, type Which } from '../utils/changes';
-import { keepSame } from '../utils/keepSame';
+import { keepSame } from '@lambda-house/ui';
 import type { Hosted } from '../utils/harness';
 
 const NONE: string[] = [];

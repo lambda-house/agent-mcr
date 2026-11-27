@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { SettingRow } from '@/ui';
+import { SettingRow } from '@lambda-house/ui';
 import { HARNESS_PREFERENCES_CHANGED, harnessApi, type HarnessStatus, type HarnessPreferences } from '../utils/harness';
 import { BackgroundPanel } from './Background';
 import { useStore } from '../store';

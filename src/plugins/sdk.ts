@@ -1,5 +1,9 @@
 import type React from 'react';
-import type { LayoutPreset, PaneItem, PaneNode } from '../utils/paneLayout';
+import { createElement } from 'react';
+import { Puzzle } from 'lucide-react';
+import { PluginRegistry, useSurfaceShown, type LayoutNode, type PaletteProvider, type PluginApi as WorkbenchPluginApi, type WorkbenchView } from '@lambda-house/workbench';
+import { SESSIONS_VIEWS } from '../sessionsView';
+import type { LayoutPreset, PaneItem } from '../utils/paneLayout';
 import type { HarnessStatus, Hosted, Resumable } from '../utils/harness';
 import type { Session } from '../utils/sessions';
 
@@ -20,6 +24,7 @@ export interface TopTabContext {
   active: boolean;
 }
 
+/** A view of Sessions, in its switch: Live is 10, the Journal 200, Board 210 and Slack 220; a plugin's is 100 unless it says otherwise. */
 export interface TopTabPlugin {
   id: string;
   label: string;
@@ -52,7 +57,9 @@ export interface LiveControllerContext {
   hosted: Hosted[];
   opened: string[];
   selected: string;
-  layout: PaneNode;
+  /** Live's layout: the list, the panes sessions open in (session, custom and empty panes) and any panel. */
+  layout: LayoutNode;
+  /** The pane a session opens in. */
   focusedPane: string;
   setFocusedPane: (leafId: string) => void;
   openItem: (item: PaneItem) => void;
@@ -159,7 +166,6 @@ export interface GlobalOverlayContext {
   onOpenSettings: () => void;
   onRefresh: () => void;
   onEnableAccess: () => void;
-  topTabs: TopTabPlugin[];
 }
 
 export interface GlobalOverlayPlugin {
@@ -178,7 +184,10 @@ export interface SettingsTabPlugin {
 }
 
 export interface PluginApi {
+  /** A view of Sessions (the workbench's `workbench:view`). */
   registerTopTab: (tab: TopTabPlugin) => void;
+  /** A source of the palette's items (the workbench's `workbench:palette-provider`). */
+  registerPaletteProvider: (provider: PaletteProvider) => void;
   registerPaneType: (pane: PaneTypePlugin) => void;
   registerSidebarSection: (section: SidebarSectionPlugin) => void;
   registerEmptyAction: (action: EmptyActionPlugin) => void;
@@ -200,268 +209,89 @@ export interface McrPlugin {
   setup: (api: PluginApi) => void | (() => void);
 }
 
-interface RegisteredEntry {
-  plugin: McrPlugin;
-  cleanup: Array<() => void>;
+// Agent MCR's extension points, slots and events in the workbench's plugin
+// registry (@lambda-house/workbench), declared by merging. Its plugins keep
+// the typed API above; the registry does the rest (shared UI spec §5.7).
+// Views of Sessions, palette providers, wrappers and Settings tabs go to the
+// workbench's own points, which the Workbench (and Sessions, for its views)
+// draws with the reader's, the journal's and the app's.
+interface McrPoints {
+  'sessions:overlay': GlobalOverlayPlugin;
+  'live:pane-type': PaneTypePlugin;
+  'live:sidebar-section': SidebarSectionPlugin;
+  'live:empty-action': EmptyActionPlugin;
+  'live:session-enricher': SessionEnricher;
 }
 
-const DISABLED_KEY = 'agent-mcr:disabled-plugins';
-const ENABLED_KEY = 'agent-mcr:enabled-plugins';
-
-function loadIdSet(key: string): Set<string> {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? new Set(parsed.filter((x): x is string => typeof x === 'string')) : new Set();
-  } catch {
-    return new Set();
-  }
+declare module '@lambda-house/workbench' {
+  interface WorkbenchPoints extends McrPoints {}
+  interface WorkbenchSlots extends ComponentOverrideMap {}
+  interface WorkbenchEvents extends PluginEventMap {}
 }
 
-function saveIdSet(key: string, ids: Set<string>): void {
-  try {
-    localStorage.setItem(key, JSON.stringify([...ids]));
-  } catch {
-    /* ignore storage errors */
-  }
+/** A plugin's view of Sessions: `active` while Sessions shows it. */
+function TopTabView({ tab }: { tab: TopTabPlugin }) {
+  return tab.render({ active: useSurfaceShown() });
 }
 
-class PluginRegistry {
-  private plugins = new Map<string, RegisteredEntry>();
-  private disabled = loadIdSet(DISABLED_KEY);
-  private explicitlyEnabled = loadIdSet(ENABLED_KEY);
-  private topTabs: Array<{ pluginId: string; item: TopTabPlugin }> = [];
-  private paneTypes = new Map<string, { pluginId: string; item: PaneTypePlugin }>();
-  private sidebarSections: Array<{ pluginId: string; item: SidebarSectionPlugin }> = [];
-  private emptyActions: Array<{ pluginId: string; item: EmptyActionPlugin }> = [];
-  private sessionEnrichers: Array<{ pluginId: string; item: SessionEnricher }> = [];
-  private appWrappers: Array<{ pluginId: string; item: AppWrapperPlugin }> = [];
-  private globalOverlays: Array<{ pluginId: string; item: GlobalOverlayPlugin }> = [];
-  private settingsTabs: Array<{ pluginId: string; item: SettingsTabPlugin }> = [];
-  private overrides = new Map<OverrideSlot, { pluginId: string; render: ComponentOverrideMap[OverrideSlot] }>();
-  private listeners = new Map<PluginEventName, Set<(payload: never) => void>>();
-  private changeSubscribers = new Set<() => void>();
+/** Agent MCR's plugin API on the workbench's: each register* contributes to its point. */
+function mcrApi(api: WorkbenchPluginApi): PluginApi {
+  return {
+    registerTopTab: tab => api.contribute('workbench:view', {
+      surface: 'sessions', id: tab.id, label: tab.label, title: tab.title, icon: tab.icon, order: tab.order,
+      render: () => createElement(TopTabView, { tab }),
+    }),
+    registerPaletteProvider: provider => api.contribute('workbench:palette-provider', provider),
+    registerPaneType: pane => api.contribute('live:pane-type', pane),
+    registerSidebarSection: section => api.contribute('live:sidebar-section', section),
+    registerEmptyAction: action => api.contribute('live:empty-action', action),
+    registerSessionEnricher: enricher => api.contribute('live:session-enricher', enricher),
+    registerAppWrapper: wrapper => api.contribute('workbench:wrapper', wrapper),
+    registerGlobalOverlay: overlay => api.contribute('sessions:overlay', overlay),
+    // A plugin's tab without a group or icon goes under Workspace & Agent, with the puzzle
+    registerSettingsTab: tab => api.contribute('workbench:settings-tab', {
+      id: tab.id, label: tab.label, group: tab.group ?? 'Workspace & Agent', order: tab.order ?? 100,
+      icon: tab.icon ?? createElement(Puzzle, { size: 15 }), render: tab.render,
+    }),
+    overrideComponent: (slot, render) => api.overrideSlot(slot, render),
+    onEvent: (event, handler) => api.onEvent(event, handler),
+    emitEvent: (event, payload) => api.emitEvent(event, payload),
+  };
+}
 
-  subscribe(fn: () => void): () => void {
-    this.changeSubscribers.add(fn);
-    return () => { this.changeSubscribers.delete(fn); };
-  }
+/** The registry under the names Agent MCR's code reads it by. Which plugins are off stays under agent-mcr:* in localStorage. */
+class McrPluginRegistry {
+  readonly workbench = new PluginRegistry(typeof localStorage === 'undefined' ? null : localStorage, 'agent-mcr');
 
-  private notify(): void {
-    this.changeSubscribers.forEach(fn => fn());
-  }
+  subscribe = (fn: () => void): (() => void) => this.workbench.subscribe(fn);
 
   register(plugin: McrPlugin): void {
-    if (this.plugins.has(plugin.id)) this.unregister(plugin.id);
-    const entry: RegisteredEntry = { plugin, cleanup: [] };
-    this.plugins.set(plugin.id, entry);
-    if (plugin.defaultDisabled && !this.explicitlyEnabled.has(plugin.id)) {
-      this.disabled.add(plugin.id);
-    }
-    if (!this.disabled.has(plugin.id)) {
-      this.activate(entry);
-    }
-    this.notify();
+    this.workbench.register({ ...plugin, setup: api => plugin.setup(mcrApi(api)) });
   }
 
-  unregister(pluginId: string): void {
-    const entry = this.plugins.get(pluginId);
-    if (!entry) return;
-    this.deactivate(entry);
-    this.plugins.delete(pluginId);
-    this.notify();
-  }
+  unregister(pluginId: string): void { this.workbench.unregister(pluginId); }
+  isEnabled(pluginId: string): boolean { return this.workbench.isEnabled(pluginId); }
+  setEnabled(pluginId: string, enabled: boolean): void { this.workbench.setEnabled(pluginId, enabled); }
+  listPlugins(): Array<Omit<McrPlugin, 'setup'> & { enabled: boolean }> { return this.workbench.listPlugins().map(({ setup: _setup, ...plugin }) => plugin); }
 
-  isEnabled(pluginId: string): boolean {
-    return !this.disabled.has(pluginId);
-  }
+  /** The views of Sessions the plugins added (Agent MCR's own are Live, the Journal, Board and Slack). */
+  getTopTabs(): WorkbenchView[] { return this.workbench.items('workbench:view').filter(v => v.surface === 'sessions' && !Object.keys(SESSIONS_VIEWS).includes(v.id)); }
+  /** The last plugin to register a kind has it. */
+  getPaneType(kind: string): PaneTypePlugin | undefined { return this.workbench.items('live:pane-type').filter(p => p.kind === kind).pop(); }
+  getSidebarSections(): SidebarSectionPlugin[] { return this.workbench.items('live:sidebar-section'); }
+  getEmptyActions(): EmptyActionPlugin[] { return this.workbench.items('live:empty-action'); }
+  getSessionEnrichers(): SessionEnricher[] { return this.workbench.items('live:session-enricher'); }
+  getAppWrappers(): AppWrapperPlugin[] { return this.workbench.items('workbench:wrapper'); }
+  getGlobalOverlays(): GlobalOverlayPlugin[] { return this.workbench.items('sessions:overlay'); }
+  /** Every tab of the Settings dialog: the plugins', the reader's, the journal's, the app's. */
+  getSettingsTabs(): SettingsTabPlugin[] { return this.workbench.items('workbench:settings-tab'); }
+  getOverride<K extends OverrideSlot>(slot: K): ComponentOverrideMap[K] | undefined { return this.workbench.slot(slot); }
 
-  setEnabled(pluginId: string, enabled: boolean): void {
-    const entry = this.plugins.get(pluginId);
-    if (enabled) {
-      this.disabled.delete(pluginId);
-      this.explicitlyEnabled.add(pluginId);
-      saveIdSet(DISABLED_KEY, this.disabled);
-      saveIdSet(ENABLED_KEY, this.explicitlyEnabled);
-      if (entry && entry.cleanup.length === 0) this.activate(entry);
-    } else {
-      this.disabled.add(pluginId);
-      this.explicitlyEnabled.delete(pluginId);
-      saveIdSet(DISABLED_KEY, this.disabled);
-      saveIdSet(ENABLED_KEY, this.explicitlyEnabled);
-      if (entry) this.deactivate(entry);
-    }
-    this.notify();
-  }
-
-  listPlugins(): Array<McrPlugin & { enabled: boolean }> {
-    return [...this.plugins.values()].map(({ plugin }) => ({
-      ...plugin,
-      enabled: !this.disabled.has(plugin.id),
-    }));
-  }
-
-  getTopTabs(): TopTabPlugin[] {
-    return [...this.topTabs]
-      .sort((a, b) => (a.item.order ?? 100) - (b.item.order ?? 100))
-      .map(x => x.item);
-  }
-
-  getPaneType(kind: string): PaneTypePlugin | undefined {
-    return this.paneTypes.get(kind)?.item;
-  }
-
-  getSidebarSections(): SidebarSectionPlugin[] {
-    return [...this.sidebarSections]
-      .sort((a, b) => (a.item.order ?? 100) - (b.item.order ?? 100))
-      .map(x => x.item);
-  }
-
-  getEmptyActions(): EmptyActionPlugin[] {
-    return [...this.emptyActions]
-      .sort((a, b) => (a.item.order ?? 100) - (b.item.order ?? 100))
-      .map(x => x.item);
-  }
-
-  getSessionEnrichers(): SessionEnricher[] {
-    return this.sessionEnrichers.map(x => x.item);
-  }
-
-  getAppWrappers(): AppWrapperPlugin[] {
-    return [...this.appWrappers]
-      .sort((a, b) => (a.item.order ?? 100) - (b.item.order ?? 100))
-      .map(x => x.item);
-  }
-
-  getGlobalOverlays(): GlobalOverlayPlugin[] {
-    return [...this.globalOverlays]
-      .sort((a, b) => (a.item.order ?? 100) - (b.item.order ?? 100))
-      .map(x => x.item);
-  }
-
-  getSettingsTabs(): SettingsTabPlugin[] {
-    return [...this.settingsTabs]
-      .sort((a, b) => (a.item.order ?? 100) - (b.item.order ?? 100))
-      .map(x => x.item);
-  }
-
-  getOverride<K extends OverrideSlot>(slot: K): ComponentOverrideMap[K] | undefined {
-    return this.overrides.get(slot)?.render as ComponentOverrideMap[K] | undefined;
-  }
-
-  onEvent<E extends PluginEventName>(event: E, handler: (payload: PluginEventMap[E]) => void): () => void {
-    let set = this.listeners.get(event);
-    if (!set) {
-      set = new Set();
-      this.listeners.set(event, set);
-    }
-    const fn = handler as (payload: never) => void;
-    set.add(fn);
-    return () => { set?.delete(fn); };
-  }
-
-  emitEvent<E extends PluginEventName>(event: E, payload: PluginEventMap[E]): void {
-    const set = this.listeners.get(event);
-    if (!set) return;
-    for (const handler of set) {
-      try {
-        (handler as (p: PluginEventMap[E]) => void)(payload);
-      } catch (err) {
-        console.error(`[plugin-event:${event}]`, err);
-      }
-    }
-  }
-
-  private activate(entry: RegisteredEntry): void {
-    const pluginId = entry.plugin.id;
-    const api: PluginApi = {
-      registerTopTab: (tab) => {
-        this.topTabs.push({ pluginId, item: tab });
-        entry.cleanup.push(() => {
-          this.topTabs = this.topTabs.filter(x => !(x.pluginId === pluginId && x.item.id === tab.id));
-        });
-      },
-      registerPaneType: (pane) => {
-        this.paneTypes.set(pane.kind, { pluginId, item: pane });
-        entry.cleanup.push(() => {
-          const cur = this.paneTypes.get(pane.kind);
-          if (cur?.pluginId === pluginId) this.paneTypes.delete(pane.kind);
-        });
-      },
-      registerSidebarSection: (section) => {
-        this.sidebarSections.push({ pluginId, item: section });
-        entry.cleanup.push(() => {
-          this.sidebarSections = this.sidebarSections.filter(x => !(x.pluginId === pluginId && x.item.id === section.id));
-        });
-      },
-      registerEmptyAction: (action) => {
-        this.emptyActions.push({ pluginId, item: action });
-        entry.cleanup.push(() => {
-          this.emptyActions = this.emptyActions.filter(x => !(x.pluginId === pluginId && x.item.id === action.id));
-        });
-      },
-      registerSessionEnricher: (enricher) => {
-        this.sessionEnrichers.push({ pluginId, item: enricher });
-        entry.cleanup.push(() => {
-          this.sessionEnrichers = this.sessionEnrichers.filter(x => !(x.pluginId === pluginId && x.item.id === enricher.id));
-        });
-      },
-      registerAppWrapper: (wrapper) => {
-        this.appWrappers.push({ pluginId, item: wrapper });
-        entry.cleanup.push(() => {
-          this.appWrappers = this.appWrappers.filter(x => !(x.pluginId === pluginId && x.item.id === wrapper.id));
-        });
-      },
-      registerGlobalOverlay: (overlay) => {
-        this.globalOverlays.push({ pluginId, item: overlay });
-        entry.cleanup.push(() => {
-          this.globalOverlays = this.globalOverlays.filter(x => !(x.pluginId === pluginId && x.item.id === overlay.id));
-        });
-      },
-      registerSettingsTab: (tab) => {
-        this.settingsTabs.push({ pluginId, item: tab });
-        entry.cleanup.push(() => {
-          this.settingsTabs = this.settingsTabs.filter(x => !(x.pluginId === pluginId && x.item.id === tab.id));
-        });
-      },
-      overrideComponent: (slot, render) => {
-        this.overrides.set(slot, { pluginId, render });
-        entry.cleanup.push(() => {
-          const cur = this.overrides.get(slot);
-          if (cur?.pluginId === pluginId) this.overrides.delete(slot);
-        });
-      },
-      onEvent: (event, handler) => {
-        let set = this.listeners.get(event);
-        if (!set) {
-          set = new Set();
-          this.listeners.set(event, set);
-        }
-        const fn = handler as (payload: never) => void;
-        set.add(fn);
-        const off = () => { set?.delete(fn); };
-        entry.cleanup.push(off);
-        return off;
-      },
-      emitEvent: (event, payload) => this.emitEvent(event, payload),
-    };
-
-    const userCleanup = entry.plugin.setup(api);
-    if (typeof userCleanup === 'function') {
-      entry.cleanup.push(userCleanup);
-    }
-  }
-
-  private deactivate(entry: RegisteredEntry): void {
-    while (entry.cleanup.length > 0) {
-      const fn = entry.cleanup.pop();
-      try { fn?.(); } catch { /* ignore */ }
-    }
-  }
+  onEvent<E extends PluginEventName>(event: E, handler: (payload: PluginEventMap[E]) => void): () => void { return this.workbench.onEvent(event, handler); }
+  emitEvent<E extends PluginEventName>(event: E, payload: PluginEventMap[E]): void { this.workbench.emitEvent(event, payload); }
 }
 
-export const pluginRegistry = new PluginRegistry();
+export const pluginRegistry = new McrPluginRegistry();
 
 export function createPlugin(plugin: McrPlugin): McrPlugin {
   return plugin;

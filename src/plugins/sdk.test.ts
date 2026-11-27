@@ -11,7 +11,8 @@ describe('plugin system', () => {
   it('auto-discovers built-in plugins', () => {
     const ids = pluginRegistry.listPlugins().map(p => p.id);
     expect(ids).toContain('command-panel');
-    expect(pluginRegistry.getGlobalOverlays().some(o => o.id === 'command-panel')).toBe(true);
+    // The command panel is a source of the palette's items
+    expect(pluginRegistry.workbench.items('workbench:palette-provider').some(p => p.id === 'command-panel:sessions')).toBe(true);
   });
 
   it('registers, toggles, and cleans up extension points and events', () => {
@@ -21,6 +22,7 @@ describe('plugin system', () => {
       name: 'Test Plugin',
       setup(api) {
         api.registerTopTab({ id: 'custom-tab', label: 'Custom', icon: null, render: () => null });
+        api.registerPaletteProvider({ id: 'custom-provider', useResults: () => ({ items: [] }) });
         api.registerPaneType({ kind: 'custom-pane', label: 'Custom', renderTitle: () => null, renderBody: () => null });
         api.registerSidebarSection({ id: 'custom-sec', render: () => null });
         api.registerEmptyAction({ id: 'custom-act', title: 'Act', subtitle: 'Sub', icon: null, onClick: () => {} });
@@ -38,6 +40,10 @@ describe('plugin system', () => {
 
     pluginRegistry.register(custom);
     expect(pluginRegistry.getTopTabs().some(t => t.id === 'custom-tab')).toBe(true);
+    // A top tab is a view of Sessions
+    expect(pluginRegistry.workbench.items('workbench:view').find(v => v.id === 'custom-tab')?.surface).toBe('sessions');
+    const provided = () => pluginRegistry.workbench.items('workbench:palette-provider').some(p => p.id === 'custom-provider');
+    expect(provided()).toBe(true);
     expect(pluginRegistry.getPaneType('custom-pane')).toBeDefined();
     expect(pluginRegistry.getAppWrappers().some(w => w.id === 'custom-wrap')).toBe(true);
     expect(pluginRegistry.getGlobalOverlays().some(o => o.id === 'custom-overlay')).toBe(true);
@@ -50,6 +56,7 @@ describe('plugin system', () => {
     pluginRegistry.setEnabled('test-plugin', false);
     expect(pluginRegistry.isEnabled('test-plugin')).toBe(false);
     expect(pluginRegistry.getTopTabs().some(t => t.id === 'custom-tab')).toBe(false);
+    expect(provided()).toBe(false);
     expect(pluginRegistry.getPaneType('custom-pane')).toBeUndefined();
     expect(pluginRegistry.getAppWrappers().some(w => w.id === 'custom-wrap')).toBe(false);
     expect(pluginRegistry.getGlobalOverlays().some(o => o.id === 'custom-overlay')).toBe(false);

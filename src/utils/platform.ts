@@ -1,39 +1,16 @@
-export type Platform = 'macos' | 'windows' | 'linux';
+// The conventions shared with MDViewer (dialog button order) live in @lambda-house/ui.
+import type { Platform } from '@lambda-house/ui';
+import { PALETTE_SHORTCUT, ariaShortcut, formatShortcut, matchesShortcut } from '@lambda-house/workbench';
+export { PLATFORM, ACTION_BUTTON_FIRST, type Platform } from '@lambda-house/ui';
 
-function detectPlatform(): Platform {
-  const name = navigator.platform || navigator.userAgent;
-  if (/mac|iphone|ipad/i.test(name)) return 'macos';
-  if (/win/i.test(name)) return 'windows';
-  return 'linux';
-}
+// The command panel's key is the workbench's palette key: Ctrl+Shift+P, and ⇧⌘P on macOS, where ⌘S is Save.
 
-/** The system the app runs on, for its conventions (shortcut names, button order). */
-export const PLATFORM: Platform = detectPlatform();
-
-/**
- * Where a dialog puts the button that goes ahead. Windows has it first and
- * Cancel last; macOS and Linux (GNOME) have Cancel first and the action last,
- * in the corner.
- */
-export const ACTION_BUTTON_FIRST = PLATFORM === 'windows';
-
-/**
- * The key that opens the command panel: Cmd+S on macOS. Elsewhere Ctrl+S is
- * taken (Save in Documents, history search and XOFF in a shell) and there is
- * no Cmd, so it is Ctrl+Shift+P, the palette key of Windows Terminal and VS Code.
- */
+/** The panel's key as the platform writes it, and for aria-keyshortcuts. */
 export function paletteShortcut(platform: Platform): { label: string; aria: string } {
-  return platform === 'macos'
-    ? { label: '⌘S', aria: 'Meta+S' }
-    : { label: 'Ctrl+Shift+P', aria: 'Control+Shift+P' };
+  return { label: formatShortcut(PALETTE_SHORTCUT, platform), aria: ariaShortcut(PALETTE_SHORTCUT, platform) };
 }
 
-/** Whether a key press opens the command panel on this platform. */
-export function isPaletteKey(e: KeyboardEvent, platform: Platform): boolean {
-  if (e.altKey) return false;
-  if (platform === 'macos') {
-    return e.metaKey && !e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 's';
-  }
-  // `code` too: on a Cyrillic or Greek layout `key` is not a Latin letter
-  return e.ctrlKey && e.shiftKey && !e.metaKey && (e.key.toLowerCase() === 'p' || e.code === 'KeyP');
+/** Whether a key press is the panel's key, on any keyboard layout (a terminal lets it through). */
+export function isPaletteKey(e: KeyboardEvent): boolean {
+  return matchesShortcut(e, PALETTE_SHORTCUT);
 }

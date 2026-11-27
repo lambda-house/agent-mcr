@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import ConfirmDialog from './ConfirmDialog';
+import { Button, ConfirmDialog, keepSame } from '@lambda-house/ui';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { HostedRow } from './SessionRow';
 import { formatAge } from '../utils/agent';
 import { ACTION_KIND, actionSource, ageTitle, clickable, harnessChips, harnessSaw, isOld, liveFacts, named, oneView, shownUrgency, staleMarks, stillAwaits, trackPublisher, trackStateShown, trackWaits, type Named, type NeedGroup } from '../utils/cockpit';
 import { harnessApi, type Cockpit, type CockpitAct, type CockpitAction, type CockpitLink, type CockpitTrack, type Hosted } from '../utils/harness';
-import { keepSame } from '../utils/keepSame';
 
 /**
  * The cockpit above the Supervisor's terminal (MCR-96): one view of tracks
@@ -114,7 +113,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
         {caution && <span className="ck-risk caution">{caution}</span>}
       </div>
       {a.derived && a.detail && <p className="ck-fact">{a.derived === 'wait' ? 'It registered: ' : ''}{a.detail}</p>}
-      {a.where?.session && heldSince && <p className="ck-buttons"><button type="button" className="ck-do quiet" disabled={busy} onClick={clearHold}>Clear hold for empty input</button></p>}
+      {a.where?.session && heldSince && <p className="ck-buttons"><Button variant="ghost" size="xs" wrap className="ck-do quiet" disabled={busy} onClick={clearHold}>Clear hold for empty input</Button></p>}
       {!a.derived && a.live?.report && <p className="ck-fact">{at ? at.name : 'The session'} reported: {a.live.report.text}</p>}
       {!a.derived && a.live?.waits?.map(w => <p key={w.id} className="ck-fact">{at ? at.name : 'The session'} waits for you, past its time. It registered: {w.on}</p>)}
       {a.why && <p>{a.why}</p>}
@@ -124,7 +123,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
           <p className="ck-say"><span>Line for {at ? at.name : 'that session'}:</span> <code>{a.say}</code></p>
           {clickable(a, 'say') && at?.hosted && (
             <p className="ck-buttons">
-              <button type="button" className="ck-do" disabled={busy} onClick={() => act('place')}>Place in {at.name}, unsent{caution ? ` (${caution})` : ''}</button>
+              <Button variant="secondary" size="xs" wrap className="ck-do" disabled={busy} onClick={() => act('place')}>Place in {at.name}, unsent{caution ? ` (${caution})` : ''}</Button>
               <span className="ck-from">{from}. Nothing is sent: you press Enter there.</span>
             </p>
           )}
@@ -137,7 +136,7 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
           {clickable(a, 'options') && choiceBox?.hosted ? (
             <>
               <p className="ck-buttons ck-choices">
-                {a.options.map((o, i) => <button key={o} type="button" className="ck-do" disabled={busy} onClick={() => act('choose', i)}>{o}{o === a.recommended ? ' (recommended by its publisher)' : ''}</button>)}
+                {a.options.map((o, i) => <Button key={o} variant="secondary" size="xs" wrap className="ck-do" disabled={busy} onClick={() => act('choose', i)}>{o}{o === a.recommended ? ' (recommended by its publisher)' : ''}</Button>)}
               </p>
               <p className="ck-from">{from}. A click places <code>Decision {a.id}: …</code> with your choice in the input box of {choiceBox.name}, unsent{caution ? ` (${caution})` : ''}: you press Enter there.</p>
             </>
@@ -152,22 +151,22 @@ function ActionRow({ action: a, cockpit, hosted, label, onSession }: { action: C
       {a.where?.command && (
         <div className="ck-click">
           <p className="ck-say"><span>Command, for you to run yourself:</span> <code>{a.where.command}</code></p>
-          {clickable(a, 'command') && <p className="ck-buttons"><button type="button" className="ck-do" disabled={busy} onClick={() => act('copy')}>Copy</button><span className="ck-from">{from}. It is copied, never run.</span></p>}
+          {clickable(a, 'command') && <p className="ck-buttons"><Button variant="secondary" size="xs" wrap className="ck-do" disabled={busy} onClick={() => act('copy')}>Copy</Button><span className="ck-from">{from}. It is copied, never run.</span></p>}
         </div>
       )}
       {a.where?.url && (
         <div className="ck-click">
           <p className="ck-say"><span>Link:</span> <code>{a.where.url}</code></p>
           {clickable(a, 'url')
-            ? <p className="ck-buttons"><button type="button" className="ck-do" disabled={busy} onClick={() => act('link')}>Open link…</button><span className="ck-from">{from}. You are shown where it goes first.</span></p>
+            ? <p className="ck-buttons"><Button variant="secondary" size="xs" wrap className="ck-do" disabled={busy} onClick={() => act('link')}>Open link…</Button><span className="ck-from">{from}. You are shown where it goes first.</span></p>
             : <p className="ck-source">No button: this is not a link a click opens (https, a public host name, no port).</p>}
         </div>
       )}
       {!a.derived && (a.detail || clickable(a, 'ask')) && (
         <div className="ck-click">
           <p className="ck-buttons">
-            {a.detail && <button type="button" className="ck-do quiet" aria-expanded={explain} onClick={() => setExplain(x => !x)}>{explain ? 'Hide the explanation' : 'Explain'}</button>}
-            {clickable(a, 'ask') && publisher?.hosted && <button type="button" className="ck-do quiet" disabled={busy} onClick={() => act('ask')}>Ask {publisher.name} more</button>}
+            {a.detail && <Button variant="ghost" size="xs" wrap className="ck-do quiet" aria-expanded={explain} onClick={() => setExplain(x => !x)}>{explain ? 'Hide the explanation' : 'Explain'}</Button>}
+            {clickable(a, 'ask') && publisher?.hosted && <Button variant="ghost" size="xs" wrap className="ck-do quiet" disabled={busy} onClick={() => act('ask')}>Ask {publisher.name} more</Button>}
           </p>
           {explain && a.detail && <p className="ck-detail">{a.detail}</p>}
         </div>
@@ -213,7 +212,7 @@ function Needs({ group, onUnfold, ...shared }: Shared & { group: NeedGroup; onUn
   return (
     <div className="ck-track-needs">
       <ul className="ck-actions">{group.rows.map(a => <ActionRow key={`${a.by ?? ''}:${a.id}:${a.updated ?? 0}`} action={a} {...shared}/>)}</ul>
-      {[...group.folded].map(([by, n]) => <button key={by} type="button" className="ck-do quiet ck-more" onClick={() => onUnfold(by)}>{n} more from {named(by, shared.cockpit, shared.hosted, shared.label).name}</button>)}
+      {[...group.folded].map(([by, n]) => <Button key={by} variant="ghost" size="xs" wrap className="ck-do quiet ck-more" onClick={() => onUnfold(by)}>{n} more from {named(by, shared.cockpit, shared.hosted, shared.label).name}</Button>)}
     </div>
   );
 }

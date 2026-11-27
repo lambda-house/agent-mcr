@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { Button } from '@lambda-house/ui';
 import { harnessApi } from '../utils/harness';
 import { chars, MAX_EXCERPT, MAX_INSTRUCTION } from '../utils/taskCopy';
 import { ACTION_BUTTON_FIRST, PLATFORM } from '../utils/platform';
@@ -59,8 +60,8 @@ export default function TaskCopyDialog({ source, name, excerpt, onDone, onCancel
     }
   };
 
-  const copyButton = <button key="copy" type="button" className="modal-btn modal-btn-primary" disabled={!ready} onClick={() => void copy()}>Copy as task</button>;
-  const cancelButton = <button key="cancel" type="button" className="modal-btn modal-btn-secondary" onClick={onCancel}>Cancel</button>;
+  const copyButton = <Button key="copy" variant="primary" disabled={!ready} onClick={() => void copy()}>Copy as task</Button>;
+  const cancelButton = <Button key="cancel" onClick={onCancel}>Cancel</Button>;
   const copyKeys = PLATFORM === 'macos' ? '⌘↩' : 'Ctrl+Enter';
 
   return createPortal(

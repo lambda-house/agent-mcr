@@ -8,7 +8,7 @@
 //! status, tool result, log line or audit row carries them.
 
 use crate::runner::{lock, now_ms, random_id};
-use crate::vault::{Keychain, Vault};
+use crate::vault::{Keychain, Unavailable, Vault};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -50,6 +50,9 @@ pub enum Fail {
     Limited(u64),
     /// No answer: whether Slack acted on the call is not known
     Transport(String),
+    /// Nothing was sent: the token could not be read from the secret store.
+    /// Never a refusal by Slack, so it changes no stored outcome
+    Vault(String),
 }
 
 impl std::fmt::Display for Fail {
@@ -58,6 +61,7 @@ impl std::fmt::Display for Fail {
             Fail::Refused(e) => write!(f, "Slack refused: {e}"),
             Fail::Limited(s) => write!(f, "Slack asks to wait {s} s"),
             Fail::Transport(e) => write!(f, "Slack was not reached: {e}"),
+            Fail::Vault(e) => write!(f, "{e}"),
         }
     }
 }
@@ -66,6 +70,29 @@ impl std::fmt::Display for Fail {
 /// with a body (refused by Slack from 2027-02-17).
 pub trait Web: Send + Sync {
     fn call(&self, token: &str, method: &str, params: &[(&str, String)]) -> Result<Value, Fail>;
+    /// The Socket Mode WebSocket at `url` (from `apps.connections.open`)
+    fn socket(&self, url: &str) -> Result<Box<dyn Frames>, String> {
+        Ok(Box::new(dial(url)?))
+    }
+}
+
+/// What the listener does with its WebSocket, so a test can stand in for it
+pub trait Frames: Send {
+    fn read(&mut self) -> Result<tungstenite::Message, tungstenite::Error>;
+    fn send(&mut self, message: tungstenite::Message) -> Result<(), tungstenite::Error>;
+    fn close(&mut self);
+}
+
+impl Frames for Socket {
+    fn read(&mut self) -> Result<tungstenite::Message, tungstenite::Error> {
+        tungstenite::WebSocket::read(self)
+    }
+    fn send(&mut self, message: tungstenite::Message) -> Result<(), tungstenite::Error> {
+        tungstenite::WebSocket::send(self, message)
+    }
+    fn close(&mut self) {
+        let _ = tungstenite::WebSocket::close(self, None);
+    }
 }
 
 pub struct Https(ureq::Agent);
@@ -312,7 +339,8 @@ impl Post {
 
 #[derive(Clone, Default)]
 struct Link {
-    /// off | connecting | connected | reconnecting | refused
+    /// off | connecting | connected | reconnecting | refused | unreadable (the
+    /// vault cannot say whether the tokens are there)
     state: String,
     error: String,
     last_event: u64,
@@ -378,6 +406,12 @@ fn clean(text: &str, max: usize) -> String {
     text.trim().chars().filter(|c| !c.is_control() || *c == '\n').take(max).collect()
 }
 
+/// Why nothing goes to Slack while the vault cannot say whether the tokens
+/// are there. The connection is kept: the tokens are not taken for gone.
+fn unreadable(why: Unavailable) -> String {
+    format!("The Slack tokens cannot be read from the secret store now ({})", why.0)
+}
+
 /// Agent text as Slack shows it without parsing anything: plain-text blocks of at most 2900 characters.
 fn text_blocks(text: &str) -> Vec<Value> {
     let chars: Vec<char> = text.chars().collect();
@@ -386,7 +420,7 @@ fn text_blocks(text: &str) -> Vec<Value> {
 
 impl Slack {
     pub fn open(dir: &Path) -> Self {
-        Self::with(dir, Box::new(Https::default()), Box::new(Keychain { service: KEYCHAIN_SERVICE, what: "Slack tokens" }), 10_000)
+        Self::with(dir, Box::new(Https::default()), Box::new(Keychain::new(KEYCHAIN_SERVICE, "Slack tokens")), 10_000)
     }
 
     fn with(dir: &Path, web: Box<dyn Web>, vault: Box<dyn Vault>, settle_after: u64) -> Self {
@@ -426,13 +460,32 @@ impl Slack {
         lock(&self.unsaved).is_empty()
     }
 
-    fn bot(&self) -> Result<String, String> {
-        self.vault.get("bot").ok_or_else(|| "Slack is not connected".to_string())
+    /// The app-level token to listen with, or the link state and its error to
+    /// show instead: `unreadable` while the vault cannot say whether it is there.
+    fn listening_token(&self) -> Result<String, (&'static str, String)> {
+        if !self.active() {
+            return Err(("off", String::new()));
+        }
+        match self.vault.get("app") {
+            Ok(Some(app)) => Ok(app),
+            Ok(None) => Err(("off", String::new())),
+            Err(why) => Err(("unreadable", unreadable(why))),
+        }
     }
 
+    /// A call with the bot token. A token the vault cannot read is
+    /// `Fail::Vault`: nothing went to Slack, and Slack refused nothing.
     fn api(&self, method: &str, params: &[(&str, String)]) -> Result<Value, Fail> {
-        let token = self.bot().map_err(Fail::Refused)?;
+        let token = self.bot_token()?;
         self.web.call(&token, method, params)
+    }
+
+    fn bot_token(&self) -> Result<String, Fail> {
+        match self.vault.get("bot") {
+            Ok(Some(bot)) => Ok(bot),
+            Ok(None) => Err(Fail::Refused("Slack is not connected".into())),
+            Err(why) => Err(Fail::Vault(unreadable(why))),
+        }
     }
 
     fn active(&self) -> bool {
@@ -543,10 +596,12 @@ impl Slack {
     /// Keep the tokens in the Keychain and start listening. The app has asked the person first.
     pub fn connect(&self, bot: &str, app: &str, operator: &str) -> Result<Value, String> {
         let found = self.probe(bot, app, operator)?;
-        self.vault.set("bot", bot)?;
-        if let Err(e) = self.vault.set("app", app) {
-            self.vault.delete("bot");
-            return Err(e);
+        let unkept = |why: Unavailable| format!("The Slack tokens could not be kept in {}: {}", crate::vault::STORE_NAME, why.0);
+        self.vault.set("bot", bot).map_err(unkept)?;
+        if let Err(why) = self.vault.set("app", app) {
+            // A bot token left behind is not used: nothing is connected, and the next connect replaces it
+            let _ = self.vault.delete("bot");
+            return Err(unkept(why));
         }
         let text = |key: &str| found[key].as_str().unwrap_or("").to_string();
         self.update(|s| {
@@ -569,12 +624,15 @@ impl Slack {
 
     pub fn disconnect(&self, host: &dyn Host) {
         self.cancel_open(host, "Slack was disconnected");
-        self.vault.delete("bot");
-        self.vault.delete("app");
+        // Both are tried; what could not be removed is said in the audit
+        let removed = self.vault.delete("bot").and(self.vault.delete("app"));
         self.update(|s| {
             s.connection = None;
             s.enabled = false;
-            s.log("disconnected", String::new());
+            s.log("disconnected", match removed {
+                Ok(()) => String::new(),
+                Err(why) => format!("the tokens could not be removed from the secret store ({}); nothing uses them, and the next connect replaces them", why.0),
+            });
         });
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
@@ -1261,7 +1319,8 @@ impl Slack {
     /// One round of the work that talks to Slack: approval messages, sending,
     /// settling unknown outcomes, catching up. Returns whether anything was done.
     pub fn work(&self, host: &dyn Host) -> bool {
-        if !self.active() || self.vault.get("bot").is_none() {
+        // Nothing goes out while the tokens cannot be read either; the listener says why
+        if !self.active() || !matches!(self.vault.get("bot"), Ok(Some(_))) {
             return false;
         }
         if !self.saved() {
@@ -1299,8 +1358,9 @@ impl Slack {
                     });
                     self.update(|s| {
                         if let Some(stored) = s.posts.get_mut(&p.id) {
-                            // Not reached or asked to wait: again in a while. A refusal will not change
-                            stored.dm_tried = !matches!(sent, Err(Fail::Transport(_)) | Err(Fail::Limited(_)));
+                            // Not reached, asked to wait or no token to send with: again in a while.
+                            // A refusal will not change
+                            stored.dm_tried = !matches!(sent, Err(Fail::Transport(_) | Fail::Limited(_) | Fail::Vault(_)));
                             if !stored.dm_tried {
                                 stored.dm_retry_at = now_ms() + 30_000;
                             }
@@ -1334,7 +1394,7 @@ impl Slack {
                 let what = Self::decided_line(&p);
                 let closed = self.api("chat.update", &[("channel", channel.clone()), ("ts", ts.clone()), ("text", what.clone()), ("blocks", Self::approval_blocks(&p, &p.channel, Some(&what)).to_string())]);
                 // A refusal will not change on a second try
-                if !matches!(closed, Err(Fail::Transport(_)) | Err(Fail::Limited(_))) {
+                if !matches!(closed, Err(Fail::Transport(_) | Fail::Limited(_) | Fail::Vault(_))) {
                     self.update(|s| {
                         if let Some(stored) = s.posts.get_mut(&p.id) {
                             stored.dm_closed = true;
@@ -1350,6 +1410,9 @@ impl Slack {
     /// Send one allowed post. The state is stored before the call, so a post
     /// is never sent twice: an unanswered call becomes `unknown`, not a retry.
     fn send(&self, host: &dyn Host, p: &Post) {
+        // The token is read before the post is marked: a vault that cannot be read leaves it
+        // allowed, to go out once it can
+        let Ok(token) = self.bot_token() else { return };
         let go = self.update(|s| {
             let on = s.enabled;
             let posting = s.channels.get(&p.channel).map(|c| c.posting.clone()).unwrap_or_default();
@@ -1401,11 +1464,16 @@ impl Slack {
         if let Some(thread) = &p.thread_ts {
             params.push(("thread_ts", thread.clone()));
         }
-        let answer = self.api("chat.postMessage", &params);
+        let answer = self.web.call(&token, "chat.postMessage", &params);
         let url = lock(&self.state).connection.as_ref().map(|c| c.url.clone()).unwrap_or_default();
         let after = self.update(|s| {
             let stored = s.posts.get_mut(&p.id)?;
             match &answer {
+                Err(Fail::Vault(_)) => {
+                    // Not sent: it stays allowed
+                    stored.state = "approved".into();
+                    stored.attempted = 0;
+                }
                 Ok(m) => {
                     let ts = m["ts"].as_str().unwrap_or("").to_string();
                     stored.link = Some(format!("{url}archives/{}/p{}", p.channel, ts.replace('.', "")));
@@ -1469,6 +1537,8 @@ impl Slack {
                         break;
                     }
                 }
+                // Nothing was looked at, and nothing is counted against the post
+                Err(Fail::Vault(_)) => return false,
                 Err(e) => {
                     checked = Err(e);
                     break;
@@ -1530,21 +1600,17 @@ impl Slack {
             let mut pause = 1;
             loop {
                 let epoch = slack.epoch.load(Ordering::SeqCst);
-                let app = slack.vault.get("app").filter(|_| slack.active());
-                let Some(app) = app else {
-                    slack.set_link("off", "");
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
+                let app = match slack.listening_token() {
+                    Ok(app) => app,
+                    // Off, or the tokens cannot be read now: looked at again shortly
+                    Err((state, error)) => {
+                        slack.set_link(state, &error);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
                 };
                 slack.set_link(if lock(&slack.link).last_event == 0 { "connecting" } else { "reconnecting" }, "");
-                match slack.listen(&*host, &app, epoch) {
-                    Ok(()) => pause = 1,
-                    Err(e) => {
-                        let refused = e.starts_with("Slack refused");
-                        slack.set_link(if refused { "refused" } else { "reconnecting" }, &e);
-                        pause = if refused { 60 } else { (pause * 2).min(60) };
-                    }
-                }
+                pause = slack.after_listen(slack.listen(&*host, &app, epoch), pause);
                 // Wait, but notice a new connection or the off switch at once
                 for _ in 0..pause * 5 {
                     if slack.epoch.load(Ordering::SeqCst) != epoch {
@@ -1557,23 +1623,60 @@ impl Slack {
         });
     }
 
+    /// What the link shows after a connection ended, and the pause, in
+    /// seconds, before the next
+    fn after_listen(&self, ended: Result<(), Stop>, pause: u64) -> u64 {
+        match ended {
+            Ok(()) => 1,
+            // The keyring locked while listening: the link says so, and the app offers the unlock
+            Err(Stop::Unreadable(e)) => {
+                self.set_link("unreadable", &e);
+                1
+            }
+            Err(Stop::Lost(e)) => {
+                let refused = e.starts_with("Slack refused");
+                self.set_link(if refused { "refused" } else { "reconnecting" }, &e);
+                if refused { 60 } else { (pause * 2).min(60) }
+            }
+        }
+    }
+
     fn set_link(&self, state: &str, error: &str) {
         let mut link = lock(&self.link);
         link.state = state.into();
         link.error = error.into();
     }
 
+    /// Whether the app-level token can still be read, looked at every
+    /// `LOOK_EVERY` while listening, at every pass of the loop, a busy one
+    /// too: a keyring that locked ends the connection, which would otherwise
+    /// stay up while nothing can go out.
+    fn still_readable(&self, looked: &mut Instant) -> Result<(), Stop> {
+        if looked.elapsed() < LOOK_EVERY {
+            return Ok(());
+        }
+        *looked = Instant::now();
+        match self.vault.get("app") {
+            Err(why) => Err(Stop::Unreadable(unreadable(why))),
+            Ok(_) => Ok(()),
+        }
+    }
+
     /// One Socket Mode connection, until Slack or the operator ends it.
-    fn listen(&self, host: &dyn Host, app: &str, epoch: u64) -> Result<(), String> {
+    fn listen(&self, host: &dyn Host, app: &str, epoch: u64) -> Result<(), Stop> {
         use tungstenite::Message;
         let url = self.web.call(app, "apps.connections.open", &[]).map_err(|e| e.to_string())?["url"].as_str().unwrap_or("").to_string();
-        let mut socket = dial(&url)?;
+        let mut socket = self.web.socket(&url)?;
         // Reads return every few seconds, so the off switch and a dead connection are noticed
-        let (mut heard, mut pinged) = (Instant::now(), Instant::now());
+        let (mut heard, mut pinged, mut looked) = (Instant::now(), Instant::now(), Instant::now());
         loop {
             if self.epoch.load(Ordering::SeqCst) != epoch {
-                let _ = socket.close(None);
+                socket.close();
                 return Ok(());
+            }
+            if let Err(stop) = self.still_readable(&mut looked) {
+                socket.close();
+                return Err(stop);
             }
             let text = match socket.read() {
                 Ok(Message::Text(text)) => {
@@ -1588,7 +1691,7 @@ impl Slack {
                 Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                     // After sleep or a network change a connection can be dead without closing
                     if heard.elapsed() > SILENCE {
-                        return Err(format!("Slack was not reached: nothing arrived for {} s", SILENCE.as_secs()));
+                        return Err(format!("Slack was not reached: nothing arrived for {} s", SILENCE.as_secs()).into());
                     }
                     if heard.elapsed() > SILENCE / 3 && pinged.elapsed() > SILENCE / 3 {
                         pinged = Instant::now();
@@ -1596,7 +1699,7 @@ impl Slack {
                     }
                     continue;
                 }
-                Err(e) => return Err(format!("Slack was not reached: {e}")),
+                Err(e) => return Err(format!("Slack was not reached: {e}").into()),
             };
             let Ok(envelope) = serde_json::from_str::<Value>(&text) else { continue };
             {
@@ -1618,7 +1721,7 @@ impl Slack {
                 }
                 // Slack ends connections every few hours: routine
                 "disconnect" => {
-                    return if envelope["reason"] == "link_disabled" { Err("Slack refused: Socket Mode is switched off for the app".into()) } else { Ok(()) };
+                    return if envelope["reason"] == "link_disabled" { Err(String::from("Slack refused: Socket Mode is switched off for the app").into()) } else { Ok(()) };
                 }
                 kind @ ("events_api" | "interactive") => {
                     {
@@ -1648,6 +1751,23 @@ impl Slack {
 
 /// With no frame for this long, not even an answer to our ping, the connection is taken for dead
 const SILENCE: Duration = Duration::from_secs(90);
+/// How often the listener looks whether the app-level token can still be read
+const LOOK_EVERY: Duration = if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(30) };
+
+/// Why a Socket Mode connection ended
+#[derive(Debug, PartialEq)]
+enum Stop {
+    /// Slack ended it, refused it, or could not be reached
+    Lost(String),
+    /// The app-level token cannot be read from the secret store any more
+    Unreadable(String),
+}
+
+impl From<String> for Stop {
+    fn from(e: String) -> Self {
+        Stop::Lost(e)
+    }
+}
 
 type Socket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
 
@@ -1693,6 +1813,7 @@ pub fn agent_tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::Held;
 
     type Params = Vec<(String, String)>;
 
@@ -1701,6 +1822,9 @@ mod tests {
         calls: Mutex<Vec<(String, Params)>>,
         /// Answers per method, used once each, before the default
         scripted: Mutex<BTreeMap<String, Vec<Result<Value, Fail>>>>,
+        /// Frames the fake Socket Mode connection gave, and whether it was closed
+        frames: std::sync::atomic::AtomicUsize,
+        closed: AtomicBool,
     }
 
     impl FakeWeb {
@@ -1715,7 +1839,27 @@ mod tests {
         }
     }
 
+    /// A Socket Mode connection that never goes quiet: a frame every 2 ms
+    struct Busy(Arc<FakeWeb>);
+
+    impl Frames for Busy {
+        fn read(&mut self) -> Result<tungstenite::Message, tungstenite::Error> {
+            std::thread::sleep(Duration::from_millis(2));
+            self.0.frames.fetch_add(1, Ordering::SeqCst);
+            Ok(tungstenite::Message::text(json!({"type": "events_api", "payload": {"event": {"type": "reaction_added"}}}).to_string()))
+        }
+        fn send(&mut self, _: tungstenite::Message) -> Result<(), tungstenite::Error> {
+            Ok(())
+        }
+        fn close(&mut self) {
+            self.0.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
     impl Web for Arc<FakeWeb> {
+        fn socket(&self, _url: &str) -> Result<Box<dyn Frames>, String> {
+            Ok(Box::new(Busy(self.clone())))
+        }
         fn call(&self, _token: &str, method: &str, params: &[(&str, String)]) -> Result<Value, Fail> {
             lock(&self.calls).push((method.into(), params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()));
             if let Some(answer) = lock(&self.scripted).get_mut(method).filter(|a| !a.is_empty()).map(|a| a.remove(0)) {
@@ -1729,22 +1873,6 @@ mod tests {
                 "chat.postMessage" => json!({"ok": true, "ts": "1700000100.000200"}),
                 _ => json!({"ok": true}),
             })
-        }
-    }
-
-    #[derive(Default)]
-    struct Memory(Mutex<BTreeMap<String, String>>);
-
-    impl Vault for Memory {
-        fn get(&self, account: &str) -> Option<String> {
-            lock(&self.0).get(account).cloned()
-        }
-        fn set(&self, account: &str, secret: &str) -> Result<(), String> {
-            lock(&self.0).insert(account.into(), secret.into());
-            Ok(())
-        }
-        fn delete(&self, account: &str) {
-            lock(&self.0).remove(account);
         }
     }
 
@@ -1769,9 +1897,13 @@ mod tests {
     }
 
     fn connected(posting: &str) -> (tempdir::Dir, Slack, Arc<FakeWeb>, FakeHost) {
+        connected_to(posting, Box::new(Held::default()))
+    }
+
+    fn connected_to(posting: &str, vault: Box<dyn Vault>) -> (tempdir::Dir, Slack, Arc<FakeWeb>, FakeHost) {
         let dir = tempdir::Dir::new();
         let web = Arc::new(FakeWeb::default());
-        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let slack = Slack::with(dir.path(), Box::new(web.clone()), vault, 0);
         slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
         // Off from connect; the tests of approval in Slack are about a connection where the operator switched it on
         slack.set_slack_approval(true);
@@ -1961,7 +2093,7 @@ mod tests {
         // The stored state holds no token, and a new service reads the same policies
         let stored = std::fs::read_to_string(dir.path().join("slack-state.json")).unwrap();
         assert!(!stored.contains("xoxb-") && !stored.contains("xapp-") && !slack.status().to_string().contains("xoxb-"));
-        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Held::default()), 0);
         assert_eq!(lock(&again.state).channels["C1"].posting, "approve");
         assert_eq!(post_of(&again, &p.id).state, "cancelled");
     }
@@ -2117,6 +2249,147 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_sent_while_the_tokens_cannot_be_read_and_nothing_is_lost() {
+        let vault = Arc::new(Held::default());
+        let (_dir, slack, web, host) = connected_to("auto", Box::new(vault.clone()));
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "later"}));
+        assert_eq!(p.state, "approved");
+        // Locked: nothing goes out, the post stays allowed, and the connection stays
+        let locked = Unavailable("the vault is locked");
+        vault.refuse(Some(locked));
+        assert!(!slack.work(&host));
+        assert_eq!(web.count("chat.postMessage"), 0);
+        assert_eq!(post_of(&slack, &p.id).state, "approved");
+        assert_eq!(slack.bot_token(), Err(Fail::Vault(unreadable(locked))));
+        assert!(slack.status()["connection"].is_object());
+        // The listener shows why, as a state of its own that the panel offers to unlock
+        assert_eq!(slack.listening_token(), Err(("unreadable", unreadable(locked))));
+        // Open again: the listener has its token, and the post goes, once
+        vault.refuse(None);
+        assert_eq!(slack.listening_token(), Ok("xapp-1".to_string()));
+        while slack.work(&host) {}
+        assert_eq!(post_of(&slack, &p.id).state, "sent");
+        assert_eq!(web.count("chat.postMessage"), 1);
+        // A disconnect while it is locked says that the tokens stayed behind, where nothing uses them
+        vault.refuse(Some(locked));
+        slack.disconnect(&host);
+        let said = lock(&slack.state).audit.last().unwrap().text.clone();
+        assert!(said.contains("could not be removed") && said.contains("the vault is locked"), "{said}");
+        vault.refuse(None);
+        assert_eq!(vault.get("bot"), Ok(Some("xoxb-1".to_string())));
+        assert!(slack.status()["connection"].is_null());
+        assert!(!slack.work(&host));
+        assert_eq!(slack.listening_token(), Err(("off", String::new())));
+    }
+
+    /// A vault that reads the bot token a given number of times more, then
+    /// answers as a locked store, as one that locks in the middle of a round
+    struct LocksAfter(Arc<Held>, Mutex<Option<usize>>);
+
+    impl Vault for Arc<LocksAfter> {
+        fn get(&self, account: &str) -> Result<Option<String>, Unavailable> {
+            if account == "bot" {
+                if let Some(left) = lock(&self.1).as_mut() {
+                    if *left == 0 {
+                        return Err(Unavailable("the vault is locked"));
+                    }
+                    *left -= 1;
+                }
+            }
+            self.0.get(account)
+        }
+        fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable> {
+            self.0.set(account, secret)
+        }
+        fn delete(&self, account: &str) -> Result<(), Unavailable> {
+            self.0.delete(account)
+        }
+    }
+
+    #[test]
+    fn a_store_that_locks_after_the_precheck_leaves_an_approved_post_to_go_out_later() {
+        let vault = Arc::new(LocksAfter(Arc::new(Held::default()), Mutex::new(None)));
+        let (_dir, slack, web, host) = connected_to("approve", Box::new(vault.clone()));
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "after the unlock"}));
+        slack.decide_in_app(&host, &p.id, true, None, None).unwrap();
+        // The round's look at the vault passes; the read before sending does not
+        *lock(&vault.1) = Some(1);
+        slack.work(&host);
+        assert_eq!(web.count("chat.postMessage"), 0);
+        let stored = post_of(&slack, &p.id);
+        assert_eq!((stored.state.as_str(), stored.reason.as_deref()), ("approved", None));
+        assert!(!lock(&slack.state).audit.iter().any(|a| a.kind == "failed"));
+        // Unlocked: it goes out, once
+        *lock(&vault.1) = None;
+        while slack.work(&host) {}
+        assert_eq!(post_of(&slack, &p.id).state, "sent");
+        assert_eq!(web.count("chat.postMessage"), 1);
+    }
+
+    #[test]
+    fn an_approval_message_with_no_token_to_send_it_with_is_tried_again() {
+        let vault = Arc::new(LocksAfter(Arc::new(Held::default()), Mutex::new(None)));
+        let (_dir, slack, web, host) = connected_to("approve", Box::new(vault.clone()));
+        let p = ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "ask me"}));
+        *lock(&vault.1) = Some(1);
+        slack.work(&host);
+        let stored = post_of(&slack, &p.id);
+        assert!(!stored.dm_tried && stored.dm_retry_at > now_ms() && stored.dm_ts.is_none(), "{stored:?}");
+        assert_eq!(web.count("conversations.open"), 0);
+        assert!(!lock(&slack.state).audit.iter().any(|a| a.kind == "failed"));
+        // Unlocked, and the 30 s are over: the operator is asked in Slack after all
+        *lock(&vault.1) = None;
+        slack.update(|s| s.posts.get_mut(&p.id).unwrap().dm_retry_at = 0);
+        slack.work(&host);
+        assert!(post_of(&slack, &p.id).dm_ts.is_some());
+        assert_eq!(web.count("chat.postMessage"), 1);
+    }
+
+    #[test]
+    fn a_store_that_locks_while_listening_ends_the_connection_and_says_so() {
+        let vault = Arc::new(Held::default());
+        let (_dir, slack, _web, _host) = connected_to("approve", Box::new(vault.clone()));
+        let locked = Unavailable("the vault is locked");
+        vault.refuse(Some(locked));
+        // Looked at recently: not read again yet
+        assert_eq!(slack.still_readable(&mut Instant::now()), Ok(()));
+        let mut looked = Instant::now().checked_sub(SILENCE).unwrap();
+        let stopped = slack.still_readable(&mut looked);
+        assert_eq!(stopped, Err(Stop::Unreadable(unreadable(locked))));
+        assert!(looked.elapsed() < SILENCE / 3);
+        // The link shows it, as the state the panel offers to unlock, and the listener looks again soon
+        assert_eq!(slack.after_listen(stopped, 8), 1);
+        assert_eq!(slack.status()["link"], "unreadable");
+        vault.refuse(None);
+        assert_eq!(slack.still_readable(&mut Instant::now().checked_sub(SILENCE).unwrap()), Ok(()));
+    }
+
+    /// A steady stream of frames never times a read out: the listener still
+    /// looks at the token by the clock, and ends as unreadable
+    #[test]
+    fn a_busy_listener_ends_as_unreadable_when_the_store_locks() {
+        let vault = Arc::new(Held::default());
+        let (_dir, slack, web, host) = connected_to("approve", Box::new(vault.clone()));
+        let locked = Unavailable("the vault is locked");
+        let epoch = slack.epoch.load(Ordering::SeqCst);
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let (slack, host) = (&slack, &host);
+            scope.spawn(move || {
+                let _ = done.send(slack.listen(host, "xapp-1", epoch));
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            vault.refuse(Some(locked));
+            let ended = ended.recv_timeout(Duration::from_secs(2));
+            // A listener that did not see it is stopped here, so the test ends either way
+            slack.epoch.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(ended, Ok(Err(Stop::Unreadable(unreadable(locked)))));
+        });
+        assert!(web.frames.load(Ordering::SeqCst) > 20, "the stream was not busy");
+        assert!(web.closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn a_session_is_told_only_the_channels_it_posts_to_or_hears_from() {
         let (_dir, slack, _web, host) = connected("never");
         let seen = |me: &str| slack.tool(&host, me, "slack_channels", &json!({})).unwrap()["channels"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap().to_string(), c["youMayPost"] == true, !c["listenedFor"].is_null())).collect::<Vec<_>>();
@@ -2146,7 +2419,7 @@ mod tests {
         let dir = tempdir::Dir::new();
         let web = Arc::new(FakeWeb::default());
         let host = FakeHost::default();
-        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let slack = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Held::default()), 0);
         slack.connect("xoxb-1", "xapp-1", "UOP").unwrap();
         slack.set_policy("C1", &json!({"listen": "all", "route": "session", "session": "s1", "posting": "approve"})).unwrap();
         assert_eq!(slack.status()["connection"]["approveInSlack"], false);
@@ -2166,7 +2439,7 @@ mod tests {
         assert_eq!((post_of(&slack, &p.id).state.as_str(), web.count("conversations.open"), web.count("chat.postMessage")), ("sent", 0, 1));
         // Switched on by the operator, it is kept as stored: on after a restart, and a later post is asked about in Slack
         slack.set_slack_approval(true);
-        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Memory::default()), 0);
+        let again = Slack::with(dir.path(), Box::new(web.clone()), Box::new(Held::default()), 0);
         assert_eq!(again.status()["connection"]["approveInSlack"], true);
         ask(&slack, &host, "slack_post", json!({"channel": "C1", "text": "asked in Slack too"}));
         slack.work(&host);

@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
+import { Menu } from '@lambda-house/ui';
 import { Terminal, type IDecoration, type IMarker } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { harnessApi, pastedImage, pointerSpans, SESSION_DRAG_TYPE, shellQuote, type TerminalCell } from '../utils/harness';
-import { isPaletteKey, PLATFORM } from '../utils/platform';
+import { isPaletteKey } from '../utils/platform';
 import { excerptFromSelection } from '../utils/taskCopy';
 import { isCopyKey, isTaskKey, terminalTask, type TerminalTask } from '../utils/terminalTask';
 import TaskCopyDialog from './TaskCopyDialog';
@@ -23,15 +24,15 @@ export const QUIT_WINDOW_MS = 10_000;
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
 const INPUT_DROPPED_NOTICE = 'Terminal input was dropped. Check the prompt and retype the lost keys.';
 
-/** Colours from the Sessions palette the pane sits in (light and dark). */
+/** Colours from the shared tokens (@lambda-house/tokens), light or dark. */
 function theme(element: HTMLElement) {
   const css = getComputedStyle(element);
   const v = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
   return {
-    background: v('--sc-bg', '#101519'),
-    foreground: v('--sc-text', '#e4ecef'),
-    cursor: v('--sc-accent', '#91d6b3'),
-    selectionBackground: v('--sc-card', '#1c252c'),
+    background: v('--canvas', '#1e1e1e'),
+    foreground: v('--text', '#cccccc'),
+    cursor: v('--accent', '#4fc1ff'),
+    selectionBackground: v('--selected', '#094771'),
   };
 }
 
@@ -205,7 +206,7 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     // So is Copy as task's (MCR-125): Ctrl+Shift+C would reach the agent as Ctrl+C and stop its turn
     // On Windows and Linux Ctrl+Shift+C copies the selection, as in other terminals, and is never the agent's
     t.attachCustomKeyEventHandler(e => {
-      if (isPaletteKey(e, PLATFORM) || isTaskKey(e)) return false;
+      if (isPaletteKey(e) || isTaskKey(e)) return false;
       if (isCopyKey(e)) {
         if (e.type === 'keydown' && t.hasSelection()) copyText(t.getSelection());
         return false;
@@ -555,24 +556,16 @@ export default function TerminalPane({ id, name, active, focusOnMount = false, o
     return () => cancelAnimationFrame(frame);
   }, [focusAt]);
 
-  // The menu closes on a click elsewhere and on Escape
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
-    window.addEventListener('mousedown', close); window.addEventListener('keydown', key); window.addEventListener('blur', close);
-    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', key); window.removeEventListener('blur', close); };
-  }, [menu]);
 
   const copied = () => { setTask(null); say('Copied as a task: paste it into the session that is to do it.'); };
 
   return <div className="hs-terminal-wrap">
     <div className="hs-terminal-pad"><div className="hs-terminal" ref={host} onClick={() => term.current?.focus()} /></div>
     {(ended || notice) && <div className="hs-terminal-notice" role="status">{notice || 'The session ended.'}</div>}
-    {menu && <div className="hs-menu tc-menu" role="menu" style={{ top: menu.y, left: menu.x }} onMouseDown={e => e.stopPropagation()}>
-      <button type="button" role="menuitem" onClick={() => { const text = menu.text; setMenu(null); copyText(text); }}>Copy</button>
-      <button type="button" role="menuitem" autoFocus onClick={() => openTask(menu.text)}>Copy as task…</button>
-    </div>}
+    {menu && <Menu label="Selection" at={{ top: menu.y, left: menu.x }} focusIndex={1} onClose={() => setMenu(null)} items={[
+      { label: 'Copy', onSelect: () => copyText(menu.text) },
+      { label: 'Copy as task…', onSelect: () => openTask(menu.text) },
+    ]}/>}
     {task !== null && <TaskCopyDialog source={id} name={name} excerpt={task} onDone={copied} onCancel={() => setTask(null)}/>}
   </div>;
 }

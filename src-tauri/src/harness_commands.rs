@@ -832,20 +832,30 @@ pub async fn memory_status() -> Result<Value, String> {
     blocking(|| service(json!({"op": "memory_status"}))).await
 }
 
+/// What the dialogs that keep a secret say of the store beyond its name.
+fn store_note() -> String {
+    crate::vault::STORE_NOTE.map(|note| format!(" {note}")).unwrap_or_default()
+}
+
 /// Ask the person, then let the service start the sign-in and open the
 /// browser at the authorization server's page. Returns the status either way.
+/// A locked keyring (Linux) is unlocked first, by its own prompt: the sign-in
+/// could not be kept otherwise.
 #[tauri::command]
 pub async fn memory_connect(app: tauri::AppHandle) -> Result<Value, String> {
     use tauri_plugin_opener::OpenerExt;
     blocking(move || {
         let now = service(json!({"op": "memory_status"}))?;
         let message = format!(
-            "Agent MCR signs in to {} in your browser, as you. The sign-in is kept in the macOS Keychain on this Mac by the background service, and is shown to no agent.\n\nEvery agent session Agent MCR starts then has the memory tools without a question per call: it can read what your account reaches there and write to it. What memory returns is data for the agent, not an instruction. Sessions that run now get the tools at their next restart.",
-            now["endpoint"].as_str().unwrap_or("the memory service")
+            "Agent MCR signs in to {} in your browser, as you. The background service keeps the sign-in in {} on this computer and gives it to no agent.{}\n\nEvery agent session Agent MCR starts then has the memory tools without a question per call: it can read what your account reaches there and write to it. What memory returns is data for the agent, not an instruction. Sessions that run now get the tools at their next restart.",
+            now["endpoint"].as_str().unwrap_or("the memory service"),
+            crate::vault::STORE_NAME,
+            store_note()
         );
         if !confirmed(&app, "Connect memory?", message, "Sign in", false) {
             return Ok(now);
         }
+        crate::vault::unlock()?;
         let mut started = service(json!({"op": "memory_connect"}))?;
         let url = started.as_object_mut().and_then(|s| s.remove("url")).and_then(|u| u.as_str().map(str::to_string)).unwrap_or_default();
         // The service only names https pages; a browser that cannot be opened ends the sign-in
@@ -865,8 +875,13 @@ pub async fn memory_connect(app: tauri::AppHandle) -> Result<Value, String> {
 pub async fn memory_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
     blocking(move || {
         let now = service(json!({"op": "memory_status"}))?;
-        if now["state"] != "connecting" && !confirmed(&app, "Disconnect memory?", "The sign-in is revoked at the memory service and removed from the Keychain. Agent sessions keep the memory server, which then tells them it is not connected.".to_string(), "Disconnect", true) {
+        let signed_in = now["state"] != "connecting";
+        if signed_in && !confirmed(&app, "Disconnect memory?", format!("The sign-in is revoked at the memory service and removed from {}. Agent sessions keep the memory server, which then tells them it is not connected.", crate::vault::STORE_NAME), "Disconnect", true) {
             return Ok(now);
+        }
+        // A keyring that stays locked keeps the sign-in there unused, and the service says so
+        if signed_in {
+            let _ = crate::vault::unlock();
         }
         service(json!({"op": "memory_disconnect"}))
     })
@@ -901,13 +916,15 @@ pub async fn slack_connect(app: tauri::AppHandle, bot: String, app_token: String
         let found = service(json!({"op": "slack_probe", "bot": bot, "app": app_token, "operator": operator}))?;
         let text = |key: &str| found[key].as_str().unwrap_or("").to_string();
         let message = format!(
-            "Workspace: {}\nBot: {}\n\n{} ({}) is recorded as you. Only this Slack user's button presses can approve or deny a post, and this is the first sender whose messages reach a session.\n\nThe two tokens are kept in {store} on this computer and are shown to no agent. Nothing is listened to and nothing can be posted until you set a channel's policy.",
+            "Workspace: {}\nBot: {}\n\n{} ({}) is recorded as you. Only this Slack user's button presses can approve or deny a post, and this is the first sender whose messages reach a session.\n\nThe two tokens are kept in {} on this computer and given to no agent.{} Nothing is listened to and nothing can be posted until you set a channel's policy.",
             text("team"), text("botName"), text("operatorName"), text("operator"),
-            store = if cfg!(windows) { "Windows Credential Manager" } else { "the macOS Keychain" }
+            crate::vault::STORE_NAME,
+            store_note()
         );
         if !confirmed(&app, "Connect Slack?", message, "Connect", false) {
             return Ok(Value::Null);
         }
+        crate::vault::unlock()?;
         service(json!({"op": "slack_connect", "bot": bot, "app": app_token, "operator": operator}))
     })
     .await
@@ -919,9 +936,19 @@ pub async fn slack_disconnect(app: tauri::AppHandle) -> Result<Value, String> {
         if !confirmed(&app, "Disconnect Slack?", "The tokens are removed from the secret store, listening stops and posts that wait are cancelled. Channel policies are kept for the next time.".to_string(), "Disconnect", true) {
             return service(json!({"op": "slack"}));
         }
+        // A keyring that stays locked keeps the tokens there unused, and the audit says so
+        let _ = crate::vault::unlock();
         service(json!({"op": "slack_disconnect"}))
     })
     .await
+}
+
+/// Unlock the desktop keyring on the person's word, from the Slack and memory
+/// panels: the keyring asks in its own prompt (Linux; nothing elsewhere). The
+/// service reads the tokens again by itself.
+#[tauri::command]
+pub async fn vault_unlock() -> Result<(), String> {
+    blocking(crate::vault::unlock).await
 }
 
 /// The off switch. Turning it off needs no question; turning it on again does.

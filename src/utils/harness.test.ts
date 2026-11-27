@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeLiveList } from '../store';
-import { agentProfileTitle, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, sessionLinks, sessionReference, sessionSummary, shellQuote, showHostedRow, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report, directorySections, pathBelow, subfolderTag, type Resumable, unframe } from './harness';
+import { agentProfileTitle, canUnlockStore, DEFAULT_LIVE_LIST, folderVisibility, temporaryFolder, type DirSection, gist, heldNote, hostedLabel, hostedState, pastedImage, pointerSpans, programHint, runningFor, secretStoreName, sessionLinks, sessionReference, sessionSummary, shellQuote, showHostedRow, type Hosted, relationRows, executorsBelow, supervisorChoices, reportGroups, type Report, directorySections, pathBelow, subfolderTag, type Resumable, unframe } from './harness';
 
 const hosted = (over: Partial<Hosted> = {}): Hosted => ({ id: 'a', pid: 1, argv: ['/bin/zsh', '-l', '-i', '-c', 'exec codex'], cwd: '/w', started: 0, cols: 80, rows: 24, title: '', lastOutput: 0, exit: null, meta: {}, ...over });
+
+it('names the secret store of each system, and offers an unlock only for the Linux keyring', () => {
+  expect(secretStoreName('macos')).toBe('the macOS Keychain');
+  expect(secretStoreName('windows')).toBe('Windows Credential Manager');
+  expect(secretStoreName('linux')).toBe('your desktop keyring');
+  expect(['macos', 'windows', 'linux'].filter(p => canUnlockStore(p as 'macos'))).toEqual(['linux']);
+});
 
 it('shows running rows and applies the ended-row grace from the exit time', () => {
   const ended = hosted({ exit: { code: 1, signal: null, at: 1000 } });
