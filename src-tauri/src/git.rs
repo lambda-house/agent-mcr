@@ -13,14 +13,23 @@
 //! reads it. A driver configured between that read and Git's own can still run
 //! for those operations, which the harness runs only at a session's start and
 //! end (tracked on MCR-191).
+//!
+//! The system configuration is read as Git reads it (MCR-194: Git for Windows
+//! keeps `core.autocrlf=true` there). Whoever can write it can replace Git
+//! itself; the name scan sees it too, and the read-only operations start no
+//! program it names.
+//!
+//! Known limit, failing closed: on Linux, with `core.ignorecase=true` and
+//! 4,000 index entries or more, Git builds its name hash with worker threads,
+//! which the process limit refuses, and a confined `status` fails (the
+//! worktree is kept, the pane shows an error). Tracked on MCR-191.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,23 +65,6 @@ const UNCONFINED: [&str; 2] = ["worktree", "checkout-index"];
 /// worker thread as fatal: preloading starts threads from 1,000 index
 /// entries, index reading by the core count.
 const ONE_THREAD: [&str; 4] = ["-c", "core.preloadIndex=false", "-c", "index.threads=1"];
-
-/// The keys of the system configuration that the runner keeps (MCR-194).
-/// Git for Windows sets line endings there (`core.autocrlf=true`): without
-/// them a clean CRLF checkout reads as modified. Every other system key stays
-/// off, so the system layer names no program.
-const SYSTEM_KEYS: [&str; 6] = [
-    "autocrlf",
-    "eol",
-    "safecrlf",
-    "symlinks",
-    "longpaths",
-    "ignorecase",
-];
-
-/// How long a read of the system configuration is used again. Each read costs
-/// a Git process, which on Windows took the worktree tests past their deadline.
-const SYSTEM_FRESH: Duration = Duration::from_secs(30);
 
 /// Callers supply a fixed Git subcommand followed by its arguments. Place user
 /// data in operands. Check the exit status before using the output.
@@ -137,8 +129,6 @@ pub fn run_from(
     let start = Instant::now();
     let left = || timeout.saturating_sub(start.elapsed());
     let mut command = local_command(cwd, left())?;
-    // Git reads it at start: it lives until Git has exited.
-    let mut _system = None;
     if let Some((operation, operands)) = args.split_first() {
         // Worktree checkout and even status/diff can invoke configured filters.
         // Inspect only their names, and disable them before running the operation.
@@ -187,15 +177,6 @@ pub fn run_from(
             }
             command.env("GIT_CONFIG_COUNT", index.to_string());
         }
-        // The kept system keys become the system layer itself, so every
-        // global, local or worktree setting outranks them when Git reads its
-        // configuration, also one written after this point.
-        if let Some(file) = system_file(cwd, left())? {
-            command
-                .env_remove("GIT_CONFIG_NOSYSTEM")
-                .env("GIT_CONFIG_SYSTEM", file.path());
-            _system = Some(file);
-        }
         if limit == Limit::Alone {
             command.args(ONE_THREAD);
         }
@@ -225,10 +206,12 @@ pub fn run_from(
     capture(command, limit, remaining, max_output)
 }
 
-/// Refuses credentials the process limit does not bind: a real or effective
-/// user id 0, and on Linux `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE` in the
-/// effective or ambient set (ambient capabilities survive `execve`; the child
-/// gets `no_new_privs`, so a file capability or set-user-id bit adds none).
+/// Refuses credentials the process limit may not bind. Linux exempts a real
+/// user id 0 and the capabilities `CAP_SYS_ADMIN` and `CAP_SYS_RESOURCE`, and
+/// capabilities belong to the thread: this reads the spawning thread's own
+/// status and refuses any real, effective or saved user id 0 and any
+/// permitted, effective or ambient capability. On Linux the child also gets
+/// `no_new_privs`, so a file capability or set-user-id bit adds none.
 #[cfg(unix)]
 fn may_run_alone() -> io::Result<()> {
     let refuse = |what: &str| {
@@ -243,9 +226,10 @@ fn may_run_alone() -> io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let status = std::fs::read_to_string("/proc/self/status")?;
-        if exempt_capabilities(&status) != Some(false) {
-            return refuse("CAP_SYS_ADMIN or CAP_SYS_RESOURCE");
+        // Run on the thread that spawns Git.
+        let status = std::fs::read_to_string("/proc/thread-self/status")?;
+        if privileged(&status) != Some(false) {
+            return refuse("user id 0 or a Linux capability");
         }
     }
     Ok(())
@@ -256,135 +240,25 @@ fn may_run_alone() -> io::Result<()> {
     Ok(())
 }
 
-/// Whether `/proc/<pid>/status` gives the process a capability that the
-/// process limit exempts. None when the text does not say.
+/// Whether a Linux `/proc/.../status` shows a real, effective or saved user
+/// id 0, or any permitted, effective or ambient capability. None when the
+/// text does not say.
 #[cfg(any(target_os = "linux", test))]
-fn exempt_capabilities(status: &str) -> Option<bool> {
-    const CAP_SYS_ADMIN: u32 = 21;
-    const CAP_SYS_RESOURCE: u32 = 24;
-    let set = |field: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(field))
-            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-    };
-    let held = set("CapEff:")? | set("CapAmb:")?;
-    Some(held & (1 << CAP_SYS_ADMIN | 1 << CAP_SYS_RESOURCE) != 0)
-}
-
-/// The allowlisted system keys as a configuration file of their own, or None
-/// when the system configuration sets none of them.
-fn system_file(cwd: &Path, timeout: Duration) -> Result<Option<tempfile::NamedTempFile>, Error> {
-    let settings = system_settings(cwd, timeout)?;
-    if settings.is_empty() {
-        return Ok(None);
+fn privileged(status: &str) -> Option<bool> {
+    let field = |name: &str| status.lines().find_map(|line| line.strip_prefix(name));
+    let ids = field("Uid:")?
+        .split_whitespace()
+        .take(3)
+        .map(|id| id.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if ids.len() != 3 {
+        return None;
     }
-    let mut text = String::from("[core]\n");
-    for (key, value) in settings {
-        text.push_str(&format!("\t{key} = {value}\n"));
+    let mut capabilities = 0;
+    for name in ["CapPrm:", "CapEff:", "CapAmb:"] {
+        capabilities |= u64::from_str_radix(field(name)?.trim(), 16).ok()?;
     }
-    let mut file = tempfile::Builder::new()
-        .prefix("agent-mcr-git-system-")
-        .tempfile()?;
-    file.write_all(text.as_bytes())?;
-    file.flush()?;
-    Ok(Some(file))
-}
-
-/// Configuration keys and their values.
-type Settings = Vec<(String, String)>;
-
-/// The allowlisted keys of the system configuration and the files it
-/// includes, the last value of each: key without `core.`, and value. Read as
-/// data, with no system configuration in effect for the reading Git.
-fn system_settings(cwd: &Path, timeout: Duration) -> Result<Settings, Error> {
-    static READ: Mutex<Option<(Instant, Settings)>> = Mutex::new(None);
-    #[cfg(not(test))]
-    let cached = true;
-    // A test that names its own files reads them every time.
-    #[cfg(test)]
-    let cached = tests::CONFIG_FILES.with(|files| files.borrow().is_empty());
-    if cached {
-        if let Some((at, settings)) = &*READ.lock().unwrap_or_else(|e| e.into_inner()) {
-            if at.elapsed() < SYSTEM_FRESH {
-                return Ok(settings.clone());
-            }
-        }
-    }
-    let start = Instant::now();
-    let Some(path) = system_path(cwd, timeout)? else {
-        return Ok(Vec::new());
-    };
-    let mut config = local_command(cwd, timeout.saturating_sub(start.elapsed()))?;
-    config.arg("config").arg("--file").arg(&path).args([
-        "--includes",
-        "--null",
-        "--get-regexp",
-        &format!("^core\\.({})$", SYSTEM_KEYS.join("|")),
-    ]);
-    let found = capture(
-        config,
-        Limit::Alone,
-        timeout.saturating_sub(start.elapsed()),
-        64 * 1024,
-    )?;
-    let mut settings: Vec<(String, String)> = Vec::new();
-    match found.status.code() {
-        Some(0) => {
-            let text = String::from_utf8(found.stdout).map_err(io::Error::other)?;
-            for entry in text.split_terminator('\0') {
-                let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
-                let Some(key) = key
-                    .strip_prefix("core.")
-                    .filter(|key| SYSTEM_KEYS.contains(key))
-                else {
-                    continue;
-                };
-                // The values of these keys are words. Anything else is not
-                // written into the file that Git reads as configuration.
-                if value.is_empty()
-                    || !value
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                {
-                    continue;
-                }
-                settings.retain(|(seen, _)| seen != key);
-                settings.push((key.to_owned(), value.to_owned()));
-            }
-        }
-        // A missing system file reads as no setting.
-        Some(1) if found.stderr.is_empty() => {}
-        _ => return Err(io::Error::other("cannot read the system Git configuration").into()),
-    }
-    if cached {
-        *READ.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), settings.clone()));
-    }
-    Ok(settings)
-}
-
-/// Where this Git keeps its system configuration (`git var`, Git 2.42 and
-/// later; None before). Git names it only while the system configuration is
-/// in effect, and reads that file as it starts: this one query runs with it,
-/// alone and with every Trace2 target set off, since the environment outranks
-/// the configuration there.
-fn system_path(cwd: &Path, timeout: Duration) -> Result<Option<PathBuf>, Error> {
-    let mut var = local_command(cwd, timeout)?;
-    var.env_remove("GIT_CONFIG_NOSYSTEM")
-        .env("GIT_TRACE2", "0")
-        .env("GIT_TRACE2_PERF", "0")
-        .env("GIT_TRACE2_EVENT", "0")
-        .args(["var", "GIT_CONFIG_SYSTEM"]);
-    let found = capture(var, Limit::Alone, timeout, 4096)?;
-    if !found.status.success() {
-        return Ok(None);
-    }
-    let path = PathBuf::from(
-        String::from_utf8(found.stdout)
-            .map_err(io::Error::other)?
-            .trim_end_matches(['\r', '\n']),
-    );
-    Ok(path.is_absolute().then_some(path))
+    Some(ids.contains(&0) || capabilities != 0)
 }
 
 fn local_command(cwd: &Path, timeout: Duration) -> io::Result<Command> {
@@ -422,7 +296,6 @@ fn local_command(cwd: &Path, timeout: Duration) -> io::Result<Command> {
             "-c",
             "log.showSignature=false",
         ])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_NO_LAZY_FETCH", "1")
@@ -472,6 +345,7 @@ fn executable(_timeout: Duration) -> io::Result<PathBuf> {
 #[cfg(windows)]
 fn executable(timeout: Duration) -> io::Result<PathBuf> {
     use std::os::windows::process::CommandExt;
+    use std::sync::Mutex;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
     static FOUND: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -820,50 +694,69 @@ pub mod tests {
         ));
     }
 
-    /// A path as Git configuration may hold it: forward slashes, which
-    /// Windows takes too, because a backslash there is an escape.
-    fn config_path(path: &Path) -> String {
-        path.display().to_string().replace('\\', "/")
+    /// Git as a person would run it with `system` as the system configuration.
+    fn raw_system(cwd: &Path, system: &Path, args: &[&str]) -> Output {
+        let mut command = Command::new("git");
+        strip_git_env(&mut command);
+        command
+            .current_dir(cwd)
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_SYSTEM", system)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// The runner's Git on this thread reads `system` as its system
+    /// configuration and an empty global one.
+    fn config_files(system: &Path, global: &Path) {
+        CONFIG_FILES.with(|files| {
+            *files.borrow_mut() = vec![
+                ("GIT_CONFIG_SYSTEM", system.to_path_buf()),
+                ("GIT_CONFIG_GLOBAL", global.to_path_buf()),
+            ]
+        })
+    }
+
+    /// A filter program that records its own start with shell builtins only,
+    /// so no second program stands between its start and the record. Git
+    /// runs it by this relative path from the top of the checkout. Returns
+    /// the record's path.
+    fn probe(repo: &Path) -> std::path::PathBuf {
+        std::fs::write(
+            repo.join(".git/probe"),
+            "#!/bin/sh\necho entered >> .git/probe-ran\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                repo.join(".git/probe"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        repo.join(".git/probe-ran")
     }
 
     /// MCR-194: Git for Windows keeps `core.autocrlf=true` in its system
-    /// configuration. Without it a clean CRLF checkout read as modified.
+    /// configuration, which the runner used to switch off, so a clean CRLF
+    /// checkout read as modified.
     #[test]
-    fn the_system_line_ending_setting_reaches_the_runner_and_nothing_else_does() {
+    fn a_crlf_checkout_reads_clean_under_a_system_autocrlf() {
         let fixture = tempfile::tempdir().unwrap();
         let dir = fixture.path();
         let system = dir.join("system.gitconfig");
-        // The include comes last, so its value is the one Git uses.
-        std::fs::write(
-            &system,
-            format!(
-                "[core]\n\tautocrlf = false\n[include]\n\tpath = included.gitconfig\n\
-                 [mcr]\n\tprobe = system\n\
-                 [trace2]\n\teventTarget = {event}\n\tnormalTarget = {normal}\n\tperfTarget = {perf}\n",
-                event = config_path(&dir.join("trace2.event")),
-                normal = config_path(&dir.join("trace2.normal")),
-                perf = config_path(&dir.join("trace2.perf")),
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("included.gitconfig"),
-            "[core]\n\tautocrlf = true\n",
-        )
-        .unwrap();
+        std::fs::write(&system, "[core]\n\tautocrlf = true\n").unwrap();
         let empty = dir.join("empty.gitconfig");
         std::fs::write(&empty, "").unwrap();
         let repo = dir.join("repo");
         std::fs::create_dir(&repo).unwrap();
-        let files = |system: &Path| {
-            CONFIG_FILES.with(|files| {
-                *files.borrow_mut() = vec![
-                    ("GIT_CONFIG_SYSTEM", system.to_path_buf()),
-                    ("GIT_CONFIG_GLOBAL", empty.clone()),
-                ]
-            })
-        };
-        files(&system);
+        config_files(&system, &empty);
         committed(&repo, &[("a.txt", "one\ntwo\n")]);
         // What a checkout under core.autocrlf=true writes.
         std::fs::write(repo.join("a.txt"), "one\r\ntwo\r\n").unwrap();
@@ -875,33 +768,70 @@ pub mod tests {
         };
         assert_eq!(status(), "");
         assert_eq!(ok(git(&["diff", "--numstat", "HEAD"])), "");
-        assert_eq!(ok(git(&["config", "--get", "core.autocrlf"])), "true\n");
-        let other = git(&["config", "--get", "mcr.probe"]);
-        assert_eq!(other.status.code(), Some(1), "{other:?}");
         // A later scope decides, as for Git itself.
         ok(git(&["config", "--local", "core.autocrlf", "false"]));
         assert_eq!(status(), " M a.txt\n");
         ok(git(&["config", "--local", "--unset", "core.autocrlf"]));
         assert_eq!(status(), "");
-        // Also when it is written after the runner looked at the configuration.
-        ok(git(&["read-tree", "HEAD"]));
-        let late = repo.clone();
-        BEFORE_RUN.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
-                ok(raw(&late, &["config", "--local", "core.autocrlf", "false"]));
-            }))
-        });
-        assert_eq!(ok(git(&["status", "--porcelain"])), " M a.txt\n");
-        assert!(BEFORE_RUN.with(|slot| slot.borrow().is_none()));
-        ok(git(&["config", "--local", "--unset", "core.autocrlf"]));
         // Without the system setting the clean checkout reads as modified.
-        files(&empty);
+        config_files(&empty, &empty);
         assert_eq!(status(), " M a.txt\n");
         CONFIG_FILES.with(|files| files.borrow_mut().clear());
-        // The system file's Trace2 targets never came into effect.
-        for name in ["trace2.event", "trace2.normal", "trace2.perf"] {
-            assert!(!dir.join(name).exists(), "{name} was written");
+    }
+
+    /// The system configuration is read in full, so a filter it names must not
+    /// run through the runner: neither one present when the guard looks nor
+    /// one written there afterwards. Plain Git runs it.
+    #[test]
+    fn a_filter_named_only_in_the_system_file_does_not_run() {
+        let fixture = tempfile::tempdir().unwrap();
+        let dir = fixture.path();
+        let system = dir.join("system.gitconfig");
+        let empty = dir.join("empty.gitconfig");
+        std::fs::write(&empty, "").unwrap();
+        std::fs::write(&system, "").unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        config_files(&empty, &empty);
+        committed(
+            &repo,
+            &[
+                (".gitattributes", "file filter=sys\n"),
+                ("file", "original\n"),
+            ],
+        );
+        let marker = probe(&repo);
+        let driver = "[filter \"sys\"]\n\tclean = .git/probe\n";
+        config_files(&system, &empty);
+        for late in [false, true] {
+            std::fs::write(&system, if late { "" } else { driver }).unwrap();
+            ok(run(&repo, &["read-tree", "HEAD"], TIMEOUT, 4096).unwrap());
+            std::fs::write(repo.join("file"), "changed\n").unwrap();
+            if late {
+                let system = system.clone();
+                BEFORE_RUN.with(|slot| {
+                    *slot.borrow_mut() =
+                        Some(Box::new(move || std::fs::write(&system, driver).unwrap()))
+                });
+            }
+            let output = run(&repo, &["status", "--porcelain"], TIMEOUT, 4096).unwrap();
+            assert!(BEFORE_RUN.with(|slot| slot.borrow().is_none()));
+            assert!(
+                !marker.exists(),
+                "late {late}: the system filter ran: {output:?}"
+            );
+            assert_eq!(ok(output), " M file\n", "late {late}");
+            // Plain Git with the same system file runs it.
+            ok(raw(&repo, &["read-tree", "HEAD"]));
+            std::fs::write(repo.join("file"), "changed\n").unwrap();
+            let _ = raw_system(&repo, &system, &["status", "--porcelain"]);
+            assert!(
+                marker.exists(),
+                "late {late}: plain Git should run the filter"
+            );
+            std::fs::remove_file(&marker).unwrap();
         }
+        CONFIG_FILES.with(|files| files.borrow_mut().clear());
     }
 
     /// The runner's Git starts no program, whatever the configuration says:
@@ -959,21 +889,7 @@ pub mod tests {
                 ("file", "original\n"),
             ],
         );
-        let marker = cwd.join(".git/probe-ran");
-        std::fs::write(
-            cwd.join(".git/probe"),
-            "#!/bin/sh\necho entered >> .git/probe-ran\nexit 1\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                cwd.join(".git/probe"),
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .unwrap();
-        }
+        let marker = probe(cwd);
         type Late = (
             &'static [&'static str],
             &'static [(&'static str, &'static str)],
@@ -1077,6 +993,15 @@ pub mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path();
         ok(run(repo, &["init", "-q"], TIMEOUT, 4096).unwrap());
+        // A system core.autocrlf=true (Git for Windows) would warn once per
+        // file while staging, past the output cap.
+        ok(run(
+            repo,
+            &["config", "--local", "core.autocrlf", "false"],
+            TIMEOUT,
+            4096,
+        )
+        .unwrap());
         for dir in 0..30 {
             let dir = repo.join(format!("d{dir:02}"));
             std::fs::create_dir(&dir).unwrap();
@@ -1118,31 +1043,46 @@ pub mod tests {
     }
 
     #[test]
-    fn credentials_the_process_limit_exempts_are_found() {
-        let status = |eff: &str, amb: &str| {
-            format!("Name:\tx\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t{eff}\nCapBnd:\t000001ffffffffff\nCapAmb:\t{amb}\n")
+    fn privileged_linux_credentials_are_found() {
+        let status = |uid: &str, prm: &str, eff: &str, amb: &str| {
+            format!(
+                "Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\n\
+                 CapInh:\t0000000000000000\nCapPrm:\t{prm}\nCapEff:\t{eff}\n\
+                 CapBnd:\t000001ffffffffff\nCapAmb:\t{amb}\n"
+            )
         };
+        let user = "1000\t1000\t1000\t1000";
         let none = "0000000000000000";
-        assert_eq!(exempt_capabilities(&status(none, none)), Some(false));
-        // CAP_NET_BIND_SERVICE (10) alone is not exempt.
+        assert_eq!(privileged(&status(user, none, none, none)), Some(false));
+        // A user id 0 in the real, effective or saved place.
+        for uid in [
+            "0\t1000\t1000\t1000",
+            "1000\t0\t1000\t1000",
+            "1000\t1000\t0\t1000",
+        ] {
+            assert_eq!(
+                privileged(&status(uid, none, none, none)),
+                Some(true),
+                "{uid}"
+            );
+        }
+        // Any capability, also one that is only permitted, and not only the
+        // two the limit exempts: CAP_NET_BIND_SERVICE (10).
+        let one = "0000000000000400";
+        assert_eq!(privileged(&status(user, one, none, none)), Some(true));
+        assert_eq!(privileged(&status(user, none, one, none)), Some(true));
+        assert_eq!(privileged(&status(user, none, none, one)), Some(true));
         assert_eq!(
-            exempt_capabilities(&status("0000000000000400", none)),
-            Some(false)
-        );
-        assert_eq!(
-            exempt_capabilities(&status("0000000000200000", none)),
+            privileged(&status(user, "000001ffffffffff", none, none)),
             Some(true)
         );
+        // Text that does not say refuses.
+        assert_eq!(privileged(&status("1000\t1000", none, none, none)), None);
+        assert_eq!(privileged(&status(user, "zz", none, none)), None);
         assert_eq!(
-            exempt_capabilities(&status(none, "0000000001000000")),
-            Some(true)
+            privileged("Name:\tx\nUid:\t1000\t1000\t1000\t1000\nCapPrm:\t0\nCapEff:\t0\n"),
+            None
         );
-        assert_eq!(
-            exempt_capabilities(&status("000001ffffffffff", none)),
-            Some(true)
-        );
-        assert_eq!(exempt_capabilities("Name:\tx\nCapEff:\t0\n"), None);
-        assert_eq!(exempt_capabilities(&status("zz", none)), None);
     }
 
     #[test]
@@ -1389,32 +1329,6 @@ pub mod tests {
         let status = String::from_utf8_lossy(&safe.stdout);
         assert!(status.contains("module"));
         assert!(!status.contains("* module "));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn system_configuration_is_disabled() {
-        let fixture = tempfile::tempdir().unwrap();
-        let system = fixture.path().join("system.gitconfig");
-        std::fs::write(&system, "[mcr]\n  probe = system\n").unwrap();
-        let args = ["config", "--get", "mcr.probe"];
-        let raw = Command::new("git")
-            .current_dir(fixture.path())
-            .env_remove("GIT_CONFIG_NOSYSTEM")
-            .env("GIT_CONFIG_SYSTEM", &system)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(raw.status.success());
-        assert_eq!(raw.stdout, b"system\n");
-        let safe = local_command(fixture.path(), TIMEOUT)
-            .unwrap()
-            .env("GIT_CONFIG_SYSTEM", &system)
-            .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(safe.status.code(), Some(1));
-        assert!(safe.stdout.is_empty());
     }
 
     #[cfg(unix)]
