@@ -13,7 +13,7 @@
 //! kernel, as for `mcr`) and written to the local log; it is not sent on.
 
 use crate::runner::{lock, now_ms};
-use crate::vault::{Unavailable, Vault};
+use crate::vault::{self, Unavailable, Vault};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -51,8 +51,14 @@ const SIGN_IN_LIMIT: Duration = Duration::from_secs(300);
 const TOOLS_FRESH: Duration = Duration::from_secs(60);
 const QUICK: Duration = Duration::from_secs(15);
 /// What the app waits for is answered inside the control client's ten
-/// seconds: starting a sign-in (discovery and registration) and a disconnect.
+/// seconds: starting a sign-in (discovery and registration).
 const FOR_THE_APP: Duration = Duration::from_secs(7);
+/// A disconnect, all of it, inside the control client's ten seconds: the vault
+/// gets at most `VAULT_SHARE` of it, the revocation what is left.
+const DISCONNECT: Duration = Duration::from_millis(if cfg!(test) { 900 } else { 9000 });
+const VAULT_SHARE: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 3000 });
+/// The secrets a sign-in keeps, by account
+const ACCOUNTS: [&str; 4] = ["meta", "client", "refresh", "access"];
 /// How long a session's `initialize` waits for the memory service. An agent
 /// shows a server that starts slowly as failed, so this stays short.
 const AT_START: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 4000 });
@@ -426,7 +432,7 @@ impl Link {
     /// could not be removed is returned.
     fn forget_tokens(&self) -> Result<(), Unavailable> {
         let mut removed = Ok(());
-        for account in ["access", "refresh", "client", "meta"] {
+        for account in ACCOUNTS {
             if let Err(why) = self.vault.delete(account) {
                 eprintln!("memory: `{account}` could not be removed from the secret store: {}", why.0);
                 removed = removed.and(Err(why));
@@ -586,7 +592,7 @@ impl Link {
             None => {
                 // Not kept; and given back, in case the disconnect could not end the grant
                 if let Some(rotated) = answer["refresh_token"].as_str() {
-                    self.revoke(meta, &client, rotated);
+                    self.revoke(meta, &client, rotated, FOR_THE_APP);
                 }
                 Err(Fail::NotConnected)
             }
@@ -594,11 +600,11 @@ impl Link {
     }
 
     /// Tell the authorization server that a refresh token is no longer wanted,
-    /// which ends its grant (RFC 7009). Whether it confirmed.
-    fn revoke(&self, meta: &Meta, client: &str, token: &str) -> bool {
+    /// which ends its grant (RFC 7009), waiting at most `wait`. Whether it confirmed.
+    fn revoke(&self, meta: &Meta, client: &str, token: &str, wait: Duration) -> bool {
         let Some(url) = meta.revocation_endpoint.as_ref() else { return false };
         // Redirects are not followed, so a 3xx comes back as an answer: it revoked nothing
-        self.agent.post(url).timeout(FOR_THE_APP).send_form(&[("token", token), ("token_type_hint", "refresh_token"), ("client_id", client)]).is_ok_and(|answer| (200..300).contains(&answer.status()))
+        self.agent.post(url).timeout(wait).send_form(&[("token", token), ("token_type_hint", "refresh_token"), ("client_id", client)]).is_ok_and(|answer| (200..300).contains(&answer.status()))
     }
 
     /// Keep what the token endpoint answered. The refresh token goes first:
@@ -1004,7 +1010,7 @@ impl Memory {
                     let kept = lock(&link.keeping);
                     if called_off() {
                         drop(kept);
-                        link.revoke(&meta, &client, refresh);
+                        link.revoke(&meta, &client, refresh, FOR_THE_APP);
                         return Err("The sign-in was called off".to_string());
                     }
                     link.epoch.fetch_add(1, Ordering::SeqCst);
@@ -1112,8 +1118,10 @@ impl Memory {
     /// End the connection: the grant is revoked at the authorization server
     /// and the tokens leave the vault, whatever the server answers. What could
     /// not be done is said: a vault that cannot be read gives nothing to revoke.
+    /// All of it is answered within `DISCONNECT`, which the app waits for.
     pub fn disconnect(&self) -> Value {
         let link = &self.link;
+        let until = Instant::now() + DISCONNECT;
         // In one step with a sign-in or a renewal that is about to keep its tokens
         // (`keeping`): either it kept them and they are taken here, or it sees that
         // it was called off. Nothing here waits for a call that is under way: the
@@ -1123,18 +1131,26 @@ impl Memory {
             self.flow.fetch_add(1, Ordering::SeqCst);
             let was = link.epoch.fetch_add(1, Ordering::SeqCst);
             // A rotated refresh token the vault did not keep is the grant's live one
-            let refresh = match link.unkept(was) {
-                Some(unkept) => Ok(Some(unkept)),
-                None => link.vault.get("refresh"),
-            };
-            let meta = match link.meta() {
-                Ok(meta) => Ok(meta),
-                Err(Fail::Vault(why)) => Err(why),
+            let unkept = link.unkept(was);
+            let known = lock(&link.meta).take();
+            *lock(&link.unkept) = None;
+            // One read and removal of all of them, in the vault's share of the time
+            let (mut values, removed) = link.vault.take(&ACCOUNTS, VAULT_SHARE);
+            if let Err(why) = &removed {
+                eprintln!("memory: the tokens could not all be removed from the secret store: {}", why.0);
+            }
+            let mut value = || if values.is_empty() { Err(vault::TOO_LATE) } else { values.remove(0) };
+            let (meta, client, refresh) = (value(), value(), value());
+            let meta = match known {
+                Some(known) => Ok(Some(known)),
                 // A description that cannot be read gives nowhere to revoke at
-                Err(_) => Ok(None),
+                None => meta.map(|text| text.and_then(|text| serde_json::from_str::<Meta>(&text).ok()).filter(Meta::sound)),
             };
-            let held = (meta, link.vault.get("client"), refresh);
-            let removed = link.forget_tokens();
+            let refresh = match unkept {
+                Some(unkept) => Ok(Some(unkept)),
+                None => refresh,
+            };
+            let held = (meta, client, refresh);
             link.change(|s| {
                 s.state = String::new();
                 s.since = 0;
@@ -1147,7 +1163,7 @@ impl Memory {
         *lock(&self.tools) = None;
         // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
         let revoked = match held {
-            (Ok(Some(meta)), Ok(Some(client)), Ok(Some(token))) => Ok(link.revoke(&meta, &client, &token)),
+            (Ok(Some(meta)), Ok(Some(client)), Ok(Some(token))) => Ok(link.revoke(&meta, &client, &token, left(until))),
             (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => Err(why),
             // Nothing was signed in: there is no grant to end
             _ => Ok(true),
@@ -1368,6 +1384,8 @@ pub(crate) mod tests {
         list_fails: bool,
         /// How long the token endpoint takes to answer
         token_slow: Duration,
+        /// How long the revocation endpoint takes to answer
+        revoke_slow: Duration,
         /// Paths of requests as they came in, before any wait
         arrived: Vec<String>,
         /// The MCP side takes requests and does not answer
@@ -1514,13 +1532,16 @@ pub(crate) mod tests {
     /// What the fake memory service does with one request, as its connection
     /// did over TCP: `None` is a connection that closes without an answer.
     fn exchange(world: &Mutex<World>, req: &Req) -> Option<Res> {
-        let (slow, hangs) = {
+        let (slow, revoke_slow, hangs) = {
             let mut w = lock(world);
             w.arrived.push(req.path.clone());
-            (w.token_slow, w.hangs)
+            (w.token_slow, w.revoke_slow, w.hangs)
         };
         if req.path == "/oauth/token" {
             std::thread::sleep(slow);
+        }
+        if req.path == "/oauth/revoke" {
+            std::thread::sleep(revoke_slow);
         }
         if req.path == "/mcp" && hangs {
             std::thread::sleep(Duration::from_secs(4));
@@ -2382,6 +2403,33 @@ pub(crate) mod tests {
         lock(&rig.world).revoke_fails = true;
         let status = rig.memory.disconnect();
         assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_revoked")));
+        assert!(rig.vault.0.lock().unwrap().is_empty());
+    }
+
+    /// A vault that takes its time cannot hold a disconnect past the app's
+    /// ten seconds: it gets its share, and what it did not do is said
+    #[test]
+    fn a_disconnect_with_a_slow_vault_answers_within_its_time_and_says_what_is_left() {
+        let rig = Rig::signed_in();
+        rig.vault.slow(Some(Duration::from_millis(200)));
+        let asked = Instant::now();
+        let status = rig.memory.disconnect();
+        assert!(asked.elapsed() < DISCONNECT, "{:?}", asked.elapsed());
+        assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_removed")));
+        let text = status["problem"]["text"].as_str().unwrap();
+        assert!(text.contains("(the secret store did not answer in time)") && text.contains("revoke it in the memory console"), "{text}");
+        // The refresh token was not read in time, so nothing was revoked
+        assert!(lock(&rig.world).revoked.is_empty());
+        rig.vault.slow(None);
+        assert_eq!(rig.memory.link.bearer(None), Err(Fail::NotConnected));
+
+        // A slow revocation gets what is left of the time, not seven seconds of its own
+        let rig = Rig::signed_in();
+        lock(&rig.world).revoke_slow = Duration::from_secs(3);
+        let asked = Instant::now();
+        let status = rig.memory.disconnect();
+        assert!(asked.elapsed() < DISCONNECT + Duration::from_millis(200), "{:?}", asked.elapsed());
+        assert_eq!(status["problem"]["kind"], "not_revoked");
         assert!(rig.vault.0.lock().unwrap().is_empty());
     }
 

@@ -19,7 +19,30 @@ pub trait Vault: Send + Sync {
     fn set(&self, account: &str, secret: &str) -> Result<(), Unavailable>;
     /// A secret that is not there counts as removed.
     fn delete(&self, account: &str) -> Result<(), Unavailable>;
+
+    /// Read the secrets of `accounts`, then remove them, within `within`
+    /// (about, for stores that answer at once): what each held, as `get`
+    /// says it, and the first reason one could not be removed. What was not
+    /// begun in time is `TOO_LATE`.
+    fn take(&self, accounts: &[&str], within: std::time::Duration) -> Taken {
+        let until = std::time::Instant::now() + within;
+        let late = || std::time::Instant::now() >= until;
+        let values = accounts.iter().map(|account| if late() { Err(TOO_LATE) } else { self.get(account) }).collect();
+        let mut removed = Ok(());
+        for account in accounts {
+            if let Err(why) = if late() { Err(TOO_LATE) } else { self.delete(account) } {
+                removed = removed.and(Err(why));
+            }
+        }
+        (values, removed)
+    }
 }
+
+/// What `take` found under each account, and whether all were removed
+pub type Taken = (Vec<Result<Option<String>, Unavailable>>, Result<(), Unavailable>);
+
+/// A secret store that did not answer within the time a call had
+pub const TOO_LATE: Unavailable = Unavailable("the secret store did not answer in time");
 
 /// The system's secret store under one service name: the macOS Keychain, on
 /// Windows a generic credential `<service>/<account>`, on Linux an item of the
@@ -247,6 +270,33 @@ impl Vault for Keychain {
             Ok(())
         })
     }
+    /// One job with one deadline, not one per account: a disconnect waits for
+    /// the keyring at most `within`
+    fn take(&self, accounts: &[&str], within: std::time::Duration) -> Taken {
+        let (service, names) = (self.service, accounts.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        let taken = self.keyring.run_within(within, move |collection| {
+            let (mut values, mut items) = (Vec::new(), Vec::new());
+            for account in &names {
+                let found = collection.search(&keyring::attributes(service, account))?;
+                values.push(match found.first() {
+                    None => Ok(None),
+                    Some(item) => collection.secret(item).map(Some),
+                });
+                items.extend(found);
+            }
+            let mut removed = Ok(());
+            for item in &items {
+                if let Err(fault) = collection.delete(item) {
+                    removed = removed.and(Err(fault));
+                }
+            }
+            Ok((values, removed))
+        });
+        match taken {
+            Ok((values, removed)) => (values.into_iter().map(|value| value.map_err(|fault| keyring::words(&fault)).and_then(|found| found.map(text_of).transpose())).collect(), removed.map_err(|fault| keyring::words(&fault))),
+            Err(why) => (vec![Err(why); accounts.len()], Err(why)),
+        }
+    }
 }
 
 /// The one thread per vault that talks to the Secret Service, through a small
@@ -439,16 +489,22 @@ mod keyring {
         /// `act` on the default collection while it is unlocked, answered by
         /// the deadline. A job whose caller gave up begins no call any more.
         pub fn run<T: Send + 'static>(&self, act: impl FnOnce(&Collection) -> Result<T, Fault> + Send + 'static) -> Result<T, Unavailable> {
+            self.run_within(self.deadline, act)
+        }
+
+        /// `run`, answered by `within` when that is sooner than the deadline
+        pub fn run_within<T: Send + 'static>(&self, within: Duration, act: impl FnOnce(&Collection) -> Result<T, Fault> + Send + 'static) -> Result<T, Unavailable> {
+            let deadline = within.min(self.deadline);
             let (answer, answered) = mpsc::channel();
             let gave_up = Arc::new(AtomicBool::new(false));
-            let calls = Calls { until: Instant::now() + self.deadline, gave_up: gave_up.clone() };
+            let calls = Calls { until: Instant::now() + deadline, gave_up: gave_up.clone() };
             let connect = self.connect.clone();
             self.send(Box::new(move |link| {
                 if !calls.over() {
                     let _ = answer.send(on_default(link, &connect, &calls, act));
                 }
             }))?;
-            answered.recv_timeout(self.deadline).unwrap_or_else(|e| {
+            answered.recv_timeout(deadline).unwrap_or_else(|e| {
                 gave_up.store(true, Ordering::SeqCst);
                 Err(match e {
                     mpsc::RecvTimeoutError::Timeout => LATE,
@@ -725,6 +781,12 @@ mod keyring {
         }
     }
 
+    /// `why`, with the log line for an unexpected answer
+    pub fn words(fault: &Fault) -> Unavailable {
+        note(fault);
+        why(fault)
+    }
+
     fn note(fault: &Fault) {
         if let Some(line) = log_line(fault) {
             eprintln!("{line}");
@@ -752,7 +814,12 @@ impl Vault for Keychain {
 /// removed, and nothing is said about what it holds.
 #[cfg(test)]
 #[derive(Default)]
-pub struct Held(pub std::sync::Mutex<std::collections::BTreeMap<String, String>>, std::sync::Mutex<Option<Unavailable>>, std::sync::Mutex<std::collections::BTreeMap<String, Unavailable>>);
+pub struct Held(
+    pub std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    std::sync::Mutex<Option<Unavailable>>,
+    std::sync::Mutex<std::collections::BTreeMap<String, Unavailable>>,
+    std::sync::Mutex<Option<std::time::Duration>>,
+);
 
 #[cfg(test)]
 impl Held {
@@ -771,7 +838,16 @@ impl Held {
         };
     }
 
+    /// Take this long over every call (`Some`), or answer at once (`None`)
+    pub fn slow(&self, each: Option<std::time::Duration>) {
+        *self.3.lock().unwrap() = each;
+    }
+
     fn refused(&self) -> Result<(), Unavailable> {
+        let slow = *self.3.lock().unwrap();
+        if let Some(slow) = slow {
+            std::thread::sleep(slow);
+        }
         match *self.1.lock().unwrap() {
             Some(why) => Err(why),
             None => Ok(()),
@@ -812,6 +888,9 @@ impl Vault for std::sync::Arc<Held> {
     fn delete(&self, account: &str) -> Result<(), Unavailable> {
         (**self).delete(account)
     }
+    fn take(&self, accounts: &[&str], within: std::time::Duration) -> Taken {
+        (**self).take(accounts, within)
+    }
 }
 
 #[cfg(test)]
@@ -835,6 +914,22 @@ mod tests {
         for code in [Some(1312), Some(5), None] {
             assert_eq!(from_credential_error(code), Err(CREDENTIALS_UNREAD), "{code:?}");
         }
+    }
+
+    #[test]
+    fn take_stops_at_its_time_and_says_so() {
+        use std::time::Duration;
+        let held = Held::default();
+        held.set("a", "synthetic-a").unwrap();
+        held.set("b", "synthetic-b").unwrap();
+        assert_eq!(held.take(&["a", "b"], Duration::from_secs(1)), (vec![Ok(Some("synthetic-a".into())), Ok(Some("synthetic-b".into()))], Ok(())));
+        assert!(held.0.lock().unwrap().is_empty());
+        held.set("a", "synthetic-a").unwrap();
+        held.slow(Some(Duration::from_millis(150)));
+        let (values, removed) = held.take(&["a", "b"], Duration::from_millis(100));
+        assert_eq!(values, [Ok(Some("synthetic-a".into())), Err(TOO_LATE)]);
+        assert_eq!(removed, Err(TOO_LATE));
+        assert!(!held.0.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1044,6 +1139,29 @@ mod tests {
         fake.0.lock().unwrap().prompt = false;
         assert_eq!(keychain.get("a"), Ok(Some("synthetic-one".into())));
         assert_eq!(fake.calls().iter().filter(|c| **c == "OpenSession").count(), 2);
+    }
+
+    /// A disconnect reads and removes every account in one job, with one deadline
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn take_reads_and_removes_every_account_in_one_job() {
+        use std::time::{Duration, Instant};
+        let fake = fake::Fake::default();
+        let keychain = fake::keychain(&fake, Duration::from_secs(5));
+        keychain.set("a", "synthetic-a").unwrap();
+        keychain.set("c", "synthetic-c").unwrap();
+        let (values, removed) = keychain.take(&["a", "b", "c"], Duration::from_secs(3));
+        assert_eq!(values, [Ok(Some("synthetic-a".into())), Ok(None), Ok(Some("synthetic-c".into()))]);
+        assert_eq!(removed, Ok(()));
+        assert!(fake.0.lock().unwrap().items.is_empty());
+        // The whole job answers within the time it is given, not a deadline per account
+        keychain.set("a", "synthetic-a").unwrap();
+        fake.0.lock().unwrap().slow = vec![Duration::from_millis(400); 3];
+        let asked = Instant::now();
+        let (values, removed) = keychain.take(&["a", "b", "c"], Duration::from_millis(200));
+        assert!(asked.elapsed() < Duration::from_millis(300), "{:?}", asked.elapsed());
+        assert_eq!(values, vec![Err(Unavailable("the keyring did not answer in time")); 3]);
+        assert_eq!(removed, Err(Unavailable("the keyring did not answer in time")));
     }
 
     #[cfg(target_os = "linux")]
