@@ -21,6 +21,8 @@ export interface ChangedFile {
   diffNote: string | null;
   /** Lines hidden as credential shapes */
   hidden: number;
+  /** Uncommitted only: staged, then put back in the work tree, so a commit would still take the staged change */
+  undone: boolean;
 }
 export interface ChangeSide { files: ChangedFile[]; more: boolean; note: string | null }
 export interface Track { name: string; ahead: number; behind: number; mergeBase: string | null }
@@ -97,6 +99,7 @@ export function aheadBehind(t: Track): string {
 
 /** Where an uncommitted change sits */
 export function stagedLabel(f: ChangedFile): string {
+  if (f.undone) return 'staged, undone in the work tree';
   return f.staged && f.unstaged ? 'staged, changed since' : f.staged ? 'staged' : 'not staged';
 }
 

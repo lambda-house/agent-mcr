@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { aheadBehind, counts, diffLines, fileKey, findFile, HIDDEN, pickFile, sideTotals, stagedLabel, type ChangedFile, type Repo } from './changes';
 
 const file = (path: string, over: Partial<ChangedFile> = {}): ChangedFile => ({
-  path, status: 'M', staged: false, unstaged: true, added: 1, removed: 0, binary: false, diff: `diff --git a/${path} b/${path}\n@@ -1 +1 @@\n+x\n`, diffNote: null, hidden: 0, ...over,
+  path, status: 'M', staged: false, unstaged: true, added: 1, removed: 0, binary: false, diff: `diff --git a/${path} b/${path}\n@@ -1 +1 @@\n+x\n`, diffNote: null, hidden: 0, undone: false, ...over,
 });
 const repo = (over: Partial<Repo> = {}): Repo => ({
   root: '/w', branch: 'main', head: 'a'.repeat(40), base: null, baseNote: null, upstream: null, commits: [], commitsMore: false,

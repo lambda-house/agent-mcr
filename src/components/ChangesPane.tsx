@@ -25,6 +25,8 @@ export default function ChangesPane({ session, active }: { session: Hosted; acti
   // Only a press of Refresh shows that a read is under way: a read on focus
   // that brings the same answer changes no state, so nothing renders
   const [busy, setBusy] = useState(false);
+  const busyNow = useRef(false);
+  const showBusy = (on: boolean) => { if (busyNow.current !== on) { busyNow.current = on; setBusy(on); } };
   const readAt = useRef(0);
   const [chosen, setChosen] = useState('');
   const request = useRef(0);
@@ -33,7 +35,7 @@ export default function ChangesPane({ session, active }: { session: Hosted; acti
 
   const load = useCallback((pressed = false) => {
     const mine = ++request.current;
-    if (pressed) setBusy(true);
+    if (pressed) showBusy(true);
     changesApi.read(id)
       .then(c => {
         if (request.current !== mine) return;
@@ -44,12 +46,13 @@ export default function ChangesPane({ session, active }: { session: Hosted; acti
         if (shown.current.error) { shown.current.error = ''; setError(''); }
       })
       .catch(e => { if (request.current === mine) { shown.current.error = err(e); setError(shown.current.error); } })
-      .finally(() => { if (request.current === mine && pressed) setBusy(false); });
+      // The newest read ends the wait, whichever started it: a read on focus may take over a pressed one
+      .finally(() => { if (request.current === mine) showBusy(false); });
   }, [id]);
 
   useEffect(() => {
     shown.current = { data: null, error: '' };
-    setData(null); setError(''); setChosen('');
+    setData(null); setError(''); setChosen(''); showBusy(false);
     if (!active) return;
     load();
     const again = () => { if (!document.hidden) load(); };
@@ -86,7 +89,7 @@ export default function ChangesPane({ session, active }: { session: Hosted; acti
       </section>
       {repo.base && <section>
         <h4>Commits ahead of {repo.base.name} · {repo.base.ahead}</h4>
-        {repo.commits.length === 0 ? <p className="hs-stats-note">None.</p> : <ul className="hs-changes-commits">
+        {repo.commits.length === 0 ? <p className="hs-stats-note">{repo.commitsMore ? 'Too many to list here.' : 'None.'}</p> : <ul className="hs-changes-commits">
           {repo.commits.map(c => <li key={c.sha} title={`${c.sha}\n${c.author}, ${new Date(c.time * 1000).toLocaleString()}`}>
             <code>{c.short}</code><span>{c.subject}</span>
           </li>)}
@@ -109,7 +112,8 @@ const FileList = memo(function FileList({ title, which, side, shown, choose, unt
   return <section>
     <h4>{title} · {totals.files}{totals.files ? ` · +${totals.added} −${totals.removed}` : ''}</h4>
     {side.note && <p className="hs-stats-note">{side.note}</p>}
-    {side.files.length === 0 && untracked.length === 0 && !side.note && <p className="hs-stats-note">Nothing.</p>}
+    {side.files.length === 0 && untracked.length === 0 && !side.note && !side.more && !untrackedMore && <p className="hs-stats-note">Nothing.</p>}
+    {side.files.length === 0 && side.more && <p className="hs-stats-note hs-changes-more">More files than can be listed here.</p>}
     {side.files.length > 0 && <ul className="hs-changes-files">
       {side.files.map(f => {
         const key = fileKey(which, f.path);
@@ -123,8 +127,8 @@ const FileList = memo(function FileList({ title, which, side, shown, choose, unt
       })}
       {side.more && <li className="hs-stats-more">More files not shown.</li>}
     </ul>}
-    {untracked.length > 0 && <p className="hs-stats-note hs-changes-untracked" title="New files git does not track yet: their content is not shown">
-      Untracked: {untracked.join(', ')}{untrackedMore ? ', and more' : ''}
+    {(untracked.length > 0 || untrackedMore) && <p className="hs-stats-note hs-changes-untracked" title="New files git does not track yet: their content is not shown">
+      {untracked.length > 0 ? <>Untracked: {untracked.join(', ')}{untrackedMore ? ', and more' : ''}</> : 'Untracked: more names than can be listed here.'}
     </p>}
   </section>;
 });
@@ -133,6 +137,7 @@ const FileDiff = memo(function FileDiff({ file, which }: { file: ChangedFile; wh
   const lines = useMemo(() => file.diff ? diffLines(file.diff) : [], [file.diff]);
   return <section className="hs-changes-diff" aria-label={`Diff of ${file.path}`}>
     <h4 title={file.path}>{file.path} · {counts(file)}{which === 'uncommitted' ? ` · ${stagedLabel(file)}` : ''}</h4>
+    {file.undone && <p className="hs-stats-note">Staged, then undone in the work tree: the head and the work tree agree, but a commit would still take the staged change.</p>}
     {file.hidden > 0 && <p className="hs-changes-hidden"><ShieldAlert size={12} aria-hidden/> {file.hidden === 1 ? 'One line' : `${file.hidden} lines`} hidden here.</p>}
     {file.diff
       ? <pre className="hs-diff">{lines.map((l, i) => <span key={i} className={`hs-diff-${l.kind}`}>{l.text}{'\n'}</span>)}</pre>

@@ -17,10 +17,10 @@ const changes = (): Changes => ({
     upstream: { name: 'origin/mcr-1-thing', ahead: 1, behind: 0, mergeBase: null },
     commits: [{ sha: 'b'.repeat(40), short: 'bbbbbbb', subject: 'Second', author: 'T', time: 1 }, { sha: 'c'.repeat(40), short: 'ccccccc', subject: 'First', author: 'T', time: 1 }],
     commitsMore: false,
-    committed: { files: [{ path: 'src/lib.rs', status: 'M', staged: false, unstaged: false, added: 3, removed: 1, binary: false, diff: 'diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n', diffNote: null, hidden: 0 }], more: false, note: null },
+    committed: { files: [{ path: 'src/lib.rs', status: 'M', staged: false, unstaged: false, added: 3, removed: 1, binary: false, diff: 'diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n', diffNote: null, hidden: 0, undone: false }], more: false, note: null },
     uncommitted: { files: [
-      { path: 'big.json', status: 'M', staged: false, unstaged: true, added: 9000, removed: 0, binary: false, diff: null, diffNote: 'too large to show here: run git diff in a terminal', hidden: 0 },
-      { path: '.env', status: 'A', staged: true, unstaged: false, added: 2, removed: 0, binary: false, diff: `diff --git a/.env b/.env\n@@ -0,0 +1,2 @@\n+NAME=demo\n+${HIDDEN}\n`, diffNote: null, hidden: 1 },
+      { path: 'big.json', status: 'M', staged: false, unstaged: true, added: 9000, removed: 0, binary: false, diff: null, diffNote: 'too large to show here: run git diff in a terminal', hidden: 0, undone: false },
+      { path: '.env', status: 'A', staged: true, unstaged: false, added: 2, removed: 0, binary: false, diff: `diff --git a/.env b/.env\n@@ -0,0 +1,2 @@\n+NAME=demo\n+${HIDDEN}\n`, diffNote: null, hidden: 1, undone: false },
     ], more: false, note: null },
     untracked: ['notes/'], untrackedMore: false, hidden: 1,
   },
@@ -109,5 +109,49 @@ describe('Changes pane', () => {
     vi.mocked(changesApi.read).mockRejectedValue(new Error('No such session'));
     await act(async () => root.render(<ChangesPane session={hosted()} active/>)); await flush();
     expect(host.querySelector('.hs-changes-error')?.textContent).toBe('No such session');
+  });
+
+  it('says a list was cut even when no row of it is left (review 17426)', async () => {
+    const c = changes();
+    const repo = { ...c.repo!, commits: [], commitsMore: true, uncommitted: { files: [], more: true, note: null }, untracked: [], untrackedMore: true };
+    vi.mocked(changesApi.read).mockResolvedValue({ ...c, repo });
+    await act(async () => root.render(<ChangesPane session={hosted()} active/>)); await flush();
+    const text = host.textContent ?? '';
+    expect(text).not.toContain('Nothing.');
+    expect(text).not.toContain('None.');
+    expect(text).toContain('Too many to list here.');
+    expect(text).toContain('More files than can be listed here.');
+    expect(text).toContain('Untracked: more names than can be listed here.');
+    // Untracked names alone, cut: still not "Nothing"
+    vi.mocked(changesApi.read).mockResolvedValue({ ...c, repo: { ...repo, uncommitted: { files: [], more: false, note: null } } });
+    await act(async () => { window.dispatchEvent(new Event('focus')); }); await flush();
+    expect(host.textContent).not.toContain('Nothing.');
+    expect(host.textContent).toContain('Untracked: more names than can be listed here.');
+  });
+
+  it('lets Refresh be pressed again after a read on focus took over its read (review 17426)', async () => {
+    const pending: ((c: Changes) => void)[] = [];
+    vi.mocked(changesApi.read).mockImplementation(() => new Promise(resolve => { pending.push(resolve); }));
+    await act(async () => root.render(<ChangesPane session={hosted()} active/>));
+    await act(async () => pending.shift()!(changes())); await flush();
+    const refresh = () => host.querySelector('.hs-changes-refresh') as HTMLButtonElement;
+    await act(async () => refresh().click());
+    expect(refresh().disabled).toBe(true);
+    // The window comes back to the front while the pressed read is under way
+    await act(async () => { window.dispatchEvent(new Event('focus')); });
+    expect(pending).toHaveLength(2);
+    await act(async () => pending.shift()!(changes())); await flush();
+    expect(refresh().disabled).toBe(true);
+    await act(async () => pending.shift()!(changes())); await flush();
+    expect(refresh().disabled).toBe(false);
+  });
+
+  it('says when a staged change was undone in the work tree', async () => {
+    const c = changes();
+    const undone = { ...c.repo!.uncommitted.files[1], path: 'a.txt', status: 'M', staged: true, unstaged: true, undone: true, hidden: 0, diff: 'diff --git a/a.txt b/a.txt\n@@ -1 +1,2 @@\n one\n+staged\ndiff --git a/a.txt b/a.txt\n@@ -1,2 +1 @@\n one\n-staged\n' };
+    vi.mocked(changesApi.read).mockResolvedValue({ ...c, repo: { ...c.repo!, hidden: 0, uncommitted: { files: [undone], more: false, note: null } } });
+    await act(async () => root.render(<ChangesPane session={hosted()} active/>)); await flush();
+    expect(host.querySelector('.hs-changes-diff h4')?.textContent).toBe('a.txt · +2 −0 · staged, undone in the work tree');
+    expect(host.querySelector('.hs-changes-diff')?.textContent).toContain('a commit would still take the staged change');
   });
 });

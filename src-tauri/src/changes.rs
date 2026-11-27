@@ -25,9 +25,20 @@
 //! Lines of a diff that have the shape of a credential (`secret_shape`, the
 //! detector of the cockpit and of Copy as task) are not sent to the page:
 //! the line keeps its `+`/`-` mark, says it was hidden, and the file and
-//! the whole read count them. Screenshots of Live travel; the operator
-//! still learns that a token is about to be committed, which is what they
-//! need to act on, and can read it in a terminal of their own.
+//! the whole read count them. Private key blocks are judged per hunk, since
+//! a hunk can hold any part of one (`hide`). Branch, base and upstream
+//! names, commit subjects and authors and file names of that shape are
+//! hidden too. Screenshots of Live travel; the operator still learns that a
+//! token is about to be committed, which is what they need to act on, and
+//! can read it in a terminal of their own.
+//!
+//! One read describes one head: HEAD, the base and the upstream are
+//! resolved to shas once, and every later call names those shas, so an
+//! agent that commits during the read cannot mix two heads in one answer.
+//! The uncommitted files are the net diff from that head plus what `git
+//! status` reports beside it (a change staged and then undone in the work
+//! tree, which a commit would still take). Logs are read with
+//! `--encoding=UTF-8`, and a count git refuses is an error, never "even".
 
 use serde::Serialize;
 use std::path::Path;
@@ -47,6 +58,8 @@ pub const MAX_COMMITS: usize = 100;
 
 /// What a diff line says instead of a credential
 pub const HIDDEN: &str = "··· hidden: this line has the shape of a credential";
+/// What a hunk header says after its ranges instead of such a line
+const HIDDEN_CONTEXT: &str = "··· hidden";
 
 /// One git call: `git <args>` in `dir`. The runner owns the timeout and the
 /// bound on what is read (`limit` bytes of standard output).
@@ -174,6 +187,10 @@ pub struct File {
     /// Why there is no diff: binary, too large, not loaded
     pub diff_note: Option<String>,
     pub hidden: usize,
+    /// Uncommitted only: staged, then put back in the work tree, so the
+    /// head and the work tree agree while a commit would still take the
+    /// staged change. Its diff is the staged one, then the work tree's.
+    pub undone: bool,
 }
 
 const TOO_LARGE: &str = "too large to show here: run git diff in a terminal";
@@ -194,15 +211,18 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
     let r = Reader { git, dir };
     let mut repo = Repo { root: root.clone(), ..Repo::default() };
     repo.branch = r.line(&["symbolic-ref", "--quiet", "--short", "HEAD"])?.filter(|b| !b.is_empty());
+    // The head and every ref compared with it are resolved once, and only
+    // those shas are used after: an agent that commits while the pane reads
+    // cannot make one answer describe two heads.
     repo.head = r.line(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?.filter(|h| !h.is_empty());
 
     if let Some(head) = repo.head.clone() {
         match r.base()? {
-            Some(name) => {
-                let merge_base = r.line(&["merge-base", &name, &head])?.filter(|m| !m.is_empty());
-                let (behind, ahead) = r.counts(&name)?;
+            Some((name, base)) => {
+                let merge_base = r.line(&["merge-base", &base, &head])?.filter(|m| !m.is_empty());
+                let (behind, ahead) = r.counts(&name, &base, &head)?;
                 repo.base = Some(Track { name: name.clone(), ahead, behind, merge_base: merge_base.clone() });
-                let (commits, more) = r.commits(&name)?;
+                let (commits, more) = r.commits(&base, &head)?;
                 repo.commits = commits;
                 repo.commits_more = more;
                 match merge_base {
@@ -213,18 +233,21 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
             None => repo.base_note = Some("No base: the repository has neither origin/HEAD nor origin/main.".into()),
         }
         if let Some(name) = r.line(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])?.filter(|u| !u.is_empty()) {
-            let (behind, ahead) = r.counts(&name)?;
-            repo.upstream = Some(Track { name, ahead, behind, merge_base: None });
+            if let Some(sha) = r.line(&["rev-parse", "--verify", "--quiet", "@{upstream}^{commit}"])?.filter(|u| !u.is_empty()) {
+                let (behind, ahead) = r.counts(&name, &sha, &head)?;
+                repo.upstream = Some(Track { name, ahead, behind, merge_base: None });
+            }
         }
     } else {
         repo.base_note = Some("No commit yet.".into());
     }
 
-    let Status { tracked: status, untracked, more } = r.status()?;
+    let (status, status_more) = r.tracked()?;
+    let (untracked, more) = r.untracked()?;
     repo.untracked = untracked;
     repo.untracked_more = more;
-    if repo.head.is_some() {
-        repo.uncommitted = r.side(&["HEAD"], true)?;
+    if let Some(head) = repo.head.clone() {
+        repo.uncommitted = r.side(&[&head], true)?;
         for file in &mut repo.uncommitted.files {
             if let Some(xy) = status.iter().find(|(path, _)| *path == file.path).map(|(_, xy)| xy) {
                 let (x, y) = (xy.as_bytes()[0], xy.as_bytes()[1]);
@@ -233,11 +256,25 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
                 file.status = (if x == b' ' { y } else { x } as char).to_string();
             }
         }
+        // A change git status sees that the net diff from the head does not:
+        // staged, then undone in the work tree. A plain commit takes it.
+        let missing: Vec<&(String, String)> = status.iter().filter(|(path, _)| !repo.uncommitted.files.iter().any(|f| f.path == *path)).collect();
+        for (n, (path, xy)) in missing.into_iter().enumerate() {
+            if n >= ONE_BY_ONE || repo.uncommitted.files.len() >= MAX_FILES {
+                repo.uncommitted.more = true;
+                break;
+            }
+            let file = r.undone(&head, path, xy)?;
+            repo.uncommitted.files.push(file);
+        }
     } else {
         repo.uncommitted.files = status.into_iter().map(|(path, xy)| File { status: xy.trim().chars().next().unwrap_or('A').to_string(), staged: xy.as_bytes()[0] != b' ', unstaged: xy.as_bytes()[1] != b' ', path, diff_note: Some("no commit to compare with yet".into()), ..File::default() }).collect();
     }
+    if status_more {
+        repo.uncommitted.more = true;
+    }
 
-    // Names and subjects are shown too: hide those with the shape as well
+    // Names, subjects and authors are shown too: hide those with the shape as well
     let mut hidden = 0;
     let mut name = |s: &mut String| {
         if crate::secret_shape::looks_secret(s) {
@@ -247,6 +284,7 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
     };
     for c in &mut repo.commits {
         name(&mut c.subject);
+        name(&mut c.author);
     }
     for f in repo.committed.files.iter_mut().chain(repo.uncommitted.files.iter_mut()) {
         name(&mut f.path);
@@ -255,16 +293,11 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
     if let Some(b) = repo.branch.as_mut() {
         name(b);
     }
+    for t in repo.base.iter_mut().chain(repo.upstream.iter_mut()) {
+        name(&mut t.name);
+    }
     repo.hidden = hidden + repo.committed.files.iter().chain(&repo.uncommitted.files).map(|f| f.hidden).sum::<usize>();
     Ok(Changes { repo: Some(repo), note: None })
-}
-
-/// What `git status` says: XY letters per tracked path, the untracked paths
-#[derive(Default)]
-struct Status {
-    tracked: Vec<(String, String)>,
-    untracked: Vec<String>,
-    more: bool,
 }
 
 struct Reader<'a> {
@@ -286,36 +319,41 @@ impl Reader<'_> {
         Ok(self.run(args, LINE_LIMIT)?.map(|o| line(&o.stdout)))
     }
 
-    /// origin/HEAD, else origin/main
-    fn base(&self) -> Result<Option<String>, String> {
+    /// origin/HEAD, else origin/main: its name and the commit it names now
+    fn base(&self) -> Result<Option<(String, String)>, String> {
+        let sha = |r: &str| -> Result<Option<String>, String> { Ok(self.line(&["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")])?.filter(|s| !s.is_empty())) };
         if let Some(r) = self.line(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])? {
             if let Some(name) = r.strip_prefix("refs/remotes/") {
-                if self.line(&["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{name}^{{commit}}")])?.is_some() {
-                    return Ok(Some(name.to_string()));
+                if let Some(at) = sha(&format!("refs/remotes/{name}"))? {
+                    return Ok(Some((name.to_string(), at)));
                 }
             }
         }
-        Ok(self.line(&["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"])?.map(|_| "origin/main".into()))
+        Ok(sha("refs/remotes/origin/main")?.map(|at| ("origin/main".into(), at)))
     }
 
     /// (behind, ahead) of HEAD against `other`. `log` marks each commit of
     /// the symmetric range `<` (only in `other`) or `>` (only in HEAD):
     /// `rev-list --count` is not among the runner's guarded subcommands.
-    fn counts(&self, other: &str) -> Result<(u64, u64), String> {
-        let range = format!("{other}...HEAD");
-        let Some(out) = self.run(&["log", "--no-color", "--no-show-signature", "--left-right", "--format=%m", &range, "--"], COUNT_LIMIT)? else { return Ok((0, 0)) };
+    /// The marks are read as UTF-8 whatever `i18n.logOutputEncoding` says,
+    /// and a count git refused is an error, never "even".
+    fn counts(&self, name: &str, other: &str, head: &str) -> Result<(u64, u64), String> {
+        let range = format!("{other}...{head}");
+        let Some(out) = self.run(&["log", "--no-color", "--no-show-signature", "--encoding=UTF-8", "--left-right", "--format=%m", &range, "--"], COUNT_LIMIT)? else {
+            return Err(format!("Git could not count the commits between {name} and the head."));
+        };
         if out.truncated {
-            return Err(format!("{other} and HEAD are too far apart to count here."));
+            return Err(format!("{name} and the head are too far apart to count here."));
         }
         let marks = String::from_utf8_lossy(&out.stdout);
         let count = |m: &str| marks.lines().filter(|l| *l == m).count() as u64;
         Ok((count("<"), count(">")))
     }
 
-    fn commits(&self, base: &str) -> Result<(Vec<Commit>, bool), String> {
+    fn commits(&self, base: &str, head: &str) -> Result<(Vec<Commit>, bool), String> {
         let n = format!("-n{}", MAX_COMMITS + 1);
-        let range = format!("{base}..HEAD");
-        let Some(out) = self.run(&["log", "--no-color", "--no-show-signature", "--format=%H%x1f%h%x1f%an%x1f%ct%x1f%s%x1e", &n, &range, "--"], LIST_LIMIT)? else { return Ok((vec![], false)) };
+        let range = format!("{base}..{head}");
+        let Some(out) = self.run(&["log", "--no-color", "--no-show-signature", "--encoding=UTF-8", "--format=%H%x1f%h%x1f%an%x1f%ct%x1f%s%x1e", &n, &range, "--"], LIST_LIMIT)? else { return Ok((vec![], false)) };
         let text = String::from_utf8_lossy(&out.stdout);
         let mut commits: Vec<Commit> = text
             .split('\x1e')
@@ -330,29 +368,68 @@ impl Reader<'_> {
         Ok((commits, more))
     }
 
-    /// Status letters per tracked path, and the untracked paths
-    fn status(&self) -> Result<Status, String> {
-        let Some(out) = self.run(&["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=normal", "--ignore-submodules=dirty"], LIST_LIMIT)? else {
-            return Ok(Status::default());
+    /// `git status -z` entries, without the one an output cut at its limit
+    /// left half written; and whether it was cut
+    fn status(&self, untracked: &str) -> Result<(Vec<(String, String)>, bool), String> {
+        let Some(out) = self.run(&["status", "--porcelain=v1", "-z", "--no-renames", untracked, "--ignore-submodules=dirty"], LIST_LIMIT)? else {
+            return Ok((vec![], false));
         };
         let text = String::from_utf8_lossy(&out.stdout);
         let mut entries: Vec<&str> = text.split('\0').filter(|e| e.len() > 3).collect();
         if out.truncated {
             entries.pop();
         }
-        let mut tracked = Vec::new();
-        let mut untracked = Vec::new();
-        for e in entries {
-            let (xy, path) = (&e[..2], &e[3..]);
-            if xy == "??" {
-                untracked.push(path.to_string());
-            } else if xy != "!!" {
-                tracked.push((path.to_string(), xy.to_string()));
+        Ok((entries.into_iter().map(|e| (e[3..].to_string(), e[..2].to_string())).collect(), out.truncated))
+    }
+
+    /// XY letters per tracked path. Read apart from the untracked names, so
+    /// that a flood of those cannot push the tracked ones out of the list.
+    fn tracked(&self) -> Result<(Vec<(String, String)>, bool), String> {
+        let (all, cut) = self.status("--untracked-files=no")?;
+        Ok((all.into_iter().filter(|(_, xy)| xy != "??" && xy != "!!").collect(), cut))
+    }
+
+    fn untracked(&self) -> Result<(Vec<String>, bool), String> {
+        let (all, cut) = self.status("--untracked-files=normal")?;
+        let mut names: Vec<String> = all.into_iter().filter(|(_, xy)| xy == "??").map(|(path, _)| path).collect();
+        let more = names.len() > MAX_FILES || cut;
+        names.truncate(MAX_FILES);
+        Ok((names, more))
+    }
+
+    /// A tracked file the net diff from `head` leaves out: its staged diff,
+    /// then its work tree's, each read alone.
+    fn undone(&self, head: &str, path: &str, xy: &str) -> Result<File, String> {
+        let (x, y) = (xy.as_bytes()[0], xy.as_bytes()[1]);
+        let mut file = File { path: path.to_string(), status: (if x == b' ' { y } else { x } as char).to_string(), staged: x != b' ', unstaged: y != b' ', undone: true, ..File::default() };
+        let spec = format!(":(literal){path}");
+        let mut text = String::new();
+        for from in [&["--cached", head][..], &[][..]] {
+            let args: Vec<String> = ["diff", "--patch"].iter().chain(DIFF.iter()).chain(from.iter()).map(|a| a.to_string()).chain(["--".to_string(), spec.clone()]).collect();
+            match self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), FILE_DIFF)? {
+                Some(out) if out.truncated => {
+                    file.diff_note = Some(TOO_LARGE.into());
+                    return Ok(file);
+                }
+                Some(out) => text.push_str(&String::from_utf8_lossy(&out.stdout)),
+                None => {}
             }
         }
-        let more = untracked.len() > MAX_FILES || out.truncated;
-        untracked.truncate(MAX_FILES);
-        Ok(Status { tracked, untracked, more })
+        if text.len() > FILE_DIFF {
+            file.diff_note = Some(TOO_LARGE.into());
+        } else if text.lines().any(|l| l.starts_with("Binary files ")) {
+            file.binary = true;
+            file.diff_note = Some("binary".into());
+        } else if text.is_empty() {
+            file.diff_note = Some("git shows no diff for it".into());
+        } else {
+            let (added, removed) = line_counts(&text);
+            (file.added, file.removed) = (Some(added), Some(removed));
+            let (shown, hidden) = hide(&text);
+            file.diff = Some(shown);
+            file.hidden = hidden;
+        }
+        Ok(file)
     }
 
     /// The files between `range` (one commit: to the work tree) with counts and diffs
@@ -427,6 +504,23 @@ fn line(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim_end_matches(['\n', '\r']).to_string()
 }
 
+/// Added and removed lines of a patch, counted in its hunks only
+fn line_counts(patch: &str) -> (u64, u64) {
+    let (mut added, mut removed, mut in_hunk) = (0, 0, false);
+    for l in patch.lines() {
+        if l.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if l.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk && l.starts_with('+') {
+            added += 1;
+        } else if in_hunk && l.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
 /// Splits a patch at its file headers and gives each file its part, in the
 /// order git lists them; a header that names another path ends the pairing.
 fn attach(files: &mut [File], patch: &str, truncated: bool) {
@@ -471,22 +565,48 @@ fn attach(files: &mut [File], patch: &str, truncated: bool) {
     }
 }
 
-/// One file's diff with every line of a credential's shape replaced, and a
-/// private key block hidden from its BEGIN line to its END line.
+/// One file's diff with every line of a credential's shape replaced, and
+/// what may be a private key hidden. A hunk can hold any part of a key
+/// block, so each hunk is judged alone: from a BEGIN line to its END line,
+/// to the hunk's end when the END is outside it, from the hunk's start when
+/// the BEGIN is; and, for the middle of a block where neither delimiter is
+/// in the hunk, every line with the shape of a key's body (at least 40
+/// characters of the base64 alphabet that are not all hex digits) with the
+/// base64 lines next to it. This hides a long run of such text that is no
+/// key as well; it is counted like any hidden line.
 pub fn hide(chunk: &str) -> (String, usize) {
+    let lines: Vec<&str> = chunk.split_inclusive('\n').collect();
+    let body = |l: &str| l.trim_end_matches(['\n', '\r']).to_string();
+    let mut hide = vec![false; lines.len()];
+    let mut from = 0;
+    for (i, l) in lines.iter().enumerate() {
+        if l.starts_with("@@") || l.starts_with("diff --git ") {
+            mark_keys(&lines, from..i, &mut hide);
+            from = i + 1;
+        }
+    }
+    mark_keys(&lines, from..lines.len(), &mut hide);
     let mut out = String::with_capacity(chunk.len());
     let mut hidden = 0;
-    let mut in_key = false;
-    for l in chunk.split_inclusive('\n') {
-        let body = l.trim_end_matches(['\n', '\r']);
-        let begins = body.contains("-----BEGIN") && body.contains("PRIVATE KEY");
-        let ends = body.contains("-----END") && body.contains("PRIVATE KEY");
-        let hunk = body.starts_with("@@");
-        if begins {
-            in_key = true;
+    for (i, l) in lines.iter().enumerate() {
+        let b = body(l);
+        // A hunk header keeps its ranges; git puts the nearest line that
+        // starts with a letter after them, which can be a key's line
+        if let Some(ranges) = b.strip_prefix("@@").and_then(|r| r.find("@@").map(|k| &b[..k + 4])) {
+            let context = b[ranges.len()..].trim();
+            if !context.is_empty() && (key_body(context) || context.contains("PRIVATE KEY") || crate::secret_shape::looks_secret(context)) {
+                out.push_str(ranges);
+                out.push(' ');
+                out.push_str(HIDDEN_CONTEXT);
+                out.push('\n');
+                hidden += 1;
+            } else {
+                out.push_str(l);
+            }
+            continue;
         }
-        if (in_key && !hunk) || crate::secret_shape::looks_secret(body) {
-            let mark = body.chars().next().filter(|c| matches!(c, '+' | '-' | ' ')).unwrap_or(' ');
+        if hide[i] || crate::secret_shape::looks_secret(&b) {
+            let mark = b.chars().next().filter(|c| matches!(c, '+' | '-' | ' ')).unwrap_or(' ');
             out.push(mark);
             out.push_str(HIDDEN);
             out.push('\n');
@@ -494,11 +614,60 @@ pub fn hide(chunk: &str) -> (String, usize) {
         } else {
             out.push_str(l);
         }
-        if ends {
-            in_key = false;
-        }
     }
     (out, hidden)
+}
+
+/// The text of a hunk's line without its `+`, `-` or ` ` mark
+fn content(l: &str) -> &str {
+    let b = l.trim_end_matches(['\n', '\r']);
+    match b.as_bytes().first() {
+        Some(b'+' | b'-' | b' ') => &b[1..],
+        _ => b,
+    }
+}
+
+fn base64ish(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))
+}
+
+/// A line that may be part of a key's body
+fn key_body(s: &str) -> bool {
+    s.len() >= 40 && base64ish(s) && !s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+fn mark_keys(lines: &[&str], hunk: std::ops::Range<usize>, hide: &mut [bool]) {
+    let begins = |i: usize| content(lines[i]).contains("-----BEGIN") && content(lines[i]).contains("PRIVATE KEY");
+    let ends = |i: usize| content(lines[i]).contains("-----END") && content(lines[i]).contains("PRIVATE KEY");
+    let mut open = None;
+    for i in hunk.clone() {
+        if begins(i) {
+            open = Some(i);
+        }
+        if ends(i) {
+            let start = open.take().unwrap_or(hunk.start);
+            hide[start..=i].iter_mut().for_each(|h| *h = true);
+        }
+    }
+    if let Some(start) = open {
+        hide[start..hunk.end].iter_mut().for_each(|h| *h = true);
+    }
+    for i in hunk.clone() {
+        if !key_body(content(lines[i])) {
+            continue;
+        }
+        hide[i] = true;
+        let mut j = i;
+        while j > hunk.start && base64ish(content(lines[j - 1])) {
+            j -= 1;
+            hide[j] = true;
+        }
+        let mut j = i + 1;
+        while j < hunk.end && base64ish(content(lines[j])) {
+            hide[j] = true;
+            j += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -517,21 +686,33 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// The repository's own settings for the tests. `core.autocrlf=false`
+    /// keeps the bytes a test writes the bytes git stores and checks out:
+    /// Git for Windows sets `autocrlf=true` in its system config, which the
+    /// test's own git calls read and the runner (`GIT_CONFIG_NOSYSTEM`) does
+    /// not, so a checkout with CRLF would look changed to the pane.
+    const SETTINGS: [(&str, &str); 4] = [("user.email", "t@example.invalid"), ("user.name", "T"), ("commit.gpgsign", "false"), ("core.autocrlf", "false")];
+
+    fn init(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        for (k, v) in SETTINGS {
+            git(dir, &["config", k, v]);
+        }
+    }
+
     /// A repository with an origin whose main has one commit, cloned.
     fn clone() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin");
         std::fs::create_dir(&origin).unwrap();
-        git(&origin, &["init", "-q", "-b", "main"]);
-        for (k, v) in [("user.email", "t@example.invalid"), ("user.name", "T"), ("commit.gpgsign", "false")] {
-            git(&origin, &["config", k, v]);
-        }
+        init(&origin);
         write(&origin, "a.txt", "one\ntwo\nthree\n");
         git(&origin, &["add", "."]);
         git(&origin, &["commit", "-qm", "first"]);
-        git(tmp.path(), &["clone", "-q", "origin", "work"]);
+        // Set before the checkout, so it writes the stored bytes
+        git(tmp.path(), &["clone", "-q", "-c", "core.autocrlf=false", "origin", "work"]);
         let work = tmp.path().join("work");
-        for (k, v) in [("user.email", "t@example.invalid"), ("user.name", "T"), ("commit.gpgsign", "false")] {
+        for (k, v) in SETTINGS {
             git(&work, &["config", k, v]);
         }
         (tmp, work)
@@ -633,14 +814,14 @@ mod tests {
     #[test]
     fn a_repository_without_origin_has_no_base_and_still_shows_uncommitted_work() {
         let tmp = tempfile::tempdir().unwrap();
-        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        init(tmp.path());
         let r = repo(tmp.path());
         assert!(r.head.is_none() && r.base.is_none());
         write(tmp.path(), "n.txt", "n\n");
         git(tmp.path(), &["add", "."]);
         let r = repo(tmp.path());
         assert_eq!(r.uncommitted.files.iter().map(|f| (f.path.as_str(), f.staged)).collect::<Vec<_>>(), vec![("n.txt", true)]);
-        git(tmp.path(), &["-c", "user.email=t@example.invalid", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-qm", "n"]);
+        git(tmp.path(), &["commit", "-qm", "n"]);
         let r = repo(tmp.path());
         assert!(r.head.is_some() && r.base.is_none() && r.base_note.unwrap().contains("origin/main"));
     }
@@ -863,5 +1044,195 @@ mod tests {
         assert_eq!(std::fs::read(&index).unwrap(), before);
         assert_eq!(std::fs::metadata(&index).unwrap().modified().unwrap(), modified);
         assert!(!work.join(".git/index.lock").exists());
+    }
+
+    /// A Git that hands each call to the shared runner, and lets a test act
+    /// after a call (an agent that commits while the pane reads) or answer
+    /// in its place.
+    struct Hooked<F: Fn(&[String]) -> Option<Result<Option<Out>, String>>, G: Fn(&[String])> {
+        instead: F,
+        after: G,
+    }
+    impl<F: Fn(&[String]) -> Option<Result<Option<Out>, String>>, G: Fn(&[String])> Git for Hooked<F, G> {
+        fn run(&self, dir: &Path, args: &[String], limit: usize) -> Result<Option<Out>, String> {
+            if let Some(answer) = (self.instead)(args) {
+                return answer;
+            }
+            let out = SharedGit::started().run(dir, args, limit);
+            (self.after)(args);
+            out
+        }
+    }
+
+    fn sha(dir: &Path, rev: &str) -> String {
+        let out = Command::new("git").args(["rev-parse", rev]).current_dir(dir).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn a_staged_change_undone_in_the_work_tree_is_still_listed() {
+        let (_tmp, work) = clone();
+        write(&work, "a.txt", "one\ntwo\nthree\nstaged\n");
+        git(&work, &["add", "a.txt"]);
+        // The work tree is the head's bytes again: the net diff is empty
+        write(&work, "a.txt", "one\ntwo\nthree\n");
+        let r = repo(&work);
+        let files: Vec<_> = r.uncommitted.files.iter().map(|f| (f.path.as_str(), f.status.as_str(), f.staged, f.unstaged, f.undone)).collect();
+        assert_eq!(files, vec![("a.txt", "M", true, true, true)]);
+        let f = &r.uncommitted.files[0];
+        let diff = f.diff.as_deref().unwrap();
+        // The staged diff first, then the work tree's that takes it back
+        let (staged, back) = (diff.find("+staged").unwrap(), diff.rfind("-staged").unwrap());
+        assert!(staged < back, "{diff}");
+        assert_eq!((f.added, f.removed), (Some(1), Some(1)));
+        // A file the net diff lists is not listed twice
+        write(&work, "a.txt", "one\nTWO\nthree\n");
+        assert_eq!(repo(&work).uncommitted.files.iter().filter(|f| f.path == "a.txt").count(), 1);
+    }
+
+    #[test]
+    fn a_flood_of_untracked_names_does_not_push_tracked_changes_out() {
+        let (_tmp, work) = clone();
+        write(&work, "a.txt", "one\ntwo\nthree\nstaged\n");
+        git(&work, &["add", "a.txt"]);
+        write(&work, "a.txt", "one\ntwo\nthree\n");
+        write(&work, "u.txt", "u\n");
+        // The untracked list passed its limit: the runner keeps none of it
+        let flood = Hooked { instead: |args: &[String]| args.iter().any(|a| a == "--untracked-files=normal").then(|| Ok(Some(Out { stdout: vec![], truncated: true }))), after: |_: &[String]| {} };
+        let r = read(&flood, &work).unwrap().repo.unwrap();
+        assert!(r.untracked.is_empty() && r.untracked_more);
+        assert_eq!(r.uncommitted.files.iter().map(|f| (f.path.as_str(), f.undone)).collect::<Vec<_>>(), vec![("a.txt", true)]);
+    }
+
+    #[test]
+    fn one_read_describes_the_head_it_resolved_first() {
+        let (_tmp, work) = clone();
+        git(&work, &["checkout", "-qb", "feature"]);
+        write(&work, "f.txt", "f\n");
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "first feature"]);
+        let first = sha(&work, "HEAD");
+        let committed = std::cell::Cell::new(false);
+        // An agent commits right after the pane resolved the head
+        let racing = Hooked {
+            instead: |_: &[String]| None,
+            after: |args: &[String]| {
+                if !committed.get() && args.iter().any(|a| a == "HEAD^{commit}") {
+                    committed.set(true);
+                    write(&work, "late.txt", "late\n");
+                    git(&work, &["add", "."]);
+                    git(&work, &["commit", "-qm", "late feature"]);
+                }
+            },
+        };
+        let r = read(&racing, &work).unwrap().repo.unwrap();
+        assert!(committed.get());
+        assert_ne!(sha(&work, "HEAD"), first);
+        assert_eq!(r.head.as_deref(), Some(first.as_str()));
+        let base = r.base.unwrap();
+        assert_eq!((base.ahead, base.behind), (1, 0));
+        assert_eq!(r.commits.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), vec!["first feature"]);
+        assert_eq!(r.committed.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), vec!["f.txt"]);
+        // Against that head, the later commit's file is work not committed
+        assert_eq!(r.uncommitted.files.iter().map(|f| (f.path.as_str(), f.status.as_str())).collect::<Vec<_>>(), vec![("late.txt", "A")]);
+    }
+
+    #[test]
+    fn counts_and_commits_are_read_as_utf8_whatever_the_log_encoding() {
+        let (_tmp, work) = clone();
+        git(&work, &["checkout", "-qb", "feature"]);
+        for i in 0..4 {
+            write(&work, &format!("f{i}.txt"), "x\n");
+            git(&work, &["add", "."]);
+            git(&work, &["commit", "-qm", &format!("feature {i} é")]);
+        }
+        git(&work, &["config", "i18n.logOutputEncoding", "UTF-16"]);
+        let r = repo(&work);
+        let base = r.base.unwrap();
+        assert_eq!((base.ahead, base.behind), (4, 0));
+        assert_eq!(r.commits.iter().map(|c| (c.subject.as_str(), c.author.as_str())).collect::<Vec<_>>(), (0..4).rev().map(|i| (format!("feature {i} é"), "T".to_string())).collect::<Vec<_>>().iter().map(|(s, a)| (s.as_str(), a.as_str())).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_count_git_refuses_is_an_error_and_never_even() {
+        let (_tmp, work) = clone();
+        let refusing = Hooked { instead: |args: &[String]| args.iter().any(|a| a == "--left-right").then_some(Ok(None)), after: |_: &[String]| {} };
+        let e = read(&refusing, &work).unwrap_err();
+        assert!(e.contains("could not count"), "{e}");
+    }
+
+    #[test]
+    fn names_of_the_base_upstream_and_authors_are_hidden_when_they_look_like_credentials() {
+        let (tmp, work) = clone();
+        let origin = tmp.path().join("origin");
+        let t = token();
+        // A branch of that name on origin, its upstream, and a commit by an author of that name
+        git(&origin, &["branch", &t]);
+        git(&work, &["fetch", "-q"]);
+        git(&work, &["checkout", "-qb", &t, "--track", &format!("origin/{t}")]);
+        git(&work, &["symbolic-ref", "refs/remotes/origin/HEAD", &format!("refs/remotes/origin/{t}")]);
+        write(&work, "f.txt", "f\n");
+        git(&work, &["add", "."]);
+        git(&work, &["-c", &format!("user.name={t}"), "commit", "-qm", "work"]);
+        let r = repo(&work);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains(&t), "{json}");
+        assert_eq!(r.base.as_ref().map(|b| (b.ahead, b.behind)), Some((1, 0)));
+        assert!(r.upstream.as_ref().unwrap().name.starts_with("(hidden"));
+        assert!(r.commits[0].author.starts_with("(hidden"));
+        // branch, base, upstream, author
+        assert_eq!(r.hidden, 4);
+    }
+
+    /// Test-only key material: base64 lines of a key's length, made at run time
+    fn key_lines(n: usize) -> Vec<String> {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        (0..n).map(|i| (0..64).map(|j| alphabet[(i * 7 + j * 13) % 64] as char).collect()).collect()
+    }
+
+    #[test]
+    fn a_hunk_in_the_middle_of_a_key_block_shows_none_of_it() {
+        let (_tmp, work) = clone();
+        let mut lines = vec![["-----BEGIN RSA ", "PRIVATE KEY-----"].concat()];
+        lines.extend(key_lines(30));
+        lines.push("AAAB3==".into());
+        lines.push(["-----END RSA ", "PRIVATE KEY-----"].concat());
+        let text = |l: &[String]| l.iter().map(|l| format!("{l}\n")).collect::<String>();
+        write(&work, "id_rsa", &text(&lines));
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "key"]);
+        // One line in the middle changes: the hunk has neither delimiter
+        let old = lines[15].clone();
+        lines[15] = key_lines(31)[30].clone();
+        write(&work, "id_rsa", &text(&lines));
+        let r = repo(&work);
+        let f = &r.uncommitted.files[0];
+        let diff = f.diff.as_deref().unwrap();
+        assert!(!diff.contains("BEGIN") && !diff.contains("END"), "the fixture's hunk holds a delimiter: {diff}");
+        for l in &lines[1..31] {
+            assert!(!diff.contains(&l[..20]), "a key line is shown: {diff}");
+        }
+        assert!(!diff.contains(&old[..20]));
+        // The hunk's eight lines and the key line git names in its header
+        assert_eq!(f.hidden, 9, "{diff}");
+        assert!(diff.contains(&format!("@@ {HIDDEN_CONTEXT}\n")), "{diff}");
+        // A hunk near the end: from its start to the END line, the short last line included
+        lines[29] = key_lines(32)[31].clone();
+        lines[15] = old;
+        write(&work, "id_rsa", &text(&lines));
+        let diff = repo(&work).uncommitted.files[0].diff.clone().unwrap();
+        assert!(!diff.contains("AAAB3==") && !diff.contains(&lines[29][..20]), "{diff}");
+    }
+
+    #[test]
+    fn hex_digests_and_ordinary_lines_beside_them_stay_shown() {
+        let chunk = "diff --git a/x b/x\n@@ -1,2 +1,2 @@\n name\n-0123456789abcdef0123456789abcdef01234567\n+89abcdef0123456789abcdef0123456789abcdef\n";
+        let (out, hidden) = hide(chunk);
+        assert_eq!((out.as_str(), hidden), (chunk, 0));
+        // An END line with its BEGIN before the hunk hides the hunk up to it, and nothing after
+        let chunk = "diff --git a/k b/k\n@@ -3,3 +3,3 @@\n-abc\n+abd\n -----END EC PRIVATE KEY-----\n+after\n";
+        let (out, hidden) = hide(chunk);
+        assert_eq!(hidden, 3);
+        assert!(out.ends_with("+after\n") && !out.contains("abd"), "{out}");
     }
 }
