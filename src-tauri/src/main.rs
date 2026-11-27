@@ -1316,6 +1316,7 @@ fn main() {
             harness_commands::memory_status,
             harness_commands::memory_connect,
             harness_commands::memory_disconnect,
+            harness_commands::vault_unlock,
             harness_commands::slack_status,
             harness_commands::slack_waiting,
             harness_commands::slack_connect,

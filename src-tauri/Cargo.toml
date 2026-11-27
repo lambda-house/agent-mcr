@@ -44,6 +44,20 @@ security-framework = "3.7.0"
 glib-sys = "0.22.9"
 glib = "0.22.10"
 gobject-sys = "0.22.9"
+# The vault on Linux (MCR-177): the desktop's Secret Service over D-Bus. zbus 5 as
+# the Tauri plugins already use it; secret-service 6 moved to zbus 6. The crate
+# is used for the app's unlock only, whose prompt is wanted: every other call
+# goes through our own client in vault.rs, which never shows a prompt
+secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+# Our own Secret Service client (MCR-177 review): the session's key exchange and
+# cipher, the same crates and versions secret-service 5.2 already brings in
+num-bigint = "0.4"
+getrandom-secret = { package = "getrandom", version = "0.4" }
+hkdf = "0.13"
+sha2-secret = { package = "sha2", version = "0.11" }
+aes = "0.9"
+cbc = { version = "0.2", features = ["block-padding", "alloc"] }
 
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1.2"
