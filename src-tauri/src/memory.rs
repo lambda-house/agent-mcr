@@ -2487,47 +2487,44 @@ pub(crate) mod tests {
 
     /// A renewal or a sign-out may hold `keeping` over a slow vault write. The
     /// disconnect's time counts from the request, its wait for the lock
-    /// included: the vault and the revocation get only what is left of it
+    /// included: the vault and the revocation get only what is left of it.
+    /// The writer says when it holds the lock; nothing here waits on a guess
     #[test]
     fn a_disconnect_behind_a_slow_vault_write_still_answers_within_its_time() {
-        // The write holds the lock past the whole budget: nothing more is begun
+        /// `rig`'s vault takes `write` over one write made under `keeping`, and the
+        /// disconnect is asked once the writer holds the lock
+        fn behind_a_write(rig: &Rig, write: Duration) -> Value {
+            let link = rig.memory.link.clone();
+            rig.vault.slow_next(write);
+            let (held, holds) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let _kept = lock(&link.keeping);
+                    held.send(()).unwrap();
+                    // As a renewal keeps a rotated token
+                    let _ = link.vault.set("refresh", "refresh-synthetic-held");
+                });
+                holds.recv().unwrap();
+                rig.memory.disconnect()
+            })
+        }
+
+        // The write holds the lock well past the whole budget: nothing more is begun
         let rig = Rig::signed_in();
-        let link = rig.memory.link.clone();
-        *lock(&link.unkept) = Some((link.epoch(), "refresh-synthetic-held".into()));
-        rig.vault.slow(Some(DISCONNECT + Duration::from_millis(100)));
-        let asked = std::thread::scope(|scope| {
-            let writer = link.clone();
-            scope.spawn(move || writer.keep_unkept(writer.epoch()));
-            std::thread::sleep(Duration::from_millis(50));
-            rig.vault.slow(None);
-            let asked = Instant::now();
-            let status = rig.memory.disconnect();
-            let elapsed = asked.elapsed();
-            assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_removed")));
-            let text = status["problem"]["text"].as_str().unwrap();
-            assert!(text.contains("(the secret store did not answer in time)") && text.contains("revoke it in the memory console"), "{text}");
-            elapsed
-        });
-        assert!(asked < DISCONNECT + Duration::from_millis(150), "{asked:?}");
+        let status = behind_a_write(&rig, DISCONNECT + DISCONNECT / 2);
+        assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_removed")));
+        let text = status["problem"]["text"].as_str().unwrap();
+        assert!(text.contains("(the secret store did not answer in time)") && text.contains("revoke it in the memory console"), "{text}");
+        assert!(rig.vault.4.lock().unwrap().is_empty(), "the vault was asked");
         assert!(lock(&rig.world).revoked.is_empty());
         assert!(rig.vault.0.lock().unwrap().contains_key("access"));
 
-        // The write ends with some time left: the vault's share is cut to it
+        // The write ends with less than the vault's share left: the share is cut to it.
+        // The wait is about the write, so about DISCONNECT - write (half the share) is left
         let rig = Rig::signed_in();
-        let link = rig.memory.link.clone();
-        *lock(&link.unkept) = Some((link.epoch(), "refresh-synthetic-held".into()));
-        rig.vault.slow(Some(Duration::from_millis(700)));
-        let asked = std::thread::scope(|scope| {
-            let writer = link.clone();
-            scope.spawn(move || writer.keep_unkept(writer.epoch()));
-            std::thread::sleep(Duration::from_millis(50));
-            rig.vault.slow(Some(Duration::from_millis(150)));
-            let asked = Instant::now();
-            let status = rig.memory.disconnect();
-            assert_eq!(status["problem"]["kind"], "not_removed");
-            asked.elapsed()
-        });
-        assert!(asked < DISCONNECT + Duration::from_millis(150), "{asked:?}");
+        let write = DISCONNECT - VAULT_SHARE / 2;
+        let status = behind_a_write(&rig, write);
+        assert_eq!(status["state"], "disconnected");
         let given = rig.vault.4.lock().unwrap().clone();
         assert!(given.len() == 1 && !given[0].is_zero() && given[0] < VAULT_SHARE, "{given:?}");
     }

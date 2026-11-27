@@ -827,6 +827,8 @@ pub struct Held(
     std::sync::Mutex<Option<std::time::Duration>>,
     /// The time each `take` was given, in order
     pub std::sync::Mutex<Vec<std::time::Duration>>,
+    /// How long the next call alone takes
+    std::sync::Mutex<Option<std::time::Duration>>,
 );
 
 #[cfg(test)]
@@ -851,8 +853,14 @@ impl Held {
         *self.3.lock().unwrap() = each;
     }
 
+    /// Take this long over the next call only
+    pub fn slow_next(&self, by: std::time::Duration) {
+        *self.5.lock().unwrap() = Some(by);
+    }
+
     fn refused(&self) -> Result<(), Unavailable> {
-        let slow = *self.3.lock().unwrap();
+        let next = self.5.lock().unwrap().take();
+        let slow = next.or(*self.3.lock().unwrap());
         if let Some(slow) = slow {
             std::thread::sleep(slow);
         }
