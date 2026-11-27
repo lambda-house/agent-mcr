@@ -112,7 +112,7 @@ impl Fail {
             Fail::NoModelKey => "The memory service has no model key for this tenant, so it cannot answer this call. Calls that need no model, such as lists and reads, still work. Tell the operator.".into(),
             Fail::Unreachable(e) => format!("The memory service could not be reached: {e}"),
             Fail::Vault(why) => format!("Memory's sign-in could not be read from the secret store: {}. The sign-in is kept, and calls work again once the store can be read. Tell the operator if this lasts.", why.0),
-            Fail::Unusable => "Memory's sign-in is in the secret store, but the authorization server's description kept with it cannot be read. The sign-in is kept and nothing was removed. The operator disconnects and connects memory again in Agent MCR (Settings, Memory).".into(),
+            Fail::Unusable => "Memory's sign-in is in the secret store, but the authorization server's description kept with it cannot be read or would send a token elsewhere, so no token is sent with it. The sign-in is kept and nothing was removed. The operator disconnects and connects memory again in Agent MCR (Settings, Memory).".into(),
             Fail::Refused(e) => format!("The memory service refused the call: {e}"),
             Fail::Rpc(e) => e["message"].as_str().unwrap_or("The memory service answered with an error").to_string(),
         }
@@ -445,15 +445,16 @@ impl Link {
 
     /// Where the tokens of this sign-in go: read from the vault, where the
     /// sign-in put it, and held to the rule of the sign-in once more. Never
-    /// from the state file. `Ok(None)`: the vault holds none that holds. One
-    /// that cannot be read at all is `Fail::Unusable`, not a missing one: a
-    /// sign-in ends only on the vault's word that it is not there.
+    /// from the state file. `Ok(None)`: the vault holds none. One that
+    /// cannot be read, or that fails the rule (`Meta::sound`), is
+    /// `Fail::Unusable`, not a missing one: no token goes anywhere with it,
+    /// and a sign-in ends only on the vault's word that it is not there.
     fn meta(&self) -> Result<Option<Meta>, Fail> {
         let mut held = lock(&self.meta);
         if held.is_none() {
             let Some(text) = self.vault.get("meta").map_err(Fail::Vault)? else { return Ok(None) };
-            let meta = serde_json::from_str::<Meta>(&text).map_err(|_| Fail::Unusable)?;
-            *held = Some(meta).filter(Meta::sound);
+            let meta = serde_json::from_str::<Meta>(&text).ok().filter(Meta::sound).ok_or(Fail::Unusable)?;
+            *held = Some(meta);
         }
         Ok(held.clone())
     }
@@ -1153,7 +1154,8 @@ impl Memory {
             let (meta, client, refresh) = (value(), value(), value());
             let meta = match known {
                 Some(known) => Ok(Some(known)),
-                // A description that cannot be read gives nowhere to revoke at
+                // A description that is missing, cannot be read or fails the rule gives
+                // nowhere to revoke at
                 None => meta.map(|text| text.and_then(|text| serde_json::from_str::<Meta>(&text).ok()).filter(Meta::sound)),
             };
             let refresh = match unkept {
@@ -1171,17 +1173,21 @@ impl Memory {
         };
         self.backend.reset();
         *lock(&self.tools) = None;
-        // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009)
-        let revoked = match held {
+        // Revoking the refresh token ends the grant, and the access tokens with it (RFC 7009).
+        // Err(Some): the store could not be read; Err(None): there is a grant, but nowhere
+        // to revoke it at
+        let revoked: Result<bool, Option<Unavailable>> = match held {
             (Ok(Some(meta)), Ok(Some(client)), Ok(Some(token))) => Ok(Instant::now() < until && link.revoke(&meta, &client, &token, left(until))),
-            (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => Err(why),
+            (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => Err(Some(why)),
             // Nothing was signed in: there is no grant to end
-            _ => Ok(true),
+            (_, _, Ok(None)) => Ok(true),
+            (_, _, Ok(Some(_))) => Err(None),
         };
         let told = match (revoked, removed) {
             (Ok(true), Ok(())) => None,
             (Ok(false), Ok(())) => Some(("not_revoked", "The tokens are removed from this computer, but the memory service did not confirm that the sign-in is revoked there. It may still be valid on that side: revoke it in the memory console.".to_string())),
-            (Err(why), Ok(())) => Some(("not_revoked", format!("The tokens are removed from this computer, but the secret store could not be read before ({}), so the memory service was not asked to revoke the sign-in. It may still be valid on that side: revoke it in the memory console.", why.0))),
+            (Err(Some(why)), Ok(())) => Some(("not_revoked", format!("The tokens are removed from this computer, but the secret store could not be read before ({}), so the memory service was not asked to revoke the sign-in. It may still be valid on that side: revoke it in the memory console.", why.0))),
+            (Err(None), Ok(())) => Some(("not_revoked", "The tokens are removed from this computer, but the authorization server's description kept with them could not be read or used, so the memory service was not asked to revoke the sign-in. It may still be valid on that side: revoke it in the memory console.".to_string())),
             (revoked, Err(why)) => Some((
                 "not_removed",
                 format!(
@@ -2390,6 +2396,12 @@ pub(crate) mod tests {
         assert_eq!(again.status()["problem"]["kind"], "sign_in_unusable");
         assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-1"));
         assert_eq!(lock(&rig.world).count("POST /oauth/token"), 1);
+        // A disconnect cannot revoke the grant without it, and says so
+        let status = again.disconnect();
+        assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_revoked")));
+        assert!(status["problem"]["text"].as_str().unwrap().contains("could not be read or used"), "{status}");
+        assert!(lock(&rig.world).revoked.is_empty());
+        assert!(rig.vault.0.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2743,15 +2755,24 @@ pub(crate) mod tests {
         assert!(lock(&elsewhere).seen.is_empty(), "{:?}", lock(&elsewhere).seen);
 
         // What is kept with the secrets is held to the same rule as at the sign-in: a token
-        // address that is not the issuer's own gets nothing, and the sign-in is over
+        // address that is not the issuer's own gets nothing. The sign-in is kept and nothing
+        // is removed (plan c17451): the operator connects again
         let rig = Rig::signed_in();
         let base = lock(&rig.world).base.clone();
         rig.vault.set("meta", &json!({"issuer": base, "authorizationEndpoint": format!("{base}/authorize"), "tokenEndpoint": format!("{other}/oauth/token"), "registrationEndpoint": format!("{base}/oauth/register")}).to_string()).unwrap();
         let again = Memory::with(&rig.dir, &format!("{base}/mcp"), Box::new(rig.vault.clone()), None);
         again.link.change(|s| s.access_expires = 1);
         let told = again.handle(&Ok("s1".into()), &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "clock", "arguments": {}}})).unwrap();
-        assert_eq!(told["result"]["content"][0]["text"], Fail::SignedOut.text());
+        assert_eq!(told["result"]["content"][0]["text"], Fail::Unusable.text());
+        assert_eq!((again.status()["state"].as_str(), again.status()["problem"]["kind"].as_str()), (Some("connected"), Some("sign_in_unusable")));
         assert!(lock(&elsewhere).seen.is_empty());
+        assert_eq!(rig.vault.get("refresh").unwrap().as_deref(), Some("refresh-secret-1"));
+        assert_eq!(lock(&rig.world).count("POST /oauth/token"), 1);
+        // A disconnect has nowhere to revoke at, and says so; the token went nowhere
+        let status = again.disconnect();
+        assert_eq!((status["state"].as_str(), status["problem"]["kind"].as_str()), (Some("disconnected"), Some("not_revoked")));
+        assert!(status["problem"]["text"].as_str().unwrap().contains("could not be read or used"), "{status}");
+        assert!(lock(&rig.world).revoked.is_empty() && lock(&elsewhere).seen.is_empty());
         assert!(rig.vault.0.lock().unwrap().is_empty());
     }
 
