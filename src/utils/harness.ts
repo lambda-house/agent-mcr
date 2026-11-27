@@ -432,7 +432,8 @@ export interface MemoryStatus {
 }
 
 /** Problems that leave memory unusable while connected: the bridge's tool list fails (`noted` in memory.rs clears them at the next call that gets through).
- *  `no_model_key` is not one: the tools are listed and calls that need no model still work. */
+ *  `no_model_key` is not one: the tools are listed and calls that need no model still work. Neither is `vault_unsaved`
+ *  (the store reads but did not save a renewed token): calls go through, and an unlock would not help. */
 const MEMORY_DOWN: Record<string, string> = {
   vault_unavailable: 'the sign-in cannot be read from the secret store',
   unreachable: 'the memory service cannot be reached',
@@ -443,6 +444,9 @@ const MEMORY_RESTART = 'restarted or reconnected (in Claude Code, /mcp and then 
 
 /** One line on where the memory connection stands, for Settings. `unlocked`: the person unlocked the keyring for the current problem. */
 export function memoryStateLine(status: MemoryStatus, unlocked = false): string {
+  if (status.state === 'connected' && status.problem?.kind === 'vault_unsaved') {
+    return `Connected to ${status.endpoint}. Memory works and new and restarted sessions have the memory tools, but the secret store could not save a renewed token: the last problem says what that means until a save succeeds.`;
+  }
   if (status.state === 'connected' && status.problem?.kind === 'sign_in_unusable') {
     return `Signed in to ${status.endpoint}, but the description kept with the sign-in in the secret store cannot be read or used, so the sign-in cannot be renewed. Nothing was removed. Disconnect and connect again.`;
   }

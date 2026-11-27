@@ -88,6 +88,17 @@ it('says in the headline that a locked keyring leaves memory unusable while stil
   expect(host.querySelector('[role="status"]')).toBeNull();
 });
 
+it('says that memory works while a renewed token could not be saved, and offers no unlock for it', async () => {
+  const unsaved = { kind: 'vault_unsaved', text: 'Memory works and its calls go through, but the secret store could not save a renewed token (the keyring asked for a confirmation that was not given). Each call renews the sign-in until a save succeeds.', at: 7 };
+  vi.mocked(memoryApi.status).mockResolvedValue({ ...base, state: 'connected', since: 5, problem: unsaved });
+  await act(async () => root.render(<MemoryConnection/>)); await flush();
+  expect(host.textContent).toContain('Memory works and new and restarted sessions have the memory tools, but the secret store could not save a renewed token');
+  expect(host.textContent).not.toContain('Memory cannot be used now');
+  expect(host.textContent).not.toContain('cannot be read from the secret store');
+  expect(host.textContent).toContain('Each call renews the sign-in until a save succeeds.');
+  expect(host.textContent).not.toContain('Unlock keyring');
+});
+
 it('offers no unlock for a problem that is not the keyring', async () => {
   vi.mocked(memoryApi.status).mockResolvedValue({ ...base, state: 'connected', since: 5, problem: { kind: 'unreachable', text: 'The memory service could not be reached: timed out', at: 3 } });
   await act(async () => root.render(<MemoryConnection/>)); await flush();
@@ -113,6 +124,8 @@ it('does not claim the memory tools while a problem leaves memory unusable', () 
   expect(memoryStateLine({ ...connected, problem: { kind: 'vault_unavailable', text: '', at: 3 } }, true)).toBe('Signed in to https://mcp.memory.teob.cc/mcp. The keyring is unlocked: memory is used again at its next call. Sessions started while it was locked have no memory tools until they are restarted or reconnected (in Claude Code, /mcp and then reconnect mcr-memory).');
   // No model key: the tools are listed and calls without a model work, so the headline stays; the Last problem row says the rest
   expect(memoryStateLine({ ...connected, problem: { kind: 'no_model_key', text: '', at: 3 } })).toContain('New and restarted sessions have the memory tools');
+  // A token the store did not save leaves memory usable
+  expect(memoryStateLine({ ...connected, problem: { kind: 'vault_unsaved', text: '', at: 3 } })).not.toContain('cannot be used now');
   // A sign-in the vault holds but cannot be used asks for a new Connect, not for patience
   const unusable = memoryStateLine({ ...connected, problem: { kind: 'sign_in_unusable', text: '', at: 3 } });
   expect(unusable).toContain('Disconnect and connect again');
