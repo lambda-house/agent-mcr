@@ -3,7 +3,7 @@ import { Flame } from 'lucide-react';
 import { cacheState, compact, contextWindow, sessionApi, sessionKey, type Session } from '../utils/sessions';
 import { runningFor, type Hosted } from '../utils/harness';
 import { estimatedCost } from '../utils/sessionCost';
-import { keepSame } from '../utils/keepSame';
+import { keepSame } from '@lambda-house/ui';
 
 /** The index keys of the listed Claude and Codex conversations, running or ended, in one order */
 export function hostedKeys(hosted: Hosted[]): string[] {

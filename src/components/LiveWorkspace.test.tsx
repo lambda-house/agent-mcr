@@ -9,6 +9,8 @@ import { useStore } from '../store';
 import { DEFAULT_LIVE_LIST } from '../utils/harness';
 import { liveNav } from '../utils/liveNav';
 import { hostedDetail } from './SessionRow';
+import { useSessionsLayout } from '../sessionsLayout';
+import { leaves } from '@lambda-house/workbench';
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), listSince: vi.fn(), spawn: vi.fn(), signal: vi.fn(), forget: vi.fn(), restart: vi.fn(), resumable: vi.fn(), storeNoticeSeen: vi.fn(), ack: vi.fn(), supervisor: vi.fn(), background: vi.fn(), allowBackground: vi.fn(), stopBackground: vi.fn() } }));
 vi.mock('./SessionRow', async importOriginal => {
@@ -78,6 +80,8 @@ beforeEach(() => {
     takeRecords() { return []; }
   });
   localStorage.removeItem('hs-dirs');
+  // Live's layout is kept per viewer: each test starts from the first one
+  useSessionsLayout.getState().reset('live');
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
   vi.mocked(harnessApi.status).mockResolvedValue({ runner: { protocol: 1, pid: 7, version: '0.1.0', exe: '/x' }, profiles: [{ id: 'claude', label: 'Claude Code', command: 'claude', optional: false, canSupervise: true, taskTracking: true }, { id: 'codex', label: 'Codex', command: 'codex', optional: false, canSupervise: true, taskTracking: true }, { id: 'antigravity', label: 'Antigravity', command: 'agy --mode accept-edits', optional: true, canSupervise: true, taskTracking: false }, { id: 'pi', label: 'Pi', command: 'pi', optional: true, canSupervise: true, taskTracking: false }, { id: 'opencode', label: 'OpenCode', command: 'opencode', optional: true, canSupervise: true, taskTracking: false }, { id: 'shell', label: 'Terminal', command: '', optional: false, canSupervise: false, taskTracking: false }], supervisorProfile: 'claude', home: '/Users/me' });
@@ -864,7 +868,9 @@ describe('Live workspace', () => {
     expect(host.textContent).toContain('2 tasks');
     expect(host.querySelector('.hs-dot.waiting')?.getAttribute('aria-label')).toBe('waiting for you');
     // One row per session, in start order: the waiting one says why, with no second card for it
-    expect(host.querySelector('.hs-notifications')?.textContent).toContain('Notifications · 1');
+    // The list's header counts the notifications
+    expect(button('Notifications').closest('.ui-pane__header')).not.toBeNull();
+    expect(button('Notifications').textContent).toBe('1');
     expect(rows()).toHaveLength(2);
     expect(rows()[0].className).toContain('needs-you');
     expect(rows()[0].textContent).toContain('reviewer');
@@ -882,7 +888,7 @@ describe('Live workspace', () => {
     await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
     await act(async () => button('Notifications').click());
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-    expect(items.map(b => b.textContent)).toEqual([' Reviewer: Which branch?', ' Builder: Build passed']);
+    expect(items.map(b => b.textContent)).toEqual(['Reviewer: Which branch?', 'Builder: Build passed']);
     await act(async () => items[1].click()); await flush();
     expect(host.querySelector('.hs-pane:not([hidden]) [data-terminal="done"]')).not.toBeNull();
     expect(harnessApi.ack).toHaveBeenCalledWith('done', 6);
@@ -1018,5 +1024,104 @@ describe('Live workspace', () => {
     expect(host.querySelector('.hs-gate')).toBeNull();
     expect(host.textContent).not.toContain('Runner pid');
     expect(host.querySelector('.hs-dir')).not.toBeNull();
+  });
+});
+
+describe('panes on the workbench layout', () => {
+  const row = (name: string) => [...host.querySelectorAll('.hs-item')].find(b => b.textContent?.includes(name)) as HTMLButtonElement;
+  const shown = () => [...host.querySelectorAll('.hs-layout-root [data-terminal]')].map(t => t.getAttribute('data-terminal'));
+  /** The ⋯ of a session's or an empty pane (by its place among them), or of the list. */
+  const paneMenu = (index: number) => host.querySelectorAll<HTMLButtonElement>('.hs-layout-root .hs-pane-title button[aria-label$="pane menu"]')[index];
+  const listMenu = () => host.querySelector<HTMLButtonElement>('.hs-list button[aria-label$="pane menu"]')!;
+  const choose = async (label: string) => {
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(b => b.textContent === label)!.click()); await flush();
+  };
+  const types = () => leaves(useSessionsLayout.getState().layouts.live).map(l => l.pane?.type);
+
+  it('keeps terminals mounted while panes are split and closed; a hidden one goes to the keep (MCR-139)', async () => {
+    const shell: Hosted = { ...ended, id: 's1', started: 3, exit: null };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => row('Fixing tests').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    await act(async () => button('Two columns').click()); await flush();
+    expect(shown()).toEqual(['s1', 'r1']);
+    const before = mounts.length;
+
+    // Split the first pane from its menu: an empty pane below it, both terminals where they were
+    await act(async () => paneMenu(0).click());
+    await choose('Split Down');
+    expect(host.querySelector('.hs-pane-title--empty')).not.toBeNull();
+    expect(shown()).toEqual(['s1', 'r1']);
+    // Close the empty pane from its menu, then one pane and two columns again
+    await act(async () => host.querySelector<HTMLButtonElement>('.hs-pane-title--empty button[aria-label$="pane menu"]')!.click());
+    await choose('Close Pane');
+    expect(host.querySelector('.hs-pane-title--empty')).toBeNull();
+    expect(mounts.length).toBe(before);
+    await act(async () => button('Single pane').click()); await flush();
+    expect(shown()).toHaveLength(1);
+    // No terminal is kept mounted hidden: the other one detached and went to the keep
+    expect(host.querySelectorAll('[data-terminal]')).toHaveLength(1);
+    await act(async () => button('Two columns').click()); await flush();
+    expect(shown()).toHaveLength(2);
+    // Shown again, it is mounted again (and takes from the keep only what it missed)
+    expect(mounts.length).toBe(before + 1);
+  });
+
+  it('has the list as a pane: it splits into an empty pane, which offers the sessions no pane shows', async () => {
+    const shell: Hosted = { ...ended, id: 's1', started: 3, exit: null, title: 'Second shell' };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    // The one pane a session can open in asks for one from the list, and has the workbench's menu
+    expect(host.querySelector('.hs-placeholder')?.textContent).toContain('Select a session');
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(types()).toEqual(['live-sessions', 'session']);
+    await act(async () => listMenu().click());
+    await choose('Split Right');
+    expect(types()).toEqual(['live-sessions', 'empty', 'session']);
+    // Two panes can take a session now: the empty one picks among those no pane shows
+    const picks = [...host.querySelectorAll<HTMLButtonElement>('.hs-pane-pick')];
+    expect(picks.map(b => b.querySelector('strong')?.textContent)).toEqual(['Second shell']);
+    // No panel to offer here (none is registered): no heading for them either
+    expect(host.querySelector('.hs-empty-panels')).toBeNull();
+    await act(async () => picks[0].click()); await flush();
+    expect(types()).toEqual(['live-sessions', 'session', 'session']);
+    expect(shown()).toEqual(['s1', 'r1']);
+    // The menus name sessions by their names
+    await act(async () => paneMenu(0).click());
+    expect([...document.querySelectorAll('[role="menuitem"]')].map(b => b.textContent)).toContain('Swap with Fixing tests');
+    await act(async () => paneMenu(0).click());
+  });
+
+  it('opens a session in a pane that can take one, never in the list', async () => {
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    // The chosen pane now holds the list (swapped): the session goes to the first pane that can take it
+    const { layouts } = useSessionsLayout.getState();
+    const [list, pane] = leaves(layouts.live);
+    useSessionsLayout.getState().focus('live', list.id);
+    await act(async () => row('Fixing tests').click()); await flush();
+    expect(types()).toEqual(['live-sessions', 'session']);
+    expect(useSessionsLayout.getState().focused.live).toBe(pane.id);
+    expect(shown()).toEqual(['r1']);
+  });
+
+  it('shows the sessions of the panes kept from the last run again, and empties the pane of one that is gone', async () => {
+    const shell: Hosted = { ...ended, id: 's1', started: 3, exit: null };
+    vi.mocked(harnessApi.list).mockResolvedValue([shell, running]);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    await act(async () => row('Fixing tests').click()); await flush();
+    await act(async () => row('Shell').click()); await flush();
+    await act(async () => button('Two columns').click()); await flush();
+    expect(shown()).toEqual(['s1', 'r1']);
+    // r1's pane is the one chosen when the app closes; when it opens again s1 has gone, r1 still runs
+    await act(async () => { host.querySelector('[data-terminal="r1"]')!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); });
+    await act(async () => root.unmount());
+    vi.mocked(harnessApi.list).mockResolvedValue([running]);
+    root = createRoot(host);
+    await act(async () => root.render(<LiveWorkspace active recentDirectories={[]}/>)); await flush();
+    expect(types()).toEqual(['live-sessions', 'empty', 'session']);
+    expect(shown()).toEqual(['r1']);
+    // Its session is the selected one again, without a click
+    expect(host.querySelector('.hs-dir li.selected')?.textContent).toContain('Fixing tests');
   });
 });

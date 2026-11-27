@@ -1,8 +1,8 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
-import { ArrowLeft, ArrowRight, BarChart3, BellRing, Check, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, History, Link2, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, Terminal, Unlink, X } from 'lucide-react';
-import { Button, Dialog } from '@/ui';
+import { ArrowLeft, ArrowRight, BarChart3, BellRing, Check, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, FolderPlus, History, Link2, ListTree, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, SquareDashed, Terminal, Unlink, X } from 'lucide-react';
+import { Button, Dialog, Menu, keepSame } from '@lambda-house/ui';
+import { LayoutView, Pane, PaneMenu, PaneTitle, ShellTools, closeLeaf, findLeaf, leaves as leavesOf, splitLeaf, usePaneTypes, type Layout, type LayoutNode, type PaneContext, type PaneRef, type PaneType } from '@lambda-house/workbench';
 import TerminalPane, { keep } from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
@@ -15,12 +15,13 @@ import { useStore } from '../store';
 import { EMPTY_HISTORY, renamed, step, visit } from '../utils/liveHistory';
 import { liveNav } from '../utils/liveNav';
 import { PLATFORM } from '../utils/platform';
-import { applyLayoutPreset, closeLeaf, createInitialLayout, findLeaf, findLeafByItem, listLeaves, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, setSplitRatio, splitLeaf, type LayoutPreset, type PaneItem, type PaneNode } from '../utils/paneLayout';
+import { CUSTOM_PANE, SESSION_PANE, addSlot, clearItems, findLeafByItem, isSlot, itemOf, newPaneId, paneOf, presetLayout, removeSessionFromLayout, replaceSessionInLayout, setLeafItem, slotsOf, type LayoutPreset, type PaneItem } from '../utils/paneLayout';
+import { EMPTY_PANE, LIST_MIN_WIDTH, LIVE_LIST, useSessionsLayout } from '../sessionsLayout';
+import { PanelChoices } from './PanesView';
 import { pickDirectory, isTauri } from '../utils/tauri';
 import { formatAge } from '../utils/agent';
 import { pluginRegistry, usePluginVersion, type LiveControllerContext } from '../plugins';
 import '../styles/harness.css';
-import { keepSame } from '../utils/keepSame';
 import { formatSessionTitle, type Session } from '../utils/sessions';
 
 const err = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -39,39 +40,29 @@ const rowUsesClock = (h: Hosted, session?: Session) => {
   return !!(hasAge || h.waits?.length || h.shells?.length || h.subagents?.some(a => !a.finished) || session?.context?.cacheAt);
 };
 
-const LIST_WIDTH_KEY = 'hs-list-width';
-/** The session list is never narrower than this, and leaves the terminal at least as much. */
-export const LIST_MIN_WIDTH = 200;
-const storedWidth = (): number | null => {
-  try { const v = Number(localStorage.getItem(LIST_WIDTH_KEY)); return v >= LIST_MIN_WIDTH ? v : null; } catch { return null; }
-};
-
 interface Action { label: string; icon: React.ReactNode; run: () => void; title?: string }
 
 /** A button whose actions open as a menu: the "…" of a session row, the "+" of a folder. */
-function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false }: { label: string; actions: Action[] | (() => Action[]); icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean }) {
+function RowMenu({ label, actions, icon, title = 'Actions', className = 'hs-actions', buttonClassName, disabled = false, wrapItems = false, tool }: { label: string; actions: Action[] | (() => Action[]); icon?: React.ReactNode; title?: string; className?: string; buttonClassName?: string; disabled?: boolean; wrapItems?: boolean;
+  /** A pane header's tool: a ghost button with `icon` and this text after it (none: the icon alone) */
+  tool?: { text?: string } }) {
   const [at, setAt] = useState<{ top: number; right: number } | null>(null);
   const wrap = useRef<HTMLSpanElement>(null);
-  useEffect(() => {
-    if (!at) return;
-    const outside = (e: MouseEvent) => { if (!wrap.current?.contains(e.target as Node)) setAt(null); };
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setAt(null); };
-    document.addEventListener('mousedown', outside); document.addEventListener('keydown', key);
-    return () => { document.removeEventListener('mousedown', outside); document.removeEventListener('keydown', key); };
-  }, [at]);
+  const toggle = (e: React.MouseEvent<HTMLButtonElement>) => {
+    // Fixed position: the list scrolls and would clip a menu placed inside it
+    const box = e.currentTarget.getBoundingClientRect();
+    setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
+  };
   return <span className={className} ref={wrap}>
-    <button type="button" className={buttonClassName} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={e => {
-      // Fixed position: the list scrolls and would clip a menu placed inside it
-      const box = e.currentTarget.getBoundingClientRect();
-      setAt(at ? null : { top: box.bottom + 2, right: Math.max(4, window.innerWidth - box.right) });
-    }}>{icon ?? <MoreHorizontal size={14}/>}</button>
-    {at && <div className="hs-menu" role="menu" style={{ top: at.top, right: at.right }} onKeyDown={e => { if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return; e.preventDefault(); const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('button')); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); buttons[(index + (e.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus(); }}>
-      {(typeof actions === 'function' ? actions() : actions).map(a => <button key={a.label} type="button" role="menuitem" title={a.title} onClick={() => {
-        setAt(null);
+    {tool
+      ? <Button variant="ghost" size="xs" icon={icon} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={toggle}>{tool.text || undefined}</Button>
+      : <button type="button" className={buttonClassName} aria-haspopup="menu" aria-expanded={!!at} aria-label={label} title={title} disabled={disabled} onClick={toggle}>{icon ?? <MoreHorizontal size={14}/>}</button>}
+    {at && <Menu label={label} at={at} anchorRef={wrap} wrap={wrapItems} onClose={() => setAt(null)}
+      items={(typeof actions === 'function' ? actions() : actions).map(a => ({ key: a.label, label: a.label, title: a.title, icon: a.icon, onSelect: () => {
+        // The latest action of that name: a memoized row's menu still acts on the current Live state
         const current = typeof actions === 'function' ? actions().find(next => next.label === a.label) : a;
         current?.run();
-      }}>{a.icon} {a.label}</button>)}
-    </div>}
+      } }))}/>}
   </span>;
 }
 
@@ -138,7 +129,7 @@ const LiveSessionRow = memo(function LiveSessionRow({
           ? <><optgroup label="This folder">{choices.here.map(choice)}</optgroup><optgroup label="Other folders">{choices.elsewhere.map(choice)}</optgroup></>
           : [...choices.here.map(choice), ...choices.elsewhere.map(choice)]}
       </select>
-      <button type="button" onClick={() => handlers.cancelBinding()}>Cancel</button>
+      <Button variant="secondary" size="xs" onClick={() => handlers.cancelBinding()}>Cancel</Button>
     </form>}
     {shells.length > 0 && <ul className="hs-subs hs-shells" aria-label={`Running shells of ${label}`}>
       {shells.map(sh => {
@@ -166,19 +157,23 @@ const LiveSessionRow = memo(function LiveSessionRow({
   </li>;
 });
 
-function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot: (id: string, el: HTMLElement | null) => void }) {
-  const ref = useRef<HTMLDivElement>(null);
+/**
+ * Whether a pane body is on screen with some size: only then does its terminal attach (MCR-140).
+ * The Cockpit can push the Supervisor's terminal offscreen or squeeze it to zero height while
+ * its pane stays shown. While the window is hidden the last answer stands (background WebKit
+ * can report an empty viewport); it is asked again when the window comes back.
+ */
+function useOnScreen(ref: React.RefObject<HTMLElement | null>, watching: boolean): boolean {
+  const [shown, setShown] = useState(false);
   useEffect(() => {
     const el = ref.current;
-    if (!el) return;
+    if (!el || !watching) { setShown(false); return; }
     let observing = true;
     let live = true;
     const intersection = new IntersectionObserver(entries => {
       if (!live || document.hidden || !observing) return;
       const entry = entries[entries.length - 1];
-      const shown = entry?.isIntersecting
-        && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0;
-      registerSlot(sessionId, shown ? el : null);
+      setShown(!!entry?.isIntersecting && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0);
     }, { threshold: [0, Number.EPSILON] });
     const resize = new ResizeObserver(([entry]) => {
       if (!live || document.hidden || !entry) return;
@@ -189,7 +184,7 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
       if (sized) intersection.observe(el);
       else {
         intersection.unobserve(el);
-        registerSlot(sessionId, null);
+        setShown(false);
       }
     });
     const stop = () => {
@@ -199,8 +194,6 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
     };
     const watch = () => {
       stop();
-      // Background WebKit can report an empty viewport. Preserve the last
-      // visible geometry and ask for fresh observations when it comes back.
       if (document.hidden) return;
       observing = true;
       intersection.observe(el);
@@ -212,11 +205,27 @@ function PaneSlot({ sessionId, registerSlot }: { sessionId: string; registerSlot
       live = false;
       document.removeEventListener('visibilitychange', watch);
       stop();
-      registerSlot(sessionId, null);
+      setShown(false);
     };
-  }, [sessionId, registerSlot]);
-  return <div className="hs-pane-slot" ref={ref}/>;
+  }, [ref, watching]);
+  return shown;
 }
+
+/** A session pane's body: the terminal attaches only while the body is on screen with some size. */
+function PaneBody({ watching, terminal, children }: { watching: boolean; terminal: () => React.ReactNode; children?: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const onScreen = useOnScreen(ref, watching);
+  return <div className="hs-pane-body" ref={ref}>
+    {watching && onScreen && terminal()}
+    {children}
+  </div>;
+}
+
+/** Smallest pane in Live, px. */
+const PANE_MIN = { w: 240, h: 120 };
+
+/** A pane Live draws: its leaf and what it shows (nothing yet: the empty pane). */
+interface LivePane { id: string; item: PaneItem | null }
 
 /**
  * Agent terminals hosted by the runner. They keep running when this view, the
@@ -233,15 +242,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   onSearch?: (directory: string) => void;
 }) {
   const sessionLabel = (h: Hosted) => liveSessionLabel(h, titles);
-  // Null: the default width, a share of the window
-  const [listWidth, setListWidth] = useState<number | null>(storedWidth);
-  const resizeList = (x: number | null, handle?: HTMLElement) => {
-    const live = handle?.closest<HTMLElement>('.hs-live')?.getBoundingClientRect();
-    const width = x === null || !live ? null
-      : Math.round(Math.max(LIST_MIN_WIDTH, Math.min(x - live.left, live.width - LIST_MIN_WIDTH)));
-    setListWidth(width);
-    try { if (width) localStorage.setItem(LIST_WIDTH_KEY, String(width)); else localStorage.removeItem(LIST_WIDTH_KEY); } catch { /* not kept */ }
-  };
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   // The background processes are not allowed: never asked ('new'), or stopped by the person
   const [gate, setGate] = useState<'new' | 'stopped' | null>(null);
@@ -253,25 +253,21 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const [error, setError] = useState('');
   const [selected, setSelected] = useState('');
   const [opened, setOpened] = useState<string[]>([]);
-  const [layout, setLayout] = useState<PaneNode>(() => createInitialLayout());
-  const leaves = useMemo(() => listLeaves(layout), [layout]);
-  const assignedSessions = useMemo(() => new Set(leaves.flatMap(({ item }) => item?.kind === 'session' && item.id ? [item.id] : [])), [leaves]);
+  // Live's layout (the list, the panes sessions open in, any panel) and the pane a session opens in, kept per viewer
+  const layout = useSessionsLayout(s => s.layouts.live);
+  const focusedPane = useSessionsLayout(s => s.focused.live);
+  const setLayout = useCallback((change: (root: LayoutNode) => LayoutNode) => {
+    const { layouts, setLayout: set } = useSessionsLayout.getState();
+    set('live', change(layouts.live));
+  }, []);
+  const setFocusedPane = useCallback((leafId: string) => useSessionsLayout.getState().focus('live', leafId), []);
+  const leaves = useMemo(() => leavesOf(layout), [layout]);
+  // The panes a session can open in: sessions', plugins' and empty ones
+  const slots = useMemo(() => leaves.filter(isSlot), [leaves]);
+  const assignedSessions = useMemo(() => new Set(leaves.flatMap(({ pane }) => { const item = itemOf(pane); return item?.kind === 'session' && item.id ? [item.id] : []; })), [leaves]);
   useLayoutEffect(() => { keep.protect(assignedSessions); }, [assignedSessions]);
   useLayoutEffect(() => () => keep.protect(new Set()), []);
-  const [focusedPane, setFocusedPane] = useState('p1');
-  const focusedItem = leaves.find(leaf => leaf.id === focusedPane)?.item;
-  const paneSeq = useRef(2);
-  const splitSeq = useRef(1);
-  const [slotEls, setSlotEls] = useState(() => new Map<string, HTMLElement>());
-  const registerSlot = useCallback((key: string, el: HTMLElement | null) => {
-    setSlotEls(prev => {
-      if ((prev.get(key) ?? null) === el) return prev;
-      const next = new Map(prev);
-      if (el) next.set(key, el);
-      else next.delete(key);
-      return next;
-    });
-  }, []);
+  const focusedItem = itemOf(leaves.find(leaf => leaf.id === focusedPane)?.pane);
   const [profile, setProfile] = useState('claude');
   const [cwd, setCwd] = useState('');
   const [starting, setStarting] = useState(false);
@@ -299,6 +295,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const closing = useRef(new Map<string, boolean>());
   // The service's list has been read since this view mounted: before that an empty list says nothing
   const listRead = useRef(false);
+  const [listed, setListed] = useState(false);
   const listStamp = useRef('');
   const listRequest = useRef(0);
   const listShown = useRef(0);
@@ -335,6 +332,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
       // An overlapping read replaced the base for this unchanged reply.
       if (!answer.sessions && stamp !== listStamp.current) return refreshList();
       listRead.current = true;
+      setListed(true);
       if (ENDED_ROW_GRACE_MS > 0) setListNow(Date.now());
       if (answer.sessions) {
         listStamp.current = answer.stamp;
@@ -416,31 +414,28 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     }
     setLayout(prev => {
       const existing = findLeafByItem(prev, item);
-      const focused = findLeaf(prev, focusedPane);
-      if (existing && existing.id !== focusedPane) {
-        if (focused && focused.item === null) {
-          return setLeafItem(setLeafItem(prev, existing.id, null), focusedPane, item);
+      // The pane chosen last, while it can still take a session (not the list, not a panel)
+      const chosen = findLeaf(prev, focusedPane);
+      const focused = chosen && isSlot(chosen) ? chosen : undefined;
+      if (existing && existing.id !== focused?.id) {
+        if (focused && !itemOf(focused.pane)) {
+          return setLeafItem(setLeafItem(prev, existing.id, null), focused.id, item);
         }
         setFocusedPane(existing.id);
         return prev;
       }
-      const targetId = focused ? focused.id : (listLeaves(prev)[0]?.id ?? 'p1');
-      if (!focused) setFocusedPane(targetId);
-      return setLeafItem(prev, targetId, item);
+      if (focused) return setLeafItem(prev, focused.id, item);
+      // None chosen: the first pane that can take it, or a new one beside the list
+      const first = slotsOf(prev)[0];
+      const target = first?.id ?? newPaneId('p');
+      setFocusedPane(target);
+      return first ? setLeafItem(prev, target, item) : addSlot(prev, target, item);
     });
-  }, [focusedPane]);
+  }, [focusedPane, setLayout, setFocusedPane]);
 
   const clearItemFromLayout = useCallback((predicate: (item: PaneItem) => boolean) => {
-    const walk = (node: PaneNode): PaneNode => {
-      if (node.kind === 'leaf') {
-        return node.item && predicate(node.item) ? { ...node, item: null } : node;
-      }
-      const a = walk(node.a);
-      const b = walk(node.b);
-      return a === node.a && b === node.b ? node : { ...node, a, b };
-    };
-    setLayout(walk);
-  }, []);
+    setLayout(prev => clearItems(prev, predicate));
+  }, [setLayout]);
 
   const select = (id: string) => {
     openItem({ kind: 'session', id });
@@ -500,50 +495,48 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     document.addEventListener('visibilitychange', acknowledge);
     return () => { window.removeEventListener('focus', acknowledge); document.removeEventListener('visibilitychange', acknowledge); };
   }, [active, hosted, selected, refresh]);
-  const focusPane = (leafId: string, item: PaneItem | null) => {
+  /** A pane was pointed at: one a session can open in becomes the chosen one, and its session the selected. */
+  const focusPane = (leafId: string) => {
+    const leaf = findLeaf(useSessionsLayout.getState().layouts.live, leafId);
+    if (!leaf || !isSlot(leaf)) return;
     setFocusedPane(leafId);
+    const item = itemOf(leaf.pane);
     if (item?.kind === 'session' && item.id) {
       setSelected(item.id);
       pluginRegistry.emitEvent('session:selected', { id: item.id });
     }
   };
   const splitPane = useCallback((leafId: string, dir: 'row' | 'col') => {
-    const newLeafId = `p${paneSeq.current++}`;
-    const newSplitId = `s${splitSeq.current++}`;
-    setLayout(prev => splitLeaf(prev, leafId, dir, newLeafId, newSplitId, null));
-    setFocusedPane(newLeafId);
+    const id = newPaneId('p');
+    setLayout(prev => splitLeaf(prev, leafId, dir, 'after', { kind: 'leaf', id, pane: paneOf(null) }, newPaneId('s')));
+    setFocusedPane(id);
     pluginRegistry.emitEvent('pane:split', { leafId, dir });
-  }, []);
+  }, [setLayout, setFocusedPane]);
   const closePane = useCallback((leafId: string) => {
-    setLayout(prev => {
-      const next = closeLeaf(prev, leafId);
-      const leaves = listLeaves(next);
-      if (!leaves.some(l => l.id === focusedPane)) {
-        const nextFocus = leaves[0];
-        if (nextFocus) {
-          setFocusedPane(nextFocus.id);
-          setSelected(nextFocus.item?.kind === 'session' && nextFocus.item.id ? nextFocus.item.id : '');
-        }
-      } else if (leafId === focusedPane && leaves.length === 1) {
-        const only = leaves[0].item;
-        setSelected(only?.kind === 'session' && only.id ? only.id : '');
-      }
-      return next;
-    });
+    setLayout(prev => closeLeaf(prev, leafId));
     pluginRegistry.emitEvent('pane:closed', { leafId });
-  }, [focusedPane]);
+  }, [setLayout]);
+  // The chosen pane went (closed, joined, or it shows the list or a panel now): the first one a session can open in
+  useEffect(() => {
+    const chosen = findLeaf(layout, focusedPane);
+    if (chosen && isSlot(chosen)) return;
+    const next = slots[0];
+    if (!next) return;
+    setFocusedPane(next.id);
+    const item = itemOf(next.pane);
+    setSelected(item?.kind === 'session' && item.id ? item.id : '');
+  }, [layout, focusedPane, slots, setFocusedPane]);
   const applyPreset = useCallback((preset: LayoutPreset) => {
-    const visibleItems = listLeaves(layout).map(l => l.item).filter((x): x is PaneItem => !!x);
-    const pool: PaneItem[] = [...visibleItems];
+    const pool: PaneItem[] = slotsOf(layout).flatMap(l => { const item = itemOf(l.pane); return item ? [item] : []; });
     for (const id of opened) {
       if (!pool.some(x => x.kind === 'session' && x.id === id)) pool.push({ kind: 'session', id });
     }
-    const next = applyLayoutPreset(preset, pool, () => `p${paneSeq.current++}`, () => `s${splitSeq.current++}`);
-    setLayout(next.layout);
-    setFocusedPane(next.focusedPane);
-    const firstItem = listLeaves(next.layout)[0]?.item;
+    const next = presetLayout(layout, preset, pool);
+    setLayout(() => next.root);
+    setFocusedPane(next.focused);
+    const firstItem = itemOf(findLeaf(next.root, next.focused)?.pane);
     if (firstItem?.kind === 'session' && firstItem.id) setSelected(firstItem.id);
-  }, [layout, opened]);
+  }, [layout, opened, setLayout, setFocusedPane]);
 
   const controller: LiveControllerContext = useMemo(() => ({
     active,
@@ -565,26 +558,26 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     },
     reportError: (msg: string) => setError(msg),
   }), [active, hosted, opened, selected, layout, focusedPane, openItem, assignPaneItem, clearItemFromLayout, splitPane, closePane, applyPreset]);
-  const startDividerDrag = (splitId: string, dir: 'row' | 'col', e: React.MouseEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    const container = e.currentTarget.parentElement;
-    if (!container) return;
-    const rect = container.getBoundingClientRect();
-    const onMove = (ev: MouseEvent) => {
-      const ratio = dir === 'row'
-        ? (ev.clientX - rect.left) / Math.max(1, rect.width)
-        : (ev.clientY - rect.top) / Math.max(1, rect.height);
-      setLayout(prev => setSplitRatio(prev, splitId, ratio));
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = '';
-    };
-    document.body.style.cursor = dir === 'row' ? 'col-resize' : 'row-resize';
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-  };
+  // Live's layout, drawn by the workbench's LayoutView: its handles and pane menus change it in the store
+  const drawn = useMemo<Layout>(() => ({ version: 1, root: layout }), [layout]);
+  const applyDrawn = useCallback((next: Layout) => {
+    const before = useSessionsLayout.getState().layouts.live;
+    useSessionsLayout.getState().setLayout('live', next.root);
+    for (const leaf of leavesOf(before)) if (!findLeaf(next.root, leaf.id)) pluginRegistry.emitEvent('pane:closed', { leafId: leaf.id });
+  }, []);
+  const resetLayout = useCallback(() => useSessionsLayout.getState().reset('live'), []);
+  // The panes kept from the last run: a session still listed opens in its pane again (its terminal attaches
+  // while the pane is shown), one that is gone leaves its pane empty. Once, at the first read of the list
+  const restored = useRef(false);
+  useEffect(() => {
+    if (!listed || restored.current) return;
+    restored.current = true;
+    const known = new Set(hosted.map(h => h.id));
+    setLayout(prev => clearItems(prev, item => item.kind === 'session' && !known.has(item.id)));
+    const kept = [...assignedSessions].filter(id => known.has(id));
+    if (kept.length) setOpened(o => [...new Set([...o, ...kept])]);
+    if (focusedItem?.kind === 'session' && known.has(focusedItem.id)) setSelected(focusedItem.id);
+  }, [listed]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (focus?.id) select(focus.id); }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
   const waiting = useMemo(() => hosted.filter(needsYou), [hosted]);
   const suggestions = useMemo(() => [...new Set([status?.home ?? '', ...recentDirectories].filter(Boolean))].slice(0, 40), [status, recentDirectories]);
@@ -799,18 +792,15 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const newAgentOverride = pluginRegistry.getOverride('live:new-agent');
   const layoutBarOverride = pluginRegistry.getOverride('live:layout-bar');
   const paneTools = pluginRegistry.getOverride('live:pane-tools');
-  // Without the Layouts plugin nothing can close a pane: fold back to one
-  const panes = listLeaves(layout).length;
-  useEffect(() => { if (!paneTools && panes > 1) applyPreset('1'); }, [paneTools, panes, applyPreset]);
   const sessionHeaderOverride = pluginRegistry.getOverride('live:session-header');
 
   const closeNewAgent = () => { setNewAgentOpen(false); setProjectFilter(''); setResume(''); };
   const defaultNewAgent = () => (
-    <Dialog open={newAgentOpen} onClose={closeNewAgent} title="New agent" footer={<>
+    <Dialog open={newAgentOpen} onClose={closeNewAgent} title="New agent" size="lg" footerLayout="spread" footer={<>
       <Button variant="ghost" size="sm" onClick={closeNewAgent}>Cancel</Button>
-      <button type="button" className="hs-start hs-start--solid" disabled={!status || (!selectedResume && !status.profiles.some(p => p.id === profile)) || (!cwd && !selectedResume) || starting} onClick={() => void start(profile, cwd, selectedResume?.id ?? '')}>
-        <Play size={12}/> {starting ? 'Starting…' : selectedResume ? `Resume ${selectedResume.agent === 'claude' ? 'Claude' : 'Codex'}` : `Start ${(status?.profiles ?? []).find(p => p.id === profile)?.label ?? profile}`}
-      </button>
+      <Button variant="primary" size="sm" icon={<Play size={12}/>} disabled={!status || (!selectedResume && !status.profiles.some(p => p.id === profile)) || (!cwd && !selectedResume) || starting} onClick={() => void start(profile, cwd, selectedResume?.id ?? '')}>
+        {starting ? 'Starting…' : selectedResume ? `Resume ${selectedResume.agent === 'claude' ? 'Claude' : 'Codex'}` : `Start ${(status?.profiles ?? []).find(p => p.id === profile)?.label ?? profile}`}
+      </Button>
     </>}>
       <div className="hs-modal-body">
         <div className="hs-palette-search">
@@ -824,7 +814,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
               else if (isAbsolutePath(q)) selectProjectCwd(q);
             }
           }} placeholder="Filter projects or paste a folder path…" aria-label="Filter projects"/>
-          <button type="button" className="hs-palette-browse" onClick={async () => { try { const dir = await pickDirectory(); if (dir) { selectProjectCwd(dir); setProjectFilter(''); } } catch (e) { setError(err(e)); } }}><FolderOpen size={13}/> Browse…</button>
+          <Button variant="secondary" size="sm" icon={<FolderOpen size={13}/>} onClick={async () => { try { const dir = await pickDirectory(); if (dir) { selectProjectCwd(dir); setProjectFilter(''); } } catch (e) { setError(err(e)); } }}>Browse…</Button>
         </div>
         <div className="hs-split-picker">
           <div className="hs-split-col">
@@ -890,12 +880,12 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   );
 
   const defaultSidebar = () => (
-    <aside className="hs-list" aria-label="Hosted sessions">
-      <div className="hs-list-resizer" role="separator" aria-orientation="vertical" aria-label="Session list width"
-        title="Drag to resize the list, double-click for the default width"
-        onPointerDown={e => { if (e.button === 0) { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); } }}
-        onPointerMove={e => { if (e.currentTarget.hasPointerCapture(e.pointerId)) resizeList(e.clientX, e.currentTarget); }}
-        onDoubleClick={() => resizeList(null)}/>
+    <Pane as="aside" className="hs-list" aria-label="Hosted sessions" title="Sessions" tools={<>
+      <Button variant="ghost" size="xs" icon={<FolderPlus size={14}/>} aria-label="Add project" title="Add a project: choose a folder to work in" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}/>
+      <RowMenu className="hs-notifications-wrap" tool={{ text: waiting.length ? String(waiting.length) : '' }} wrapItems label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
+        icon={<BellRing size={14}/>} actions={waiting.map(h => ({ label: `${sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
+    </>}>
+      <div className="hs-list-body">
       {error && <div className="hs-error" role="alert">{error}</div>}
       {status?.storeNotice && (() => {
         const notice = status.storeNotice;
@@ -904,7 +894,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
           <div className="hs-error hs-store-notice" role="alert">
             <p>{lines.what}</p>
             <p>{lines.kept}</p>
-            {!notice.frozen && <button type="button" onClick={() => { void harnessApi.storeNoticeSeen().then(left => { if (mounted.current) setStatus(s => s && { ...s, storeNotice: left }); }).catch(e => setError(String(e))); }}>Dismiss</button>}
+            {!notice.frozen && <Button variant="ghost" size="xs" onClick={() => { void harnessApi.storeNoticeSeen().then(left => { if (mounted.current) setStatus(s => s && { ...s, storeNotice: left }); }).catch(e => setError(String(e))); }}>Dismiss</Button>}
           </div>
         );
       })()}
@@ -926,12 +916,6 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
         </button>
         {supervisor && <RowMenu label="Actions for the supervisor" actions={actions(supervisor)}/>}
       </div>
-      <div className="hs-add">
-        <Button variant="ghost" size="sm" title="Choose a folder to work in" aria-label="Add project" onClick={async () => { try { const dir = await pickDirectory(); if (dir) addFolder(dir); } catch (e) { setError(err(e)); } }}><Plus size={14}/> Add project</Button>
-      </div>
-      <RowMenu className="hs-notifications-wrap" buttonClassName="hs-notifications" label="Notifications" title="Notifications from sessions" disabled={!waiting.length}
-        icon={<><BellRing size={14}/> Notifications{waiting.length > 0 && ` · ${waiting.length}`}</>}
-        actions={waiting.map(h => ({ label: `${sessionLabel(h)}: ${h.harness!.attention!.text}`, icon: <BellRing size={14}/>, run: () => select(h.id) }))}/>
       {gate && <BackgroundGate stopped={gate === 'stopped'} onAllowed={connect}/>}
       <ul className="hs-dirs">
         {shown.map(d => {
@@ -989,7 +973,8 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
         </ul>}
       </div>}
       {!sections.length && status && <p className="hs-empty">No sessions yet. Add a project above and start an agent in it; it keeps running when you close the app.</p>}
-    </aside>
+      </div>
+    </Pane>
   );
 
   const sidebarController: LiveControllerContext = {
@@ -1013,24 +998,39 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
     },
   };
 
-  return <div className="hs-live" style={listWidth ? { gridTemplateColumns: `${listWidth}px minmax(0, 1fr)` } : undefined}>
-    {sidebarOverride ? sidebarOverride({ controller: sidebarController, defaultRender: defaultSidebar }) : defaultSidebar()}
+  // Board's and Slack's panels in Live (the app plugin's, for every view of Sessions with panes)
+  const panels = usePaneTypes(pluginRegistry.workbench, 'live');
+
+  // The view's tools in the window's top bar: Back and Forward (MCR-108), then the Layouts plugin's presets
+  const layoutBar = layoutBarOverride?.({ leavesCount: slots.length, controller, defaultRender: () => null });
+  const nameAt = (index: number | null) => index === null ? '' : names.get(history.entries[index]) ?? '';
+  const tools = (opened.length > 0 || layoutBar) && <ShellTools>
+    <div className="wb-tool-group hs-live-tools">
+      {opened.length > 0 && <div className="hs-history" role="toolbar" aria-label="Session history">
+        <button type="button" className="wb-tool" aria-label="Back" disabled={backTo === null} title={backTo === null ? 'Back' : `Back to ${nameAt(backTo)} (${BACK_KEYS})`} onClick={goBack}><ArrowLeft size={14}/></button>
+        <button type="button" className="wb-tool" aria-label="Forward" disabled={forwardTo === null} title={forwardTo === null ? 'Forward' : `Forward to ${nameAt(forwardTo)} (${FORWARD_KEYS})`} onClick={goForward}><ArrowRight size={14}/></button>
+      </div>}
+      {opened.length > 0 && layoutBar && <span className="wb-tool-separator" aria-hidden="true"/>}
+      {layoutBar}
+    </div>
+  </ShellTools>;
+
+  return <div className="hs-live">
     {newAgentOverride ? newAgentOverride({ open: newAgentOpen, onClose: closeNewAgent, controller, defaultRender: defaultNewAgent }) : defaultNewAgent()}
-    <main className="hs-terminals">
+    {tools}
+    <main className="hs-live-layout">
       {(() => {
-        const multiPane = leaves.length > 1;
+        const multiPane = slots.length > 1;
         const emptyActions = pluginRegistry.getEmptyActions();
         const emptyPaneOverride = pluginRegistry.getOverride('live:empty-pane');
-        const renderNode = (node: PaneNode): React.ReactNode => {
-          if (node.kind === 'split') {
-            return (
-              <div key={node.id} className={`hs-split hs-split--${node.dir}`}>
-                <div className="hs-split-child" style={{ flex: node.ratio }}>{renderNode(node.a)}</div>
-                <div className="hs-divider" role="separator" aria-orientation={node.dir === 'row' ? 'vertical' : 'horizontal'} onMouseDown={e => startDividerDrag(node.id, node.dir, e)}/>
-                <div className="hs-split-child" style={{ flex: 1 - node.ratio }}>{renderNode(node.b)}</div>
-              </div>
-            );
-          }
+        // A leaf's pane: a session (header, cockpit, terminal, usage), a plugin's pane, or the empty pane.
+        // A session's pane is kept alive by the layout while a leaf shows it. Its terminal is there only
+        // while the pane is visible, its body is on screen with some size and the Live view is shown
+        // (MCR-139, MCR-140): a hidden one detaches from the runner and goes to the keep (TerminalPane's
+        // `keep`; the panes' sessions are protected there), and shown again takes only what it missed.
+        // A terminal kept attached for every session ever opened parsed all their output for good, and one
+        // mounted hidden told the agent 80×24. (`parked`, a pane no leaf shows, no longer happens.)
+        const renderPane = (node: LivePane, parked = false, visible = true): React.ReactNode => {
           const sessItem = node.item?.kind === 'session' ? node.item : null;
           const h = sessItem ? hosted.find(x => x.id === sessItem.id) : undefined;
           const pluginKind = node.item ? (node.item.kind === 'custom' ? node.item.type : node.item.kind) : '';
@@ -1041,17 +1041,19 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
             <>
               <header className="hs-pane-title hs-pane-title--empty">
                 <span className="hs-empty-dot" aria-hidden="true"/>
-                <strong>Empty pane</strong>
+                <strong><PaneTitle>Empty pane</PaneTitle></strong>
                 <div className="hs-pane-tools">
                   {paneTools?.({ leafId: node.id, multiPane, controller })}
+                  <PaneMenu/>
                 </div>
               </header>
-              <div className="hs-pane-empty">
+              {/* The only pane a session can open in: the list is the picker */}
+              {slots.length === 1 && !node.item ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div> : <div className="hs-pane-empty">
                 <div className="hs-empty-card">
                   <div className="hs-empty-head hs-empty-head--split">
                     <div>
                       <h3>Open in this pane</h3>
-                      <p>Pick a workspace session or launch a new agent.</p>
+                      <p>Pick a workspace session, launch a new agent, or show a panel.</p>
                     </div>
                     <button
                       type="button"
@@ -1145,13 +1147,16 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                   ) : (
                     <p className="hs-empty-none">No running sessions yet. Click New agent to start one.</p>
                   )}
+
+                  <PanelChoices heading="Or show a panel here"/>
                 </div>
-              </div>
+              </div>}
             </>
           );
 
           return (
-            <div key={node.id} className={`hs-pane${multiPane && isFocused ? ' focused' : ''}`} onMouseDown={() => focusPane(node.id, node.item)}>
+            // No key: a kept-alive pane moves between leaves (and in from the parking); a key that changed would remount its terminal
+            <div className="hs-pane" hidden={parked} onMouseDown={parked ? undefined : () => focusPane(node.id)}>
               {h ? (() => {
                 const defaultHeader = () => (
                   <header className="hs-pane-title">
@@ -1161,22 +1166,27 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                     <span title={h.cwd}>{h.cwd}</span>
                     <ProgramLine hosted={h} compact/>
                     <div className="hs-pane-tools">
-                      <button type="button" className="hs-stats-toggle" aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}><BarChart3 size={13}/> Usage</button>
+                      <Button variant="ghost" size="xs" icon={<BarChart3 size={13}/>} aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}>Usage</Button>
                       {paneTools?.({ leafId: node.id, multiPane, controller })}
+                      <PaneMenu/>
                     </div>
                   </header>
                 );
                 return (
                   <>
-                    {sessionHeaderOverride
+                    {!parked && (sessionHeaderOverride
                       ? sessionHeaderOverride({ session: h, leafId: node.id, multiPane, isFocused, statsOpen: stats, toggleStats, controller, defaultRender: defaultHeader })
-                      : defaultHeader()}
+                      : defaultHeader())}
                     {/* The cockpit sits over the Supervisor's own terminal and nowhere else (MCR-96) */}
-                    {!h.exit && isSupervisor(h) && <CockpitPanel active={active} hosted={hosted} label={sessionLabel} onSession={follow}/>}
-                    <div className="hs-pane-body">
-                      <PaneSlot sessionId={h.id} registerSlot={registerSlot}/>
-                      {stats && isFocused && <SessionStats session={h} active={active}/>}
-                    </div>
+                    {!parked && !h.exit && isSupervisor(h) && <CockpitPanel active={active} hosted={hosted} label={sessionLabel} onSession={follow}/>}
+                    {/* The terminal attaches only while its body is on screen with some size (MCR-140) */}
+                    <PaneBody watching={opened.includes(h.id) && active && visible} terminal={() => {
+                      // Only the selected, focused pane takes the keyboard on mount, or a link's focus
+                      const selectedPane = selected === h.id && focusedItem?.kind === 'session' && focusedItem.id === h.id;
+                      return <TerminalPane key={h.id} id={h.id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === h.id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === h.id ? null : l)}/>;
+                    }}>
+                      {!parked && stats && isFocused && <SessionStats session={h} active={active}/>}
+                    </PaneBody>
                   </>
                 );
               })() : pluginPane && node.item ? (
@@ -1195,36 +1205,45 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
           );
         };
 
+        /** A split of a pane a session can open in: an empty pane beside it, chosen (as Live's own split does). */
+        const splitHere = ({ leaf }: PaneContext, dir: 'row' | 'col') => { if (leaf) splitPane(leaf.id, dir); };
+        const sessionTitle = (pane: PaneRef) => {
+          const item = itemOf(pane);
+          const h = item?.kind === 'session' ? hosted.find(x => x.id === item.id) : undefined;
+          return h ? sessionLabel(h) : undefined;
+        };
+        // Live's panes: the list, Board's and Slack's panels (the app plugin's, for every view of Sessions), the sessions', plugins' and empty panes
+        const paneTypes: Record<string, PaneType> = {
+          [LIVE_LIST]: {
+            type: LIVE_LIST, label: 'session list', title: 'Sessions', icon: <ListTree size={14}/>, switchable: true, singleton: true, collapsible: true, min: { w: LIST_MIN_WIDTH },
+            render: () => sidebarOverride ? sidebarOverride({ controller: sidebarController, defaultRender: defaultSidebar }) : defaultSidebar(),
+          },
+          ...panels,
+          [SESSION_PANE]: {
+            type: SESSION_PANE, label: 'session pane', title: 'Session', paneTitle: sessionTitle, keepAlive: true, min: PANE_MIN, split: splitHere,
+            render: ({ pane, leaf, visible }) => renderPane({ id: leaf?.id ?? `bg:${pane.key}`, item: itemOf(pane) }, !leaf, visible),
+          },
+          [CUSTOM_PANE]: {
+            type: CUSTOM_PANE, label: 'pane', min: PANE_MIN, split: splitHere,
+            render: ({ pane, leaf }) => renderPane({ id: leaf?.id ?? '', item: itemOf(pane) }),
+          },
+          [EMPTY_PANE]: {
+            type: EMPTY_PANE, label: 'empty pane', title: 'Empty pane', icon: <SquareDashed size={14}/>, placeholder: true, min: PANE_MIN, split: splitHere,
+            render: ({ leaf }) => renderPane({ id: leaf?.id ?? '', item: null }),
+          },
+        };
+
         return (
-          <>
-            {(() => {
-              const layoutBar = layoutBarOverride?.({ leavesCount: leaves.length, controller, defaultRender: () => null });
-              if (!opened.length && !layoutBar) return null;
-              const nameAt = (index: number | null) => index === null ? '' : names.get(history.entries[index]) ?? '';
-              return (
-                <div className="hs-pane-toolbar">
-                  {opened.length > 0 && <div className="hs-history" role="toolbar" aria-label="Session history">
-                    <button type="button" className="hs-layout-btn" aria-label="Back" disabled={backTo === null} title={backTo === null ? 'Back' : `Back to ${nameAt(backTo)} (${BACK_KEYS})`} onClick={goBack}><ArrowLeft size={13}/></button>
-                    <button type="button" className="hs-layout-btn" aria-label="Forward" disabled={forwardTo === null} title={forwardTo === null ? 'Forward' : `Forward to ${nameAt(forwardTo)} (${FORWARD_KEYS})`} onClick={goForward}><ArrowRight size={13}/></button>
-                  </div>}
-                  {layoutBar}
-                </div>
-              );
-            })()}
-            {leaves.length === 1 && !leaves[0].item
-              ? <div className="hs-placeholder"><p>Select a session, or start one.</p></div>
-              : <div className="hs-layout-root">{renderNode(layout)}</div>}
-            {/* Only visible slots attach. The Cockpit can push a slot offscreen
-                or squeeze it to zero height even when its session stays selected. */}
-            {opened.filter(id => active && assignedSessions.has(id)).map(id => {
-              const h = hosted.find(x => x.id === id);
-              if (!h) return null;
-              const el = slotEls.get(id);
-              if (!el) return null;
-              const selectedPane = selected === id && focusedItem?.kind === 'session' && focusedItem.id === id;
-              return createPortal(<TerminalPane key={id} id={id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === id ? null : l)}/>, el, id);
-            })}
-          </>
+          <LayoutView
+            className="hs-panes hs-layout-root"
+            layout={drawn}
+            onChange={applyDrawn}
+            focusedLeaf={focusedPane}
+            onFocusLeaf={focusPane}
+            onReset={resetLayout}
+            paneTypes={paneTypes}
+            renderEmpty={(leaf) => renderPane({ id: leaf.id, item: null })}
+          />
         );
       })()}
     </main>

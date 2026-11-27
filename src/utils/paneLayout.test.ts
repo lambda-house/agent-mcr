@@ -1,62 +1,74 @@
 import { describe, expect, it } from 'vitest';
+import { leaves, splitLeaf, type LayoutNode } from '@lambda-house/workbench';
 import {
-  applyLayoutPreset,
-  closeLeaf,
-  createInitialLayout,
+  addSlot,
+  clearItems,
   findLeafByItem,
-  listLeaves,
+  isSlot,
+  itemOf,
+  paneOf,
+  presetLayout,
   removeSessionFromLayout,
   replaceSessionInLayout,
   setLeafItem,
-  setSplitRatio,
-  splitLeaf,
+  slotsOf,
   type PaneItem,
 } from './paneLayout';
+import { defaultLayout } from '../sessionsLayout';
 
 const s = (id: string): PaneItem => ({ kind: 'session', id });
 const d = (key: string): PaneItem => ({ kind: 'custom', type: 'note', key });
+/** What each leaf shows: an item, the empty pane, or the list or a panel by its type. */
+const shows = (root: LayoutNode) => leaves(root).map(l => itemOf(l.pane) ?? l.pane?.type);
 
-describe('paneLayout', () => {
-  it('splits a leaf between sessions and custom panes, and collapses back cleanly on close', () => {
-    let tree = setLeafItem(createInitialLayout(), 'p1', s('s1'));
-    tree = splitLeaf(tree, 'p1', 'row', 'p2', 'sp1', d('/work/README.md'));
-
-    expect(listLeaves(tree).map(l => [l.id, l.item])).toEqual([
-      ['p1', s('s1')],
-      ['p2', d('/work/README.md')],
-    ]);
+describe('Live’s panes', () => {
+  it('shows sessions and plugin panes in the panes a session can open in, and empties them', () => {
+    let tree = setLeafItem(defaultLayout('live'), 'p1', s('s1'));
+    tree = splitLeaf(tree, 'p1', 'row', 'after', { kind: 'leaf', id: 'p2', pane: paneOf(d('/work/README.md')) }, 'sp1');
+    expect(shows(tree)).toEqual(['live-sessions', s('s1'), d('/work/README.md')]);
     expect(findLeafByItem(tree, d('/work/README.md'))?.id).toBe('p2');
-
-    const collapsed = closeLeaf(tree, 'p1');
-    expect(collapsed.kind).toBe('leaf');
-    expect(listLeaves(collapsed)).toEqual([{ kind: 'leaf', id: 'p2', item: d('/work/README.md') }]);
+    // The list is no such pane; an empty pane is
+    expect(slotsOf(tree).map(l => l.id)).toEqual(['p1', 'p2']);
+    expect(isSlot(leaves(tree)[0])).toBe(false);
+    tree = setLeafItem(tree, 'p2', null);
+    expect(shows(tree)).toEqual(['live-sessions', s('s1'), 'empty']);
+    expect(slotsOf(tree).map(l => l.id)).toEqual(['p1', 'p2']);
+    // Emptying an empty pane changes nothing
+    expect(setLeafItem(tree, 'p2', null)).toBe(tree);
   });
 
-  it('clamps split ratios and updates/removes sessions', () => {
-    let tree = splitLeaf(setLeafItem(createInitialLayout(), 'p1', s('s1')), 'p1', 'col', 'p2', 'sp1', d('/a.md'));
-    tree = setSplitRatio(tree, 'sp1', 0.99);
-    expect(tree.kind === 'split' && tree.ratio).toBe(0.85);
-    tree = setSplitRatio(tree, 'sp1', 0.01);
-    expect(tree.kind === 'split' && tree.ratio).toBe(0.15);
-
+  it('gives a restarted session its old pane, and empties the panes of sessions that went', () => {
+    let tree = setLeafItem(defaultLayout('live'), 'p1', s('s1'));
     tree = replaceSessionInLayout(tree, 's1', 's1-new');
     expect(findLeafByItem(tree, s('s1-new'))?.id).toBe('p1');
-
+    expect(findLeafByItem(tree, s('s1'))).toBeUndefined();
     tree = removeSessionFromLayout(tree, 's1-new');
-    expect(findLeafByItem(tree, s('s1-new'))).toBeNull();
-
+    expect(shows(tree)).toEqual(['live-sessions', 'empty']);
+    tree = clearItems(setLeafItem(tree, 'p1', d('/a.md')), item => item.kind === 'custom');
+    expect(shows(tree)).toEqual(['live-sessions', 'empty']);
   });
 
-  it('builds 1, 2-col, and 2x2 presets', () => {
-    let p = 1;
-    let sp = 1;
-    const nextLeaf = () => `p${p++}`;
-    const nextSplit = () => `s${sp++}`;
+  it('adds a pane beside the list when none can take a session', () => {
+    const onlyPanels: LayoutNode = { kind: 'split', id: 'live', dir: 'row', children: [{ kind: 'leaf', id: 'list', pane: { type: 'live-sessions', key: 'live-sessions' } }, { kind: 'leaf', id: 'r', pane: { type: 'board-reports', key: 'board-reports' } }], sizes: [{ px: 290 }, { fr: 1 }] };
+    expect(slotsOf(onlyPanels)).toEqual([]);
+    const tree = addSlot(onlyPanels, 'p9', s('a'));
+    expect(shows(tree)).toEqual(['live-sessions', s('a'), 'board-reports']);
+  });
 
-    const two = applyLayoutPreset('2-col', [s('a'), d('/b.md')], nextLeaf, nextSplit);
-    expect(listLeaves(two.layout).map(l => l.item)).toEqual([s('a'), d('/b.md')]);
+  it('builds the presets beside the list as it was, and brings the list back', () => {
+    const narrow: LayoutNode = { ...defaultLayout('live'), sizes: [{ px: 250 }, { fr: 1 }] } as LayoutNode;
+    const two = presetLayout(narrow, '2-col', [s('a'), d('/b.md')]);
+    expect(shows(two.root)).toEqual(['live-sessions', s('a'), d('/b.md')]);
+    expect(two.root).toMatchObject({ kind: 'split', dir: 'row', sizes: [{ px: 250 }, { fr: 0.5 }, { fr: 0.5 }] });
+    expect(itemOf(leaves(two.root).find(l => l.id === two.focused)?.pane)).toEqual(s('a'));
 
-    const four = applyLayoutPreset('2x2', [s('a'), d('/b.md'), s('c')], nextLeaf, nextSplit);
-    expect(listLeaves(four.layout).map(l => l.item)).toEqual([s('a'), d('/b.md'), s('c'), null]);
+    const four = presetLayout(narrow, '2x2', [s('a'), d('/b.md'), s('c')]);
+    expect(shows(four.root)).toEqual(['live-sessions', s('a'), d('/b.md'), s('c'), 'empty']);
+
+    // Without the list (its pane closed): it comes back at its width
+    const withoutList: LayoutNode = { kind: 'leaf', id: 'p1', pane: paneOf(s('a')) };
+    const one = presetLayout(withoutList, '1', [s('a')]);
+    expect(shows(one.root)).toEqual(['live-sessions', s('a')]);
+    expect(one.root).toMatchObject({ sizes: [{ px: 290 }, { fr: 1 }] });
   });
 });

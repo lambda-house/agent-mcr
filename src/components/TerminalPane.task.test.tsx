@@ -50,20 +50,20 @@ const rightClick = () => {
   act(() => { host.querySelector('.hs-terminal')!.dispatchEvent(event); });
   return event;
 };
-const item = (label: string) => [...document.querySelectorAll('.tc-menu button')].find(b => b.textContent === label) as HTMLButtonElement;
+const item = (label: string) => [...document.querySelectorAll('[role="menu"] [role="menuitem"]')].find(b => b.textContent === label) as HTMLButtonElement;
 
 it('offers Copy and Copy as task on a right click only when text is selected', async () => {
   show();
   // No selection: the right click is xterm's, as before
   expect(rightClick().defaultPrevented).toBe(false);
-  expect(document.querySelector('.tc-menu')).toBeNull();
+  expect(document.querySelector('[role="menu"]')).toBeNull();
   fake.selection = '⏺ Gap 3: no drill-down';
   expect(rightClick().defaultPrevented).toBe(true);
-  expect([...document.querySelectorAll('.tc-menu button')].map(b => b.textContent)).toEqual(['Copy', 'Copy as task…']);
+  expect([...document.querySelectorAll('[role="menu"] [role="menuitem"]')].map(b => b.textContent)).toEqual(['Copy', 'Copy as task…']);
   // Copy goes through the app's clipboard tool, not the webview's
   act(() => item('Copy').click());
   expect(harnessApi.copyText).toHaveBeenCalledWith('⏺ Gap 3: no drill-down');
-  expect(document.querySelector('.tc-menu')).toBeNull();
+  expect(document.querySelector('[role="menu"]')).toBeNull();
   // Copy as task opens the dialog with the passage, without the frame
   rightClick();
   act(() => item('Copy as task…').click());

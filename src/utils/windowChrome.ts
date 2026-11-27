@@ -1,4 +1,5 @@
-import { useSyncExternalStore, type CSSProperties } from 'react';
+import { useSyncExternalStore } from 'react';
+import type { TitleBar } from '@lambda-house/workbench';
 import { PLATFORM, type Platform } from './platform';
 import { isTauri } from './tauri';
 import { documentWindowPath } from './documentWindow';
@@ -6,37 +7,19 @@ import { documentWindowPath } from './documentWindow';
 /*
  * The window's top row (MCR-138). On macOS the main window has an overlay
  * title bar (src-tauri/tauri.macos.conf.json): no title row of its own, the
- * traffic lights drawn over the app's top row (the Documents toolbar or the
- * Sessions bar). That row then leaves room for the lights, and its empty
- * space moves the window and zooms it on a double-click, as a title bar does.
- * Windows and Linux keep their native title bar, and so do the memory reader
- * windows, which Rust opens with the default chrome.
+ * traffic lights drawn over the app's top row, the workbench's top bar. That
+ * bar then leaves room for the lights, and its empty space moves the window
+ * and zooms it on a double-click, as a title bar does. Windows and Linux keep
+ * their native title bar, and so do the memory reader windows, which Rust
+ * opens with the default chrome.
+ *
+ * The bar's side (the lights' geometry, MCR-145, its attributes and the
+ * no-drag mark) is the workbench's `titleBar.ts`: the Workbench gets
+ * `titleBar={useTitleBar()}`. tauri.macos.conf.json's trafficLightPosition
+ * {x 14, y 21} is what its TRAFFIC_LIGHT_X and --titlebar-height are measured
+ * for. What is here needs Tauri: which window this is, and full screen.
  */
-
-/*
- * Where the traffic lights land (MCR-145, measured on macOS 27.2 with tao 0.37.1,
- * which places them for trafficLightPosition {x, y}): each light is 14 px square,
- * one every 23 px from x, so the third ends at x + 60; tao makes the title bar
- * 14 + y tall and AppKit keeps the lights 9 px above its bottom, so their centre
- * is at y - 2 from the window's top. tauri.macos.conf.json has x 14 and y 21:
- * centre 19, the centre of the row (--titlebar-height 39px less its 1 px border).
- */
-/** The lights' left edge in the window, trafficLightPosition.x. */
-export const TRAFFIC_LIGHT_X = 14;
-/** From the first light's left edge to the third's right edge. */
-export const TRAFFIC_LIGHTS_WIDTH = 3 * 14 + 2 * 9;
-/**
- * Room at the left of the top row for the traffic lights: the gap after the
- * third light is the window's margin before the first, 14 px.
- */
-export const TRAFFIC_LIGHT_INSET = TRAFFIC_LIGHT_X + TRAFFIC_LIGHTS_WIDTH + TRAFFIC_LIGHT_X;
-
-/**
- * `native`: the system draws the title bar, the top row is an ordinary row.
- * `overlay`: the lights are over the top row. `fullscreen`: an overlay window
- * in full screen, where macOS hides the lights, so the row needs no room for them.
- */
-export type TitleBar = 'native' | 'overlay' | 'fullscreen';
+export { NO_DRAG, TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_X, TRAFFIC_LIGHTS_WIDTH, topRowInset, topRowProps, type TitleBar, type TopRowProps } from '@lambda-house/workbench';
 
 /** Whether this window has the overlay title bar: the main window of the app on macOS. */
 export function hasOverlayTitleBar(platform: Platform, tauri: boolean, readerWindow: boolean): boolean {
@@ -47,41 +30,6 @@ export function titleBar(overlay: boolean, fullscreen: boolean): TitleBar {
   if (!overlay) return 'native';
   return fullscreen ? 'fullscreen' : 'overlay';
 }
-
-/** Left inset of the top row, in CSS pixels. */
-export function topRowInset(bar: TitleBar): number {
-  return bar === 'overlay' ? TRAFFIC_LIGHT_INSET : 0;
-}
-
-export interface TopRowProps {
-  'data-titlebar'?: TitleBar;
-  /**
-   * Tauri's drag script (tauri 2.12, `window/scripts/drag.js`): `deep` makes
-   * a press anywhere in the row drag the window and a double-click zoom it,
-   * except on what can be clicked (buttons, inputs, links, `role="tab"` and
-   * the like) and below an element marked `false` (`NO_DRAG`).
-   */
-  'data-tauri-drag-region'?: 'deep';
-  style?: CSSProperties;
-}
-
-/**
- * The attributes of the top row. Nothing for a native title bar, so Windows
- * and Linux get the row they had. No drag region in full screen, where the
- * window cannot be moved and a double-click must not unzoom it.
- */
-export function topRowProps(bar: TitleBar): TopRowProps {
-  if (bar === 'native') return {};
-  if (bar === 'fullscreen') return { 'data-titlebar': bar };
-  return { 'data-titlebar': bar, 'data-tauri-drag-region': 'deep', style: { paddingLeft: topRowInset(bar) } };
-}
-
-/**
- * For a part of the top row that reacts to the pointer without being a
- * button (a menu's frame, a popover, a hover control): a press there is not
- * a drag. Without a drag region above it, the attribute does nothing.
- */
-export const NO_DRAG = { 'data-tauri-drag-region': 'false' } as const;
 
 /** The part of a Tauri window this needs; a fake in tests. */
 export interface FullscreenSource {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { SettingRow } from '@/ui';
+import { SettingRow } from '@lambda-house/ui';
 import { canUnlockStore, memoryApi, memoryStateLine, secretStoreName, vaultApi, type MemoryStatus } from '../utils/harness';
 import { PLATFORM } from '../utils/platform';
 

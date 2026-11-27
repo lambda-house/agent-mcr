@@ -2,7 +2,8 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import BoardView from './BoardView';
+import { NotesPanel, ReportsPanel, useBoard } from './BoardView';
+import { useSessionsView } from '../sessionsView';
 import { formatUntil, harnessApi, openReports, type Board, type Hosted } from '../utils/harness';
 
 vi.mock('../utils/harness', async importOriginal => ({ ...await importOriginal<object>(), harnessApi: { status: vi.fn(), list: vi.fn(), board: vi.fn(), postNote: vi.fn(), removeNote: vi.fn() } }));
@@ -21,6 +22,11 @@ const board: Board = {
 
 let root: Root; let host: HTMLDivElement;
 const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
+/** Board as it first is: its two panes; a report opens its session through `onOpen` (Live's). */
+const renderBoard = (onOpen: (id: string) => void = () => {}) => {
+  useSessionsView.setState({ openLive: onOpen });
+  return root.render(<><ReportsPanel/><NotesPanel/></>);
+};
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -30,13 +36,15 @@ beforeEach(() => {
   vi.mocked(harnessApi.list).mockResolvedValue([session]);
   vi.mocked(harnessApi.board).mockResolvedValue(board);
   vi.mocked(harnessApi.removeNote).mockResolvedValue();
+  // The board read by the last test is gone (the home folder stays: it is asked once)
+  useBoard.setState({ board: null, hosted: [], error: '' });
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 
 describe('Board view', () => {
   it('lists reports newest first and marks the one still waiting', async () => {
     const onOpen = vi.fn();
-    await act(async () => root.render(<BoardView active onOpen={onOpen}/>)); await flush();
+    await act(async () => renderBoard(onOpen)); await flush();
     const rows = [...host.querySelectorAll('section[aria-label="Reports"] li')];
     expect(rows.map(li => li.querySelector('.hs-board-text')?.textContent)).toEqual(['Which database?', 'Merged', 'Tests pass']);
     expect(rows.map(li => li.className)).toEqual(['open', '', '']);
@@ -50,7 +58,7 @@ describe('Board view', () => {
   });
 
   it('filters reports by kind', async () => {
-    await act(async () => root.render(<BoardView active onOpen={() => {}}/>)); await flush();
+    await act(async () => renderBoard()); await flush();
     const done = [...host.querySelectorAll('.hs-board-filter button')].find(b => b.textContent === 'Done') as HTMLButtonElement;
     await act(async () => done.click());
     expect([...host.querySelectorAll('section[aria-label="Reports"] .hs-board-text')].map(e => e.textContent)).toEqual(['Merged', 'Tests pass']);
@@ -67,7 +75,7 @@ describe('Board view', () => {
       { id: 'r6', session: 'lead', name: 'Lead', cwd: '/Users/me/repo', kind: 'status', text: 'One executor at work', created: 6, executors: [{ session: 'w1', name: 'Worker', state: 'working', needsOperator: false, waits: ['CI run 42'] }, { session: 'w2', name: 'Builder', state: 'waiting', needsOperator: true, waits: [] }] },
     ] });
     const onOpen = vi.fn();
-    await act(async () => root.render(<BoardView active onOpen={onOpen}/>)); await flush();
+    await act(async () => renderBoard(onOpen)); await flush();
     const groups = [...host.querySelectorAll('.hs-board-group')];
     expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Reports of Lead and its executors', 'Reports of sessions without a supervisor']);
     const rows = [...groups[0].querySelectorAll('li')];
@@ -88,7 +96,7 @@ describe('Board view', () => {
 
   it('posts a note of the person for a folder sessions run in', async () => {
     vi.mocked(harnessApi.postNote).mockResolvedValue();
-    await act(async () => root.render(<BoardView active onOpen={() => {}}/>)); await flush();
+    await act(async () => renderBoard()); await flush();
     const form = host.querySelector('form[aria-label="Leave a note"]') as HTMLFormElement;
     const post = form.querySelector('button[type="submit"]') as HTMLButtonElement;
     expect(post.disabled).toBe(true);
@@ -104,7 +112,7 @@ describe('Board view', () => {
   });
 
   it('removes a note only on the second click', async () => {
-    await act(async () => root.render(<BoardView active onOpen={() => {}}/>)); await flush();
+    await act(async () => renderBoard()); await flush();
     const note = host.querySelector('section[aria-label="Bulletin board"] li') as HTMLElement;
     expect(note.textContent).toContain('Do not run the migration');
     expect(note.textContent).toContain('expires in 5 h, or when its session ends');
