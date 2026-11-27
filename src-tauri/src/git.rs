@@ -275,10 +275,24 @@ fn local_command(cwd: &Path, timeout: Duration, limit: Limit) -> io::Result<Comm
     } else {
         executable(timeout)?
     };
+    // The inner `git.exe` started alone gets what the launcher would have
+    // added to `MSYS`, so its symlink default stays the installation's.
+    #[cfg(windows)]
+    let msys = if limit == Limit::Alone {
+        launcher_msys(&program)
+    } else {
+        None
+    };
     let mut command = Command::new(program);
     // Inherited Git variables can redirect an operation away from its working directory,
     // add configuration, or send traces to a file.
     strip_git_env(&mut command);
+    #[cfg(windows)]
+    {
+        if let Some(msys) = msys {
+            command.env("MSYS", msys);
+        }
+    }
     #[cfg(test)]
     tests::CONFIG_FILES.with(|files| {
         for (name, path) in files.borrow().iter() {
@@ -383,6 +397,49 @@ fn executable(timeout: Duration) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("cannot find the Git program"))?;
     *FOUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(found.clone());
     Ok(found)
+}
+
+/// What Git for Windows' launcher puts into `MSYS` before it starts Git
+/// (`maybe_read_config` in git-wrapper.c): every `MSYS=` line of
+/// `<top>\etc\git-bash.config`. Without it the inner `git.exe` misses the
+/// installation's symlink default (`winsymlinks:nativestrict`) and can read a
+/// link replaced by a file as unchanged. A file that is missing or cannot be
+/// read adds nothing, as for the launcher.
+#[cfg(windows)]
+fn launcher_msys(git: &Path) -> Option<String> {
+    let config = git
+        .ancestors()
+        .skip(1)
+        .take(4)
+        .map(|dir| dir.join("etc").join("git-bash.config"))
+        .find(|path| path.is_file())?;
+    let mut text = String::new();
+    std::fs::File::open(config)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    msys_from(&text, std::env::var("MSYS").ok())
+}
+
+/// The launcher's rule: each `MSYS=` line goes in front of the value so far,
+/// with a space; a line when `MSYS` is unset is the value. None when no line
+/// changes it.
+#[cfg(any(windows, test))]
+fn msys_from(config: &str, inherited: Option<String>) -> Option<String> {
+    let mut msys = inherited;
+    let mut changed = false;
+    for line in config.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(value) = line.strip_prefix("MSYS=") {
+            msys = Some(match msys {
+                Some(old) => format!("{value} {old}"),
+                None => value.to_owned(),
+            });
+            changed = true;
+        }
+    }
+    msys.filter(|_| changed)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1109,6 +1166,42 @@ pub mod tests {
         let output = run(&nested, &["rev-parse", "--verify", "HEAD"], TIMEOUT, 4096).unwrap();
         assert!(!output.status.success());
         assert!(!output.stderr.is_empty());
+    }
+
+    /// Git for Windows' launcher (git-wrapper.c, `maybe_read_config`) puts each
+    /// `MSYS=` line in front of the inherited value; the confined inner Git
+    /// gets the same.
+    #[test]
+    fn the_launchers_msys_lines_go_in_front_of_the_inherited_value() {
+        assert_eq!(
+            msys_from("# native links\r\nMSYS=winsymlinks:nativestrict\r\n", None).as_deref(),
+            Some("winsymlinks:nativestrict")
+        );
+        assert_eq!(
+            msys_from("MSYS=a\nMSYS=b\n", Some("c".into())).as_deref(),
+            Some("b a c")
+        );
+        assert_eq!(msys_from("MSYS=a", Some(String::new())).as_deref(), Some("a "));
+        assert_eq!(msys_from("msys=a\nOTHER=b\n", Some("c".into())), None);
+    }
+
+    /// The launcher's file is found from the inner Git's path,
+    /// `<top>\mingw64\bin\git.exe` -> `<top>\etc\git-bash.config`.
+    #[cfg(windows)]
+    #[test]
+    fn the_inner_git_finds_the_launchers_config() {
+        let top = tempfile::tempdir().unwrap();
+        let bin = top.path().join("mingw64").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(top.path().join("etc")).unwrap();
+        std::fs::write(
+            top.path().join("etc").join("git-bash.config"),
+            "MSYS=winsymlinks:nativestrict\r\n",
+        )
+        .unwrap();
+        let found = launcher_msys(&bin.join("git.exe")).unwrap();
+        assert!(found.starts_with("winsymlinks:nativestrict"), "{found}");
+        assert_eq!(launcher_msys(&top.path().join("elsewhere").join("git.exe")), None);
     }
 
     #[test]
