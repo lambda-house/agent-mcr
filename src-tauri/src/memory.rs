@@ -514,6 +514,13 @@ impl Link {
         self.refresh(&meta, epoch)
     }
 
+    /// Whether a renewed token is one the vault did not keep: a rotated
+    /// refresh token held in memory, or an access token due to be renewed
+    /// again because it was not written (`RENEW_NOW`)
+    fn unwritten(&self) -> bool {
+        lock(&self.unkept).is_some() || self.snapshot().access_expires == RENEW_NOW
+    }
+
     /// The rotated refresh token of this sign-in that the vault did not keep
     fn unkept(&self, epoch: u64) -> Option<String> {
         lock(&self.unkept).as_ref().filter(|(of, _)| *of == epoch).map(|(_, token)| token.clone())
@@ -1213,9 +1220,9 @@ impl Memory {
     fn noted<T>(&self, result: Result<T, Fail>) -> Result<T, Fail> {
         match &result {
             Err(fail @ (Fail::NoModelKey | Fail::Unreachable(_) | Fail::Vault(_) | Fail::Unusable | Fail::Refused(_))) => self.link.problem(fail),
-            // A call that got through says the earlier trouble with the service or the vault is over
-            // but not while a renewed refresh token is held that the vault did not keep
-            Ok(_) if lock(&self.link.unkept).is_none() && self.link.snapshot().problem.as_ref().is_some_and(|p| ["unreachable", "vault_unavailable", "refused"].contains(&p.kind.as_str())) => self.link.change(|s| s.problem = None),
+            // A call that got through says the earlier trouble with the service or the vault is over,
+            // but not while a renewed token is one the vault did not keep: that lasts until a write succeeds
+            Ok(_) if !self.link.unwritten() && self.link.snapshot().problem.as_ref().is_some_and(|p| ["unreachable", "vault_unavailable", "refused"].contains(&p.kind.as_str())) => self.link.change(|s| s.problem = None),
             _ => {}
         }
         result
@@ -2313,9 +2320,15 @@ pub(crate) mod tests {
             assert_eq!(rig.vault.get("access").unwrap().as_deref(), Some("access-secret-1"));
             assert_eq!(rig.memory.link.snapshot().access_expires, RENEW_NOW);
             assert!(lock(&rig.memory.link.unkept).is_none());
+            // The call got through, and the operator still sees why: nothing was written yet
+            assert_eq!(rig.memory.status()["problem"]["kind"], "vault_unavailable");
+            assert_eq!(rig.call("clock", json!({}))["result"]["isError"], false);
+            assert_eq!(rig.memory.status()["problem"]["kind"], "vault_unavailable");
+            let issued = lock(&rig.world).issued as usize;
             // The next call renews again, and once the vault keeps the token it is used as before
             rig.vault.refuse_set("access", None);
             assert_eq!(rig.call("clock", json!({}))["result"]["isError"], false);
+            assert!(rig.memory.status()["problem"].is_null());
             assert_eq!(lock(&rig.world).count("POST /oauth/token"), issued + 1);
             assert_eq!(rig.vault.get("access").unwrap(), Some(format!("access-secret-{}", issued + 1)));
             assert!(rig.memory.link.snapshot().access_expires > RENEW_NOW);
