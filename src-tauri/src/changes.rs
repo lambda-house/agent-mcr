@@ -220,7 +220,7 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
         match r.base()? {
             Some((name, base)) => {
                 let merge_base = r.line(&["merge-base", &base, &head])?.filter(|m| !m.is_empty());
-                let (behind, ahead) = r.counts(&name, &base, &head)?;
+                let (behind, ahead) = r.counts("the base", &base, &head)?;
                 repo.base = Some(Track { name: name.clone(), ahead, behind, merge_base: merge_base.clone() });
                 let (commits, more) = r.commits(&base, &head)?;
                 repo.commits = commits;
@@ -232,9 +232,12 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
             }
             None => repo.base_note = Some("No base: the repository has neither origin/HEAD nor origin/main.".into()),
         }
-        if let Some(name) = r.line(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])?.filter(|u| !u.is_empty()) {
-            if let Some(sha) = r.line(&["rev-parse", "--verify", "--quiet", "@{upstream}^{commit}"])?.filter(|u| !u.is_empty()) {
-                let (behind, ahead) = r.counts(&name, &sha, &head)?;
+        // `@{upstream}` follows the branch's setting, which can change during
+        // the read: it is asked once, and the ref it named then is resolved
+        if let Some(full) = r.line(&["rev-parse", "--symbolic-full-name", "@{upstream}"])?.filter(|u| u.starts_with("refs/")) {
+            if let Some(sha) = r.line(&["rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")])?.filter(|u| !u.is_empty()) {
+                let (behind, ahead) = r.counts("the upstream", &sha, &head)?;
+                let name = full.strip_prefix("refs/remotes/").or_else(|| full.strip_prefix("refs/heads/")).unwrap_or(&full).to_string();
                 repo.upstream = Some(Track { name, ahead, behind, merge_base: None });
             }
         }
@@ -264,8 +267,9 @@ pub fn read(git: &dyn Git, cwd: &Path) -> Result<Changes, String> {
                 repo.uncommitted.more = true;
                 break;
             }
-            let file = r.undone(&head, path, xy)?;
-            repo.uncommitted.files.push(file);
+            if let Some(file) = r.undone(&head, path, xy)? {
+                repo.uncommitted.files.push(file);
+            }
         }
     } else {
         repo.uncommitted.files = status.into_iter().map(|(path, xy)| File { status: xy.trim().chars().next().unwrap_or('A').to_string(), staged: xy.as_bytes()[0] != b' ', unstaged: xy.as_bytes()[1] != b' ', path, diff_note: Some("no commit to compare with yet".into()), ..File::default() }).collect();
@@ -336,14 +340,16 @@ impl Reader<'_> {
     /// the symmetric range `<` (only in `other`) or `>` (only in HEAD):
     /// `rev-list --count` is not among the runner's guarded subcommands.
     /// The marks are read as UTF-8 whatever `i18n.logOutputEncoding` says,
-    /// and a count git refused is an error, never "even".
-    fn counts(&self, name: &str, other: &str, head: &str) -> Result<(u64, u64), String> {
+    /// and a count git refused is an error, never "even". `what` says which
+    /// ref in fixed words: a ref's own name may have a credential's shape,
+    /// and an error reaches the page unredacted.
+    fn counts(&self, what: &str, other: &str, head: &str) -> Result<(u64, u64), String> {
         let range = format!("{other}...{head}");
         let Some(out) = self.run(&["log", "--no-color", "--no-show-signature", "--encoding=UTF-8", "--left-right", "--format=%m", &range, "--"], COUNT_LIMIT)? else {
-            return Err(format!("Git could not count the commits between {name} and the head."));
+            return Err(format!("Git could not count the commits between {what} and the head."));
         };
         if out.truncated {
-            return Err(format!("{name} and the head are too far apart to count here."));
+            return Err(format!("The head and {what} are too far apart to count here."));
         }
         let marks = String::from_utf8_lossy(&out.stdout);
         let count = |m: &str| marks.lines().filter(|l| *l == m).count() as u64;
@@ -398,30 +404,35 @@ impl Reader<'_> {
     }
 
     /// A tracked file the net diff from `head` leaves out: its staged diff,
-    /// then its work tree's, each read alone.
-    fn undone(&self, head: &str, path: &str, xy: &str) -> Result<File, String> {
+    /// then its work tree's, each read alone. What it says comes from those
+    /// two diffs, not from the status read before them: a file an editor
+    /// put back in the meantime has neither and is no row (None), and only
+    /// a staged diff that the work tree takes back is `undone`.
+    fn undone(&self, head: &str, path: &str, xy: &str) -> Result<Option<File>, String> {
         let (x, y) = (xy.as_bytes()[0], xy.as_bytes()[1]);
-        let mut file = File { path: path.to_string(), status: (if x == b' ' { y } else { x } as char).to_string(), staged: x != b' ', unstaged: y != b' ', undone: true, ..File::default() };
+        let mut file = File { path: path.to_string(), status: (if x == b' ' { y } else { x } as char).to_string(), ..File::default() };
         let spec = format!(":(literal){path}");
-        let mut text = String::new();
-        for from in [&["--cached", head][..], &[][..]] {
+        let mut parts = [String::new(), String::new()];
+        let mut cut = [false, false];
+        for (i, from) in [&["--cached", head][..], &[][..]].into_iter().enumerate() {
             let args: Vec<String> = ["diff", "--patch"].iter().chain(DIFF.iter()).chain(from.iter()).map(|a| a.to_string()).chain(["--".to_string(), spec.clone()]).collect();
-            match self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), FILE_DIFF)? {
-                Some(out) if out.truncated => {
-                    file.diff_note = Some(TOO_LARGE.into());
-                    return Ok(file);
-                }
-                Some(out) => text.push_str(&String::from_utf8_lossy(&out.stdout)),
-                None => {}
+            if let Some(out) = self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), FILE_DIFF)? {
+                cut[i] = out.truncated;
+                parts[i] = String::from_utf8_lossy(&out.stdout).into_owned();
             }
         }
-        if text.len() > FILE_DIFF {
+        file.staged = cut[0] || !parts[0].is_empty();
+        file.unstaged = cut[1] || !parts[1].is_empty();
+        if !file.staged && !file.unstaged {
+            return Ok(None);
+        }
+        file.undone = file.staged && file.unstaged;
+        let text = parts.concat();
+        if cut[0] || cut[1] || text.len() > FILE_DIFF {
             file.diff_note = Some(TOO_LARGE.into());
         } else if text.lines().any(|l| l.starts_with("Binary files ")) {
             file.binary = true;
             file.diff_note = Some("binary".into());
-        } else if text.is_empty() {
-            file.diff_note = Some("git shows no diff for it".into());
         } else {
             let (added, removed) = line_counts(&text);
             (file.added, file.removed) = (Some(added), Some(removed));
@@ -429,7 +440,7 @@ impl Reader<'_> {
             file.diff = Some(shown);
             file.hidden = hidden;
         }
-        Ok(file)
+        Ok(Some(file))
     }
 
     /// The files between `range` (one commit: to the work tree) with counts and diffs
@@ -618,13 +629,15 @@ pub fn hide(chunk: &str) -> (String, usize) {
     (out, hidden)
 }
 
-/// The text of a hunk's line without its `+`, `-` or ` ` mark
+/// The text of a hunk's line without its `+`, `-` or ` ` mark, and
+/// without the file's own indentation (a key in a YAML block scalar)
 fn content(l: &str) -> &str {
     let b = l.trim_end_matches(['\n', '\r']);
-    match b.as_bytes().first() {
+    let b = match b.as_bytes().first() {
         Some(b'+' | b'-' | b' ') => &b[1..],
         _ => b,
-    }
+    };
+    b.trim_matches([' ', '\t'])
 }
 
 fn base64ish(s: &str) -> bool {
@@ -652,21 +665,20 @@ fn mark_keys(lines: &[&str], hunk: std::ops::Range<usize>, hide: &mut [bool]) {
     if let Some(start) = open {
         hide[start..hunk.end].iter_mut().for_each(|h| *h = true);
     }
-    for i in hunk.clone() {
-        if !key_body(content(lines[i])) {
-            continue;
+    // Each run of base64 lines is looked at once: hidden whole when any
+    // line of it has a key body's shape
+    let mut i = hunk.start;
+    while i < hunk.end {
+        let start = i;
+        let mut keyish = false;
+        while i < hunk.end && base64ish(content(lines[i])) {
+            keyish |= key_body(content(lines[i]));
+            i += 1;
         }
-        hide[i] = true;
-        let mut j = i;
-        while j > hunk.start && base64ish(content(lines[j - 1])) {
-            j -= 1;
-            hide[j] = true;
+        if keyish {
+            hide[start..i].iter_mut().for_each(|h| *h = true);
         }
-        let mut j = i + 1;
-        while j < hunk.end && base64ish(content(lines[j])) {
-            hide[j] = true;
-            j += 1;
-        }
+        i = i.max(start + 1);
     }
 }
 
@@ -1234,5 +1246,99 @@ mod tests {
         let (out, hidden) = hide(chunk);
         assert_eq!(hidden, 3);
         assert!(out.ends_with("+after\n") && !out.contains("abd"), "{out}");
+    }
+
+    #[test]
+    fn a_count_error_names_no_ref() {
+        let (tmp, work) = clone();
+        let origin = tmp.path().join("origin");
+        let t = token();
+        git(&origin, &["branch", &t]);
+        git(&work, &["fetch", "-q"]);
+        git(&work, &["checkout", "-qb", &t, "--track", &format!("origin/{t}")]);
+        git(&work, &["symbolic-ref", "refs/remotes/origin/HEAD", &format!("refs/remotes/origin/{t}")]);
+        // The base's count, then the upstream's, refused and then cut at its limit
+        for (nth, answer) in [(0, None), (1, None), (0, Some(true)), (1, Some(true))] {
+            let calls = std::cell::Cell::new(0);
+            let failing = Hooked {
+                instead: |args: &[String]| {
+                    if !args.iter().any(|a| a == "--left-right") {
+                        return None;
+                    }
+                    calls.set(calls.get() + 1);
+                    (calls.get() - 1 == nth).then(|| Ok(answer.map(|truncated| Out { stdout: vec![], truncated })))
+                },
+                after: |_: &[String]| {},
+            };
+            let e = read(&failing, &work).unwrap_err();
+            assert!(!e.contains(&t), "{e}");
+            assert!(e.contains(if nth == 0 { "the base" } else { "the upstream" }), "{e}");
+        }
+    }
+
+    #[test]
+    fn an_indented_key_body_is_hidden_too() {
+        let (_tmp, work) = clone();
+        let mut lines = vec!["service:".to_string(), "  key: |".to_string()];
+        lines.extend(key_lines(30).into_iter().map(|l| format!("    {l}")));
+        lines.push("  name: demo".into());
+        let text = |l: &[String]| l.iter().map(|l| format!("{l}\n")).collect::<String>();
+        write(&work, "config.yaml", &text(&lines));
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "config"]);
+        lines[16] = format!("\t{}", key_lines(31)[30]);
+        write(&work, "config.yaml", &text(&lines));
+        let r = repo(&work);
+        let diff = r.uncommitted.files[0].diff.as_deref().unwrap();
+        assert!(!diff.contains("PRIVATE KEY"), "the fixture's hunk holds a delimiter: {diff}");
+        for l in &lines[2..32] {
+            assert!(!diff.contains(&l.trim()[..20]), "a key line is shown: {diff}");
+        }
+        // The mark of each hidden line stays
+        assert!(diff.contains(&format!("-{HIDDEN}")) && diff.contains(&format!("+{HIDDEN}")), "{diff}");
+    }
+
+    #[test]
+    fn an_edit_put_back_while_the_pane_reads_is_no_staged_change() {
+        let (_tmp, work) = clone();
+        write(&work, "a.txt", "one\ntwo\nthree\nedited\n");
+        // Status sees the edit; then the editor puts the file back, nothing staged at any time
+        let reverting = Hooked {
+            instead: |_: &[String]| None,
+            after: |args: &[String]| {
+                if args.iter().any(|a| a == "--untracked-files=no") {
+                    write(&work, "a.txt", "one\ntwo\nthree\n");
+                }
+            },
+        };
+        let r = read(&reverting, &work).unwrap().repo.unwrap();
+        assert!(r.uncommitted.files.is_empty(), "{:?}", r.uncommitted.files.iter().map(|f| (&f.path, f.staged, f.undone)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_upstream_count_is_of_the_ref_it_names() {
+        let (_tmp, work) = clone();
+        git(&work, &["checkout", "-qb", "feature"]);
+        write(&work, "f.txt", "f\n");
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-qm", "feature"]);
+        // origin/captured is the head itself; origin/main is one behind it
+        git(&work, &["update-ref", "refs/remotes/origin/captured", "HEAD"]);
+        git(&work, &["branch", "--set-upstream-to=origin/captured"]);
+        let switched = std::cell::Cell::new(false);
+        // The tracking setting changes right after the upstream was asked
+        let racing = Hooked {
+            instead: |_: &[String]| None,
+            after: |args: &[String]| {
+                if !switched.get() && args.iter().any(|a| a == "@{upstream}") {
+                    switched.set(true);
+                    git(&work, &["branch", "--set-upstream-to=origin/main"]);
+                }
+            },
+        };
+        let r = read(&racing, &work).unwrap().repo.unwrap();
+        assert!(switched.get());
+        let up = r.upstream.unwrap();
+        assert_eq!((up.name.as_str(), up.ahead, up.behind), ("origin/captured", 0, 0));
     }
 }
