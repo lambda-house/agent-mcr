@@ -1,11 +1,12 @@
 import { basename as base, isAbsolutePath } from '../utils/paths';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRight, BarChart3, BellRing, Check, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, FolderPlus, History, Link2, ListTree, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, SquareDashed, Terminal, Unlink, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, BarChart3, BellRing, Check, ChevronDown, ChevronRight, Copy, CornerDownRight, Eye, EyeOff, Folder, FolderOpen, FolderPlus, GitCompare, History, Link2, ListTree, MoreHorizontal, Network, Play, Plus, Radar, RotateCw, Search, SquareDashed, Terminal, Unlink, X } from 'lucide-react';
 import { Button, Dialog, Menu, keepSame } from '@lambda-house/ui';
 import { LayoutView, Pane, PaneMenu, PaneTitle, ShellTools, closeLeaf, findLeaf, leaves as leavesOf, splitLeaf, usePaneTypes, type Layout, type LayoutNode, type PaneContext, type PaneRef, type PaneType } from '@lambda-house/workbench';
 import TerminalPane, { keep } from './TerminalPane';
 import AgentMark from './AgentMark';
 import SessionStats from './SessionStats';
+import ChangesPane from './ChangesPane';
 import CockpitPanel from './CockpitPanel';
 import { BackgroundGate } from './Background';
 import { cacheClass, indexedSession, useSessionMetrics } from './SessionMetrics';
@@ -39,6 +40,9 @@ const rowUsesClock = (h: Hosted, session?: Session) => {
   const hasAge = t?.state === 'working' || ((t?.state === 'idle' || t?.state === 'waiting') && (t.status?.trim() || t.lastMessage?.trim()));
   return !!(hasAge || h.waits?.length || h.shells?.length || h.subagents?.some(a => !a.finished) || session?.context?.cacheAt);
 };
+
+/** The pane beside a terminal */
+type SidePane = '' | 'usage' | 'changes';
 
 interface Action { label: string; icon: React.ReactNode; run: () => void; title?: string }
 
@@ -288,9 +292,23 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
   const [hiddenOpen, setHiddenOpen] = useState(false);
   // The session being connected to a supervisor: its row shows the chooser
   const [binding, setBinding] = useState('');
-  // The usage pane beside the terminal: open or closed is this viewer's preference
-  const [stats, setStats] = useState(() => { try { return localStorage.getItem('hs-stats') === '1'; } catch { return false; } });
-  const toggleStats = () => setStats(on => { try { localStorage.setItem('hs-stats', on ? '0' : '1'); } catch { /* not kept */ } return !on; });
+  // The pane beside the terminal, usage or changes (MCR-176), or none: this viewer's preference.
+  // 'hs-stats' is the older key, from when usage was the only one.
+  const [side, setSide] = useState<SidePane>(() => {
+    try {
+      const kept = localStorage.getItem('hs-side');
+      if (kept === 'usage' || kept === 'changes' || kept === '') return kept;
+      return localStorage.getItem('hs-stats') === '1' ? 'usage' : '';
+    } catch { return ''; }
+  });
+  const toggleSide = (pane: Exclude<SidePane, ''>) => setSide(open => {
+    const next = open === pane ? '' : pane;
+    try { localStorage.setItem('hs-side', next); } catch { /* not kept */ }
+    return next;
+  });
+  const stats = side === 'usage';
+  const toggleStats = () => toggleSide('usage');
+  const toggleChanges = () => toggleSide('changes');
   // Sessions to forget after exit and any report acknowledgement. The value says whether the pane was cleared.
   const closing = useRef(new Map<string, boolean>());
   // The service's list has been read since this view mounted: before that an empty list says nothing
@@ -1166,6 +1184,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                     <span title={h.cwd}>{h.cwd}</span>
                     <ProgramLine hosted={h} compact/>
                     <div className="hs-pane-tools">
+                      <Button variant="ghost" size="xs" icon={<GitCompare size={13}/>} aria-pressed={side === 'changes'} title="Branch, commits, uncommitted work and diffs of this session's git work tree (read only)" onClick={toggleChanges}>Changes</Button>
                       <Button variant="ghost" size="xs" icon={<BarChart3 size={13}/>} aria-pressed={stats} title="Tokens, context size, tools and skills of this session" onClick={toggleStats}>Usage</Button>
                       {paneTools?.({ leafId: node.id, multiPane, controller })}
                       <PaneMenu/>
@@ -1175,7 +1194,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                 return (
                   <>
                     {!parked && (sessionHeaderOverride
-                      ? sessionHeaderOverride({ session: h, leafId: node.id, multiPane, isFocused, statsOpen: stats, toggleStats, controller, defaultRender: defaultHeader })
+                      ? sessionHeaderOverride({ session: h, leafId: node.id, multiPane, isFocused, statsOpen: stats, toggleStats, changesOpen: side === 'changes', toggleChanges, controller, defaultRender: defaultHeader })
                       : defaultHeader())}
                     {/* The cockpit sits over the Supervisor's own terminal and nowhere else (MCR-96) */}
                     {!parked && !h.exit && isSupervisor(h) && <CockpitPanel active={active} hosted={hosted} label={sessionLabel} onSession={follow}/>}
@@ -1186,6 +1205,7 @@ export default function LiveWorkspace({ active, recentDirectories, titles: index
                       return <TerminalPane key={h.id} id={h.id} name={sessionLabel(h)} active={active} focusOnMount={selectedPane} onQuit={() => quit(h)} isSession={isSession} onSession={follow} focusAt={selectedPane && linked?.id === h.id ? linked.at : undefined} onFocused={() => setLinked(l => l?.id === h.id ? null : l)}/>;
                     }}>
                       {!parked && stats && isFocused && <SessionStats session={h} active={active}/>}
+                      {!parked && side === 'changes' && isFocused && <ChangesPane session={h} active={active}/>}
                     </PaneBody>
                   </>
                 );

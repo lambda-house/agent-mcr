@@ -140,6 +140,9 @@ export interface ComponentOverrideMap {
     isFocused: boolean;
     statsOpen: boolean;
     toggleStats: () => void;
+    /** The Changes pane beside the terminal (MCR-176) */
+    changesOpen: boolean;
+    toggleChanges: () => void;
     controller: LiveControllerContext;
     defaultRender: () => React.ReactNode;
   }) => React.ReactNode;

@@ -665,6 +665,32 @@ pub async fn harness_copy_text(text: String) -> Result<(), String> {
     blocking(move || to_clipboard(&text)).await
 }
 
+/// The Changes pane of a session (MCR-176): what its git work tree holds
+/// against the base, read only (`changes::read`). The page names the
+/// session and nothing else; the folder is the runner's record of it. The
+/// runner is asked without being started: with no runner there is no session.
+#[tauri::command]
+pub async fn harness_changes(id: String) -> Result<Value, String> {
+    valid_id(&id)?;
+    blocking(move || {
+        let list = Client::connect(&socket()?).and_then(|mut c| c.call(json!({"op": "list"}))).map_err(|_| "The runner is not running.".to_string())?;
+        let cwd = session_folder(&list, &id)?;
+        let changes = crate::changes::read(&crate::changes::SharedGit::started(), &cwd)?;
+        serde_json::to_value(changes).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// The folder of session `id` in the runner's list
+fn session_folder(list: &Value, id: &str) -> Result<PathBuf, String> {
+    let session = list["sessions"].as_array().into_iter().flatten().find(|s| s["id"] == id).ok_or("No such session.")?;
+    let cwd = PathBuf::from(session["cwd"].as_str().unwrap_or(""));
+    if !cwd.is_absolute() {
+        return Err("The session has no folder.".into());
+    }
+    Ok(cwd)
+}
+
 /// Text to the system clipboard, through the platform's own tool: the app
 /// has no clipboard library, and the page is not given the text to copy.
 fn to_clipboard(text: &str) -> Result<(), String> {
@@ -1280,6 +1306,15 @@ pub fn terminal_save_image(request: Request<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_changes_folder_is_the_runners_record_of_the_session() {
+        let one = if cfg!(windows) { r"C:\work\one" } else { "/work/one" };
+        let list = json!({"sessions": [{"id": "a1", "cwd": one}, {"id": "b2", "cwd": "relative"}, {"id": "c3"}]});
+        assert_eq!(session_folder(&list, "a1").unwrap(), PathBuf::from(one));
+        assert!(session_folder(&list, "zz").unwrap_err().contains("No such session"));
+        assert!(session_folder(&list, "b2").is_err() && session_folder(&list, "c3").is_err());
+    }
 
     #[test]
     fn live_list_sends_visible_changes_and_ignores_terminal_output() {
