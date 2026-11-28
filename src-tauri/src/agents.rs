@@ -315,6 +315,41 @@ pub const CODEX_SOCKET_PROFILE: &str = "agent-mcr-sockets";
 /// stay closed.
 pub const CODEX_SOCKETS: &str = "/private/tmp/agent-mcr-sockets";
 
+/// The build caches a Codex session under a root may write (MCR-205, design
+/// 17519), as the profile's filesystem keys: what cargo and sbt write with a
+/// warm cache, measured with `codex sandbox --log-denials` on 28 Nov
+/// (codex-cli 0.172). The network stays behind the proxy, so a download
+/// still goes to the operator; these only spare the prompts of a warm cache.
+/// Each is code a later build runs outside any sandbox, which the owner
+/// weighs in 17519; configuration and executables stay read-only
+/// (`CODEX_CACHES_CLOSED`)
+pub const CODEX_CACHES: &[&str] = &[
+    // cargo: extracted crates, git dependencies, and its locks and tracker
+    "~/.cargo/registry",
+    "~/.cargo/git",
+    "~/.cargo/.package-cache",
+    "~/.cargo/.package-cache-mutate",
+    "~/.cargo/.global-cache",
+    "~/.cargo/.global-cache-journal",
+    // sbt: the launcher's lock, the compiler bridge, the compiled global plugins
+    "~/.sbt/boot",
+    "~/.sbt/1.0/zinc",
+    "~/.sbt/1.0/staging",
+    // Ivy, as sbt uses it, and Coursier
+    "~/.ivy2/cache",
+    "~/.ivy2/.sbt.ivy.lock",
+    "~/Library/Caches/Coursier",
+];
+
+/// Folders next to `CODEX_CACHES` whose writes would change every later
+/// build rather than fill a cache: cargo's `bin` (on PATH) and
+/// `config.toml`, sbt's global settings, plugins and `repositories`, Ivy's
+/// `local` (resolved first) and credentials, and the home folder. The
+/// launch check proves each is refused (`codex_sockets`, code
+/// `cache-wide`), or the profile is not used. The check is macOS's alone
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const CODEX_CACHES_CLOSED: &[&str] = &["~", "~/.cargo", "~/.cargo/bin", "~/.sbt", "~/.sbt/1.0", "~/.sbt/1.0/plugins", "~/.ivy2", "~/.ivy2/local", "~/Library/Caches"];
+
 impl Launch<'_> {
     fn claude_mode(&self) -> &str {
         if self.claude_uses_auto() { "auto" } else { self.profile_mode().unwrap_or("acceptEdits") }
@@ -1091,8 +1126,12 @@ fn one_sandbox(words: &[String]) -> Result<(), String> {
 /// firewall as the mitigation (17284). Without it, `allow_local_binding` is
 /// false. Both ways it is set here, with the two `dangerously_*` switches
 /// false, so a lower config layer cannot set them for this profile.
+///
+/// Besides workspace-write's filesystem, the build caches of `CODEX_CACHES`
+/// are writable (MCR-205): Codex takes `~/` keys and expands them itself.
 pub fn codex_socket_words(ports: bool) -> Vec<String> {
     let p = CODEX_SOCKET_PROFILE;
+    let caches: String = CODEX_CACHES.iter().map(|c| format!(", \"{c}\"=\"write\"")).collect();
     [
         "--enable".to_owned(),
         "network_proxy".to_owned(),
@@ -1100,7 +1139,7 @@ pub fn codex_socket_words(ports: bool) -> Vec<String> {
         format!("default_permissions=\"{p}\""),
         "-c".to_owned(),
         format!(
-            "permissions.{p}.filesystem={{\":root\"=\"read\", \":project_roots\"={{\".\"=\"write\", \".git\"=\"read\", \".codex\"=\"read\", \".agents\"=\"read\", \".aws\"=\"read\"}}, \":slash_tmp\"=\"write\", \":tmpdir\"=\"write\"}}"
+            "permissions.{p}.filesystem={{\":root\"=\"read\", \":project_roots\"={{\".\"=\"write\", \".git\"=\"read\", \".codex\"=\"read\", \".agents\"=\"read\", \".aws\"=\"read\"}}, \":slash_tmp\"=\"write\", \":tmpdir\"=\"write\"{caches}}}"
         ),
         "-c".to_owned(),
         format!("permissions.{p}.network.enabled=true"),
@@ -1841,6 +1880,19 @@ mod tests {
             let filesystem = &sockets[5];
             for rule in [r#"":root"="read""#, r#""."="write""#, r#"".git"="read""#, r#"".codex"="read""#, r#"".agents"="read""#, r#"":slash_tmp"="write""#, r#"":tmpdir"="write""#] {
                 assert!(filesystem.contains(rule), "{filesystem}");
+            }
+            // The build caches and nothing beside them (MCR-205): every key
+            // outside the folder is one of `CODEX_CACHES`, each writable
+            for cache in CODEX_CACHES {
+                assert!(filesystem.contains(&format!(", \"{cache}\"=\"write\"")), "{cache}: {filesystem}");
+                assert!(cache.starts_with("~/") && !cache.contains("..") && !cache.contains('"'), "{cache}");
+            }
+            assert_eq!(filesystem.matches("\"~").count(), CODEX_CACHES.len(), "{filesystem}");
+            assert_eq!(filesystem.matches("\"/").count(), 0, "{filesystem}");
+            for closed in CODEX_CACHES_CLOSED {
+                assert!(!filesystem.contains(&format!("\"{closed}\"")), "{closed}: {filesystem}");
+                // A closed folder is never inside a cache
+                assert!(!CODEX_CACHES.iter().any(|c| closed.starts_with(&format!("{c}/")) || closed == c), "{closed}");
             }
             for word in ["network.enabled=true".to_owned(), format!("network.allow_local_binding={ports}"), "network.dangerously_allow_all_unix_sockets=false".into(), "network.dangerously_allow_non_loopback_proxy=false".into()] {
                 assert!(sockets.contains(&format!("permissions.agent-mcr-sockets.{word}")), "{word}");

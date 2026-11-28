@@ -22,6 +22,7 @@
 //! The probe passes only when the proxy runs, Seatbelt itself refuses a
 //! direct connection out, TCP listening is allowed or refused exactly as the
 //! firewall decided, Unix sockets bind in `CODEX_SOCKETS` and nowhere else,
+//! nothing can be created beside the writable build caches (MCR-205),
 //! the proxy answers 403 for hosts it was given no domain for, and no config
 //! layer, rules file or managed file that Codex reads could widen the proxy
 //! (`refusal`). It answers with a code; what the harness shows is the fixed
@@ -75,6 +76,8 @@ const MESSAGES: &[(&str, &str)] = &[
     ("off-proxy", "a network proxy runs in the plain sandbox"),
     ("off-connect", "the plain sandbox let a connection through"),
     ("off-bind", "the plain sandbox let a command listen on TCP"),
+    ("cache-wide", "a write beside the build caches was allowed"),
+    ("home", "the home folder is not known"),
 ];
 pub const TIMEOUT: &str = "the check did not finish within 2 s";
 pub const NOT_STARTED: &str = "the check could not start";
@@ -363,6 +366,7 @@ fn probe(nonce: &str, ports: bool, codex_home: &Path, cwd: &Path) -> Result<(), 
     direct_refused()?;
     tcp(ports)?;
     unix_sockets(nonce)?;
+    caches_closed(nonce)?;
     proxy_refuses(proxy, nonce, ports)?;
     match refusal(&Sources::for_launch(codex_home, cwd)) {
         Some(code) => Err(code),
@@ -477,6 +481,53 @@ fn unix_sockets(nonce: &str) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// The folders beside the writable build caches stay closed (MCR-205):
+/// configuration and executables that every later build would take up
+/// (`agents::CODEX_CACHES_CLOSED`). The home folder is the one Codex
+/// expands `~` to, from `HOME`
+fn caches_closed(nonce: &str) -> Result<(), &'static str> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).ok_or("home")?;
+    if !home.is_absolute() {
+        return Err("home");
+    }
+    for closed in crate::agents::CODEX_CACHES_CLOSED {
+        if !write_refused(&in_home(&home, closed), nonce) {
+            return Err("cache-wide");
+        }
+    }
+    Ok(())
+}
+
+/// `~` and `~/<rest>` below `home`
+pub fn in_home(home: &Path, path: &str) -> PathBuf {
+    match path.strip_prefix('~') {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None => PathBuf::from(path),
+    }
+}
+
+/// Whether nothing may be created in `dir`: a new file there fails, and
+/// where `dir` does not exist, making it fails too (its parent is then
+/// checked as an entry of its own, or is the home folder). Only a write
+/// that went through counts as open, and it is taken back at once
+pub fn write_refused(dir: &Path, nonce: &str) -> bool {
+    let probe = dir.join(format!(".amcr-probe-{nonce}"));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(dir) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(dir);
+                false
+            }
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
 }
 
 /// The proxy must refuse what it was given no domain for: a name nobody
@@ -858,6 +909,52 @@ mod tests {
         let ran = run_bounded(&sh("echo \"$AGENT_MCR_PROFILE $TERM\"; pwd -P"), Some(dir.path()), &[("AGENT_MCR_PROFILE".into(), "codex".into()), ("TERM".into(), "xterm-256color".into())], Instant::now() + Duration::from_secs(2)).unwrap();
         assert_eq!(ran.out, format!("codex xterm-256color\n{}\n", dunce::canonicalize(dir.path()).unwrap().display()));
         assert_eq!(run_bounded(&["/nonexistent/program".to_owned()], None, &[], Instant::now() + Duration::from_secs(1)).err(), Some(NOT_STARTED));
+    }
+
+    /// A folder counts as closed only when nothing could be made in it, and
+    /// a write that went through is taken back (MCR-205)
+    #[test]
+    fn a_folder_is_closed_only_when_no_write_goes_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let top = tempfile::tempdir().unwrap();
+        let open = top.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        assert!(!write_refused(&open, "n1"));
+        assert_eq!(std::fs::read_dir(&open).unwrap().count(), 0, "the probe file is taken back");
+        // A folder that is not there but could be made is open, and is not left behind
+        let missing = open.join("missing");
+        assert!(!write_refused(&missing, "n2"));
+        assert!(!missing.exists());
+        // Refused writes, and a folder that cannot be made below one
+        let shut = top.path().join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(write_refused(&shut, "n3"));
+        assert!(write_refused(&shut.join("missing"), "n4"));
+        // A parent that is not there either: its own entry decides
+        assert!(write_refused(&shut.join("a/b"), "n5"));
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn closed_folders_are_named_below_home() {
+        let home = Path::new("/Users/me");
+        assert_eq!(in_home(home, "~"), PathBuf::from("/Users/me"));
+        assert_eq!(in_home(home, "~/.cargo/bin"), PathBuf::from("/Users/me/.cargo/bin"));
+        for closed in crate::agents::CODEX_CACHES_CLOSED {
+            assert!(in_home(home, closed).starts_with(home), "{closed}");
+        }
+        // Each cache's folder and every folder above it up to home is closed,
+        // so no write beside a cache creates the way to it (MCR-205)
+        for cache in crate::agents::CODEX_CACHES {
+            let mut above = in_home(home, cache);
+            while above.pop() && above.starts_with(home) {
+                let named = above.strip_prefix(home).unwrap();
+                let key = if named.as_os_str().is_empty() { "~".to_owned() } else { format!("~/{}", named.display()) };
+                assert!(crate::agents::CODEX_CACHES_CLOSED.contains(&key.as_str()) || key == "~/Library", "{cache}: {key} is not checked");
+            }
+        }
+        assert!(MESSAGES.iter().any(|(c, _)| *c == "cache-wide") && MESSAGES.iter().any(|(c, _)| *c == "home"));
     }
 
     /// The whole check against the Codex installed here, through the login
